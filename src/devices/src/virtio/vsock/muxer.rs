@@ -138,19 +138,26 @@ impl VsockMuxer {
         queue: Arc<Mutex<VirtQueue>>,
         interrupt: InterruptTransport,
     ) {
+        let activate_start = std::time::Instant::now();
+        info!("[VSOCK_TIMING] muxer.activate() called, cid={}", self.cid);
+
         self.queue = Some(queue.clone());
         self.mem = Some(mem.clone());
         self.interrupt = Some(interrupt.clone());
 
         #[cfg(target_os = "macos")]
         {
+            info!("[VSOCK_TIMING] starting TimesyncThread");
             let timesync =
                 TimesyncThread::new(self.cid, mem.clone(), queue.clone(), interrupt.clone());
             timesync.run();
+            info!("[VSOCK_TIMING] TimesyncThread started");
         }
 
         let (sender, receiver) = unbounded();
 
+        info!("[VSOCK_TIMING] creating MuxerThread with {} unix_ipc_ports",
+              self.unix_ipc_port_map.as_ref().map(|m| m.len()).unwrap_or(0));
         let thread = MuxerThread::new(
             self.cid,
             self.epoll.clone(),
@@ -163,10 +170,14 @@ impl VsockMuxer {
             self.unix_ipc_port_map.clone().unwrap_or_default(),
         );
         thread.run();
+        info!("[VSOCK_TIMING] MuxerThread spawned");
 
         self.reaper_sender = Some(sender);
         let reaper = ReaperThread::new(receiver, self.proxy_map.clone());
         reaper.run();
+        info!("[VSOCK_TIMING] ReaperThread spawned");
+
+        info!("[VSOCK_TIMING] muxer.activate() completed in {:?}", activate_start.elapsed());
     }
 
     pub(crate) fn has_pending_rx(&self) -> bool {
@@ -539,6 +550,8 @@ impl VsockMuxer {
     fn process_op_request(&mut self, pkt: &VsockPacket) {
         debug!("OP_REQUEST");
         let id: u64 = ((pkt.src_port() as u64) << 32) | (pkt.dst_port() as u64);
+        info!("[VSOCK_TIMING] process_op_request: id={:#x} src_port={} dst_port={}",
+              id, pkt.src_port(), pkt.dst_port());
         let mut proxy_map = self.proxy_map.write().unwrap();
 
         if let Some(proxy) = proxy_map.get(&id) {
@@ -586,12 +599,19 @@ impl VsockMuxer {
     fn process_op_response(&self, pkt: &VsockPacket) {
         debug!("OP_RESPONSE");
         let id: u64 = ((pkt.src_port() as u64) << 32) | (pkt.dst_port() as u64);
+        info!("[VSOCK_TIMING] process_op_response: id={:#x} src_port={} dst_port={}",
+              id, pkt.src_port(), pkt.dst_port());
         let update = self
             .proxy_map
             .read()
             .unwrap()
             .get(&id)
             .map(|proxy| proxy.lock().unwrap().process_op_response(pkt));
+
+        if update.is_none() {
+            info!("[VSOCK_TIMING] process_op_response: NO PROXY FOUND for id={:#x}", id);
+        }
+
         update
             .as_ref()
             .and_then(|u| u.push_accept)
@@ -671,9 +691,11 @@ impl VsockMuxer {
     fn process_stream_rst(&self, pkt: &VsockPacket) {
         debug!("OP_RST");
         let id: u64 = ((pkt.src_port() as u64) << 32) | (pkt.dst_port() as u64);
+        info!("[VSOCK_TIMING] process_stream_rst: GUEST SENT RST! id={:#x} src_port={} dst_port={}",
+              id, pkt.src_port(), pkt.dst_port());
         if let Some(proxy_lock) = self.proxy_map.read().unwrap().get(&id) {
-            debug!(
-                "allowing OP_RST: id={} src={} dst={}",
+            info!(
+                "[VSOCK_TIMING] OP_RST: releasing proxy id={:#x} src={} dst={}",
                 id,
                 pkt.src_port(),
                 pkt.dst_port()
@@ -682,11 +704,30 @@ impl VsockMuxer {
             let update = proxy.release();
             self.process_proxy_update(id, update);
         } else {
-            debug!("invalid OP_RST for {}", pkt.src_port());
+            info!("[VSOCK_TIMING] OP_RST: no proxy found for id={:#x}", id);
         }
     }
 
     pub(crate) fn send_stream_pkt(&mut self, pkt: &VsockPacket) -> super::Result<()> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static STREAM_PKT_COUNT: AtomicU64 = AtomicU64::new(0);
+        let count = STREAM_PKT_COUNT.fetch_add(1, Ordering::Relaxed);
+
+        // Log first 20 packets for debugging
+        if count < 20 {
+            let op_name = match pkt.op() {
+                uapi::VSOCK_OP_REQUEST => "REQUEST",
+                uapi::VSOCK_OP_RESPONSE => "RESPONSE",
+                uapi::VSOCK_OP_SHUTDOWN => "SHUTDOWN",
+                uapi::VSOCK_OP_CREDIT_UPDATE => "CREDIT_UPDATE",
+                uapi::VSOCK_OP_RW => "RW",
+                uapi::VSOCK_OP_RST => "RST",
+                _ => "UNKNOWN",
+            };
+            info!("[VSOCK_TIMING] send_stream_pkt #{}: op={} src_port={} dst_port={}",
+                  count, op_name, pkt.src_port(), pkt.dst_port());
+        }
+
         debug!(
             "send_pkt: src_port={} dst_port={}, op={}",
             pkt.src_port(),

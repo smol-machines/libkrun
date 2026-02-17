@@ -109,6 +109,8 @@ impl MuxerThread {
         if let Some((peer_port, accept_fd, family, proxy_type)) = update.new_proxy {
             let local_port: u32 = thread_rng.random_range(1024..u32::MAX);
             let new_id: u64 = ((peer_port as u64) << 32) | (local_port as u64);
+            info!("[VSOCK_TIMING] creating new proxy: new_id={:#x} (peer_port={}, local_port={}) from acceptor id={:#x}",
+                  new_id, peer_port, local_port, id);
             let new_proxy: Box<dyn Proxy> = match proxy_type {
                 NewProxyType::Tcp => Box::new(TsiStreamProxy::new_reverse(
                     new_id,
@@ -137,6 +139,7 @@ impl MuxerThread {
                 .write()
                 .unwrap()
                 .insert(new_id, Mutex::new(new_proxy));
+            info!("[VSOCK_TIMING] new proxy inserted into proxy_map, calling push_op_request");
             if let Some(proxy) = self.proxy_map.read().unwrap().get(&new_id) {
                 proxy.lock().unwrap().push_op_request();
             };
@@ -150,13 +153,25 @@ impl MuxerThread {
     }
 
     fn create_lisening_ipc_sockets(&self) {
+        let start = std::time::Instant::now();
+        info!("[VSOCK_TIMING] create_lisening_ipc_sockets() called, {} ports to create",
+              self.unix_ipc_port_map.len());
+
         for (port, (path, do_listen)) in &self.unix_ipc_port_map {
             if !do_listen {
+                info!("[VSOCK_TIMING] skipping port {} (do_listen=false)", port);
                 continue;
             }
+            let proxy_start = std::time::Instant::now();
             let id = ((*port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
+            info!("[VSOCK_TIMING] creating UnixAcceptorProxy for port {} at {:?}", port, path);
+
             let proxy = match UnixAcceptorProxy::new(id, path, *port) {
-                Ok(proxy) => proxy,
+                Ok(proxy) => {
+                    info!("[VSOCK_TIMING] UnixAcceptorProxy created for port {} in {:?}",
+                          port, proxy_start.elapsed());
+                    proxy
+                }
                 Err(e) => {
                     warn!("Failed to create listening proxy at {path:?}: {e:?}");
                     continue;
@@ -169,12 +184,23 @@ impl MuxerThread {
             if let Some(proxy) = self.proxy_map.read().unwrap().get(&id) {
                 self.update_polling(id, proxy.lock().unwrap().as_raw_fd(), EventSet::IN);
             };
+            info!("[VSOCK_TIMING] port {} registered with epoll", port);
         }
+
+        info!("[VSOCK_TIMING] create_lisening_ipc_sockets() completed in {:?}", start.elapsed());
     }
 
     fn work(self) {
+        let work_start = std::time::Instant::now();
+        info!("[VSOCK_TIMING] MuxerThread work() started");
+
         let mut thread_rng = rng();
         self.create_lisening_ipc_sockets();
+
+        info!("[VSOCK_TIMING] MuxerThread entering epoll loop after {:?}", work_start.elapsed());
+
+        let mut first_event = true;
+        let mut event_count: u64 = 0;
         loop {
             let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
             match self
@@ -182,10 +208,23 @@ impl MuxerThread {
                 .wait(epoll_events.len(), -1, epoll_events.as_mut_slice())
             {
                 Ok(ev_cnt) => {
+                    if first_event && ev_cnt > 0 {
+                        info!("[VSOCK_TIMING] MuxerThread received first epoll event(s) after {:?} since work() start",
+                              work_start.elapsed());
+                        first_event = false;
+                    }
+                    event_count += ev_cnt as u64;
+
                     for ev in &epoll_events[0..ev_cnt] {
                         debug!("Event: ev.data={} ev.fd={}", ev.data(), ev.fd());
                         let evset = EventSet::from_bits(ev.events).unwrap();
                         let id = ev.data();
+
+                        // Log connection-related events
+                        if event_count <= 10 {
+                            info!("[VSOCK_TIMING] processing event #{}: id={:#x} evset={:?}",
+                                  event_count, id, evset);
+                        }
 
                         let update = self.proxy_map.read().unwrap().get(&id).map(|proxy_lock| {
                             let mut proxy = proxy_lock.lock().unwrap();

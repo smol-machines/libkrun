@@ -478,9 +478,9 @@ impl Proxy for UnixProxy {
     }
 
     fn push_op_request(&self) {
-        debug!(
-            "push_op_request: id={}, local_port={} peer_port={}",
-            self.id, self.local_port, self.peer_port
+        info!(
+            "[VSOCK_TIMING] push_op_request: id={:#x} local_port={} peer_port={} (expecting RESPONSE with src_port={} dst_port={})",
+            self.id, self.local_port, self.peer_port, self.peer_port, self.local_port
         );
 
         // This packet goes to the connection.
@@ -629,6 +629,10 @@ pub struct UnixAcceptorProxy {
 
 impl UnixAcceptorProxy {
     pub fn new(id: u64, path: &PathBuf, peer_port: u32) -> Result<Self, ProxyError> {
+        let start = std::time::Instant::now();
+        info!("[VSOCK_TIMING] UnixAcceptorProxy::new() id={:#x} path={:?} peer_port={}",
+              id, path, peer_port);
+
         let fd = socket(
             AddressFamily::Unix,
             SockType::Stream,
@@ -636,13 +640,19 @@ impl UnixAcceptorProxy {
             None,
         )
         .map_err(ProxyError::CreatingSocket)?;
+        info!("[VSOCK_TIMING] UnixAcceptorProxy socket created in {:?}", start.elapsed());
+
         bind(
             fd.as_raw_fd(),
             &UnixAddr::new(path).map_err(ProxyError::CreatingSocket)?,
         )
         .map_err(ProxyError::CreatingSocket)?;
+        info!("[VSOCK_TIMING] UnixAcceptorProxy bound to {:?} in {:?}", path, start.elapsed());
+
         listen(&fd, Backlog::new(5).map_err(ProxyError::CreatingSocket)?)
             .map_err(ProxyError::CreatingSocket)?;
+        info!("[VSOCK_TIMING] UnixAcceptorProxy listening, total setup {:?}", start.elapsed());
+
         Ok(UnixAcceptorProxy { id, fd, peer_port })
     }
 }
@@ -697,8 +707,14 @@ impl Proxy for UnixAcceptorProxy {
             return update;
         }
         if evset.contains(EventSet::IN) {
+            info!("[VSOCK_TIMING] UnixAcceptorProxy id={:#x} received IN event, accepting connection",
+                  self.id);
+            let accept_start = std::time::Instant::now();
+
             match accept(self.fd.as_raw_fd()) {
                 Ok(accept_fd) => {
+                    info!("[VSOCK_TIMING] UnixAcceptorProxy id={:#x} accepted connection fd={} in {:?}",
+                          self.id, accept_fd, accept_start.elapsed());
                     // Safe because we've just obtained the FD from the `accept` call above.
                     let new_fd = unsafe { OwnedFd::from_raw_fd(accept_fd) };
                     update.new_proxy = Some((

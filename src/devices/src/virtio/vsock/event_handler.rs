@@ -15,6 +15,14 @@ use crate::virtio::VirtioDevice;
 
 impl Vsock {
     pub(crate) fn handle_rxq_event(&mut self, event: &EpollEvent) -> bool {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static RX_EVENT_COUNT: AtomicU64 = AtomicU64::new(0);
+
+        let count = RX_EVENT_COUNT.fetch_add(1, Ordering::Relaxed);
+        if count < 5 {
+            info!("[VSOCK_TIMING] handle_rxq_event: RX event #{}", count + 1);
+        }
+
         debug!("RX queue event");
 
         let event_set = event.event_set();
@@ -33,6 +41,19 @@ impl Vsock {
     }
 
     pub(crate) fn handle_txq_event(&mut self, event: &EpollEvent) -> bool {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static TX_EVENT_COUNT: AtomicU64 = AtomicU64::new(0);
+        static FIRST_TX_TIME: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+        let count = TX_EVENT_COUNT.fetch_add(1, Ordering::Relaxed);
+        if count == 0 {
+            let _ = FIRST_TX_TIME.set(std::time::Instant::now());
+            info!("[VSOCK_TIMING] handle_txq_event: FIRST TX event from guest!");
+        }
+        if count < 5 {
+            info!("[VSOCK_TIMING] handle_txq_event: TX event #{}", count + 1);
+        }
+
         debug!("TX queue event");
 
         let event_set = event.event_set();
@@ -72,6 +93,7 @@ impl Vsock {
     }
 
     fn handle_activate_event(&self, event_manager: &mut EventManager) {
+        info!("[VSOCK_TIMING] handle_activate_event called - registering RX/TX queues with event manager");
         debug!("activate event");
         if let Err(e) = self.activate_evt.read() {
             error!("Failed to consume vsock activate event: {e:?}");
@@ -113,7 +135,9 @@ impl Vsock {
             .unregister(self.activate_evt.as_raw_fd())
             .unwrap_or_else(|e| {
                 error!("Failed to unregister vsock activate evt: {e:?}");
-            })
+            });
+
+        info!("[VSOCK_TIMING] handle_activate_event completed - vsock queues registered");
     }
 }
 
