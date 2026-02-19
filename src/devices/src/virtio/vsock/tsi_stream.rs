@@ -344,7 +344,7 @@ impl TsiStreamProxy {
                         pkt.hdr().len() + cnt
                     }
                     RecvPkt::Close => {
-                        self.status = ProxyStatus::Closed;
+                        self.status = ProxyStatus::PeerClosed;
                         0
                     }
                     RecvPkt::Error => 0,
@@ -400,6 +400,20 @@ impl TsiStreamProxy {
         let rx = MuxerRx::Reset {
             local_port: self.local_port,
             peer_port: self.peer_port,
+        };
+        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+    }
+
+    fn push_shutdown(&self) {
+        debug!(
+            "push_shutdown: id: {}, peer_port: {}, local_port: {}",
+            self.id, self.peer_port, self.local_port
+        );
+
+        let rx = MuxerRx::Shutdown {
+            local_port: self.local_port,
+            peer_port: self.peer_port,
+            flags: uapi::VSOCK_FLAGS_SHUTDOWN_SEND,
         };
         push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
     }
@@ -807,19 +821,36 @@ impl Proxy for TsiStreamProxy {
             debug!("process_event: HANG_UP");
             if self.status == ProxyStatus::Connecting {
                 self.push_connect_rsp(-libc::ECONNREFUSED);
+                self.status = ProxyStatus::Closed;
+                update.polling = Some((self.id, self.fd.as_raw_fd(), EventSet::empty()));
+                update.signal_queue = true;
+                update.remove_proxy = ProxyRemoval::Deferred;
+                return update;
+            } else if self.status == ProxyStatus::Connected {
+                // Drain any remaining data before signaling closure.
+                // When the remote sends a response then closes (e.g. HTTP Connection: close),
+                // both IN and HANG_UP fire simultaneously. We must read the data first,
+                // then send SHUTDOWN (not RST) so the guest can read buffered data.
+                let (signal_queue, _) = self.recv_pkt();
+                update.signal_queue = signal_queue;
+                self.push_shutdown();
+                self.status = ProxyStatus::Closed;
+                update.signal_queue = true;
+                update.polling = Some((self.id, self.fd.as_raw_fd(), EventSet::empty()));
+                update.remove_proxy = ProxyRemoval::Deferred;
+                return update;
             } else {
                 self.push_reset();
+                self.status = ProxyStatus::Closed;
+                update.polling = Some((self.id, self.fd.as_raw_fd(), EventSet::empty()));
+                update.signal_queue = true;
+                update.remove_proxy = if self.status == ProxyStatus::Listening {
+                    ProxyRemoval::Immediate
+                } else {
+                    ProxyRemoval::Deferred
+                };
+                return update;
             }
-
-            self.status = ProxyStatus::Closed;
-            update.polling = Some((self.id, self.fd.as_raw_fd(), EventSet::empty()));
-            update.signal_queue = true;
-            update.remove_proxy = if self.status == ProxyStatus::Listening {
-                ProxyRemoval::Immediate
-            } else {
-                ProxyRemoval::Deferred
-            };
-            return update;
         }
 
         if evset.contains(EventSet::IN) {
@@ -838,14 +869,16 @@ impl Proxy for TsiStreamProxy {
                     update.push_credit_req = Some(rx);
                 }
 
-                if self.status == ProxyStatus::Closed {
+                if self.status == ProxyStatus::PeerClosed {
                     debug!(
-                        "process_event: endpoint closed, sending reset: id={}",
+                        "process_event: peer closed, sending shutdown: id={}",
                         self.id
                     );
-                    self.push_reset();
+                    self.push_shutdown();
+                    self.status = ProxyStatus::Closed;
                     update.signal_queue = true;
                     update.polling = Some((self.id(), self.fd.as_raw_fd(), EventSet::empty()));
+                    update.remove_proxy = ProxyRemoval::Deferred;
                     return update;
                 } else if self.status == ProxyStatus::WaitingCreditUpdate {
                     debug!("process_event: WaitingCreditUpdate");

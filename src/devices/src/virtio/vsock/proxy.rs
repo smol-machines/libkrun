@@ -32,6 +32,7 @@ pub enum ProxyStatus {
     Connected,
     Listening,
     Closed,
+    PeerClosed,
     WaitingCreditUpdate,
     ReverseInit,
     WaitingOnAccept,

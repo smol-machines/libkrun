@@ -34,6 +34,11 @@ pub enum MuxerRx {
         local_port: u32,
         peer_port: u32,
     },
+    Shutdown {
+        local_port: u32,
+        peer_port: u32,
+        flags: u32,
+    },
     GetnameResponse {
         local_port: u32,
         peer_port: u32,
