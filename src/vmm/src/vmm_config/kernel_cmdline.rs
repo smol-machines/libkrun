@@ -5,7 +5,7 @@ use std::fmt::{Display, Formatter, Result};
 
 #[cfg(target_os = "linux")]
 pub const DEFAULT_KERNEL_CMDLINE: &str = "reboot=k panic=-1 panic_print=0 nomodule console=hvc0 \
-                                          rootfstype=virtiofs rw quiet no-kvmapf";
+                                          rootfstype=virtiofs rw quiet no-kvmapf noapictimer";
 #[cfg(target_os = "macos")]
 pub const DEFAULT_KERNEL_CMDLINE: &str = "reboot=k panic=-1 panic_print=0 nomodule console=hvc0 \
                                           rootfstype=virtiofs rw quiet no-kvmapf";
