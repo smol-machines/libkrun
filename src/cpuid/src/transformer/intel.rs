@@ -96,6 +96,9 @@ fn update_power_management_entry(
     use crate::cpu_leaf::leaf_0x6::*;
 
     entry.eax.write_bit(eax::TURBO_BOOST_BITINDEX, false);
+    // Advertise ARAT (Always Running APIC Timer) so the guest kernel skips
+    // the ~200ms calibrate_APIC_clock() busy-wait loop during boot.
+    entry.eax.write_bit(eax::ARAT_BITINDEX, true);
     // Clear X86 EPB feature. No frequency selection in the hypervisor.
     entry.ecx.write_bit(ecx::EPB_BITINDEX, false);
 

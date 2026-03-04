@@ -97,6 +97,9 @@ pub mod leaf_0x6 {
 
     pub mod eax {
         pub const TURBO_BOOST_BITINDEX: u32 = 1;
+        // ARAT = Always Running APIC Timer. When set, the guest kernel skips
+        // the ~200ms calibrate_APIC_clock() busy-wait loop.
+        pub const ARAT_BITINDEX: u32 = 2;
     }
 
     pub mod ecx {
