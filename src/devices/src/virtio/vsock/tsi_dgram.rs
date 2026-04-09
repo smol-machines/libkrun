@@ -6,9 +6,10 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::{Arc, Mutex};
 
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
+use nix::errno::Errno;
 use nix::sys::socket::{
-    bind, connect, getpeername, recv, send, sendto, socket, AddressFamily, MsgFlags, SockFlag,
-    SockType, SockaddrIn, SockaddrLike, SockaddrStorage,
+    bind, connect, getpeername, getsockname, recv, send, sendto, socket, AddressFamily, MsgFlags,
+    SockFlag, SockType, SockaddrIn, SockaddrLike, SockaddrStorage,
 };
 
 #[cfg(target_os = "macos")]
@@ -114,14 +115,20 @@ impl TsiDgramProxy {
 
     fn init_pkt(&self, pkt: &mut VsockPacket) {
         debug!(
-            "init_pkt: id={}, src_port={}, dst_port={}",
+            "init_pkt: id={}, local_port={}, peer_port={}",
             self.id, self.local_port, self.peer_port
         );
+        // Outbound RX packet (host -> guest). Match the addressing convention
+        // used by TsiStreamProxy::init_data_pkt and the muxer RX queue: the
+        // host is the source and the guest is the destination. Previously this
+        // function had src_cid/dst_cid swapped and hard-coded src_port to 0,
+        // which produced packets the guest could not correlate back to the
+        // sending socket.
         pkt.set_op(uapi::VSOCK_OP_RW)
-            .set_src_cid(self.cid)
-            .set_dst_cid(uapi::VSOCK_HOST_CID)
+            .set_src_cid(uapi::VSOCK_HOST_CID)
+            .set_dst_cid(self.cid)
+            .set_src_port(self.local_port)
             .set_dst_port(self.peer_port)
-            .set_src_port(0)
             .set_type(uapi::VSOCK_TYPE_DGRAM)
             .set_buf_alloc(defs::CONN_TX_BUF_SIZE as u32)
             .set_fwd_cnt(self.tx_cnt.0);
@@ -166,11 +173,21 @@ impl TsiDgramProxy {
             match recv(self.fd.as_raw_fd(), &mut buf[..max_len], MsgFlags::empty()) {
                 Ok(cnt) => {
                     debug!("recv cnt={cnt}");
-                    if cnt > 0 {
-                        RecvPkt::Read(cnt)
-                    } else {
-                        RecvPkt::Close
-                    }
+                    // Note: unlike SOCK_STREAM, recv() returning 0 on a
+                    // SOCK_DGRAM socket means a zero-byte datagram was
+                    // received. Datagram sockets are connectionless and have
+                    // no "peer closed" state, so we must not transition to
+                    // Closed here. We forward zero-byte payloads as Read(0)
+                    // so the loop exits cleanly without dropping the proxy.
+                    RecvPkt::Read(cnt)
+                }
+                Err(Errno::EAGAIN) | Err(Errno::EWOULDBLOCK) => {
+                    // Spurious wakeup or the data was already consumed by a
+                    // previous recv() call in this batch. Polling stays
+                    // registered, so when real data arrives we'll be woken
+                    // again. Don't change proxy state.
+                    debug!("recv_pkt: EAGAIN, will retry on next event");
+                    RecvPkt::Error
                 }
                 Err(e) => {
                     debug!("recv_pkt: recv error: {e:?}");
@@ -341,6 +358,20 @@ impl Proxy for TsiDgramProxy {
         if !self.listening {
             match bind(self.fd.as_raw_fd(), &SockaddrIn::new(0, 0, 0, 0, 0)) {
                 Ok(_) => {
+                    // Read back the kernel-assigned ephemeral port so init_pkt
+                    // can populate src_port correctly. Without this the proxy
+                    // would always advertise src_port=0 to the guest.
+                    match getsockname::<SockaddrStorage>(self.fd.as_raw_fd()) {
+                        Ok(addr) => {
+                            if let Some(sin) = addr.as_sockaddr_in() {
+                                self.local_port = sin.port() as u32;
+                            } else if let Some(sin6) = addr.as_sockaddr_in6() {
+                                self.local_port = sin6.port() as u32;
+                            }
+                            debug!("sendto_addr: bound local_port={}", self.local_port);
+                        }
+                        Err(e) => debug!("getsockname after bind failed: {e}"),
+                    }
                     self.listening = true;
                     update.polling = Some((self.id, self.fd.as_raw_fd(), EventSet::IN));
                 }
