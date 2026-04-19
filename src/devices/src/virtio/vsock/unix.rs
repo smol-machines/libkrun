@@ -207,21 +207,6 @@ impl UnixProxy {
         push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
     }
 
-    fn push_shutdown(&self) {
-        debug!(
-            "push_shutdown: id: {}, peer_port: {}, local_port: {}",
-            self.id, self.peer_port, self.local_port
-        );
-
-        let rx = MuxerRx::Shutdown {
-            local_port: self.local_port,
-            peer_port: self.peer_port,
-            flags: uapi::VSOCK_FLAGS_SHUTDOWN_SEND,
-        };
-
-        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
-    }
-
     fn peer_avail_credit(&self) -> usize {
         (Wrapping(self.peer_buf_alloc) - (self.rx_cnt - self.peer_fwd_cnt)).0 as usize
     }
@@ -605,7 +590,8 @@ impl Proxy for UnixProxy {
                 // Drain any remaining data before signaling closure.
                 let (signal_queue, _) = self.recv_pkt();
                 update.signal_queue = signal_queue;
-                self.push_shutdown();
+                // Send RST to force-close — see tsi_stream.rs HANG_UP handler.
+                self.push_reset();
                 self.status = ProxyStatus::Closed;
                 update.signal_queue = true;
                 update.polling = Some((self.id, self.fd.as_raw_fd(), EventSet::empty()));
@@ -639,11 +625,11 @@ impl Proxy for UnixProxy {
 
                 if self.status == ProxyStatus::PeerClosed {
                     debug!(
-                        "process_event: peer closed, sending shutdown: id={}",
+                        "process_event: peer closed, sending reset: id={}",
                         self.id
                     );
-
-                    self.push_shutdown();
+                    // Send RST instead of SHUTDOWN — see tsi_stream.rs HANG_UP handler.
+                    self.push_reset();
                     self.status = ProxyStatus::Closed;
                     update.signal_queue = true;
                     update.polling = Some((self.id(), self.fd.as_raw_fd(), EventSet::empty()));

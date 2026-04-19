@@ -117,6 +117,48 @@ impl TsiStreamProxy {
             };
         }
 
+        // Enable TCP keepalive to prevent silent drops on idle connections.
+        // Without this, idle connections through NAT/firewalls or to servers
+        // with keepAliveTimeout can be silently dropped.
+        if family != AddressFamily::Unix {
+            let _ = setsockopt(&fd, sockopt::KeepAlive, &true);
+
+            #[cfg(target_os = "macos")]
+            unsafe {
+                let idle: libc::c_int = 60; // start probes after 60s idle
+                let interval: libc::c_int = 15; // 15s between probes
+                let count: libc::c_int = 4; // give up after 4 failures
+                libc::setsockopt(
+                    fd.as_raw_fd(),
+                    libc::IPPROTO_TCP,
+                    libc::TCP_KEEPALIVE,
+                    &idle as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&idle) as libc::socklen_t,
+                );
+                libc::setsockopt(
+                    fd.as_raw_fd(),
+                    libc::IPPROTO_TCP,
+                    0x101, // TCP_KEEPINTVL
+                    &interval as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&interval) as libc::socklen_t,
+                );
+                libc::setsockopt(
+                    fd.as_raw_fd(),
+                    libc::IPPROTO_TCP,
+                    0x102, // TCP_KEEPCNT
+                    &count as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&count) as libc::socklen_t,
+                );
+            }
+
+            #[cfg(target_os = "linux")]
+            {
+                let _ = setsockopt(&fd, sockopt::TcpKeepIdle, &60);
+                let _ = setsockopt(&fd, sockopt::TcpKeepInterval, &15);
+                let _ = setsockopt(&fd, sockopt::TcpKeepCount, &4);
+            }
+        }
+
         Ok(TsiStreamProxy {
             id,
             cid,
@@ -404,20 +446,6 @@ impl TsiStreamProxy {
         push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
     }
 
-    fn push_shutdown(&self) {
-        debug!(
-            "push_shutdown: id: {}, peer_port: {}, local_port: {}",
-            self.id, self.peer_port, self.local_port
-        );
-
-        let rx = MuxerRx::Shutdown {
-            local_port: self.local_port,
-            peer_port: self.peer_port,
-            flags: uapi::VSOCK_FLAGS_SHUTDOWN_SEND,
-        };
-        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
-    }
-
     fn switch_to_connected(&mut self) {
         self.status = ProxyStatus::Connected;
         match fcntl(&self.fd, FcntlArg::F_GETFL) {
@@ -598,6 +626,18 @@ impl Proxy for TsiStreamProxy {
 
     fn sendmsg(&mut self, pkt: &VsockPacket) -> ProxyUpdate {
         debug!("sendmsg");
+
+        // If the proxy is already closed (e.g. remote server closed the connection
+        // while the guest was idle), send RST immediately so the guest gets a clean
+        // error instead of writing into the void and timing out.
+        if self.status == ProxyStatus::Closed || self.status == ProxyStatus::PeerClosed {
+            debug!("sendmsg: proxy closed/peer-closed, sending RST: id={}", self.id);
+            self.push_reset();
+            return ProxyUpdate {
+                signal_queue: true,
+                ..Default::default()
+            };
+        }
 
         let mut update = ProxyUpdate::default();
 
@@ -829,11 +869,18 @@ impl Proxy for TsiStreamProxy {
             } else if self.status == ProxyStatus::Connected {
                 // Drain any remaining data before signaling closure.
                 // When the remote sends a response then closes (e.g. HTTP Connection: close),
-                // both IN and HANG_UP fire simultaneously. We must read the data first,
-                // then send SHUTDOWN (not RST) so the guest can read buffered data.
+                // both IN and HANG_UP fire simultaneously. We must read the data first.
                 let (signal_queue, _) = self.recv_pkt();
                 update.signal_queue = signal_queue;
-                self.push_shutdown();
+                // Send RST to force-close the vsock connection. RST (not SHUTDOWN)
+                // is required because SHUTDOWN only marks peer_shutdown flags in the
+                // guest kernel — it does NOT change sk_state, so a subsequent guest
+                // write will block waiting for credit that will never arrive (the
+                // proxy is about to be removed). RST triggers do_close() in the
+                // guest kernel, which sets sk_state and wakes all blocked threads.
+                // Data already drained by recv_pkt() above is queued ahead of this
+                // RST in the RX ring, so the guest will process data first.
+                self.push_reset();
                 self.status = ProxyStatus::Closed;
                 update.signal_queue = true;
                 update.polling = Some((self.id, self.fd.as_raw_fd(), EventSet::empty()));
@@ -871,10 +918,11 @@ impl Proxy for TsiStreamProxy {
 
                 if self.status == ProxyStatus::PeerClosed {
                     debug!(
-                        "process_event: peer closed, sending shutdown: id={}",
+                        "process_event: peer closed, sending reset: id={}",
                         self.id
                     );
-                    self.push_shutdown();
+                    // Send RST instead of SHUTDOWN — see HANG_UP handler comment.
+                    self.push_reset();
                     self.status = ProxyStatus::Closed;
                     update.signal_queue = true;
                     update.polling = Some((self.id(), self.fd.as_raw_fd(), EventSet::empty()));

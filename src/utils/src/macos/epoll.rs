@@ -7,7 +7,7 @@
 use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::ptr;
-use std::time::Duration;
+
 
 use bitflags::bitflags;
 use log::debug;
@@ -264,15 +264,19 @@ impl Epoll {
         timeout: i32,
         events: &mut [EpollEvent],
     ) -> io::Result<usize> {
-        let _tout = if timeout >= 0 {
-            Some(Duration::from_millis(timeout as u64))
+        // Convert millisecond timeout to timespec. For timeout = -1 (infinite),
+        // use a 3-second periodic wakeup to avoid blocking the muxer thread
+        // indefinitely — it needs periodic wakeups for housekeeping.
+        let ts = if timeout >= 0 {
+            libc::timespec {
+                tv_sec: (timeout / 1000) as i64,
+                tv_nsec: ((timeout % 1000) as i64) * 1_000_000,
+            }
         } else {
-            None
-        };
-
-        let ts = libc::timespec {
-            tv_sec: 3,
-            tv_nsec: 0,
+            libc::timespec {
+                tv_sec: 3,
+                tv_nsec: 0,
+            }
         };
 
         let mut kevs = vec![Kevent::default(); events.len()];

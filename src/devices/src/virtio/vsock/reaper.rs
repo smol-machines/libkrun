@@ -7,9 +7,11 @@ use super::proxy::Proxy;
 use crossbeam_channel::Receiver;
 
 pub type ProxyMap = Arc<RwLock<HashMap<u64, Mutex<Box<dyn Proxy>>>>>;
-// Reduced from 5 seconds to 100ms for faster RST recovery during cold start.
-// This allows the guest agent to become ready without long retry delays.
-const TIMEOUT: Duration = Duration::from_millis(100);
+// Grace period before removing a closed proxy from the map.
+// Must be long enough for the guest kernel to process the RST and
+// close its end of the connection; too short causes silent drops on
+// idle keep-alive connections.
+const TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct ReaperThread {
     receiver: Receiver<u64>,
