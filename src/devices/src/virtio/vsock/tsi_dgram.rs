@@ -3,7 +3,7 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use std::num::Wrapping;
 use std::os::fd::OwnedFd;
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::sys::socket::{
@@ -16,6 +16,7 @@ use super::super::linux_errno::linux_errno_raw;
 use super::super::Queue as VirtQueue;
 use super::defs;
 use super::defs::uapi;
+use super::dns_filter::{handle_dns_query, EgressPolicy};
 use super::muxer::{push_packet, MuxerRx};
 use super::muxer_rxq::MuxerRxQ;
 use super::packet::{
@@ -34,6 +35,7 @@ pub struct TsiDgramProxy {
     fd: OwnedFd,
     pub status: ProxyStatus,
     sendto_addr: Option<SockaddrStorage>,
+    connected_dns_addr: Option<SockaddrStorage>,
     listening: bool,
     mem: GuestMemoryMmap,
     queue: Arc<Mutex<VirtQueue>>,
@@ -42,6 +44,7 @@ pub struct TsiDgramProxy {
     tx_cnt: Wrapping<u32>,
     peer_buf_alloc: u32,
     peer_fwd_cnt: Wrapping<u32>,
+    egress_policy: Option<Arc<RwLock<EgressPolicy>>>,
 }
 
 impl TsiDgramProxy {
@@ -53,6 +56,7 @@ impl TsiDgramProxy {
         mem: GuestMemoryMmap,
         queue: Arc<Mutex<VirtQueue>>,
         rxq: Arc<Mutex<MuxerRxQ>>,
+        egress_policy: Option<Arc<RwLock<EgressPolicy>>>,
     ) -> Result<Self, ProxyError> {
         let family = match family {
             defs::LINUX_AF_INET => AddressFamily::Inet,
@@ -101,6 +105,7 @@ impl TsiDgramProxy {
             fd,
             status: ProxyStatus::Idle,
             sendto_addr: None,
+            connected_dns_addr: None,
             listening: false,
             mem,
             queue,
@@ -109,6 +114,7 @@ impl TsiDgramProxy {
             tx_cnt: Wrapping(0),
             peer_buf_alloc: 0,
             peer_fwd_cnt: Wrapping(0),
+            egress_policy,
         })
     }
 
@@ -228,6 +234,41 @@ impl TsiDgramProxy {
         debug!("recv_pkt: have_used={have_used}");
         (have_used, wait_credit)
     }
+
+    fn intercept_dns_query(
+        &mut self,
+        addr: &SockaddrStorage,
+        pkt: &VsockPacket,
+        buf: &[u8],
+    ) -> Option<ProxyUpdate> {
+        let policy = self.egress_policy.clone()?;
+        let intercept_dns = policy
+            .read()
+            .map(|policy| policy.should_intercept_dns(addr))
+            .unwrap_or(false);
+        if !intercept_dns {
+            return None;
+        }
+
+        let len = std::cmp::min(pkt.len() as usize, buf.len());
+        let response = handle_dns_query(&policy, &buf[..len], addr);
+        self.tx_cnt += Wrapping(len as u32);
+        push_packet(
+            self.cid,
+            MuxerRx::DgramDataDnsResponse {
+                peer_port: self.peer_port,
+                data: response,
+                fwd_cnt: self.tx_cnt.0,
+            },
+            &self.rxq,
+            &self.queue,
+            &self.mem,
+        );
+        Some(ProxyUpdate {
+            signal_queue: true,
+            ..Default::default()
+        })
+    }
 }
 
 impl Proxy for TsiDgramProxy {
@@ -239,21 +280,40 @@ impl Proxy for TsiDgramProxy {
         self.status
     }
 
+    fn is_dgram(&self) -> bool {
+        true
+    }
+
     fn connect(&mut self, pkt: &VsockPacket, req: TsiConnectReq) -> ProxyUpdate {
         debug!("connect: addr={}", req.addr);
-        let res = match connect(self.fd.as_raw_fd(), &req.addr) {
-            Ok(()) => {
-                debug!("connect: Connected");
-                self.status = ProxyStatus::Connected;
-                0
-            }
-            Err(e) => {
-                debug!("Error connecting: {e}");
-                #[cfg(target_os = "macos")]
-                let errno = -linux_errno_raw(e as i32);
-                #[cfg(target_os = "linux")]
-                let errno = -(e as i32);
-                errno
+        let connected_dns_addr = self.egress_policy.as_ref().and_then(|policy| {
+            policy
+                .read()
+                .ok()
+                .and_then(|policy| policy.should_intercept_dns(&req.addr).then_some(req.addr))
+        });
+        self.connected_dns_addr = None;
+
+        let (res, poll_host_socket) = if let Some(addr) = connected_dns_addr {
+            debug!("connect: intercepting DNS socket without host connect");
+            self.status = ProxyStatus::Connected;
+            self.connected_dns_addr = Some(addr);
+            (0, false)
+        } else {
+            match connect(self.fd.as_raw_fd(), &req.addr) {
+                Ok(()) => {
+                    debug!("connect: Connected");
+                    self.status = ProxyStatus::Connected;
+                    (0, true)
+                }
+                Err(e) => {
+                    debug!("Error connecting: {e}");
+                    #[cfg(target_os = "macos")]
+                    let errno = -linux_errno_raw(e as i32);
+                    #[cfg(target_os = "linux")]
+                    let errno = -(e as i32);
+                    (errno, false)
+                }
             }
         };
 
@@ -269,7 +329,7 @@ impl Proxy for TsiDgramProxy {
         push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
 
         let mut update = ProxyUpdate::default();
-        if res == 0 && !self.listening {
+        if poll_host_socket && !self.listening {
             update.polling = Some((self.id, self.fd.as_raw_fd(), EventSet::IN));
         }
         update
@@ -311,6 +371,12 @@ impl Proxy for TsiDgramProxy {
         debug!("sendmsg");
 
         let ret = if let Some(buf) = pkt.buf() {
+            if let Some(addr) = self.connected_dns_addr {
+                if let Some(update) = self.intercept_dns_query(&addr, pkt, buf) {
+                    return update;
+                }
+            }
+
             #[cfg(target_os = "macos")]
             let flags = MsgFlags::empty();
             #[cfg(target_os = "linux")]
@@ -351,7 +417,7 @@ impl Proxy for TsiDgramProxy {
         update
     }
 
-    fn sendto_data(&mut self, pkt: &VsockPacket) {
+    fn sendto_data(&mut self, pkt: &VsockPacket) -> ProxyUpdate {
         debug!("sendto_data");
 
         self.peer_buf_alloc = pkt.buf_alloc();
@@ -359,6 +425,13 @@ impl Proxy for TsiDgramProxy {
 
         if let Some(addr) = self.sendto_addr {
             if let Some(buf) = pkt.buf() {
+                let len = std::cmp::min(pkt.len() as usize, buf.len());
+                let buf = &buf[..len];
+
+                if let Some(update) = self.intercept_dns_query(&addr, pkt, buf) {
+                    return update;
+                }
+
                 #[cfg(target_os = "macos")]
                 let flags = MsgFlags::empty();
                 #[cfg(target_os = "linux")]
@@ -376,6 +449,8 @@ impl Proxy for TsiDgramProxy {
         } else {
             debug!("sendto_data without sendto_addr");
         }
+
+        ProxyUpdate::default()
     }
 
     fn listen(
