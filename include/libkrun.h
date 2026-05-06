@@ -931,27 +931,22 @@ int32_t krun_add_vsock(uint32_t ctx_id, uint32_t tsi_features);
  *                     strings (e.g., "10.0.0.0/8", "1.1.1.1/32"). Bare IPs
  *                     without a prefix are treated as /32 (IPv4) or /128
  *                     (IPv6). NULL means no explicit CIDR rules.
- *  "c_egress_hosts"        - optional null-terminated array of null-terminated
+ *  "c_egress_hosts" - optional null-terminated array of null-terminated
  *                     hostnames. Guest UDP DNS queries to port 53 are
  *                     intercepted and filtered against this list. A/AAAA
  *                     answers from allowed responses are learned as temporary
  *                     egress entries. NULL means no DNS hostname filtering.
- *  "c_egress_refresh_per_secs" - optional refresh period in seconds for resolving
- *                     c_egress_hosts through DNS servers observed from guest DNS
- *                     traffic. NULL uses the default (5 minutes).
  *
  * Returns:
  *  Zero on success or a negative error number on failure.
- *  -EINVAL if both c_cidrs and c_egress_hosts are NULL, if c_egress_refresh_per_secs points to
- *           zero, or if an entry is invalid.
+ *  -EINVAL if both c_cidrs and c_egress_hosts are NULL or if an entry is invalid.
  *  -ENOENT if ctx_id is invalid.
  *  -ENODEV if vsock is disabled.
  */
 int32_t krun_set_egress_policy(
     uint32_t ctx_id,
     const char **c_cidrs,
-    const char **c_egress_hosts,
-    const uint32_t *c_egress_refresh_per_secs);
+    const char **c_egress_hosts);
 
 /**
  * Returns the eventfd file descriptor to signal the guest to shut down orderly. This must be

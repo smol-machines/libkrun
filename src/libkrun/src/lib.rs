@@ -159,7 +159,6 @@ struct ContextConfig {
     unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
     egress_cidrs: Option<Vec<(std::net::IpAddr, u8)>>,
     egress_hosts: Option<Vec<String>>,
-    egress_refresh_per_secs: Option<u32>,
     shutdown_efd: Option<EventFd>,
     gpu_virgl_flags: Option<u32>,
     gpu_shm_size: Option<usize>,
@@ -1334,15 +1333,13 @@ fn parse_egress_hosts(c_egress_hosts: *const *const c_char) -> Result<Option<Vec
 /// Accepts optional null-terminated arrays of CIDR strings and hostnames.
 /// Explicit CIDRs are always allowed. Hostnames enable DNS interception for
 /// guest UDP DNS queries to port 53; A/AAAA answers are learned as temporary
-/// allowed IPs. Hostnames are also periodically resolved through DNS servers
-/// observed from guest DNS traffic and merged into the live egress allow-list.
+/// allowed IPs.
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
 pub unsafe extern "C" fn krun_set_egress_policy(
     ctx_id: u32,
     c_cidrs: *const *const c_char,
     c_egress_hosts: *const *const c_char,
-    c_egress_refresh_per_secs: *const u32,
 ) -> i32 {
     let cidrs = match parse_egress_cidrs(c_cidrs) {
         Ok(cidrs) => cidrs,
@@ -1357,16 +1354,6 @@ pub unsafe extern "C" fn krun_set_egress_policy(
         return -libc::EINVAL;
     }
 
-    let egress_refresh_per_secs = if c_egress_refresh_per_secs.is_null() {
-        None
-    } else {
-        let secs = *c_egress_refresh_per_secs;
-        if secs == 0 {
-            return -libc::EINVAL;
-        }
-        Some(secs)
-    };
-
     let mut map = match CTX_MAP.lock() {
         Ok(map) => map,
         Err(_) => return -libc::EINVAL,
@@ -1379,7 +1366,6 @@ pub unsafe extern "C" fn krun_set_egress_policy(
             }
             cfg.egress_cidrs = cidrs;
             cfg.egress_hosts = hosts;
-            cfg.egress_refresh_per_secs = egress_refresh_per_secs;
         }
         Entry::Vacant(_) => return -libc::ENOENT,
     }
@@ -2798,7 +2784,6 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
 
     let egress_cidrs = ctx_cfg.egress_cidrs.take();
     let egress_hosts = ctx_cfg.egress_hosts.take();
-    let egress_refresh_per_secs = ctx_cfg.egress_refresh_per_secs.take();
 
     match &ctx_cfg.vsock_config {
         VsockConfig::Disabled => (),
@@ -2811,7 +2796,6 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
                 tsi_flags: *tsi_flags,
                 egress_cidrs,
                 egress_hosts,
-                egress_refresh_per_secs,
             };
             ctx_cfg.vmr.set_vsock_device(vsock_device_config).unwrap();
         }
@@ -2840,7 +2824,6 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
                     tsi_flags,
                     egress_cidrs,
                     egress_hosts,
-                    egress_refresh_per_secs,
                 };
                 ctx_cfg.vmr.set_vsock_device(vsock_device_config).unwrap();
             }

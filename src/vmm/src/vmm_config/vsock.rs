@@ -47,8 +47,6 @@ pub struct VsockDeviceConfig {
     pub egress_cidrs: Option<Vec<(IpAddr, u8)>>,
     /// Optional DNS allow-host filter for TSI networking.
     pub egress_hosts: Option<Vec<String>>,
-    /// Optional host refresh period in seconds for DNS allow-hosts.
-    pub egress_refresh_per_secs: Option<u32>,
 }
 
 struct VsockWrapper {
@@ -99,7 +97,6 @@ impl VsockBuilder {
             cfg.tsi_flags,
             cfg.egress_cidrs,
             cfg.egress_hosts,
-            cfg.egress_refresh_per_secs,
         )
         .map_err(VsockConfigError::CreateVsockDevice)
     }
@@ -140,7 +137,6 @@ pub(crate) mod tests {
             tsi_flags: TsiFlags::empty(),
             egress_cidrs: None,
             egress_hosts: None,
-            egress_refresh_per_secs: None,
         }
     }
 

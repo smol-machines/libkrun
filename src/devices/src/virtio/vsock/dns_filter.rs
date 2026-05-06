@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
-use std::sync::{Arc, RwLock, Weak};
-use std::thread;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use nix::sys::socket::SockaddrStorage;
@@ -11,9 +10,6 @@ const DNS_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_DNS_PACKET_SIZE: usize = 65_535;
 const MIN_LEARNED_TTL: u64 = 30;
 const MAX_LEARNED_TTL: u64 = 300;
-const DEFAULT_EGRESS_REFRESH_PER_SECS: u32 = 5 * 60;
-const DYNAMIC_ALLOWED_IP_CAP: usize = 512;
-const MAX_OBSERVED_DNS_RESOLVERS: usize = 3;
 const DNS_HEADER_LEN: usize = 12;
 const DNS_ID_LEN: usize = 2;
 const DNS_U16_LEN: usize = 2;
@@ -50,19 +46,9 @@ const DNS_MAX_LABEL_LEN: usize = 63;
 pub(super) struct EgressPolicy {
     allowed_cidrs: Vec<(IpAddr, u8)>,
     allowed_hosts: Option<Vec<String>>,
-    // allowed_ips are learned from the on-demand dns queries of the allowed_hosts. The key is 
-    // the IpAddr and the value is the expiration of this resolved ip. We update this map by
-    // removing the ips that have expired and upserting the ips with the latest expiration.
+    // allowed_ips are learned from allowed guest DNS responses. The key is the
+    // IP address and the value is the expiration of that learned address.
     allowed_ips: HashMap<IpAddr, Instant>,
-    // The DNS servers that are seen by the guest. DNS servers can be configured by both
-    // the guest resolve.conf or the resolve.conf in the container. Whenever the app in 
-    // guest initiate a DNS query, it invokes either a UDP connect (used by nslookup) or
-    // send_to (libc UDP socket send_to). This is when TSI gets to know what DNS servers are
-    // used by the guest. This guest DNS server ip is saved in this dns_resolver, and then
-    // for a DNS query, we check whether the parsed hostname is in the list of allowed hosts
-    // This approach ensures the egress policies are enforced in guest based on the actual
-    // DNS servers used by the guest.
-    dns_resolvers: Vec<SocketAddr>,
 }
 
 #[derive(Debug)]
@@ -91,7 +77,6 @@ impl EgressPolicy {
             allowed_cidrs: allowed_cidrs.unwrap_or_default(),
             allowed_ips: HashMap::new(),
             allowed_hosts: egress_hosts,
-            dns_resolvers: Vec::new(),
         })
     }
 
@@ -114,7 +99,7 @@ impl EgressPolicy {
             return true;
         }
 
-        // allow this ip if it is the from the dns query of any allow_hosts and it hasn't expire.
+        // allow this IP if it came from an unexpired DNS answer for an allowed hostname.
         self.allowed_ips
             .get(&ip)
             .is_some_and(|expires_at| *expires_at > Instant::now())
@@ -155,145 +140,6 @@ impl EgressPolicy {
         self.allowed_ips
             .retain(|_, expires_at| *expires_at > now);
     }
-
-    fn remember_dns_resolver(&mut self, resolver: SocketAddr) {
-        self.dns_resolvers.retain(|existing| *existing != resolver);
-        self.dns_resolvers.insert(0, resolver);
-        self.dns_resolvers.truncate(MAX_OBSERVED_DNS_RESOLVERS);
-    }
-}
-
-pub(super) fn start_host_refresh(
-    policy: &Arc<RwLock<EgressPolicy>>,
-    egress_refresh_per_secs: Option<u32>,
-) {
-    let hosts = match policy.read() {
-        Ok(policy) => policy.allowed_hosts.clone().unwrap_or_default(),
-        Err(_) => return,
-    };
-
-    if hosts.is_empty() {
-        return;
-    }
-
-    let interval = Duration::from_secs(u64::from(
-        egress_refresh_per_secs
-            .unwrap_or(DEFAULT_EGRESS_REFRESH_PER_SECS)
-            .max(1),
-    ));
-    let weak_policy = Arc::downgrade(policy);
-
-    if let Err(err) = thread::Builder::new()
-        .name("tsi-egress-refresh".into())
-        .spawn(move || refresh_loop(weak_policy, hosts, interval))
-    {
-        debug!("failed to spawn egress refresh thread: {err}");
-    }
-}
-
-fn refresh_loop(policy: Weak<RwLock<EgressPolicy>>, hosts: Vec<String>, interval: Duration) {
-    while let Some(policy) = policy.upgrade() {
-        refresh_once(&policy, &hosts);
-        thread::sleep(interval);
-    }
-}
-
-fn refresh_once(policy: &Arc<RwLock<EgressPolicy>>, hosts: &[String]) {
-    let resolvers = match policy.read() {
-        Ok(policy) => policy.dns_resolvers.clone(),
-        Err(_) => return,
-    };
-    if resolvers.is_empty() {
-        return;
-    }
-
-    let ips = resolve_hosts_to_ips(hosts, &resolvers);
-    if ips.is_empty() {
-        return;
-    }
-
-    if let Ok(mut policy) = policy.write() {
-        policy.learn_ips(ips);
-    }
-}
-
-fn resolve_hosts_to_ips(hosts: &[String], resolvers: &[SocketAddr]) -> Vec<(IpAddr, u32)> {
-    let mut ips = Vec::new();
-
-    'hosts: for host in hosts {
-        if let Ok(ip) = host.parse::<IpAddr>() {
-            push_ip(&mut ips, ip, MAX_LEARNED_TTL as u32);
-            if ips.len() >= DYNAMIC_ALLOWED_IP_CAP {
-                break;
-            }
-            continue;
-        }
-
-        for resolver in resolvers {
-            for qtype in [DNS_TYPE_A, DNS_TYPE_AAAA] {
-                let query = match build_query(host, qtype) {
-                    Some(query) => query,
-                    None => continue 'hosts,
-                };
-                let response = match forward_dns_udp(&query, *resolver) {
-                    Ok(response) => response,
-                    Err(err) => {
-                        debug!("egress refresh failed to resolve {host} via {resolver}: {err}");
-                        continue;
-                    }
-                };
-                if let Ok(answer_ips) = parse_answer_ips(&response) {
-                    for (ip, ttl) in answer_ips {
-                        push_ip(&mut ips, ip, ttl);
-                        if ips.len() >= DYNAMIC_ALLOWED_IP_CAP {
-                            break 'hosts;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    ips
-}
-
-fn build_query(hostname: &str, qtype: u16) -> Option<Vec<u8>> {
-    let hostname = normalize_hostname(hostname)?;
-    let mut query = vec![
-        0x12,
-        0x34, // ID
-        (DNS_FLAG_RECURSION_DESIRED >> 8) as u8,
-        DNS_FLAG_RECURSION_DESIRED as u8,
-        0x00,
-        0x01, // QDCOUNT
-        0x00,
-        0x00, // ANCOUNT
-        0x00,
-        0x00, // NSCOUNT
-        0x00,
-        0x00, // ARCOUNT
-    ];
-
-    for label in hostname.split('.') {
-        if label.is_empty() || label.len() > DNS_MAX_LABEL_LEN {
-            return None;
-        }
-        query.push(label.len() as u8);
-        query.extend_from_slice(label.as_bytes());
-    }
-    query.push(0);
-    query.extend_from_slice(&qtype.to_be_bytes());
-    query.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
-
-    Some(query)
-}
-
-fn push_ip(ips: &mut Vec<(IpAddr, u32)>, ip: IpAddr, ttl: u32) {
-    if let Some((_, existing_ttl)) = ips.iter_mut().find(|(existing_ip, _)| *existing_ip == ip) {
-        *existing_ttl = (*existing_ttl).max(ttl);
-    } else {
-        ips.push((ip, ttl));
-    }
 }
 
 pub(super) fn handle_dns_query(
@@ -319,17 +165,11 @@ pub(super) fn handle_dns_query(
         return build_error_response(query, DNS_RCODE_SERVFAIL);
     };
 
-    if let Ok(mut policy) = policy.write() {
-        policy.remember_dns_resolver(resolver);
-    }
-
     match forward_dns_udp(query, resolver) {
         Ok(response) => {
             if let Ok(ips) = parse_answer_ips(&response) {
-                if !ips.is_empty() {
-                    if let Ok(mut policy) = policy.write() {
-                        policy.learn_ips(ips);
-                    }
+                if let Ok(mut policy) = policy.write() {
+                    policy.learn_ips(ips);
                 }
             }
             response
@@ -762,29 +602,6 @@ mod tests {
 
         assert!(!policy.is_addr_allowed(&sockaddr_v4(203, 0, 113, 22, 443)));
         assert!(policy.is_addr_allowed(&sockaddr_v4(203, 0, 113, 23, 443)));
-    }
-
-    #[test]
-    fn learn_ips_keeps_later_expiration() {
-        let mut policy = EgressPolicy::new(None, Some(vec!["example.com".to_string()])).unwrap();
-        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 24));
-
-        policy.learn_ips(vec![(ip, 60)]);
-        let first_expiration = policy.allowed_ips[&ip];
-
-        policy.learn_ips(vec![(ip, 1)]);
-        assert_eq!(policy.allowed_ips[&ip], first_expiration);
-
-        policy.learn_ips(vec![(ip, 120)]);
-        assert!(policy.allowed_ips[&ip] > first_expiration);
-    }
-
-    #[test]
-    fn resolve_hosts_to_ips_returns_ttl_bearing_entries() {
-        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 25));
-        let ips = resolve_hosts_to_ips(&["203.0.113.25".to_string()], &[]);
-
-        assert_eq!(ips, vec![(ip, MAX_LEARNED_TTL as u32)]);
     }
 
     #[test]

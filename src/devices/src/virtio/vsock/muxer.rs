@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use super::super::Queue as VirtQueue;
 use super::defs;
 use super::defs::uapi;
-use super::dns_filter::{start_host_refresh, EgressPolicy};
+use super::dns_filter::EgressPolicy;
 use super::muxer_rxq::{rx_to_pkt, MuxerRxQ};
 use super::muxer_thread::MuxerThread;
 use super::packet::{TsiConnectReq, TsiGetnameRsp, VsockPacket};
@@ -126,7 +126,6 @@ impl VsockMuxer {
         tsi_flags: TsiFlags,
         egress_cidrs: Option<Vec<(IpAddr, u8)>>,
         egress_hosts: Option<Vec<String>>,
-        egress_refresh_per_secs: Option<u32>,
     ) -> Self {
         if let Some(ref cidrs) = egress_cidrs {
             info!("egress policy configured with {} CIDR rule(s)", cidrs.len());
@@ -136,9 +135,6 @@ impl VsockMuxer {
         }
         let egress_policy = EgressPolicy::new(egress_cidrs, egress_hosts)
             .map(|policy| Arc::new(RwLock::new(policy)));
-        if let Some(policy) = &egress_policy {
-            start_host_refresh(policy, egress_refresh_per_secs);
-        }
         VsockMuxer {
             cid,
             host_port_map,
