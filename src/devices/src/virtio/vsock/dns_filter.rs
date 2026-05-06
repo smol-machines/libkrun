@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::{Arc, RwLock, Weak};
 use std::thread;
@@ -50,14 +50,14 @@ const DNS_MAX_LABEL_LEN: usize = 63;
 pub(super) struct EgressPolicy {
     allowed_cidrs: Vec<(IpAddr, u8)>,
     allowed_hosts: Option<Vec<String>>,
-    // None means the IP came from the latest allowed-host refresh and does not
-    // expire until the next refresh omits it. Some(expiry) means the IP was
-    // learned from an intercepted DNS response and expires at that instant.
-    allowed_ips: HashMap<IpAddr, Option<Instant>>,
+    // allowed_ips are learned from the on-demand dns queries of the allowed_hosts. The key is 
+    // the IpAddr and the value is the expiration of this resolved ip. We update this map by
+    // removing the ips that have expired and upserting the ips with the latest expiration.
+    allowed_ips: HashMap<IpAddr, Instant>,
     // The DNS servers that are seen by the guest. DNS servers can be configured by both
     // the guest resolve.conf or the resolve.conf in the container. Whenever the app in 
     // guest initiate a DNS query, it invokes either a UDP connect (used by nslookup) or
-    // send_to (libc UDP socket send_to). This when TSI gets to know what DNS servers are
+    // send_to (libc UDP socket send_to). This is when TSI gets to know what DNS servers are
     // used by the guest. This guest DNS server ip is saved in this dns_resolver, and then
     // for a DNS query, we check whether the parsed hostname is in the list of allowed hosts
     // This approach ensures the egress policies are enforced in guest based on the actual
@@ -108,16 +108,16 @@ impl EgressPolicy {
         let Some(ip) = sockaddr_ip(addr) else {
             return true;
         };
-
+        
+        // allow this ip if it is within the provided cidrs which are static
         if ip_matches_cidrs(ip, &self.allowed_cidrs) {
             return true;
         }
 
-        match self.allowed_ips.get(&ip) {
-            Some(None) => true,
-            Some(Some(expires_at)) => *expires_at > Instant::now(),
-            None => false,
-        }
+        // allow this ip if it is the from the dns query of any allow_hosts and it hasn't expire.
+        self.allowed_ips
+            .get(&ip)
+            .is_some_and(|expires_at| *expires_at > Instant::now())
     }
 
     fn is_hostname_allowed(&self, hostname: &str) -> bool {
@@ -146,36 +146,14 @@ impl EgressPolicy {
             let expires_at = now + Duration::from_secs(ttl);
             self.allowed_ips
                 .entry(ip)
-                .and_modify(|existing| {
-                    if let Some(current) = existing {
-                        *existing = Some((*current).max(expires_at));
-                    }
-                })
-                .or_insert(Some(expires_at));
-        }
-    }
-
-    fn replace_refreshed_allowed_ips(&mut self, ips: Vec<IpAddr>) {
-        let now = Instant::now();
-        let refreshed_ips: HashSet<IpAddr> = ips.into_iter().collect();
-
-        self.allowed_ips.retain(|ip, expires_at| {
-            refreshed_ips.contains(ip)
-                || match *expires_at {
-                    Some(expires_at) => expires_at > now,
-                    None => false,
-                }
-        });
-        for ip in refreshed_ips {
-            self.allowed_ips.insert(ip, None);
+                .and_modify(|existing| *existing = (*existing).max(expires_at))
+                .or_insert(expires_at);
         }
     }
 
     fn prune_allowed_ips(&mut self, now: Instant) {
-        self.allowed_ips.retain(|_, expires_at| match *expires_at {
-            Some(expires_at) => expires_at > now,
-            None => true,
-        });
+        self.allowed_ips
+            .retain(|_, expires_at| *expires_at > now);
     }
 
     fn remember_dns_resolver(&mut self, resolver: SocketAddr) {
@@ -235,16 +213,16 @@ fn refresh_once(policy: &Arc<RwLock<EgressPolicy>>, hosts: &[String]) {
     }
 
     if let Ok(mut policy) = policy.write() {
-        policy.replace_refreshed_allowed_ips(ips);
+        policy.learn_ips(ips);
     }
 }
 
-fn resolve_hosts_to_ips(hosts: &[String], resolvers: &[SocketAddr]) -> Vec<IpAddr> {
+fn resolve_hosts_to_ips(hosts: &[String], resolvers: &[SocketAddr]) -> Vec<(IpAddr, u32)> {
     let mut ips = Vec::new();
 
     'hosts: for host in hosts {
         if let Ok(ip) = host.parse::<IpAddr>() {
-            push_ip(&mut ips, ip);
+            push_ip(&mut ips, ip, MAX_LEARNED_TTL as u32);
             if ips.len() >= DYNAMIC_ALLOWED_IP_CAP {
                 break;
             }
@@ -265,8 +243,8 @@ fn resolve_hosts_to_ips(hosts: &[String], resolvers: &[SocketAddr]) -> Vec<IpAdd
                     }
                 };
                 if let Ok(answer_ips) = parse_answer_ips(&response) {
-                    for (ip, _) in answer_ips {
-                        push_ip(&mut ips, ip);
+                    for (ip, ttl) in answer_ips {
+                        push_ip(&mut ips, ip, ttl);
                         if ips.len() >= DYNAMIC_ALLOWED_IP_CAP {
                             break 'hosts;
                         }
@@ -310,9 +288,11 @@ fn build_query(hostname: &str, qtype: u16) -> Option<Vec<u8>> {
     Some(query)
 }
 
-fn push_ip(ips: &mut Vec<IpAddr>, ip: IpAddr) {
-    if !ips.contains(&ip) {
-        ips.push(ip);
+fn push_ip(ips: &mut Vec<(IpAddr, u32)>, ip: IpAddr, ttl: u32) {
+    if let Some((_, existing_ttl)) = ips.iter_mut().find(|(existing_ip, _)| *existing_ip == ip) {
+        *existing_ttl = (*existing_ttl).max(ttl);
+    } else {
+        ips.push((ip, ttl));
     }
 }
 
@@ -749,7 +729,6 @@ mod tests {
             .allowed_ips
             .get(&ip)
             .copied()
-            .flatten()
             .is_some_and(|expires_at| expires_at > Instant::now()));
     }
 
@@ -766,28 +745,46 @@ mod tests {
     }
 
     #[test]
-    fn refresh_removes_stale_refreshed_ips_and_expired_ips() {
+    fn learn_ips_prunes_expired_ips() {
         let mut policy = EgressPolicy::new(None, Some(vec!["example.com".to_string()])).unwrap();
-        let stale_refreshed_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 20));
-        let fresh_refreshed_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 21));
         let expired_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 22));
         let learned_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 23));
         let now = Instant::now();
 
-        policy.allowed_ips.insert(stale_refreshed_ip, None);
         policy
             .allowed_ips
-            .insert(expired_ip, Some(now - Duration::from_secs(1)));
+            .insert(expired_ip, now - Duration::from_secs(1));
         policy
             .allowed_ips
-            .insert(learned_ip, Some(now + Duration::from_secs(60)));
+            .insert(learned_ip, now + Duration::from_secs(60));
 
-        policy.replace_refreshed_allowed_ips(vec![fresh_refreshed_ip]);
+        policy.learn_ips(vec![]);
 
-        assert!(!policy.is_addr_allowed(&sockaddr_v4(203, 0, 113, 20, 443)));
-        assert!(policy.is_addr_allowed(&sockaddr_v4(203, 0, 113, 21, 443)));
         assert!(!policy.is_addr_allowed(&sockaddr_v4(203, 0, 113, 22, 443)));
         assert!(policy.is_addr_allowed(&sockaddr_v4(203, 0, 113, 23, 443)));
+    }
+
+    #[test]
+    fn learn_ips_keeps_later_expiration() {
+        let mut policy = EgressPolicy::new(None, Some(vec!["example.com".to_string()])).unwrap();
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 24));
+
+        policy.learn_ips(vec![(ip, 60)]);
+        let first_expiration = policy.allowed_ips[&ip];
+
+        policy.learn_ips(vec![(ip, 1)]);
+        assert_eq!(policy.allowed_ips[&ip], first_expiration);
+
+        policy.learn_ips(vec![(ip, 120)]);
+        assert!(policy.allowed_ips[&ip] > first_expiration);
+    }
+
+    #[test]
+    fn resolve_hosts_to_ips_returns_ttl_bearing_entries() {
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 25));
+        let ips = resolve_hosts_to_ips(&["203.0.113.25".to_string()], &[]);
+
+        assert_eq!(ips, vec![(ip, MAX_LEARNED_TTL as u32)]);
     }
 
     #[test]
