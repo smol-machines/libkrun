@@ -134,7 +134,7 @@ impl InterruptTransport {
         let prev = self.status().fetch_or(status as usize, Ordering::SeqCst);
         // Only kick the interrupt controller if this status bit was not already
         // pending. If it was, the guest has not acknowledged the interrupt yet;
-        // another set_irq/vcpu_request_exit call would waste an HVF exit (~5ms).
+        // kicking again would be a redundant notification.
         if prev & (status as usize) == 0 {
             self.intc()
                 .lock()

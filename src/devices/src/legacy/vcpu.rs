@@ -32,8 +32,8 @@ impl PerCPUInterruptControllerState {
             self.vcpuid, irq
         );
         // Dedupe: if this IRQ is already in the pending queue, the guest has
-        // not acknowledged it yet. Pushing again and calling vcpu_request_exit
-        // would waste an HVF exit (~5ms) with no benefit.
+        // not acknowledged it yet. Pushing again would deliver a duplicate IRQ
+        // with no benefit.
         if self.pending_irqs.contains(&irq) {
             return;
         }

@@ -262,7 +262,7 @@ impl Vmm {
     /// Starts the microVM vcpus.
     pub fn start_vcpus(&mut self, mut vcpus: Vec<Vcpu>) -> Result<()> {
         let t_sv = std::time::Instant::now();
-        let sv_timing_on = std::env::var("RUST_LOG").unwrap_or_default().contains("info");
+        let sv_timing_on = std::env::var("LIBKRUN_TIMING").is_ok();
         macro_rules! sv_timing {
             ($label:expr) => {
                 if sv_timing_on {

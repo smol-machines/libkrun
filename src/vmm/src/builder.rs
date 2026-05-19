@@ -567,7 +567,7 @@ pub fn build_microvm(
     _sender: Sender<WorkerMessage>,
 ) -> std::result::Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
     let t_vmm = std::time::Instant::now();
-    let vmm_timing_on = std::env::var("RUST_LOG").unwrap_or_default().contains("info");
+    let vmm_timing_on = std::env::var("LIBKRUN_TIMING").is_ok();
     macro_rules! vmm_timing {
         ($label:expr) => {
             if vmm_timing_on {

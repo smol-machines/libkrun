@@ -1176,24 +1176,6 @@ char *clone_str(const char *str)
 
 #if __linux__
 /*
- * kmsg_time - write a boot timing line to stderr (fd=2) with CLOCK_BOOTTIME ms.
- * As PID 1, fd=2 is the kernel's console device, which is captured by
- * libkrun into agent-console.log via the virtio-console/serial redirect.
- * Falls back to /dev/kmsg if stderr write fails (e.g. console not yet ready).
- */
-static void kmsg_time(const char *label)
-{
-    struct timespec ts;
-    char buf[128];
-    int n;
-    clock_gettime(CLOCK_BOOTTIME, &ts);
-    n = snprintf(buf, sizeof(buf), "smolvm-init: [boot] %-24s %ldms\n",
-                 label, ts.tv_sec * 1000L + ts.tv_nsec / 1000000L);
-    if (n > 0)
-        write(2, buf, n);
-}
-
-/*
  * exec_via_memfd - copy an ELF binary from virtiofs into a memfd, then
  * fexecve from it.
  *
@@ -1219,7 +1201,6 @@ static int exec_via_memfd(const char *path, char **exec_argv)
     ssize_t total, n;
     int ret = -1;
 
-    kmsg_time("memfd: open");
     src_fd = open(path, O_RDONLY);
     if (src_fd < 0)
         goto out;
@@ -1240,7 +1221,6 @@ static int exec_via_memfd(const char *path, char **exec_argv)
             goto out;
         total += n;
     }
-    kmsg_time("memfd: read done");
 
     /* memfd_create via syscall to avoid glibc version requirements. */
     mem_fd = (int)syscall(SYS_memfd_create, "agent", 1U /* MFD_CLOEXEC */);
@@ -1255,11 +1235,9 @@ static int exec_via_memfd(const char *path, char **exec_argv)
             goto out;
         total += n;
     }
-    kmsg_time("memfd: write done");
 
     /* fexecve maps ELF segments from memfd: faults hit guest RAM (minor
      * faults, no HVF exits) instead of DAX (major faults, HVF exits). */
-    kmsg_time("memfd: fexecve");
     fexecve(mem_fd, exec_argv, __environ);
     /* fexecve only returns on failure; fall through to return -1. */
 
@@ -1301,9 +1279,6 @@ int main(int argc, char **argv)
     open_console();
 #endif
 
-#if __linux__
-    kmsg_time("init: main");
-#endif
 
 #ifdef TDX
     if (mkdir("/tmp", 0755) < 0 && errno != EEXIST) {
@@ -1510,9 +1485,6 @@ int main(int argc, char **argv)
     }
     if (child == 0) { // child
     exec_init:
-#if __linux__
-        kmsg_time("init: exec_init");
-#endif
 #if __FreeBSD__
         open_console();
 #else

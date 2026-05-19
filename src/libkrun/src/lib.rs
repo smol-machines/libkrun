@@ -2722,7 +2722,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     return krun_start_enter_nitro(ctx_id);
 
     let t_libkrun = std::time::Instant::now();
-    let lk_timing_on = std::env::var("RUST_LOG").unwrap_or_default().contains("info");
+    let lk_timing_on = std::env::var("LIBKRUN_TIMING").is_ok();
     macro_rules! lk_timing {
         ($label:expr) => {
             if lk_timing_on {

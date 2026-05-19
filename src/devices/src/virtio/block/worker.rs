@@ -209,9 +209,9 @@ impl BlockWorker {
                 signal_needed = true;
             }
         }
-        // Signal once after draining all block requests rather than per-request.
-        // Each try_signal_used_queue() triggers a vcpu_request_exit (~5ms HVF exit);
-        // batching turns N exits into 1 for a burst of block I/O completions.
+        // Signal once after draining all block requests rather than per-request,
+        // avoiding redundant IRQ signals when multiple descriptors complete in
+        // a single epoll wake-up.
         if signal_needed {
             if let Err(e) = self.interrupt.try_signal_used_queue() {
                 error!("error signalling queue: {e:?}");
