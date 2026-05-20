@@ -35,6 +35,17 @@ const INIT_CSTR: &[u8] = b"init.krun\0";
 const XATTR_KEY: &[u8] = b"user.containers.override_stat\0";
 const SECURITY_CAPABILITY: &[u8] = b"security.capability\0";
 
+/// macOS-private xattr namespace prefix. Attributes in this namespace (e.g.
+/// `com.apple.provenance`, `com.apple.quarantine`) have no meaning in a Linux
+/// guest. Exposing them causes xattr-aware Linux tools like `rsync -X` to
+/// attempt `lsetxattr(..., "com.apple.*", ...)` on destination filesystems
+/// (tmpfs, overlayfs) that reject the unknown namespace with EOPNOTSUPP,
+/// producing spurious errors and non-zero exit codes.
+///
+/// We strip this prefix from `listxattr` and return `ENODATA` from `getxattr`
+/// so that the Linux guest sees a consistent empty set of these attributes.
+const MACOS_XATTR_PREFIX: &[u8] = b"com.apple.";
+
 const UID_MAX: u32 = u32::MAX - 1;
 
 static INIT_BINARY: &[u8] = include_bytes!(env!("KRUN_INIT_BINARY_PATH"));
@@ -2066,6 +2077,10 @@ impl FileSystem for PassthroughFs {
             return Err(linux_error(io::Error::from_raw_os_error(libc::EACCES)));
         }
 
+        if name.to_bytes().starts_with(MACOS_XATTR_PREFIX) {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::ENODATA)));
+        }
+
         let mut buf = vec![0; size as usize];
 
         // Safe because this will only modify the contents of `buf`
@@ -2158,6 +2173,9 @@ impl FileSystem for PassthroughFs {
             for attr in buf.split(|c| *c == 0) {
                 if attr.starts_with(&XATTR_KEY[..XATTR_KEY.len() - 1]) {
                     clean_size -= XATTR_KEY.len();
+                } else if attr.starts_with(MACOS_XATTR_PREFIX) {
+                    // attr does not include the null terminator; add 1 for it.
+                    clean_size -= attr.len() + 1;
                 }
             }
 
@@ -2166,7 +2184,10 @@ impl FileSystem for PassthroughFs {
             let mut clean_buf = Vec::new();
 
             for attr in buf.split(|c| *c == 0) {
-                if attr.is_empty() || attr.starts_with(&XATTR_KEY[..XATTR_KEY.len() - 1]) {
+                if attr.is_empty()
+                    || attr.starts_with(&XATTR_KEY[..XATTR_KEY.len() - 1])
+                    || attr.starts_with(MACOS_XATTR_PREFIX)
+                {
                     continue;
                 }
 
