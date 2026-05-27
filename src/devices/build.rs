@@ -1,4 +1,3 @@
-use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -13,7 +12,6 @@ fn build_default_init() -> PathBuf {
 
     println!("cargo:rerun-if-env-changed=CC_LINUX");
     println!("cargo:rerun-if-env-changed=CC");
-    println!("cargo:rerun-if-env-changed=TIMESYNC");
     println!("cargo:rerun-if-changed={}", init_src.display());
     println!("cargo:rerun-if-changed={}", dhcp_src.display());
     println!(
@@ -25,10 +23,7 @@ fn build_default_init() -> PathBuf {
         libkrun_root.join("init/dhcp.h").display()
     );
 
-    let mut init_cc_flags = vec!["-O2", "-static", "-Wall"];
-    if std::env::var_os("TIMESYNC").as_deref() == Some(OsStr::new("1")) {
-        init_cc_flags.push("-D__TIMESYNC__");
-    }
+    let init_cc_flags = ["-O2", "-static", "-Wall"];
 
     let cc_value = std::env::var("CC_LINUX")
         .or_else(|_| std::env::var("CC"))
