@@ -45,6 +45,8 @@ pub struct VsockDeviceConfig {
     pub tsi_flags: TsiFlags,
     /// Optional egress policy: list of allowed CIDR ranges (ip, prefix_len).
     pub egress_cidrs: Option<Vec<(IpAddr, u8)>>,
+    /// Optional DNS allow-host filter for TSI networking.
+    pub egress_hosts: Option<Vec<String>>,
 }
 
 struct VsockWrapper {
@@ -94,6 +96,7 @@ impl VsockBuilder {
             cfg.unix_ipc_port_map,
             cfg.tsi_flags,
             cfg.egress_cidrs,
+            cfg.egress_hosts,
         )
         .map_err(VsockConfigError::CreateVsockDevice)
     }
@@ -133,6 +136,7 @@ pub(crate) mod tests {
             unix_ipc_port_map: None,
             tsi_flags: TsiFlags::empty(),
             egress_cidrs: None,
+            egress_hosts: None,
         }
     }
 

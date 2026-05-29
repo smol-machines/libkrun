@@ -85,6 +85,17 @@ ifeq ($(PREFIX),)
     PREFIX := /usr/local
 endif
 
+ifeq ($(OS),Darwin)
+    LLVM_PREFIX ?= $(shell brew --prefix llvm 2>/dev/null)
+ifneq ($(LLVM_PREFIX),)
+    LLVM_LIB_DIR ?= $(LLVM_PREFIX)/lib
+    LIBCLANG_PATH ?= $(LLVM_LIB_DIR)
+    RUSTFLAGS += -C link-arg=-Wl,-rpath,$(LLVM_LIB_DIR)
+    export LIBCLANG_PATH
+    export RUSTFLAGS
+endif
+endif
+
 .PHONY: install clean test test-prefix $(LIBRARY_RELEASE_$(OS)) $(LIBRARY_DEBUG_$(OS)) libkrun.pc clean-sysroot clean-all
 
 all: $(LIBRARY_RELEASE_$(OS)) libkrun.pc

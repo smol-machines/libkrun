@@ -223,5 +223,28 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
             pkt.write_accept_rsp(TsiAcceptRsp { result });
             pkt.set_len(pkt.buf().unwrap().len() as u32);
         }
+        MuxerRx::DgramDataDnsResponse {
+            peer_port,
+            data,
+            fwd_cnt,
+        } => {
+            pkt.set_op(uapi::VSOCK_OP_RW)
+                .set_src_cid(cid)
+                .set_dst_cid(uapi::VSOCK_HOST_CID)
+                .set_src_port(0)
+                .set_dst_port(peer_port)
+                .set_type(uapi::VSOCK_TYPE_DGRAM)
+                .set_buf_alloc(defs::CONN_TX_BUF_SIZE as u32)
+                .set_fwd_cnt(fwd_cnt);
+
+            let len = if let Some(buf) = pkt.buf_mut() {
+                let len = std::cmp::min(buf.len(), data.len());
+                buf[..len].copy_from_slice(&data[..len]);
+                len
+            } else {
+                0
+            };
+            pkt.set_len(len as u32);
+        }
     }
 }
