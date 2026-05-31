@@ -22,6 +22,42 @@ pub struct Rng {
     pub(crate) device_state: DeviceState,
 }
 
+/// Serializable runtime state of an [`Rng`] device for VM checkpoint/fork.
+/// The entropy source is the host RNG (recreated per process), so only the
+/// negotiated features and the request-queue indices need to be carried —
+/// reactivating the device on a clone gives the guest a *fresh* host entropy
+/// source, which the kernel credits and reseeds the CRNG from (the practical
+/// fork-safety reseed, since the kernel here lacks ACPI/VMGENID).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RngState {
+    pub acked_features: u64,
+    pub queue: Option<crate::virtio::queue::QueueState>,
+}
+
+impl Rng {
+    /// Capture runtime state for checkpoint/fork. vCPUs must be paused (the
+    /// device processes synchronously on the queue-kick event, so a paused
+    /// guest leaves the queue at a clean boundary).
+    pub fn save_state(&self) -> RngState {
+        RngState {
+            acked_features: self.acked_features,
+            queue: self
+                .queues
+                .as_ref()
+                .map(|q| q[REQ_INDEX].queue.save_state()),
+        }
+    }
+
+    /// Restore negotiated features onto a freshly-built, not-yet-activated Rng.
+    /// The request-queue indices are re-applied when the device is re-activated
+    /// (cross-process fork uses `restore_and_activate`), and a fresh host
+    /// entropy source is wired up there.
+    pub fn restore_state(&mut self, state: &RngState) -> Result<(), String> {
+        self.acked_features = state.acked_features;
+        Ok(())
+    }
+}
+
 impl Rng {
     pub(crate) fn queue_event(&self, idx: usize) -> &std::sync::Arc<utils::eventfd::EventFd> {
         &self.queues.as_ref().expect("queues should exist")[idx].event

@@ -2,7 +2,7 @@ mod device;
 mod event_handler;
 
 pub use self::defs::uapi::VIRTIO_ID_RNG as TYPE_RNG;
-pub use self::device::Rng;
+pub use self::device::{Rng, RngState};
 
 mod defs {
     use crate::virtio::QueueConfig;
