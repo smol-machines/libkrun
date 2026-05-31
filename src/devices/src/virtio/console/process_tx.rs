@@ -7,16 +7,19 @@ use vm_memory::{GuestMemory, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegio
 use crate::virtio::console::port_io::PortOutput;
 use crate::virtio::{DescriptorChain, InterruptTransport, Queue};
 
+/// Drains the guest's console-output virtqueue to the host output fd. Returns
+/// the [`Queue`] when stopped (via `stop`) so the device can reclaim its
+/// virtqueue indices for a checkpoint/restore at a clean boundary.
 pub(crate) fn process_tx(
     mem: GuestMemoryMmap,
     mut queue: Queue,
     interrupt: InterruptTransport,
     output: Arc<Mutex<Box<dyn PortOutput + Send>>>,
     stop: Arc<AtomicBool>,
-) {
+) -> Queue {
     loop {
         let Some(head) = pop_head_blocking(&mut queue, &mem, &interrupt, &stop) else {
-            return;
+            return queue;
         };
 
         let head_index = head.index;
@@ -39,7 +42,7 @@ pub(crate) fn process_tx(
                         // Errors could conceivably be spurious. Broken
                         // pipe is not and there is no point in attempting
                         // to write more.
-                        return;
+                        return queue;
                     }
                 }
             }

@@ -4,7 +4,7 @@
 pub mod device;
 mod worker;
 
-pub use self::device::{Block, CacheType};
+pub use self::device::{Block, BlockState, CacheType};
 
 use vm_memory::GuestMemoryError;
 

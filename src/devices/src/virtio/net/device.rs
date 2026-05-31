@@ -4,14 +4,19 @@
 // Portions Copyright 2017 The Chromium OS Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
+use crate::virtio::net::Error;
 use crate::virtio::net::Result;
 use crate::virtio::net::{NUM_QUEUES, QUEUE_CONFIG};
 use crate::virtio::queue::Error as QueueError;
+use crate::virtio::queue::QueueState;
 use crate::virtio::{
     ActivateError, ActivateResult, DeviceQueue, DeviceState, InterruptTransport, QueueConfig,
     VirtioDevice, TYPE_NET,
 };
 use crate::Error as DeviceError;
+
+use std::thread::JoinHandle;
+use utils::eventfd::{EventFd, EFD_NONBLOCK};
 
 use super::backend::{ReadError, WriteError};
 use super::worker::NetWorker;
@@ -79,6 +84,13 @@ pub struct Net {
     pub(crate) device_state: DeviceState,
 
     config: VirtioNetConfig,
+
+    worker_thread: Option<JoinHandle<NetWorker>>,
+    worker_stopfd: EventFd,
+    /// Worker reclaimed by [`Self::quiesce_for_snapshot`] (stopped): holds the
+    /// rx/tx queues + backend so their state can be snapshotted/restored and the
+    /// worker re-armed. `None` during normal running.
+    quiesced_worker: Option<NetWorker>,
 }
 
 impl Net {
@@ -109,6 +121,9 @@ impl Net {
 
             device_state: DeviceState::Inactive,
             config,
+            worker_thread: None,
+            worker_stopfd: EventFd::new(EFD_NONBLOCK).map_err(Error::EventFd)?,
+            quiesced_worker: None,
         })
     }
 
@@ -120,6 +135,77 @@ impl Net {
     /// Provides the virtio-net backend of this net device.
     pub fn backend(&self) -> &VirtioNetBackend {
         &self.cfg_backend
+    }
+}
+
+/// Serializable runtime state of the [`Net`] device, for VM checkpoint/fork.
+///
+/// Captures device-level negotiated state (acked features, activation). The MAC
+/// config and the tap/backend are re-provided from the VM config on restore.
+/// Like block, net's virtqueues live in its worker thread, so queue state and
+/// the in-flight packet drain require the shared worker-quiesce step — not
+/// captured here.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NetState {
+    pub acked_features: u64,
+    pub activated: bool,
+    /// rx/tx virtqueue indices, captured after the worker is drained
+    /// ([`Net::quiesce_for_snapshot`]). `None` if not activated/quiesced.
+    pub queue_rx: Option<QueueState>,
+    pub queue_tx: Option<QueueState>,
+}
+
+impl Net {
+    /// Capture device-level + virtqueue runtime state for VM checkpoint/fork.
+    /// The caller must have run [`Self::quiesce_for_snapshot`] first.
+    pub fn save_state(&self) -> NetState {
+        let (queue_rx, queue_tx) = match self.quiesced_worker.as_ref() {
+            Some(w) => {
+                let (rx, tx) = w.save_queue_states();
+                (Some(rx), Some(tx))
+            }
+            None => (None, None),
+        };
+        NetState {
+            acked_features: self.acked_features,
+            activated: matches!(self.device_state, DeviceState::Activated(..)),
+            queue_rx,
+            queue_tx,
+        }
+    }
+
+    /// Restore device-level + virtqueue state. The worker must be quiesced first;
+    /// the restored indices take effect when [`Self::rearm_after_snapshot`] re-arms it.
+    pub fn restore_state(&mut self, state: &NetState) -> std::result::Result<(), String> {
+        self.acked_features = state.acked_features;
+        if let (Some(worker), Some(rx), Some(tx)) = (
+            self.quiesced_worker.as_mut(),
+            state.queue_rx.as_ref(),
+            state.queue_tx.as_ref(),
+        ) {
+            worker.restore_queue_states(rx, tx)?;
+        }
+        Ok(())
+    }
+
+    /// Stop + reclaim the worker so its rx/tx queue indices can be snapshotted at
+    /// a clean boundary. Idempotent; no-op if not running. Device stays activated.
+    fn quiesce_worker(&mut self) {
+        if let Some(handle) = self.worker_thread.take() {
+            let _ = self.worker_stopfd.write(1);
+            match handle.join() {
+                Ok(worker) => self.quiesced_worker = Some(worker),
+                Err(e) => error!("net: error draining worker thread: {e:?}"),
+            }
+        }
+    }
+
+    /// Re-arm a worker reclaimed by [`Self::quiesce_worker`] from the (possibly
+    /// restored) queue indices. No-op if not quiesced.
+    fn rearm_worker(&mut self) {
+        if let Some(worker) = self.quiesced_worker.take() {
+            self.worker_thread = Some(worker.run());
+        }
     }
 }
 
@@ -181,6 +267,14 @@ impl VirtioDevice for Net {
             ActivateError::BadActivate
         })?;
 
+        let stop_fd = match self.worker_stopfd.try_clone() {
+            Ok(fd) => fd,
+            Err(e) => {
+                error!("virtio-net: cannot clone stop fd: {e:?}");
+                return Err(ActivateError::BadActivate);
+            }
+        };
+
         match NetWorker::new(
             rx_q,
             tx_q,
@@ -188,9 +282,10 @@ impl VirtioDevice for Net {
             mem.clone(),
             self.acked_features,
             self.cfg_backend.clone(),
+            stop_fd,
         ) {
             Ok(worker) => {
-                worker.run();
+                self.worker_thread = Some(worker.run());
                 self.device_state = DeviceState::Activated(mem, interrupt);
                 Ok(())
             }
@@ -206,5 +301,27 @@ impl VirtioDevice for Net {
 
     fn is_activated(&self) -> bool {
         self.device_state.is_activated()
+    }
+
+    fn reset(&mut self) -> bool {
+        if let Some(worker) = self.worker_thread.take() {
+            let _ = self.worker_stopfd.write(1);
+            if let Err(e) = worker.join() {
+                error!("net: error waiting for worker thread: {e:?}");
+            }
+        }
+        self.quiesced_worker = None;
+        self.device_state = DeviceState::Inactive;
+        true
+    }
+
+    /// Quiesce for checkpoint/fork: drain + reclaim the worker's rx/tx queues.
+    fn quiesce_for_snapshot(&mut self) {
+        self.quiesce_worker();
+    }
+
+    /// Re-arm the worker after checkpoint/restore (resumes packet processing).
+    fn rearm_after_snapshot(&mut self) {
+        self.rearm_worker();
     }
 }

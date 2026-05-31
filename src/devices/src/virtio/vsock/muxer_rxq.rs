@@ -69,6 +69,14 @@ impl MuxerRxQ {
         self.q.pop_front()
     }
 
+    /// Drop all pending RX items and mark the queue synced. Used on VM restore
+    /// to discard packets queued for connections that no longer exist after the
+    /// rewind (see [`super::muxer::VsockMuxer::reset_connections`]).
+    pub fn clear(&mut self) {
+        self.q.clear();
+        self.synced = true;
+    }
+
     /// Check if the RX queue is synchronized with the connection pool.
     pub fn is_synced(&self) -> bool {
         self.synced

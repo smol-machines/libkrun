@@ -64,9 +64,17 @@ enum PortState {
     Active {
         stopfd: utils::eventfd::EventFd,
         stop: Arc<AtomicBool>,
-        rx_thread: Option<JoinHandle<()>>,
-        tx_thread: Option<JoinHandle<()>>,
+        rx_thread: Option<JoinHandle<Queue>>,
+        tx_thread: Option<JoinHandle<Queue>>,
     },
+}
+
+/// Virtqueues reclaimed from a port's worker threads when it is stopped for a
+/// checkpoint. `rx`/`tx` are present only for the directions the port runs.
+#[derive(Default)]
+pub(crate) struct ReclaimedQueues {
+    pub rx: Option<Queue>,
+    pub tx: Option<Queue>,
 }
 
 pub(crate) struct Port {
@@ -170,6 +178,14 @@ impl Port {
     }
 
     pub fn shutdown(&mut self) {
+        let _ = self.shutdown_and_reclaim();
+    }
+
+    /// Stop the port's worker threads and reclaim the virtqueues they own, so
+    /// the device can capture their indices for a checkpoint. Returns the queues
+    /// for whichever directions the port was running (empty if it was inactive).
+    pub(crate) fn shutdown_and_reclaim(&mut self) -> ReclaimedQueues {
+        let mut reclaimed = ReclaimedQueues::default();
         if let PortState::Active {
             stopfd,
             stop,
@@ -180,23 +196,32 @@ impl Port {
             stop.store(true, Ordering::Release);
             if let Some(tx_thread) = mem::take(tx_thread) {
                 tx_thread.thread().unpark();
-                if let Err(e) = tx_thread.join() {
-                    log::error!(
+                match tx_thread.join() {
+                    Ok(q) => reclaimed.tx = Some(q),
+                    Err(e) => log::error!(
                         "Failed to flush tx for port {port_id}, thread panicked: {e:?}",
                         port_id = self.port_id
-                    )
+                    ),
                 }
             }
             stopfd.write(1).unwrap();
             if let Some(rx_thread) = mem::take(rx_thread) {
                 rx_thread.thread().unpark();
-                if let Err(e) = rx_thread.join() {
-                    log::error!(
-                        "Failed to flush tx for port {port_id}, thread panicked: {e:?}",
+                match rx_thread.join() {
+                    Ok(q) => reclaimed.rx = Some(q),
+                    Err(e) => log::error!(
+                        "Failed to flush rx for port {port_id}, thread panicked: {e:?}",
                         port_id = self.port_id
-                    )
+                    ),
                 }
             }
         };
+        self.state = PortState::Inactive;
+        reclaimed
+    }
+
+    /// True if this port currently has running worker threads.
+    pub(crate) fn is_active(&self) -> bool {
+        matches!(self.state, PortState::Active { .. })
     }
 }

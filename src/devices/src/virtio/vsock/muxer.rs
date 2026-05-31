@@ -300,6 +300,31 @@ impl VsockMuxer {
         }
     }
 
+    /// Reset all live host-backed connections for a VM restore/rewind.
+    ///
+    /// Drops every active connection proxy — agent unix-IPC connections *and*
+    /// TSI network-egress sockets — which closes their host fds (also removing
+    /// them from the shared epoll, since closing an fd evicts it) and clears the
+    /// pending RX queue. **Listener/acceptor proxies are preserved** so the
+    /// muxer keeps accepting new connections on the configured unix-IPC ports
+    /// (e.g. the agent channel). The guest, rewound to the checkpoint, has no
+    /// live connections either, so both sides start clean and the host
+    /// reconnects on its next request.
+    ///
+    /// Safe to call concurrently with the `MuxerThread`: the proxy_map/rxq are
+    /// the same `RwLock`/`Mutex`-guarded structures it uses, and it tolerates a
+    /// proxy disappearing between epoll wakeup and lookup.
+    pub(crate) fn reset_connections(&self) {
+        let removed = {
+            let mut map = self.proxy_map.write().unwrap();
+            let before = map.len();
+            map.retain(|_id, proxy| proxy.lock().unwrap().is_listener());
+            before - map.len()
+        };
+        self.rxq.lock().unwrap().clear();
+        info!("vsock muxer reset on restore: dropped {removed} connection proxy(ies)");
+    }
+
     pub fn update_polling(&self, id: u64, fd: RawFd, evset: EventSet) {
         debug!("update_polling id={id} fd={fd:?} evset={evset:?}");
         let _ = self

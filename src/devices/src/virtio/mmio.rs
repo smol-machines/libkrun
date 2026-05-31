@@ -325,6 +325,41 @@ impl MmioTransport {
             .expect("Failed to activate device");
     }
 
+    /// Re-activate this device from a checkpoint, **bypassing the guest's
+    /// virtio handshake** (a restored guest resumes already past boot and will
+    /// not re-negotiate). Reconstructs the transport's queues from the saved
+    /// per-queue state (ring addresses + indices), restores the negotiated
+    /// `acked_features`, marks the device fully initialized, and activates it —
+    /// starting its worker on the restored queues. Used by restore-into-a-fresh
+    /// clone (cross-process fork). `queue_states[i]` is `None` for a queue the
+    /// guest never set up.
+    pub fn restore_and_activate(
+        &mut self,
+        queue_states: &[Option<super::queue::QueueState>],
+        acked_features: u64,
+    ) -> std::result::Result<(), String> {
+        self.locked_device().set_acked_features(acked_features);
+
+        let mut queues = Self::create_queues(&self.queue_config);
+        for (i, queue) in queues.iter_mut().enumerate() {
+            if let Some(Some(qs)) = queue_states.get(i) {
+                queue.restore_state(qs)?;
+            }
+        }
+        self.queues = Some(queues);
+
+        // Mark the device as the guest would have after a full init handshake.
+        self.device_status = device_status::ACKNOWLEDGE
+            | device_status::DRIVER
+            | device_status::FEATURES_OK
+            | device_status::DRIVER_OK;
+
+        if !self.locked_device().is_activated() {
+            self.activate();
+        }
+        Ok(())
+    }
+
     /// Update device status according to the state machine defined by VirtIO Spec 1.0.
     /// Please refer to VirtIO Spec 1.0, section 2.1.1 and 3.1.1.
     ///

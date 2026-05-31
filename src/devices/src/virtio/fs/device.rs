@@ -48,11 +48,66 @@ pub struct Fs {
     shm_region: Option<VirtioShmRegion>,
     passthrough_cfg: passthrough::Config,
     read_only: bool,
-    worker_thread: Option<JoinHandle<()>>,
+    worker_thread: Option<JoinHandle<FsWorker>>,
     worker_stopfd: EventFd,
+    /// A worker reclaimed by [`Self::quiesce_for_snapshot`] (stopped, drained):
+    /// holds the virtqueues so their indices can be captured for a checkpoint
+    /// and re-armed afterwards.
+    quiesced_worker: Option<FsWorker>,
+    /// FUSE server state restored from a checkpoint, consumed by the next
+    /// `activate` to rebuild the worker's passthrough inode/handle maps.
+    pending_fuse: Option<FuseServerState>,
     exit_code: Arc<AtomicI32>,
     #[cfg(target_os = "macos")]
     map_sender: Option<Sender<WorkerMessage>>,
+}
+
+/// Serializable runtime state of an [`Fs`] device for VM checkpoint/fork.
+/// The virtqueue indices and negotiated features are serialized, as is the
+/// host-side FUSE server's logical state ([`FuseServerState`]) — the latter is
+/// rebuilt in the clone process by re-opening the recorded host paths, since
+/// the open file descriptors themselves are process-local.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FsState {
+    pub acked_features: u64,
+    /// Per-queue runtime state, indexed like the device's queue config. `None`
+    /// means the queue was owned by the worker at snapshot time (a faithful
+    /// snapshot first quiesces the worker so it releases its queues).
+    pub queues: Vec<Option<crate::virtio::queue::QueueState>>,
+    /// Logical FUSE passthrough server state (inode + handle maps as host paths,
+    /// counters, negotiated options). `None` if the device was never activated.
+    pub fuse: Option<FuseServerState>,
+}
+
+/// Logical snapshot of a passthrough FUSE server, captured by host path so it
+/// can be rebuilt in a different process. Platform-neutral (no OS handles) so it
+/// serializes cleanly; the rebuild logic lives in the per-OS passthrough impl.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FuseServerState {
+    pub inodes: Vec<FuseInodeSnap>,
+    pub handles: Vec<FuseHandleSnap>,
+    pub next_inode: u64,
+    pub next_handle: u64,
+    pub writeback: bool,
+    pub announce_submounts: bool,
+}
+
+/// One FUSE inode: the guest's nodeid mapped to an absolute host path (recovered
+/// via `/proc/self/fd`) plus its lookup refcount.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FuseInodeSnap {
+    pub nodeid: u64,
+    pub path: String,
+    pub refcount: u64,
+}
+
+/// One open FUSE handle: the guest's fh, its owning nodeid, and the open flags
+/// it was created with (so it can be re-opened against the rebuilt inode).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FuseHandleSnap {
+    pub handle: u64,
+    pub nodeid: u64,
+    pub flags: i32,
 }
 
 impl Fs {
@@ -86,6 +141,8 @@ impl Fs {
             read_only,
             worker_thread: None,
             worker_stopfd: EventFd::new(EFD_NONBLOCK).map_err(FsError::EventFd)?,
+            quiesced_worker: None,
+            pending_fuse: None,
             exit_code,
             #[cfg(target_os = "macos")]
             map_sender: None,
@@ -112,6 +169,53 @@ impl Fs {
     #[cfg(target_os = "macos")]
     pub fn set_map_sender(&mut self, map_sender: Sender<WorkerMessage>) {
         self.map_sender = Some(map_sender);
+    }
+
+    /// Capture this device's runtime state for VM checkpoint/fork. The worker
+    /// must be quiesced ([`Self::quiesce_for_snapshot`]) first so the virtqueue
+    /// indices can be read; otherwise the queues are owned by the worker.
+    pub fn save_state(&self) -> FsState {
+        FsState {
+            acked_features: self.acked_features,
+            queues: self
+                .quiesced_worker
+                .as_ref()
+                .map(|w| w.save_queue_states().into_iter().map(Some).collect())
+                .unwrap_or_default(),
+            fuse: self.quiesced_worker.as_ref().and_then(|w| w.save_fuse_state()),
+        }
+    }
+
+    /// Restore runtime state onto a freshly-constructed, not-yet-activated Fs.
+    /// Only negotiated features are applied here; the virtqueue indices are
+    /// re-applied when the device is re-activated (cross-process fork uses
+    /// `restore_and_activate`, which rebuilds the queues from the saved indices
+    /// and starts a fresh worker). The host-side FUSE server is recreated fresh.
+    pub fn restore_state(&mut self, state: &FsState) -> std::result::Result<(), String> {
+        self.acked_features = state.acked_features;
+        self.pending_fuse = state.fuse.clone();
+        Ok(())
+    }
+
+    /// Stop and drain the worker, reclaiming its virtqueues so the indices can
+    /// be captured at a clean checkpoint boundary. Pairs with
+    /// [`Self::rearm_worker`].
+    fn quiesce_worker(&mut self) {
+        if let Some(worker) = self.worker_thread.take() {
+            let _ = self.worker_stopfd.write(1);
+            match worker.join() {
+                Ok(w) => self.quiesced_worker = Some(w),
+                Err(e) => error!("virtio_fs: error reclaiming worker: {e:?}"),
+            }
+        }
+    }
+
+    /// Re-arm a worker reclaimed by [`Self::quiesce_worker`], resuming FUSE
+    /// service from the (possibly restored) virtqueue indices.
+    fn rearm_worker(&mut self) {
+        if let Some(worker) = self.quiesced_worker.take() {
+            self.worker_thread = Some(worker.run());
+        }
     }
 }
 
@@ -190,6 +294,7 @@ impl VirtioDevice for Fs {
             self.read_only,
             self.worker_stopfd.try_clone().unwrap(),
             self.exit_code.clone(),
+            self.pending_fuse.take(),
             #[cfg(target_os = "macos")]
             self.map_sender.clone(),
         )
@@ -218,7 +323,16 @@ impl VirtioDevice for Fs {
                 error!("error waiting for worker thread: {e:?}");
             }
         }
+        self.quiesced_worker = None;
         self.device_state = DeviceState::Inactive;
         true
+    }
+
+    fn quiesce_for_snapshot(&mut self) {
+        self.quiesce_worker();
+    }
+
+    fn rearm_after_snapshot(&mut self) {
+        self.rearm_worker();
     }
 }

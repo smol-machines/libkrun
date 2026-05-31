@@ -96,4 +96,12 @@ pub trait Proxy: Send + AsRawFd {
     fn shutdown(&mut self, _pkt: &VsockPacket) {}
     fn release(&mut self) -> ProxyUpdate;
     fn process_event(&mut self, evset: EventSet) -> ProxyUpdate;
+    /// True if this proxy is a passive listener/acceptor (e.g. a host unix-IPC
+    /// socket awaiting inbound connections), as opposed to a live connection.
+    /// Listeners are preserved across a VM restore so the muxer keeps accepting
+    /// new connections; active connection proxies are dropped and re-established
+    /// (see [`super::muxer::VsockMuxer::reset_connections`]).
+    fn is_listener(&self) -> bool {
+        false
+    }
 }

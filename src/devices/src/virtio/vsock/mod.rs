@@ -22,7 +22,7 @@ mod unix;
 
 pub use self::defs::uapi::VIRTIO_ID_VSOCK as TYPE_VSOCK;
 pub use self::defs::TsiFlags;
-pub use self::device::Vsock;
+pub use self::device::{Vsock, VsockState};
 
 use bitflags::bitflags;
 use vm_memory::GuestMemoryError;

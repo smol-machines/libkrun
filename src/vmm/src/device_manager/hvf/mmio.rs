@@ -11,6 +11,7 @@ use std::{fmt, io};
 
 use devices::fdt::DeviceInfoForFDT;
 use devices::legacy::IrqChip;
+use devices::virtio::persist::{restore_device, snapshot_device, VmDevicesState};
 use devices::{BusDevice, DeviceType};
 use kernel::cmdline as kernel_cmdline;
 use polly::event_manager::EventManager;
@@ -84,6 +85,9 @@ pub struct MMIODeviceManager {
     irq: u32,
     last_irq: u32,
     id_to_dev_info: HashMap<(DeviceType, String), MMIODeviceInfo>,
+    /// Handles to the registered virtio devices, kept so checkpoint/fork can
+    /// snapshot/restore their runtime state (see [`Self::snapshot_devices`]).
+    virtio_devices: Vec<Arc<Mutex<dyn devices::virtio::VirtioDevice>>>,
 }
 
 impl MMIODeviceManager {
@@ -99,7 +103,60 @@ impl MMIODeviceManager {
             last_irq: irq_interval.1,
             bus: devices::Bus::new(),
             id_to_dev_info: HashMap::new(),
+            virtio_devices: Vec::new(),
         }
+    }
+
+    /// Capture the runtime state of every snapshot-supporting virtio device
+    /// for VM checkpoint/fork. Mirrors the KVM device manager.
+    pub fn snapshot_devices(&self) -> VmDevicesState {
+        let mut snapshots = Vec::new();
+        for dev in &self.virtio_devices {
+            let guard = dev.lock().expect("poisoned virtio device lock");
+            if let Some(snap) = snapshot_device(&*guard) {
+                snapshots.push(snap);
+            }
+        }
+        VmDevicesState {
+            devices: snapshots,
+        }
+    }
+
+    /// Quiesce every virtio device to a clean boundary before snapshotting.
+    /// Pair with [`Self::rearm_devices`]. Mirrors the KVM device manager.
+    pub fn quiesce_devices(&self) {
+        for dev in &self.virtio_devices {
+            dev.lock()
+                .expect("poisoned virtio device lock")
+                .quiesce_for_snapshot();
+        }
+    }
+
+    /// Re-arm every virtio device quiesced by [`Self::quiesce_devices`].
+    pub fn rearm_devices(&self) {
+        for dev in &self.virtio_devices {
+            dev.lock()
+                .expect("poisoned virtio device lock")
+                .rearm_after_snapshot();
+        }
+    }
+
+    /// Restore device runtime state captured by [`Self::snapshot_devices`].
+    pub fn restore_devices(&self, state: &VmDevicesState) -> std::result::Result<(), String> {
+        for snap in &state.devices {
+            let mut applied = false;
+            for dev in &self.virtio_devices {
+                let mut guard = dev.lock().expect("poisoned virtio device lock");
+                if restore_device(&mut *guard, snap).is_ok() {
+                    applied = true;
+                    break;
+                }
+            }
+            if !applied {
+                return Err(format!("no matching device to restore snapshot {snap:?}"));
+            }
+        }
+        Ok(())
     }
 
     /// Register an already created MMIO device to be used via MMIO transport.
@@ -114,6 +171,9 @@ impl MMIODeviceManager {
         }
 
         mmio_device.set_irq_line(self.irq);
+
+        // Track the underlying virtio device for checkpoint/fork snapshots.
+        self.virtio_devices.push(mmio_device.device());
 
         self.bus
             .insert(Arc::new(Mutex::new(mmio_device)), self.mmio_base, MMIO_LEN)

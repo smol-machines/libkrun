@@ -112,6 +112,12 @@ where
         self.alt.clear();
         self.main.clear()
     }
+
+    /// Iterate over all `(main key, value)` pairs. Used to snapshot the map for
+    /// checkpoint/fork.
+    pub fn iter(&self) -> impl Iterator<Item = (&K1, &V)> {
+        self.main.iter().map(|(k1, (_, v))| (k1, v))
+    }
 }
 
 #[cfg(test)]

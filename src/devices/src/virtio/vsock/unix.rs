@@ -718,6 +718,9 @@ impl Proxy for UnixAcceptorProxy {
     fn id(&self) -> u64 {
         self.id
     }
+    fn is_listener(&self) -> bool {
+        true
+    }
     fn status(&self) -> ProxyStatus {
         ProxyStatus::WaitingOnAccept
     }

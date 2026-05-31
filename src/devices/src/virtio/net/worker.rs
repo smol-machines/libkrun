@@ -16,6 +16,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::thread;
 use std::{cmp, result};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
+use utils::eventfd::EventFd;
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
 pub struct NetWorker {
@@ -34,6 +35,8 @@ pub struct NetWorker {
     tx_frame_buf: [u8; MAX_BUFFER_SIZE],
     tx_frame_len: usize,
     tx_has_deferred_frame: bool,
+
+    stop_fd: EventFd,
 }
 
 impl NetWorker {
@@ -44,6 +47,7 @@ impl NetWorker {
         mem: GuestMemoryMmap,
         _vnet_features: u64,
         cfg_backend: VirtioNetBackend,
+        stop_fd: EventFd,
     ) -> Result<Self, ConnectError> {
         let backend = match cfg_backend {
             VirtioNetBackend::UnixstreamFd(fd) => {
@@ -86,26 +90,60 @@ impl NetWorker {
             tx_frame_len: 0,
             tx_iovec: Vec::with_capacity(QUEUE_SIZE as usize),
             tx_has_deferred_frame: false,
+
+            stop_fd,
         })
     }
 
-    pub fn run(self) {
+    /// Snapshot the rx/tx virtqueue indices for checkpoint/fork. Call only while
+    /// the worker is stopped (reclaimed).
+    pub(crate) fn save_queue_states(
+        &self,
+    ) -> (
+        crate::virtio::queue::QueueState,
+        crate::virtio::queue::QueueState,
+    ) {
+        (self.rx_q.queue.save_state(), self.tx_q.queue.save_state())
+    }
+
+    /// Restore rx/tx virtqueue indices onto the reclaimed worker before re-arming.
+    pub(crate) fn restore_queue_states(
+        &mut self,
+        rx: &crate::virtio::queue::QueueState,
+        tx: &crate::virtio::queue::QueueState,
+    ) -> std::result::Result<(), String> {
+        self.rx_q.queue.restore_state(rx)?;
+        self.tx_q.queue.restore_state(tx)?;
+        Ok(())
+    }
+
+    /// Spawn the worker thread. On stop (a write to `stop_fd`) it returns the
+    /// `NetWorker` so the device can reclaim the rx/tx queues (to snapshot their
+    /// indices) and later re-arm — the device-layer quiesce step for
+    /// checkpoint/fork.
+    pub fn run(self) -> thread::JoinHandle<NetWorker> {
         thread::Builder::new()
             .name("virtio-net worker".into())
             .spawn(|| self.work())
-            .unwrap();
+            .unwrap()
     }
 
-    fn work(mut self) {
+    fn work(mut self) -> NetWorker {
         #[cfg(target_os = "macos")]
         const TX_TIMER_FD: RawFd = -2;
 
         let virtq_rx_ev_fd = self.rx_q.event.as_raw_fd();
         let virtq_tx_ev_fd = self.tx_q.event.as_raw_fd();
         let backend_socket = self.backend.raw_socket_fd();
+        let stop_ev_fd = self.stop_fd.as_raw_fd();
 
         let epoll = Epoll::new().unwrap();
 
+        let _ = epoll.ctl(
+            ControlOperation::Add,
+            stop_ev_fd,
+            &EpollEvent::new(EventSet::IN, stop_ev_fd as u64),
+        );
         let _ = epoll.ctl(
             ControlOperation::Add,
             virtq_rx_ev_fd,
@@ -133,6 +171,11 @@ impl NetWorker {
                         let source = event.fd();
                         let event_set = event.event_set();
                         match event_set {
+                            EventSet::IN if source == stop_ev_fd => {
+                                debug!("stopping net worker thread");
+                                let _ = self.stop_fd.read();
+                                return self;
+                            }
                             EventSet::IN if source == virtq_rx_ev_fd => {
                                 self.process_rx_queue_event();
                             }

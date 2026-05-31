@@ -21,6 +21,7 @@ pub mod console;
 pub mod descriptor_utils;
 pub mod device;
 pub mod file_traits;
+pub mod persist;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 pub mod fs;
 #[cfg(feature = "gpu")]

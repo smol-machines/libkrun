@@ -26,6 +26,7 @@ use super::super::filesystem::{
 };
 use super::super::fuse;
 use super::super::multikey::MultikeyBTreeMap;
+use super::super::{FuseHandleSnap, FuseInodeSnap, FuseServerState};
 
 const CURRENT_DIR_CSTR: &[u8] = b".\0";
 const PARENT_DIR_CSTR: &[u8] = b"..\0";
@@ -153,6 +154,16 @@ pub fn drop_effective_cap(cap: Capability) -> io::Result<Option<ScopedCaps>> {
 
 fn ebadf() -> io::Error {
     io::Error::from_raw_os_error(libc::EBADF)
+}
+
+/// Returned when a request references an inode the server doesn't know. After a
+/// cross-process fork/restore the host-side FUSE server starts fresh (empty
+/// inode map), but the restored guest still holds dentries with the golden's
+/// nodeids. Returning `ESTALE` (rather than `EBADF`) makes the guest VFS treat
+/// those handles as stale and re-walk the path from the root nodeid (which is
+/// always valid), rebuilding its mapping against the fresh server.
+fn estale() -> io::Error {
+    io::Error::from_raw_os_error(libc::ESTALE)
 }
 
 fn einval() -> io::Error {
@@ -436,7 +447,7 @@ impl PassthroughFs {
         // Safe because we just opened this fd or it was provided by our caller.
         let proc_self_fd = unsafe { File::from_raw_fd(fd) };
 
-        Ok(PassthroughFs {
+        let fs = PassthroughFs {
             inodes: RwLock::new(MultikeyBTreeMap::new()),
             next_inode: AtomicU64::new(fuse::ROOT_ID + 2),
             init_inode: fuse::ROOT_ID + 1,
@@ -453,7 +464,195 @@ impl PassthroughFs {
             my_gid,
             cap_fowner,
             cfg,
-        })
+        };
+
+        // Establish the root inode (nodeid `ROOT_ID`) up front. Normally the
+        // guest's `FUSE_INIT` does this, but a guest restored onto a cross-process
+        // clone has already completed `FUSE_INIT` against the golden's server and
+        // will not re-send it. Pre-populating the root inode lets the restored
+        // guest re-walk paths from the root (whose nodeid is always valid) after
+        // the fresh server returns `ESTALE` for the golden's stale nodeids. On a
+        // fresh boot this is harmless — `FUSE_INIT` simply re-inserts the root.
+        fs.setup_root_inode()?;
+
+        Ok(fs)
+    }
+
+    /// Open the configured root directory and register it as the FUSE root inode
+    /// (`ROOT_ID`). Idempotent: a later call replaces the entry.
+    fn setup_root_inode(&self) -> io::Result<()> {
+        let root = CString::new(self.cfg.root_dir.as_str()).expect("CString::new failed");
+
+        // O_PATH for tree traversal only. O_NOFOLLOW is intentionally omitted —
+        // the root dir may be a symlink to the real rootfs; statx on a symlink fd
+        // would otherwise record the symlink's inode rather than the target's.
+        let fd = unsafe {
+            libc::openat(libc::AT_FDCWD, root.as_ptr(), libc::O_PATH | libc::O_CLOEXEC)
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // Safe because we just opened this fd above.
+        let f = unsafe { File::from_raw_fd(fd) };
+        let (st, mnt_id) = statx(&f)?;
+
+        // Clear umask so the client controls all mode bits.
+        unsafe { libc::umask(0o000) };
+
+        // Root gets a refcount of 2 to match libfuse.
+        self.inodes.write().unwrap().insert(
+            fuse::ROOT_ID,
+            InodeAltKey {
+                ino: st.st_ino,
+                dev: st.st_dev,
+                mnt_id,
+            },
+            Arc::new(InodeData {
+                inode: fuse::ROOT_ID,
+                file: f,
+                dev: st.st_dev,
+                mnt_id,
+                refcount: AtomicU64::new(2),
+            }),
+        );
+        Ok(())
+    }
+
+    /// Capture the logical inode + handle maps for a checkpoint/fork. Each inode
+    /// is recorded by its absolute host path (recovered from its `O_PATH` fd via
+    /// `/proc/self/fd`), since the fds themselves cannot cross to the clone
+    /// process. The root inode is omitted — it is re-established by
+    /// [`Self::setup_root_inode`] when the clone's server is constructed.
+    pub fn snapshot(&self) -> FuseServerState {
+        let mut inode_snaps = Vec::new();
+        {
+            let inodes = self.inodes.read().unwrap();
+            for (nodeid, data) in inodes.iter() {
+                if *nodeid == fuse::ROOT_ID {
+                    continue;
+                }
+                let link = format!("/proc/self/fd/{}", data.file.as_raw_fd());
+                match std::fs::read_link(&link) {
+                    Ok(p) => inode_snaps.push(FuseInodeSnap {
+                        nodeid: *nodeid,
+                        path: p.to_string_lossy().into_owned(),
+                        refcount: data.refcount.load(Ordering::Relaxed),
+                    }),
+                    Err(e) => warn!("fs snapshot: cannot resolve path for nodeid {nodeid}: {e}"),
+                }
+            }
+        }
+
+        let mut handle_snaps = Vec::new();
+        {
+            let handles = self.handles.read().unwrap();
+            for (h, hdata) in handles.iter() {
+                let fd = hdata.file.read().unwrap().as_raw_fd();
+                // SAFETY: F_GETFL on a valid fd has no memory effects.
+                let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+                handle_snaps.push(FuseHandleSnap {
+                    handle: *h,
+                    nodeid: hdata.inode,
+                    flags,
+                });
+            }
+        }
+
+        FuseServerState {
+            inodes: inode_snaps,
+            handles: handle_snaps,
+            next_inode: self.next_inode.load(Ordering::Relaxed),
+            next_handle: self.next_handle.load(Ordering::Relaxed),
+            writeback: self.writeback.load(Ordering::Relaxed),
+            announce_submounts: self.announce_submounts.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Rebuild the inode + handle maps in a clone process from a [`snapshot`].
+    /// Re-opens each recorded host path (same host, different process) to recreate
+    /// the `O_PATH` inode fds and the open handle fds, preserving the guest's
+    /// nodeids/handles so its cached references resolve. The root inode is assumed
+    /// already present (from [`Self::setup_root_inode`]). Entries whose path has
+    /// since vanished are skipped — the guest gets `ESTALE`/`ENOENT` and re-looks-up.
+    ///
+    /// [`snapshot`]: Self::snapshot
+    pub fn restore(&self, state: &FuseServerState) -> io::Result<()> {
+        {
+            let mut inodes = self.inodes.write().unwrap();
+            for snap in &state.inodes {
+                let cpath = match CString::new(snap.path.as_bytes()) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                // SAFETY: constant flags, checked return value. `O_NOFOLLOW`
+                // matches `do_lookup`: a symlink inode must resolve to the symlink
+                // itself, not its target (the target may not even exist on the
+                // host — e.g. an absolute symlink like /bin/sh -> /bin/busybox).
+                let fd = unsafe {
+                    libc::openat(
+                        libc::AT_FDCWD,
+                        cpath.as_ptr(),
+                        libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    )
+                };
+                if fd < 0 {
+                    warn!("fs restore: reopen {} failed: {}", snap.path, io::Error::last_os_error());
+                    continue;
+                }
+                // SAFETY: we just opened this fd.
+                let f = unsafe { File::from_raw_fd(fd) };
+                let (st, mnt_id) = match statx(&f) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!("fs restore: statx {} failed: {e}", snap.path);
+                        continue;
+                    }
+                };
+                inodes.insert(
+                    snap.nodeid,
+                    InodeAltKey {
+                        ino: st.st_ino,
+                        dev: st.st_dev,
+                        mnt_id,
+                    },
+                    Arc::new(InodeData {
+                        inode: snap.nodeid,
+                        file: f,
+                        dev: st.st_dev,
+                        mnt_id,
+                        refcount: AtomicU64::new(snap.refcount),
+                    }),
+                );
+            }
+        }
+
+        // Counters must be restored before reopening handles so newly-allocated
+        // ids don't collide with the restored ones.
+        self.next_inode.store(state.next_inode, Ordering::Relaxed);
+        self.next_handle.store(state.next_handle, Ordering::Relaxed);
+        self.writeback.store(state.writeback, Ordering::Relaxed);
+        self.announce_submounts
+            .store(state.announce_submounts, Ordering::Relaxed);
+
+        for snap in &state.handles {
+            match self.open_inode(snap.nodeid, snap.flags) {
+                Ok(file) => {
+                    self.handles.write().unwrap().insert(
+                        snap.handle,
+                        Arc::new(HandleData {
+                            inode: snap.nodeid,
+                            file: RwLock::new(file),
+                            exported: AtomicBool::new(false),
+                        }),
+                    );
+                }
+                Err(e) => warn!(
+                    "fs restore: reopen handle {} (nodeid {}) failed: {e}",
+                    snap.handle, snap.nodeid
+                ),
+            }
+        }
+        Ok(())
     }
 
     fn open_inode(&self, inode: Inode, mut flags: i32) -> io::Result<File> {
@@ -463,7 +662,7 @@ impl PassthroughFs {
             .unwrap()
             .get(&inode)
             .cloned()
-            .ok_or_else(ebadf)?;
+            .ok_or_else(estale)?;
 
         let pathname = CString::new(format!("{}", data.file.as_raw_fd()))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -536,7 +735,7 @@ impl PassthroughFs {
             .unwrap()
             .get(&parent)
             .cloned()
-            .ok_or_else(ebadf)?;
+            .ok_or_else(estale)?;
 
         // Safe because this doesn't modify any memory and we check the return value.
         let fd = unsafe {
@@ -805,7 +1004,7 @@ impl PassthroughFs {
             .unwrap()
             .get(&inode)
             .cloned()
-            .ok_or_else(ebadf)?;
+            .ok_or_else(estale)?;
 
         let st = stat(&data.file)?;
 
@@ -905,55 +1104,9 @@ impl FileSystem for PassthroughFs {
     type Handle = Handle;
 
     fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
-        let root = CString::new(self.cfg.root_dir.as_str()).expect("CString::new failed");
-
-        // Safe because this doesn't modify any memory and we check the return value.
-        // We use `O_PATH` because we just want this for traversing the directory tree
-        // and not for actually reading the contents.
-        // Note: O_NOFOLLOW is intentionally omitted — the root dir may be a symlink
-        // (e.g. a cache entry pointing to the real rootfs directory). O_PATH | O_NOFOLLOW
-        // on a symlink succeeds on Linux (unlike macOS) but gives a symlink fd; statx()
-        // on a symlink fd returns the symlink's inode/dev rather than the target's,
-        // corrupting the FUSE root inode table entry.
-        let fd = unsafe {
-            libc::openat(
-                libc::AT_FDCWD,
-                root.as_ptr(),
-                libc::O_PATH | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        // Safe because we just opened this fd above.
-        let f = unsafe { File::from_raw_fd(fd) };
-
-        let (st, mnt_id) = statx(&f)?;
-
-        // Safe because this doesn't modify any memory and there is no need to check the return
-        // value because this system call always succeeds. We need to clear the umask here because
-        // we want the client to be able to set all the bits in the mode.
-        unsafe { libc::umask(0o000) };
-
-        let mut inodes = self.inodes.write().unwrap();
-
-        // Not sure why the root inode gets a refcount of 2 but that's what libfuse does.
-        inodes.insert(
-            fuse::ROOT_ID,
-            InodeAltKey {
-                ino: st.st_ino,
-                dev: st.st_dev,
-                mnt_id,
-            },
-            Arc::new(InodeData {
-                inode: fuse::ROOT_ID,
-                file: f,
-                dev: st.st_dev,
-                mnt_id,
-                refcount: AtomicU64::new(2),
-            }),
-        );
+        // (Re)establish the root inode. Already done once in `new`, but a fresh
+        // `FUSE_INIT` re-inserts it (harmless).
+        self.setup_root_inode()?;
 
         let mut opts = FsOptions::DO_READDIRPLUS | FsOptions::READDIRPLUS_AUTO;
         if self.cfg.writeback && capable.contains(FsOptions::WRITEBACK_CACHE) {

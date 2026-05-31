@@ -81,14 +81,33 @@ impl BlockWorker {
         }
     }
 
-    pub fn run(self) -> thread::JoinHandle<()> {
+    /// Snapshot the worker's virtqueue indices (for checkpoint/fork). Call only
+    /// while the worker is stopped (reclaimed), so there is no concurrent access.
+    pub(crate) fn save_queue_state(&self) -> crate::virtio::queue::QueueState {
+        self.device_queue.queue.save_state()
+    }
+
+    /// Restore virtqueue indices onto the reclaimed worker before re-arming it.
+    pub(crate) fn restore_queue_state(
+        &mut self,
+        state: &crate::virtio::queue::QueueState,
+    ) -> std::result::Result<(), String> {
+        self.device_queue.queue.restore_state(state)
+    }
+
+    /// Spawn the worker thread. On stop (a write to `stop_fd`) the thread drains
+    /// any pending requests and **returns the `BlockWorker`**, so the device can
+    /// reclaim the virtqueue (to snapshot its indices) and later re-arm the
+    /// worker from it — the device-layer "quiesce to a clean boundary" step for
+    /// checkpoint/fork.
+    pub fn run(self) -> thread::JoinHandle<BlockWorker> {
         thread::Builder::new()
             .name("block worker".into())
             .spawn(|| self.work())
             .unwrap()
     }
 
-    fn work(mut self) {
+    fn work(mut self) -> BlockWorker {
         let virtq_ev_fd = self.device_queue.event.as_raw_fd();
         let stop_ev_fd = self.stop_fd.as_raw_fd();
 
@@ -120,7 +139,11 @@ impl BlockWorker {
                             EventSet::IN if source == stop_ev_fd => {
                                 debug!("stopping worker thread");
                                 let _ = self.stop_fd.read();
-                                return;
+                                // Drain: complete any requests the guest made
+                                // available before the stop so we yield the
+                                // queue at a clean boundary (no in-flight I/O).
+                                self.process_virtio_queues();
+                                return self;
                             }
                             _ => {
                                 log::warn!(

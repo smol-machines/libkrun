@@ -19,6 +19,7 @@ use super::super::{
     VirtioDevice,
 };
 use super::muxer::VsockMuxer;
+use crate::virtio::queue::QueueState;
 use super::packet::VsockPacket;
 use super::TsiFlags;
 use super::{defs, defs::uapi};
@@ -185,6 +186,71 @@ impl Vsock {
         }
 
         have_used
+    }
+}
+
+/// Serializable runtime state of the [`Vsock`] device, for VM checkpoint/fork.
+///
+/// Captures device-level negotiated state (acked features, activation), the
+/// guest `cid`, and the rx/tx [`QueueState`].
+///
+/// **Connections are intentionally NOT captured.** vsock/TSI connections live
+/// in the muxer's `proxy_map` as host-backed sockets (live `RawFd`s); they
+/// cannot be serialized to disk nor cloned across a fork (a clone could not
+/// share the parent's fds). The model is therefore **reset-and-reconnect**: on
+/// restore the muxer starts with an empty `proxy_map` and the guest
+/// re-establishes connections. This is sound for the target use case — a
+/// "browser ready, no active task" checkpoint has no in-flight task
+/// connections to preserve, and the persistent agent channel simply reconnects.
+///
+/// **Fork note:** `cid` is the VM's vsock identity. A plain restore keeps it; a
+/// *fork* must construct the clone with a FRESH `cid` (rejuvenation) so the two
+/// VMs are distinguishable on the host — `restore_state` deliberately does not
+/// overwrite the device's `cid`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct VsockState {
+    pub cid: u64,
+    pub acked_features: u64,
+    pub activated: bool,
+    pub queue_rx: Option<QueueState>,
+    pub queue_tx: Option<QueueState>,
+}
+
+impl Vsock {
+    /// Capture this vsock device's runtime state for VM checkpoint/fork.
+    pub fn save_state(&self) -> VsockState {
+        let q = |slot: &Option<Arc<Mutex<VirtQueue>>>| {
+            slot.as_ref().map(|m| m.lock().unwrap().save_state())
+        };
+        VsockState {
+            cid: self.cid,
+            acked_features: self.acked_features,
+            activated: matches!(self.device_state, DeviceState::Activated(..)),
+            queue_rx: q(&self.queue_rx),
+            queue_tx: q(&self.queue_tx),
+        }
+    }
+
+    /// Restore runtime state onto a freshly-constructed, not-yet-activated
+    /// vsock device. Connections are NOT restored (see [`VsockState`]); the
+    /// muxer's `proxy_map` stays empty and the guest reconnects.
+    pub fn restore_state(&mut self, state: &VsockState) -> Result<(), String> {
+        self.acked_features = state.acked_features;
+        // `cid` left as constructed (fresh on fork, matching on restore).
+        if let (Some(m), Some(qs)) = (self.queue_rx.as_ref(), state.queue_rx.as_ref()) {
+            m.lock().unwrap().restore_state(qs)?;
+        }
+        if let (Some(m), Some(qs)) = (self.queue_tx.as_ref(), state.queue_tx.as_ref()) {
+            m.lock().unwrap().restore_state(qs)?;
+        }
+        // Tear down all live host-backed connections (agent + TSI egress) so the
+        // host side matches the rewound guest, which has no live connections at
+        // the checkpoint. Listeners are kept; the host reconnects on demand.
+        // This is the in-process-rewind counterpart to the "reset-and-reconnect"
+        // model — for a fresh-device restore the proxy_map is already empty, so
+        // this is a no-op there.
+        self.muxer.reset_connections();
+        Ok(())
     }
 }
 

@@ -164,6 +164,28 @@ pub trait VirtioDevice: AsAny + Send {
     fn shm_region(&self) -> Option<&VirtioShmRegion> {
         None
     }
+
+    /// Quiesce the device to a clean boundary for a checkpoint/fork snapshot:
+    /// devices that move their virtqueues into a worker thread (block, net)
+    /// drain in-flight work and reclaim the queue so its indices can be
+    /// captured by `save_state`. Default: no-op (devices that keep their queues
+    /// in-struct, e.g. vsock). Paired with [`Self::rearm_after_snapshot`].
+    /// The vCPUs must already be paused when this is called.
+    fn quiesce_for_snapshot(&mut self) {}
+
+    /// Re-arm a device quiesced by [`Self::quiesce_for_snapshot`], resuming its
+    /// worker from the (possibly restored) virtqueue indices. Default: no-op.
+    fn rearm_after_snapshot(&mut self) {}
+
+    /// Finish re-activating a device on a cross-process clone, after its queues
+    /// have been restored and [`Self::activate`] called. Most devices start
+    /// their workers inside `activate`, so this is a no-op for them. The console
+    /// is special: on a fresh boot it starts each port's worker only when the
+    /// guest sends the `VIRTIO_CONSOLE_PORT_OPEN` control message, but a restored
+    /// guest has already completed that handshake and will not re-send it — so
+    /// the console must restart its port workers here, or the guest hard-spins
+    /// writing console output to a queue nobody drains. Default: no-op.
+    fn finish_restore_activation(&mut self) {}
 }
 
 pub trait VmmExitObserver: Send {

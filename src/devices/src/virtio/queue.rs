@@ -351,6 +351,27 @@ pub struct Queue {
     num_added: Wrapping<u16>,
 }
 
+/// Serializable runtime state of a [`Queue`], captured for VM checkpoint/fork.
+///
+/// `max_size` is device-fixed (known from the device's configuration) and is
+/// restored when the device reconstructs its queues, so it is not carried in
+/// the snapshot. Everything here is the per-run state the guest driver
+/// established — including the mid-stream `next_avail`/`next_used` indices,
+/// which must survive a checkpoint so a restored or forked device neither
+/// re-processes nor drops in-flight descriptor chains.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct QueueState {
+    pub size: u16,
+    pub ready: bool,
+    pub desc_table: u64,
+    pub avail_ring: u64,
+    pub used_ring: u64,
+    pub next_avail: u16,
+    pub next_used: u16,
+    pub event_idx_enabled: bool,
+    pub num_added: u16,
+}
+
 impl Queue {
     /// Constructs an empty virtio queue with the given `max_size`.
     pub fn new(max_size: u16) -> Queue {
@@ -370,6 +391,46 @@ impl Queue {
 
     pub fn get_max_size(&self) -> u16 {
         self.max_size
+    }
+
+    /// Capture this queue's runtime state for VM checkpoint/fork.
+    ///
+    /// `max_size` is intentionally omitted — it is device-fixed and supplied by
+    /// the device when it reconstructs its queues. See [`QueueState`].
+    pub fn save_state(&self) -> QueueState {
+        QueueState {
+            size: self.size,
+            ready: self.ready,
+            desc_table: self.desc_table.raw_value(),
+            avail_ring: self.avail_ring.raw_value(),
+            used_ring: self.used_ring.raw_value(),
+            next_avail: self.next_avail.0,
+            next_used: self.next_used.0,
+            event_idx_enabled: self.event_idx_enabled,
+            num_added: self.num_added.0,
+        }
+    }
+
+    /// Restore runtime state onto a freshly-constructed queue (which already
+    /// carries the correct device-fixed `max_size`). Rejects a snapshot whose
+    /// driver-selected size exceeds the device maximum.
+    pub fn restore_state(&mut self, state: &QueueState) -> Result<(), String> {
+        if state.size > self.max_size {
+            return Err(format!(
+                "queue snapshot size {} exceeds device max_size {}",
+                state.size, self.max_size
+            ));
+        }
+        self.size = state.size;
+        self.ready = state.ready;
+        self.desc_table = GuestAddress(state.desc_table);
+        self.avail_ring = GuestAddress(state.avail_ring);
+        self.used_ring = GuestAddress(state.used_ring);
+        self.next_avail = Wrapping(state.next_avail);
+        self.next_used = Wrapping(state.next_used);
+        self.event_idx_enabled = state.event_idx_enabled;
+        self.num_added = Wrapping(state.num_added);
+        Ok(())
     }
 
     /// Return the actual size of the queue, as the driver may not set up a
@@ -949,6 +1010,42 @@ pub(crate) mod tests {
         pub fn end(&self) -> GuestAddress {
             self.used.end()
         }
+    }
+
+    #[test]
+    fn test_queue_state_save_restore_roundtrip() {
+        // A queue caught mid-stream: event-idx negotiated, 42 avail consumed,
+        // 40 used produced (2 chains in flight). All of this must survive a
+        // checkpoint so a restored/forked device resumes exactly where it left
+        // off — no re-processing, no dropped descriptors.
+        let mut live = Queue::new(256);
+        live.size = 128;
+        live.ready = true;
+        live.desc_table = GuestAddress(0x4000_0000);
+        live.avail_ring = GuestAddress(0x4000_2000);
+        live.used_ring = GuestAddress(0x4000_3000);
+        live.next_avail = Wrapping(42);
+        live.next_used = Wrapping(40);
+        live.event_idx_enabled = true;
+        live.num_added = Wrapping(2);
+
+        let snap = live.save_state();
+
+        // Reconstruct a fresh queue (device supplies the fixed max_size) and
+        // restore the captured runtime state.
+        let mut restored = Queue::new(256);
+        restored.restore_state(&snap).expect("restore");
+
+        assert_eq!(restored.save_state(), snap, "roundtrip must be lossless");
+        assert_eq!(restored.next_avail, Wrapping(42), "consumer index preserved");
+        assert_eq!(restored.next_used, Wrapping(40), "producer index preserved");
+        assert_eq!(restored.desc_table, GuestAddress(0x4000_0000));
+        assert!(restored.event_idx_enabled && restored.ready);
+        assert_eq!(restored.size, 128);
+
+        // A snapshot whose selected size exceeds the device maximum is rejected.
+        let mut small = Queue::new(64);
+        assert!(small.restore_state(&snap).is_err(), "size > max_size must be rejected");
     }
 
     #[test]

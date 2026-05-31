@@ -167,6 +167,9 @@ struct ContextConfig {
     control_socket_path: Option<PathBuf>,
     vmm_uid: Option<libc::uid_t>,
     vmm_gid: Option<libc::gid_t>,
+    /// When set, boot this VM as a fork clone from the snapshot dir (checkpoint
+    /// + manifest written by a golden VM's FORK command) instead of cold boot.
+    snapshot_dir: Option<PathBuf>,
 }
 
 impl ContextConfig {
@@ -433,6 +436,27 @@ fn with_cfg(ctx_id: u32, f: impl FnOnce(&mut ContextConfig) -> i32) -> i32 {
 static CTX_MAP: Lazy<Mutex<HashMap<u32, ContextConfig>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 static CTX_IDS: AtomicI32 = AtomicI32::new(0);
 
+/// An in-process VM checkpoint kept resident in the libkrun process: the
+/// captured VM/vCPU/device state plus the guest-memory image. Used by the
+/// control-socket CHECKPOINT/RESTORE commands to rewind a running VM without
+/// serializing to disk (the same in-memory model the fork fast-path uses).
+#[cfg(any(all(target_os = "linux", target_arch = "x86_64"), all(target_os = "macos", target_arch = "aarch64")))]
+struct StashedCheckpoint {
+    checkpoint: vmm::VmCheckpoint,
+    // Eager byte image + region layout. NOTE: the in-process rewind (RESTORE
+    // into the same, *resuming* VM) requires an eager copy of guest RAM taken at
+    // checkpoint time — a CoW (`MAP_PRIVATE`) clone is NOT valid here, because
+    // the resuming parent keeps writing the shared memfd and the clone would
+    // observe those later writes on un-CoW'd pages (plan §4). CoW memory is for
+    // *fork* (parent frozen), via `Vmm::checkpoint_cow`.
+    mem_descs: Vec<vmm::snapshot::MemoryRegionDesc>,
+    memory: Vec<u8>,
+}
+
+#[cfg(any(all(target_os = "linux", target_arch = "x86_64"), all(target_os = "macos", target_arch = "aarch64")))]
+static CHECKPOINTS: Lazy<Mutex<HashMap<String, StashedCheckpoint>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
 fn log_level_to_filter_str(level: u32) -> &'static str {
     match level {
         0 => "off",
@@ -444,13 +468,181 @@ fn log_level_to_filter_str(level: u32) -> &'static str {
     }
 }
 
+#[cfg(any(all(target_os = "linux", target_arch = "x86_64"), all(target_os = "macos", target_arch = "aarch64")))]
+fn handle_checkpoint(vmm: &Arc<Mutex<vmm::Vmm>>, id: &str) -> String {
+    if id.is_empty() {
+        return "ERR EINVAL checkpoint id required\n".to_string();
+    }
+    // Pauses the vCPUs + drains device workers at a clean boundary, then captures
+    // state + an eager guest-RAM image (correct for rewind — see StashedCheckpoint).
+    // The VM remains paused (workers re-armed) on success.
+    let mut memory = Vec::new();
+    let (checkpoint, mem_descs) = match vmm.lock().unwrap().checkpoint(&mut memory) {
+        Ok(v) => v,
+        Err(e) => return format!("ERR EIO checkpoint failed: {e}\n"),
+    };
+    let bytes = memory.len();
+    CHECKPOINTS.lock().unwrap().insert(
+        id.to_string(),
+        StashedCheckpoint {
+            checkpoint,
+            mem_descs,
+            memory,
+        },
+    );
+    format!("OK checkpointed {id} ({bytes} bytes, paused)\n")
+}
+
+#[cfg(any(all(target_os = "linux", target_arch = "x86_64"), all(target_os = "macos", target_arch = "aarch64")))]
+fn handle_restore(vmm: &Arc<Mutex<vmm::Vmm>>, id: &str) -> String {
+    if id.is_empty() {
+        return "ERR EINVAL checkpoint id required\n".to_string();
+    }
+    let stash = match CHECKPOINTS.lock().unwrap().remove(id) {
+        Some(s) => s,
+        None => return format!("ERR ENOENT no checkpoint '{id}'\n"),
+    };
+    // Requires the VM to be paused; loads guest RAM + VM/device/vCPU state and
+    // re-arms device workers. The VM stays paused — the caller sends RESUME.
+    let StashedCheckpoint {
+        checkpoint,
+        mem_descs,
+        memory,
+    } = stash;
+    match vmm
+        .lock()
+        .unwrap()
+        .restore(checkpoint, &mem_descs, &mut memory.as_slice())
+    {
+        Ok(()) => format!("OK restored {id} (paused)\n"),
+        Err(e) => format!("ERR EIO restore failed: {e}\n"),
+    }
+}
+
+/// Magic for the fork manifest ("SMOLFORK").
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const FORK_MANIFEST_MAGIC: u64 = 0x534d4f4c464f524b;
+
+/// Serialize the fork manifest: owner pid + guest-RAM region descriptors
+/// (gpa/len/memfd-fd/offset) so a clone can reach the fds via /proc.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn write_fork_manifest(
+    path: &std::path::Path,
+    owner_pid: i32,
+    descs: &[vmm::snapshot::MemfdRegionDesc],
+) -> std::io::Result<()> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&FORK_MANIFEST_MAGIC.to_le_bytes());
+    buf.extend_from_slice(&owner_pid.to_le_bytes());
+    buf.extend_from_slice(&(descs.len() as u32).to_le_bytes());
+    for d in descs {
+        buf.extend_from_slice(&d.gpa.to_le_bytes());
+        buf.extend_from_slice(&d.len.to_le_bytes());
+        buf.extend_from_slice(&d.fd.to_le_bytes());
+        buf.extend_from_slice(&d.offset.to_le_bytes());
+    }
+    std::fs::write(path, buf)
+}
+
+/// Parse a manifest written by [`write_fork_manifest`].
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn read_fork_manifest(
+    path: &std::path::Path,
+) -> std::io::Result<(i32, Vec<vmm::snapshot::MemfdRegionDesc>)> {
+    let b = std::fs::read(path)?;
+    let err = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, m.to_string());
+    let mut p = 0usize;
+    let take = |b: &[u8], p: &mut usize, n: usize| -> std::io::Result<Vec<u8>> {
+        if *p + n > b.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "fork manifest truncated",
+            ));
+        }
+        let s = b[*p..*p + n].to_vec();
+        *p += n;
+        Ok(s)
+    };
+    let magic = u64::from_le_bytes(take(&b, &mut p, 8)?.try_into().unwrap());
+    if magic != FORK_MANIFEST_MAGIC {
+        return Err(err("bad fork manifest magic"));
+    }
+    let owner_pid = i32::from_le_bytes(take(&b, &mut p, 4)?.try_into().unwrap());
+    let n = u32::from_le_bytes(take(&b, &mut p, 4)?.try_into().unwrap()) as usize;
+    let mut descs = Vec::with_capacity(n);
+    for _ in 0..n {
+        let gpa = u64::from_le_bytes(take(&b, &mut p, 8)?.try_into().unwrap());
+        let len = u64::from_le_bytes(take(&b, &mut p, 8)?.try_into().unwrap());
+        let fd = i32::from_le_bytes(take(&b, &mut p, 4)?.try_into().unwrap());
+        let offset = u64::from_le_bytes(take(&b, &mut p, 8)?.try_into().unwrap());
+        descs.push(vmm::snapshot::MemfdRegionDesc {
+            gpa,
+            len,
+            fd,
+            offset,
+        });
+    }
+    Ok((owner_pid, descs))
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn handle_fork(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
+    if dir.is_empty() {
+        return "ERR EINVAL fork snapshot dir required\n".to_string();
+    }
+    let dir = std::path::Path::new(dir);
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        return format!("ERR EIO create {}: {e}\n", dir.display());
+    }
+    // Capture + freeze (the VM stays paused as the CoW base).
+    let (checkpoint, descs) = match vmm.lock().unwrap().checkpoint_for_fork() {
+        Ok(v) => v,
+        Err(e) => return format!("ERR EIO fork checkpoint failed: {e}\n"),
+    };
+    if descs.iter().all(|d| d.fd < 0) {
+        return "ERR EINVAL no memfd-backed RAM (start the golden VM with SMOLVM_FORKABLE=1)\n"
+            .to_string();
+    }
+    if let Err(e) = std::fs::write(dir.join("checkpoint.bin"), checkpoint.serialize()) {
+        return format!("ERR EIO write checkpoint: {e}\n");
+    }
+    let pid = std::process::id() as i32;
+    if let Err(e) = write_fork_manifest(&dir.join("manifest.bin"), pid, &descs) {
+        return format!("ERR EIO write manifest: {e}\n");
+    }
+    format!("OK forked (frozen base, pid {pid}, {} regions)\n", descs.len())
+}
+
+/// Build a [`vmm::builder::RestoreCtx`] from a fork snapshot directory: parse the
+/// manifest, CoW-map the golden VM's guest RAM from `/proc/<pid>/fd`, and load
+/// the serialized checkpoint.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn build_restore_ctx(dir: &std::path::Path) -> std::result::Result<vmm::builder::RestoreCtx, String> {
+    let (owner_pid, descs) =
+        read_fork_manifest(&dir.join("manifest.bin")).map_err(|e| format!("manifest: {e}"))?;
+    let checkpoint =
+        std::fs::read(dir.join("checkpoint.bin")).map_err(|e| format!("checkpoint: {e}"))?;
+    let guest_memory = vmm::snapshot::open_cow_memory_from_pid(owner_pid, &descs)
+        .map_err(|e| format!("cow-map guest memory: {e}"))?;
+    Ok(vmm::builder::RestoreCtx {
+        guest_memory,
+        checkpoint,
+    })
+}
+
 fn handle_control_stream(mut stream: UnixStream, vmm: &Arc<Mutex<vmm::Vmm>>) {
     let mut buf = [0_u8; 128];
     let response = match stream.read(&mut buf) {
         Ok(0) => "ERR EINVAL empty command\n".to_string(),
         Ok(n) => {
             let cmd = String::from_utf8_lossy(&buf[..n]);
-            match cmd.trim().to_ascii_uppercase().as_str() {
+            let cmd = cmd.trim();
+            // Split into a verb (case-insensitive) and an optional argument
+            // (e.g. a checkpoint id), preserving the argument's case.
+            let mut parts = cmd.splitn(2, char::is_whitespace);
+            let verb = parts.next().unwrap_or("").to_ascii_uppercase();
+            let arg = parts.next().map(str::trim).unwrap_or("");
+            match verb.as_str() {
                 "PAUSE" => match vmm.lock().unwrap().pause() {
                     Ok(()) => "OK paused\n".to_string(),
                     Err(e) => format!("ERR EIO {e}\n"),
@@ -463,6 +655,24 @@ fn handle_control_stream(mut stream: UnixStream, vmm: &Arc<Mutex<vmm::Vmm>>) {
                     let state = vmm.lock().unwrap().run_state();
                     format!("OK {state}\n")
                 }
+                // CHECKPOINT <id>: capture VM/vCPU/device state + guest memory
+                // into an in-process stash keyed by <id>. The VM is left paused;
+                // send RESUME to keep the original running, or RESTORE <id>
+                // later to rewind it to this point.
+                #[cfg(any(all(target_os = "linux", target_arch = "x86_64"), all(target_os = "macos", target_arch = "aarch64")))]
+                "CHECKPOINT" => handle_checkpoint(vmm, arg),
+                // RESTORE <id>: rewind the (paused) VM to a stashed checkpoint.
+                // The VM stays paused; send RESUME afterwards. Consumes the
+                // stash (one-shot) since the captured state is moved into KVM.
+                #[cfg(any(all(target_os = "linux", target_arch = "x86_64"), all(target_os = "macos", target_arch = "aarch64")))]
+                "RESTORE" => handle_restore(vmm, arg),
+                // FORK <dir>: capture a fork checkpoint to <dir> (checkpoint.bin +
+                // manifest.bin) and leave this VM FROZEN as the CoW base. A clone
+                // process then boots from <dir> via krun_set_snapshot, mapping this
+                // VM's guest-RAM memfd MAP_PRIVATE. Requires memfd-backed RAM
+                // (SMOLVM_FORKABLE=1).
+                #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+                "FORK" => handle_fork(vmm, arg),
                 _ => "ERR EINVAL unknown command\n".to_string(),
             }
         }
@@ -1965,6 +2175,32 @@ pub unsafe extern "C" fn krun_set_control_socket(ctx_id: u32, c_socket_path: *co
     }
 }
 
+/// Boot this context as a **fork clone** from a snapshot directory produced by a
+/// golden VM's `FORK` control command (containing `checkpoint.bin` +
+/// `manifest.bin`). The clone CoW-maps the golden VM's guest-RAM memfd and
+/// restores VM/device/vCPU state instead of cold-booting. The rest of the
+/// context (rootfs, vsock socket, mem/cpu config) must be configured to match
+/// the golden VM, with fresh host-side resources (a new vsock socket, etc.).
+/// Linux/x86_64 only.
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+pub unsafe extern "C" fn krun_set_snapshot(ctx_id: u32, c_snapshot_dir: *const c_char) -> i32 {
+    if c_snapshot_dir.is_null() {
+        return -libc::EINVAL;
+    }
+    let dir = match CStr::from_ptr(c_snapshot_dir).to_str() {
+        Ok(path) => PathBuf::from(path),
+        Err(_) => return -libc::EINVAL,
+    };
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            ctx_cfg.get_mut().snapshot_dir = Some(dir);
+            KRUN_SUCCESS
+        }
+        Entry::Vacant(_) => -libc::ENOENT,
+    }
+}
+
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
 pub unsafe extern "C" fn krun_set_console_output(ctx_id: u32, c_filepath: *const c_char) -> i32 {
@@ -2895,12 +3131,30 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
 
     let (sender, _receiver) = unbounded();
 
+    // Fork clone: build a RestoreCtx from the snapshot dir (CoW-map the golden
+    // VM's guest RAM + load its checkpoint) so build_microvm restores instead of
+    // cold-booting.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    let restore_ctx = match ctx_cfg.snapshot_dir.take() {
+        Some(dir) => match build_restore_ctx(&dir) {
+            Ok(rc) => Some(rc),
+            Err(e) => {
+                error!("fork restore from {}: {e}", dir.display());
+                return -libc::EINVAL;
+            }
+        },
+        None => None,
+    };
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    let restore_ctx: Option<vmm::builder::RestoreCtx> = None;
+
     lk_timing!("before build_microvm");
     let _vmm = match vmm::builder::build_microvm(
         &ctx_cfg.vmr,
         &mut event_manager,
         ctx_cfg.shutdown_efd,
         sender,
+        restore_ctx,
     ) {
         Ok(vmm) => vmm,
         Err(e) => {

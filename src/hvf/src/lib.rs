@@ -218,8 +218,19 @@ pub fn vcpu_adjust_vtimer_offset(vcpuid: u64, delta_ns: u64) -> Result<(), Error
     // Read the host timer frequency to convert nanoseconds to ticks.
     // virtual_counter = physical_counter - offset, so adding delta_ticks compensates
     // for the physical counter advancing during pause (freeze semantics).
+    // CNTFRQ_EL0 is an AArch64 system register; the `mrs` only assembles on
+    // aarch64. The `hvf` crate is an unconditional dependency and is compiled on
+    // non-arm64 hosts too (where this fn is never called — those hosts use KVM),
+    // so gate the asm to keep the build portable.
     let cntfrq: u64;
-    unsafe { asm!("mrs {}, cntfrq_el0", out(reg) cntfrq) };
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) cntfrq)
+    };
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        cntfrq = 0;
+    }
 
     let mut offset = 0_u64;
     let ret = unsafe { hv_vcpu_get_vtimer_offset(vcpuid, &mut offset) };
@@ -237,6 +248,156 @@ pub fn vcpu_adjust_vtimer_offset(vcpuid: u64, delta_ns: u64) -> Result<(), Error
     } else {
         Ok(())
     }
+}
+
+/// Captured aarch64 vCPU register state for HVF checkpoint/restore — the macOS
+/// analogue of KVM's `VcpuState`. Holds the general-purpose registers, program
+/// state, NEON/FP registers, and the writable EL1 system registers that define
+/// guest execution + MMU state. Read-only ID registers, EL2 (VMM-managed)
+/// state, debug breakpoints, and the virtual-timer registers are intentionally
+/// excluded — the timer is re-aligned via [`vcpu_adjust_vtimer_offset`] on
+/// resume, exactly as the pause/resume path does.
+#[derive(Clone, Debug)]
+pub struct HvfVcpuState {
+    /// X0..X30.
+    pub gp: [u64; 31],
+    /// Program counter.
+    pub pc: u64,
+    /// Processor state (CPSR/PSTATE).
+    pub cpsr: u64,
+    /// FP control register.
+    pub fpcr: u64,
+    /// FP status register.
+    pub fpsr: u64,
+    /// NEON/FP registers Q0..Q31 (128-bit each).
+    pub simd: [u128; 32],
+    /// Writable EL1 system registers as (hv_sys_reg_t, value) pairs.
+    pub sys: Vec<(u16, u64)>,
+}
+
+/// The writable EL1 system registers captured/restored for a faithful guest
+/// state snapshot (MMU config, exception state, thread pointers, etc.).
+#[cfg(target_arch = "aarch64")]
+const SNAPSHOT_SYS_REGS: &[u16] = &[
+    hv_sys_reg_t_HV_SYS_REG_SP_EL0,
+    hv_sys_reg_t_HV_SYS_REG_SP_EL1,
+    hv_sys_reg_t_HV_SYS_REG_ELR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_SPSR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_SCTLR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_TCR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_TTBR0_EL1,
+    hv_sys_reg_t_HV_SYS_REG_TTBR1_EL1,
+    hv_sys_reg_t_HV_SYS_REG_MAIR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_AMAIR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_VBAR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_CONTEXTIDR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_TPIDR_EL0,
+    hv_sys_reg_t_HV_SYS_REG_TPIDR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_TPIDRRO_EL0,
+    hv_sys_reg_t_HV_SYS_REG_CPACR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_AFSR0_EL1,
+    hv_sys_reg_t_HV_SYS_REG_AFSR1_EL1,
+    hv_sys_reg_t_HV_SYS_REG_ESR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_FAR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_PAR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_CSSELR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_ACTLR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_MDSCR_EL1,
+];
+
+/// Capture the full register state of a (paused) HVF vCPU by its id. The macOS
+/// adapter mirroring KVM's `Vcpu::save_state`; see [`HvfVcpuState`].
+#[cfg(target_arch = "aarch64")]
+pub fn vcpu_save_state(vcpuid: u64) -> Result<HvfVcpuState, Error> {
+    let mut gp = [0u64; 31];
+    for (i, slot) in gp.iter_mut().enumerate() {
+        let mut v = 0u64;
+        let ret = unsafe { hv_vcpu_get_reg(vcpuid, hv_reg_t_HV_REG_X0 + i as u32, &mut v) };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuReadRegister);
+        }
+        *slot = v;
+    }
+    let read_reg = |reg: u32| -> Result<u64, Error> {
+        let mut v = 0u64;
+        let ret = unsafe { hv_vcpu_get_reg(vcpuid, reg, &mut v) };
+        if ret != HV_SUCCESS {
+            Err(Error::VcpuReadRegister)
+        } else {
+            Ok(v)
+        }
+    };
+    let pc = read_reg(hv_reg_t_HV_REG_PC)?;
+    let cpsr = read_reg(hv_reg_t_HV_REG_CPSR)?;
+    let fpcr = read_reg(hv_reg_t_HV_REG_FPCR)?;
+    let fpsr = read_reg(hv_reg_t_HV_REG_FPSR)?;
+
+    let mut simd = [0u128; 32];
+    for (i, slot) in simd.iter_mut().enumerate() {
+        let mut v: hv_simd_fp_uchar16_t = 0;
+        let ret =
+            unsafe { hv_vcpu_get_simd_fp_reg(vcpuid, hv_simd_fp_reg_t_HV_SIMD_FP_REG_Q0 + i as u32, &mut v) };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuReadRegister);
+        }
+        *slot = v;
+    }
+
+    let mut sys = Vec::with_capacity(SNAPSHOT_SYS_REGS.len());
+    for &reg in SNAPSHOT_SYS_REGS {
+        let mut v = 0u64;
+        let ret = unsafe { hv_vcpu_get_sys_reg(vcpuid, reg, &mut v) };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuReadSystemRegister);
+        }
+        sys.push((reg, v));
+    }
+
+    Ok(HvfVcpuState {
+        gp,
+        pc,
+        cpsr,
+        fpcr,
+        fpsr,
+        simd,
+        sys,
+    })
+}
+
+/// Restore previously-captured register state onto a (paused) HVF vCPU by its
+/// id. The macOS adapter mirroring KVM's `Vcpu::restore_state`.
+#[cfg(target_arch = "aarch64")]
+pub fn vcpu_restore_state(vcpuid: u64, state: &HvfVcpuState) -> Result<(), Error> {
+    // System registers first (MMU/exception config), then GP/PC/PSTATE/SIMD.
+    for &(reg, val) in &state.sys {
+        let ret = unsafe { hv_vcpu_set_sys_reg(vcpuid, reg, val) };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuSetSystemRegister(reg, val));
+        }
+    }
+    let write_reg = |reg: u32, val: u64| -> Result<(), Error> {
+        let ret = unsafe { hv_vcpu_set_reg(vcpuid, reg, val) };
+        if ret != HV_SUCCESS {
+            Err(Error::VcpuSetRegister)
+        } else {
+            Ok(())
+        }
+    };
+    for (i, &v) in state.gp.iter().enumerate() {
+        write_reg(hv_reg_t_HV_REG_X0 + i as u32, v)?;
+    }
+    write_reg(hv_reg_t_HV_REG_PC, state.pc)?;
+    write_reg(hv_reg_t_HV_REG_CPSR, state.cpsr)?;
+    write_reg(hv_reg_t_HV_REG_FPCR, state.fpcr)?;
+    write_reg(hv_reg_t_HV_REG_FPSR, state.fpsr)?;
+    for (i, &v) in state.simd.iter().enumerate() {
+        let ret =
+            unsafe { hv_vcpu_set_simd_fp_reg(vcpuid, hv_simd_fp_reg_t_HV_SIMD_FP_REG_Q0 + i as u32, v) };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuSetRegister);
+        }
+    }
+    Ok(())
 }
 
 /// Checks if Nested Virtualization is supported on the current system. Only

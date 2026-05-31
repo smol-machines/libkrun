@@ -78,6 +78,11 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
+    /// Access the wrapped filesystem (used to snapshot/restore its state).
+    pub fn fs(&self) -> &F {
+        &self.fs
+    }
+
     #[allow(clippy::cognitive_complexity)]
     pub fn handle_message(
         &self,

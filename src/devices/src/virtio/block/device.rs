@@ -37,6 +37,7 @@ use super::{
 
 use crate::virtio::{
     block::{ImageType, SyncMode},
+    queue::QueueState,
     ActivateError, InterruptTransport,
 };
 
@@ -207,8 +208,12 @@ pub struct Block {
     cache_type: CacheType,
     disk_image: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
     disk_image_id: Vec<u8>,
-    worker_thread: Option<JoinHandle<()>>,
+    worker_thread: Option<JoinHandle<BlockWorker>>,
     worker_stopfd: EventFd,
+    /// A worker reclaimed by [`Self::quiesce_for_snapshot`] (stopped, drained):
+    /// holds the virtqueue + disk so its state can be snapshotted/restored and
+    /// the worker re-armed. `None` during normal running.
+    quiesced_worker: Option<BlockWorker>,
 
     // Virtio fields.
     pub(crate) avail_features: u64,
@@ -327,6 +332,7 @@ impl Block {
             device_state: DeviceState::Inactive,
             worker_thread: None,
             worker_stopfd: EventFd::new(EFD_NONBLOCK)?,
+            quiesced_worker: None,
         })
     }
 
@@ -343,6 +349,77 @@ impl Block {
     /// Specifies if this block device is read only.
     pub fn is_read_only(&self) -> bool {
         self.avail_features & (1u64 << VIRTIO_BLK_F_RO) != 0
+    }
+}
+
+/// Serializable runtime state of the [`Block`] device, for VM checkpoint/fork.
+///
+/// Captures device-level negotiated state (acked features, activation) and the
+/// disk id. The backing disk image is re-provided from the VM config on
+/// restore, not serialized.
+///
+/// QUEUE STATE + IN-FLIGHT DRAIN: block does not hold its virtqueues in the
+/// device struct — they are moved into `worker_thread` at `activate()`. So a
+/// faithful snapshot must DRAIN the worker first (signal `worker_stopfd`, join
+/// the thread so in-flight I/O completes) and have the worker surface its
+/// `QueueState` before exiting. The stop path (stopfd + join) already exists
+/// for deactivation; extending it to return queue state is the shared
+/// worker-quiesce step (block/net/console). Not captured here.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BlockState {
+    pub acked_features: u64,
+    pub activated: bool,
+    pub disk_image_id: Vec<u8>,
+    /// Virtqueue indices, captured after the worker is drained
+    /// ([`Block::quiesce_for_snapshot`]). `None` if the device was not
+    /// activated / not quiesced at snapshot time.
+    pub queue: Option<QueueState>,
+}
+
+impl Block {
+    /// Capture device-level + virtqueue runtime state for VM checkpoint/fork.
+    /// The caller must have run [`Self::quiesce_for_snapshot`] first so the
+    /// worker is stopped and its queue reclaimed — otherwise `queue` is `None`.
+    pub fn save_state(&self) -> BlockState {
+        BlockState {
+            acked_features: self.acked_features,
+            activated: matches!(self.device_state, DeviceState::Activated(..)),
+            disk_image_id: self.disk_image_id.clone(),
+            queue: self.quiesced_worker.as_ref().map(|w| w.save_queue_state()),
+        }
+    }
+
+    /// Restore device-level + virtqueue state. The worker must be quiesced
+    /// (reclaimed) first; the restored indices are applied to it and take effect
+    /// when [`Self::rearm_after_snapshot`] re-arms the worker.
+    pub fn restore_state(&mut self, state: &BlockState) -> std::result::Result<(), String> {
+        self.acked_features = state.acked_features;
+        if let (Some(worker), Some(qs)) = (self.quiesced_worker.as_mut(), state.queue.as_ref()) {
+            worker.restore_queue_state(qs)?;
+        }
+        Ok(())
+    }
+
+    /// Stop and drain the worker, reclaiming its virtqueue so the indices can be
+    /// snapshotted at a clean boundary (no in-flight I/O). Idempotent; no-op if
+    /// not running. The device stays `Activated`; re-arm with
+    /// [`Self::rearm_after_snapshot`].
+    fn quiesce_worker(&mut self) {
+        if let Some(handle) = self.worker_thread.take() {
+            let _ = self.worker_stopfd.write(1);
+            match handle.join() {
+                Ok(worker) => self.quiesced_worker = Some(worker),
+                Err(e) => error!("block: error draining worker thread: {e:?}"),
+            }
+        }
+    }
+
+    /// Re-arm a worker reclaimed by [`Self::quiesce_worker`], resuming I/O from
+    /// the (possibly restored) virtqueue indices. No-op if not quiesced.
+    fn rearm_worker(&mut self) {
+        if let Some(worker) = self.quiesced_worker.take() {
+            self.worker_thread = Some(worker.run());
+        }
     }
 }
 
@@ -438,7 +515,20 @@ impl VirtioDevice for Block {
                 error!("error waiting for worker thread: {e:?}");
             }
         }
+        // Drop any worker reclaimed for a snapshot too.
+        self.quiesced_worker = None;
         self.device_state = DeviceState::Inactive;
         true
+    }
+
+    /// Quiesce for checkpoint/fork: drain + reclaim the worker's virtqueue so
+    /// `save_state` can capture the indices at a clean boundary.
+    fn quiesce_for_snapshot(&mut self) {
+        self.quiesce_worker();
+    }
+
+    /// Re-arm the worker after a checkpoint/restore (resumes I/O).
+    fn rearm_after_snapshot(&mut self) {
+        self.rearm_worker();
     }
 }

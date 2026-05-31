@@ -28,7 +28,7 @@ fn write_virtio_net_hdr(buf: &mut [u8]) -> usize {
     VNET_HDR_LEN
 }
 
-pub use self::device::Net;
+pub use self::device::{Net, NetState};
 #[derive(Debug)]
 pub enum Error {
     /// EventFd error.

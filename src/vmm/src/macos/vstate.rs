@@ -117,6 +117,22 @@ impl Vm {
         Ok(())
     }
 
+    /// Capture VM-level state for a checkpoint. HVF has no in-kernel interrupt
+    /// controller / PIT / clock to serialize (unlike KVM's PIC/IOAPIC/PIT/clock)
+    /// — guest-timer continuity is handled by the vtimer-offset adjustment on
+    /// resume — so the macOS `VmState` is empty. Present for cross-platform
+    /// symmetry with the KVM `Vm::save_state`.
+    #[cfg(target_arch = "aarch64")]
+    pub fn save_state(&self) -> Result<VmState> {
+        Ok(VmState {})
+    }
+
+    /// Restore VM-level state (no-op on HVF; see [`Self::save_state`]).
+    #[cfg(target_arch = "aarch64")]
+    pub fn restore_state(&self, _state: &VmState) -> Result<()> {
+        Ok(())
+    }
+
     /// Initializes the guest memory.
     pub fn memory_init(&mut self, guest_mem: &GuestMemoryMmap) -> Result<()> {
         for region in guest_mem.iter() {
@@ -564,6 +580,30 @@ impl Vcpu {
                                 .send(VcpuResponse::Paused)
                                 .expect("failed to send pause status");
                         }
+                        // Checkpoint: capture register state while paused (the
+                        // safe boundary). Stays paused afterwards.
+                        #[cfg(target_arch = "aarch64")]
+                        Ok(VcpuEvent::SaveState) => match hvf::vcpu_save_state(hvf_vcpuid) {
+                            Ok(state) => self
+                                .response_sender
+                                .send(VcpuResponse::SavedState(Box::new(state)))
+                                .expect("failed to send saved vcpu state"),
+                            Err(e) => {
+                                error!("failed to capture HVF vcpu state: {e:?}");
+                                return false;
+                            }
+                        },
+                        // Restore: load captured register state onto the paused vCPU.
+                        #[cfg(target_arch = "aarch64")]
+                        Ok(VcpuEvent::RestoreState(state)) => {
+                            if let Err(e) = hvf::vcpu_restore_state(hvf_vcpuid, &state) {
+                                error!("failed to restore HVF vcpu state: {e:?}");
+                                return false;
+                            }
+                            self.response_sender
+                                .send(VcpuResponse::RestoredState)
+                                .expect("failed to send restored vcpu ack");
+                        }
                         Err(_) => return false,
                     }
                 }
@@ -575,6 +615,13 @@ impl Vcpu {
                 self.response_sender
                     .send(VcpuResponse::Resumed)
                     .expect("failed to send resume status");
+                true
+            }
+            // Save/restore are only valid while paused; the orchestrator always
+            // pauses first, so receiving one here is a protocol error — ignore it.
+            #[cfg(target_arch = "aarch64")]
+            Some(VcpuEvent::SaveState) | Some(VcpuEvent::RestoreState(_)) => {
+                error!("ignoring vcpu SaveState/RestoreState received while running");
                 true
             }
             None => true,
@@ -598,6 +645,17 @@ impl Drop for Vcpu {
     }
 }
 
+/// Captured HVF vCPU register state (the macOS analogue of KVM's `VcpuState`),
+/// used by the cross-platform checkpoint/restore orchestration in `vmm::lib`.
+#[cfg(target_arch = "aarch64")]
+pub type VcpuState = hvf::HvfVcpuState;
+
+/// VM-level state for a checkpoint. Empty on HVF (no in-kernel PIC/PIT/clock to
+/// serialize); see [`Vm::save_state`].
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Debug)]
+pub struct VmState {}
+
 #[derive(Debug)]
 /// List of events that the Vcpu can receive.
 pub enum VcpuEvent {
@@ -605,9 +663,15 @@ pub enum VcpuEvent {
     Pause,
     /// Event that should resume the Vcpu.
     Resume { paused_ns: u64 },
+    /// Capture the full vCPU register state (the vCPU must be paused).
+    #[cfg(target_arch = "aarch64")]
+    SaveState,
+    /// Restore previously-captured vCPU register state (vCPU paused).
+    #[cfg(target_arch = "aarch64")]
+    RestoreState(Box<VcpuState>),
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 /// List of responses that the Vcpu reports.
 pub enum VcpuResponse {
     /// Vcpu is paused.
@@ -616,6 +680,12 @@ pub enum VcpuResponse {
     Resumed,
     /// Vcpu is stopped.
     Exited(u8),
+    /// Captured vCPU register state, in reply to [`VcpuEvent::SaveState`].
+    #[cfg(target_arch = "aarch64")]
+    SavedState(Box<VcpuState>),
+    /// Acknowledges a [`VcpuEvent::RestoreState`].
+    #[cfg(target_arch = "aarch64")]
+    RestoredState,
 }
 
 /// Wrapper over Vcpu that hides the underlying interactions with the Vcpu thread.

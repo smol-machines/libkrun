@@ -17,6 +17,7 @@ use crate::virtio::console::console_control::{
 };
 use crate::virtio::console::defs::QUEUE_SIZE;
 use crate::virtio::console::port::Port;
+use crate::virtio::queue::QueueState;
 use crate::virtio::console::port_queue_mapping::{
     num_queues, port_id_to_queue_idx, QueueDirection,
 };
@@ -280,6 +281,108 @@ impl Console {
     }
 }
 
+/// Serializable runtime state of a [`Console`] device, for VM checkpoint/fork.
+///
+/// Composes the per-queue [`QueueState`] with the device-level state that is
+/// negotiated/established at run time (acked features, activation). Host-side
+/// resources — `EventFd`s, port I/O handles, worker threads, and the
+/// `Activated` guest-memory/interrupt — are recreated and re-wired when the
+/// device is re-activated on restore, so they are not serialized.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ConsoleState {
+    pub acked_features: u64,
+    pub activated: bool,
+    /// Per-queue runtime state, indexed like [`Console::queues`]. `None` means
+    /// the queue was owned by a port worker thread at snapshot time and was not
+    /// captured — a faithful snapshot must first quiesce the port threads so
+    /// they release their queues (the device-level drain step).
+    pub queues: Vec<Option<QueueState>>,
+}
+
+impl Console {
+    /// Capture this console's runtime state for VM checkpoint/fork.
+    pub fn save_state(&self) -> ConsoleState {
+        ConsoleState {
+            acked_features: self.acked_features,
+            activated: matches!(self.device_state, DeviceState::Activated(..)),
+            queues: self
+                .queues
+                .iter()
+                .map(|q| q.as_ref().map(|dq| dq.queue.save_state()))
+                .collect(),
+        }
+    }
+
+    /// Restore runtime state onto a freshly-constructed, not-yet-activated
+    /// console. The VMM re-activates the device afterwards (re-supplying guest
+    /// memory + interrupt and starting port threads).
+    pub fn restore_state(&mut self, state: &ConsoleState) -> Result<(), String> {
+        self.acked_features = state.acked_features;
+        for (slot, snap) in self.queues.iter_mut().zip(state.queues.iter()) {
+            if let (Some(dq), Some(qs)) = (slot.as_mut(), snap.as_ref()) {
+                dq.queue.restore_state(qs)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Stop every running port worker thread and reclaim its virtqueue back into
+    /// `self.queues`, so [`Self::save_state`] captures the queue ring addresses
+    /// and indices at a clean checkpoint boundary. Without this, the port
+    /// workers own the data queues and `save_state` records them as `None`,
+    /// losing the state needed to resume console I/O on a clone.
+    pub fn quiesce_ports_for_snapshot(&mut self) {
+        for port_id in 0..self.ports.len() {
+            if !self.ports[port_id].is_active() {
+                continue;
+            }
+            let reclaimed = self.ports[port_id].shutdown_and_reclaim();
+            if let Some(q) = reclaimed.rx {
+                let idx = port_id_to_queue_idx(QueueDirection::Rx, port_id);
+                self.queues[idx] = Some(DeviceQueue::new(q, self.queue_events[idx].clone()));
+            }
+            if let Some(q) = reclaimed.tx {
+                let idx = port_id_to_queue_idx(QueueDirection::Tx, port_id);
+                self.queues[idx] = Some(DeviceQueue::new(q, self.queue_events[idx].clone()));
+            }
+        }
+    }
+
+    /// (Re)start every port's worker threads from the (restored) virtqueues in
+    /// `self.queues`. Used after a checkpoint/restore: the restored guest has
+    /// already completed the virtio-console port handshake and will not re-issue
+    /// the `PORT_OPEN` control messages that start port workers on a fresh boot,
+    /// so the device must restart them itself — otherwise the guest hard-spins
+    /// in `__send_to_port` writing console output to a queue nobody drains,
+    /// wedging the vCPU (and starving every other device, e.g. vsock).
+    pub fn start_ports_after_restore(&mut self) {
+        let (mem, interrupt) = match &self.device_state {
+            DeviceState::Activated(mem, interrupt) => (mem.clone(), interrupt.clone()),
+            _ => return,
+        };
+        for port_id in 0..self.ports.len() {
+            if self.ports[port_id].is_active() {
+                continue;
+            }
+            let rx_idx = port_id_to_queue_idx(QueueDirection::Rx, port_id);
+            let tx_idx = port_id_to_queue_idx(QueueDirection::Tx, port_id);
+            let (Some(rx_dq), Some(tx_dq)) =
+                (self.queues[rx_idx].take(), self.queues[tx_idx].take())
+            else {
+                log::warn!("console: missing queues to restart port {port_id} after restore");
+                continue;
+            };
+            self.ports[port_id].start(
+                mem.clone(),
+                rx_dq.queue,
+                tx_dq.queue,
+                interrupt.clone(),
+                self.control.clone(),
+            );
+        }
+    }
+}
+
 impl VirtioDevice for Console {
     fn avail_features(&self) -> u64 {
         self.avail_features
@@ -358,6 +461,18 @@ impl VirtioDevice for Console {
         self.queue_events.clear();
         self.device_state = DeviceState::Inactive;
         true
+    }
+
+    fn quiesce_for_snapshot(&mut self) {
+        self.quiesce_ports_for_snapshot();
+    }
+
+    fn rearm_after_snapshot(&mut self) {
+        self.start_ports_after_restore();
+    }
+
+    fn finish_restore_activation(&mut self) {
+        self.start_ports_after_restore();
     }
 }
 

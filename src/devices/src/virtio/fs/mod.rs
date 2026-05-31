@@ -25,7 +25,7 @@ use super::bindings;
 use super::descriptor_utils;
 
 pub use self::defs::uapi::VIRTIO_ID_FS as TYPE_FS;
-pub use self::device::Fs;
+pub use self::device::{Fs, FsState, FuseHandleSnap, FuseInodeSnap, FuseServerState};
 pub use self::filesystem::ExportTable;
 
 mod defs {

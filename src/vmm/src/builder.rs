@@ -97,7 +97,7 @@ use vm_memory::Bytes;
 use vm_memory::GuestMemory;
 #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
 use vm_memory::GuestRegionMmap;
-use vm_memory::{GuestAddress, GuestMemoryMmap};
+use vm_memory::{FileOffset, GuestAddress, GuestMemoryMmap};
 
 #[cfg(target_arch = "aarch64")]
 #[allow(dead_code)]
@@ -560,11 +560,24 @@ fn choose_payload(vm_resources: &VmResources) -> Result<Payload, StartMicrovmErr
 ///
 /// An `Arc` reference of the built `Vmm` is also plugged in the `EventManager`, while another
 /// is returned.
+/// Restore context for building a VM from a checkpoint (cross-process fork /
+/// hibernate-restore) instead of cold-booting. Platform-neutral: `checkpoint`
+/// is the serialized [`VmCheckpoint`] blob (so this type needs no per-arch cfg),
+/// deserialized only on platforms that support restore.
+pub struct RestoreCtx {
+    /// Guest RAM for the clone — a CoW clone of the golden VM's memory (Linux
+    /// `memfd` `MAP_PRIVATE`) / `vm_remap` (macOS), already holding the image.
+    pub guest_memory: GuestMemoryMmap,
+    /// Serialized `VmCheckpoint` (VM + vCPU + device state).
+    pub checkpoint: Vec<u8>,
+}
+
 pub fn build_microvm(
     vm_resources: &super::resources::VmResources,
     event_manager: &mut EventManager,
     _shutdown_efd: Option<EventFd>,
     _sender: Sender<WorkerMessage>,
+    restore: Option<RestoreCtx>,
 ) -> std::result::Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
     let t_vmm = std::time::Instant::now();
     let vmm_timing_on = std::env::var("LIBKRUN_TIMING").is_ok();
@@ -586,6 +599,7 @@ pub fn build_microvm(
             .ok_or(StartMicrovmError::MissingMemSizeConfig)?,
         vm_resources,
         &payload,
+        restore.as_ref().map(|r| r.guest_memory.clone()),
     )?;
     vmm_timing!("memory created");
 
@@ -840,7 +854,12 @@ pub fn build_microvm(
             Some(intc.clone()),
         )?;
 
-        let kernel_boot = vm_resources.firmware_config.is_none() && !cfg!(feature = "tee");
+        // When restoring (fork/hibernate) the guest is past boot: skip boot vCPU
+        // setup, which writes boot page tables/GDT into guest memory via
+        // `setup_sregs` and would corrupt the cloned running-state RAM. The vCPU
+        // registers are loaded from the checkpoint by `restore_vcpu_states`.
+        let kernel_boot =
+            restore.is_none() && vm_resources.firmware_config.is_none() && !cfg!(feature = "tee");
 
         vcpus = create_vcpus_x86_64(
             &vm,
@@ -1093,19 +1112,24 @@ pub fn build_microvm(
     };
     vmm_timing!("devices attached");
 
-    // Write the kernel command line to guest memory. This is x86_64 specific, since on
-    // aarch64 the command line will be specified through the FDT.
-    #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
-    load_cmdline(&vmm)?;
+    // Boot-time system configuration (cmdline, zero-page/FDT, boot regs) is
+    // SKIPPED when restoring — the clone's guest RAM + restored vCPU/device
+    // state already encode a running guest past boot.
+    if restore.is_none() {
+        // Write the kernel command line to guest memory. This is x86_64 specific, since on
+        // aarch64 the command line will be specified through the FDT.
+        #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+        load_cmdline(&vmm)?;
 
-    vmm.configure_system(
-        vcpus.as_slice(),
-        &intc,
-        &payload_config.initrd_config,
-        &vm_resources.smbios_oem_strings,
-    )
-    .map_err(StartMicrovmError::Internal)?;
-    vmm_timing!("system configured (FDT)");
+        vmm.configure_system(
+            vcpus.as_slice(),
+            &intc,
+            &payload_config.initrd_config,
+            &vm_resources.smbios_oem_strings,
+        )
+        .map_err(StartMicrovmError::Internal)?;
+        vmm_timing!("system configured (FDT)");
+    }
 
     #[cfg(feature = "tee")]
     {
@@ -1141,9 +1165,43 @@ pub fn build_microvm(
         println!("Starting TEE/microVM.");
     }
 
-    vmm.start_vcpus(vcpus)
-        .map_err(StartMicrovmError::Internal)?;
-    vmm_timing!("vcpus running");
+    match restore {
+        None => {
+            vmm.start_vcpus(vcpus).map_err(StartMicrovmError::Internal)?;
+            vmm_timing!("vcpus running");
+        }
+        Some(_ctx) => {
+            // Restore-into-a-fresh-clone: start vCPUs paused, apply the
+            // checkpoint (VM + device re-activation + vCPU registers), then
+            // resume so the clone runs from the checkpoint instruction.
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            {
+                let checkpoint = super::VmCheckpoint::deserialize(&_ctx.checkpoint)
+                    .map_err(StartMicrovmError::GuestMemoryMmap)?;
+                vmm.start_vcpus_paused(vcpus)
+                    .map_err(StartMicrovmError::Internal)?;
+                vmm.apply_restore(checkpoint)
+                    .map_err(StartMicrovmError::Internal)?;
+                // Device re-activation signals each device's activate eventfd; the
+                // event manager must process those (registering the RX/TX queue
+                // handlers) BEFORE the guest resumes. Otherwise the clone resumes
+                // into a window where guest queue kicks (e.g. vsock TX) are not
+                // serviced and the agent channel never completes its handshake.
+                for _ in 0..8 {
+                    let _ = event_manager.run_with_timeout(0);
+                }
+                vmm.resume().map_err(StartMicrovmError::Internal)?;
+                vmm_timing!("vcpus restored + running");
+            }
+            #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+            {
+                let _ = vcpus;
+                return Err(StartMicrovmError::GuestMemoryMmap(
+                    "restore-from-snapshot is only supported on linux/x86_64".to_string(),
+                ));
+            }
+        }
+    }
 
     // Clippy thinks we don't need Arc<Mutex<...
     // but we don't want to change the event_manager interface
@@ -1359,9 +1417,30 @@ fn load_payload(
                     return Err(StartMicrovmError::MissingKernelConfig);
                 };
 
-            let kernel_region = unsafe {
-                MmapRegion::build_raw(kernel_host_addr as *mut u8, kernel_size, 0, 0)
-                    .map_err(StartMicrovmError::InvalidKernelBundle)?
+            let kernel_region = if memfd_backed_ram_enabled() {
+                // Forkable: back the kernel region with a memfd (copying the
+                // kernel image in) so its runtime-mutated pages (.data/.bss) are
+                // CoW-shareable to clones — a `build_raw` view of libkrunfw's
+                // buffer is anonymous and would be zeroed on a clone.
+                let memfd = create_guest_ram_memfd(kernel_size)
+                    .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("kernel memfd: {e}")))?;
+                let region = MmapRegion::from_file(FileOffset::new(memfd, 0), kernel_size)
+                    .map_err(StartMicrovmError::InvalidKernelBundle)?;
+                // Safety: copy `kernel_size` bytes from libkrunfw's kernel buffer
+                // into the freshly-mapped memfd region (both are `kernel_size`).
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        kernel_host_addr as *const u8,
+                        region.as_ptr(),
+                        kernel_size,
+                    );
+                }
+                region
+            } else {
+                unsafe {
+                    MmapRegion::build_raw(kernel_host_addr as *mut u8, kernel_size, 0, 0)
+                        .map_err(StartMicrovmError::InvalidKernelBundle)?
+                }
             };
 
             Ok((
@@ -1451,10 +1530,65 @@ pub struct PayloadConfig {
     kernel_cmdline: Option<String>,
 }
 
+/// Whether guest RAM should be `memfd`-backed (CoW-fork-cloneable) instead of
+/// anonymous. Opt-in via `SMOLVM_FORKABLE=1`; Linux-only (`memfd_create`).
+fn memfd_backed_ram_enabled() -> bool {
+    cfg!(target_os = "linux")
+        && std::env::var_os("SMOLVM_FORKABLE").is_some_and(|v| v == "1")
+}
+
+/// Create an anonymous, RAM-backed `memfd` of `size` bytes to back a guest-RAM
+/// region. Being a real file object, it can later be CoW-cloned with
+/// `mmap(MAP_PRIVATE)` for fast, dense VM fork.
+#[cfg(target_os = "linux")]
+pub(crate) fn create_guest_ram_memfd(size: usize) -> std::result::Result<File, String> {
+    use std::os::fd::FromRawFd;
+    let name = std::ffi::CString::new("smolvm-guest-ram").expect("static name");
+    // Safety: passing a valid C string and flags; the returned fd is owned.
+    let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        return Err(format!("memfd_create: {}", std::io::Error::last_os_error()));
+    }
+    // Safety: `fd` is a fresh, owned file descriptor from memfd_create.
+    let file = unsafe { File::from_raw_fd(fd) };
+    file.set_len(size as u64)
+        .map_err(|e| format!("sizing guest-RAM memfd to {size}: {e}"))?;
+    Ok(file)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn create_guest_ram_memfd(_size: usize) -> std::result::Result<File, String> {
+    Err("memfd-backed guest RAM is Linux-only".to_string())
+}
+
+/// Build the `(GuestAddress, size, Option<FileOffset>)` list for
+/// `from_ranges_with_files`: the first `ram_region_count` regions get their own
+/// guest-RAM `memfd`; the trailing SHM/GPU regions stay anonymous (`None`).
+fn build_memfd_backed_ranges(
+    regions: &[(GuestAddress, usize)],
+    ram_region_count: usize,
+) -> std::result::Result<Vec<(GuestAddress, usize, Option<FileOffset>)>, String> {
+    let mut out = Vec::with_capacity(regions.len());
+    for (i, &(addr, size)) in regions.iter().enumerate() {
+        let file = if i < ram_region_count {
+            Some(FileOffset::new(create_guest_ram_memfd(size)?, 0))
+        } else {
+            None
+        };
+        out.push((addr, size, file));
+    }
+    Ok(out)
+}
+
 pub fn create_guest_memory(
     mem_size: usize,
     vm_resources: &VmResources,
     payload: &Payload,
+    // Restore mode: when `Some`, use this guest memory (a CoW clone of a golden
+    // VM's RAM that already contains the running image) instead of allocating
+    // fresh, and SKIP loading the kernel/firmware/initrd. The same memory layout
+    // (config) must have produced it.
+    restore_mem: Option<GuestMemoryMmap>,
 ) -> std::result::Result<
     (GuestMemoryMmap, ArchMemoryInfo, ShmManager, PayloadConfig),
     StartMicrovmError,
@@ -1530,10 +1664,41 @@ pub fn create_guest_memory(
             .map_err(StartMicrovmError::ShmCreate)?;
     }
 
+    // Number of guest-RAM regions before the SHM/GPU regions are appended —
+    // only the RAM regions are CoW-fork-backed; SHM/GPU stay anonymous.
+    let ram_region_count = arch_mem_regions.len();
     arch_mem_regions.extend(shm_manager.regions());
 
-    let guest_mem = GuestMemoryMmap::from_ranges(&arch_mem_regions)
-        .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?;
+    // Opt-in (Linux): back guest RAM with a `memfd` instead of anonymous memory
+    // so it can be CoW-cloned (`mmap(MAP_PRIVATE)`) for fast, dense VM fork — the
+    // mechanism from docs/fast-fork-snapshot-plan.md §4. Default (flag unset) is
+    // the original anonymous allocation, unchanged. SHM/GPU regions are never
+    // memfd-backed (they are device-shared, not part of the CoW fork image).
+    // Restore: the provided CoW-clone memory already holds the running image —
+    // skip allocation + payload load entirely.
+    if let Some(guest_mem) = restore_mem {
+        let payload_config = PayloadConfig {
+            entry_addr: GuestAddress(0),
+            initrd_config: None,
+            kernel_cmdline: None,
+        };
+        return Ok((guest_mem, arch_mem_info, shm_manager, payload_config));
+    }
+
+    let guest_mem = if memfd_backed_ram_enabled() {
+        // Back ALL guest regions (RAM *and* device-SHM such as the virtiofs-DAX
+        // rootfs window) with memfds so a fork clone can CoW-share every region.
+        // Backing only the RAM regions left SHM windows anonymous → zeroed on the
+        // clone → the guest's file-backed code vanished → triple fault.
+        let _ = ram_region_count;
+        let ranges = build_memfd_backed_ranges(&arch_mem_regions, arch_mem_regions.len())
+            .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("memfd backing: {e}")))?;
+        GuestMemoryMmap::from_ranges_with_files(ranges)
+            .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?
+    } else {
+        GuestMemoryMmap::from_ranges(&arch_mem_regions)
+            .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?
+    };
 
     let (guest_mem, entry_addr, initrd_config, cmdline) =
         load_payload(vm_resources, guest_mem, &arch_mem_info, payload)?;
@@ -2385,7 +2550,7 @@ pub mod tests {
             size: 0x1000,
         });
 
-        create_guest_memory(mem_size_mib, &vm_resources, &Payload::Empty)
+        create_guest_memory(mem_size_mib, &vm_resources, &Payload::Empty, None)
     }
 
     #[test]
