@@ -489,10 +489,14 @@ impl Vcpu {
             .send(hvf_vcpuid)
             .expect("Cannot notify vcpu TLS initialization.");
 
-        let entry_addr = if let Some(boot_receiver) = &self.boot_receiver {
-            boot_receiver.recv().unwrap()
-        } else {
-            self.boot_entry_addr
+        // Restore-into-a-clone: the secondary-vCPU PSCI `CpuOn` handshake already
+        // happened in the golden, and each vCPU's PC comes from the restored
+        // register state — so do NOT block on `boot_receiver` (no `CpuOn` will be
+        // sent here, and the orchestrator drives restore over the event channel).
+        // set_initial_state's entry_addr is overwritten by the restore anyway.
+        let entry_addr = match &self.boot_receiver {
+            Some(boot_receiver) if !self.start_paused => boot_receiver.recv().unwrap(),
+            _ => self.boot_entry_addr,
         };
 
         hvf_vcpu
