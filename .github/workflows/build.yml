@@ -1,0 +1,105 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: libkrun (linux-${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+            file_arch: x86-64
+          - arch: aarch64
+            runner: self-hosted
+            file_arch: aarch64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup build environment
+        uses: ./.github/actions/setup-build-env
+
+      # setup-build-env installs the GPU build deps (virglrenderer/epoxy/drm)
+      # and libclang; patchelf is the only extra needed for packaging.
+      - name: Install patchelf
+        shell: bash
+        run: sudo apt-get install -y patchelf
+
+      # The init runs as PID 1 inside the guest, so it must be static and match
+      # the guest arch — which equals the host arch (KVM is same-arch). Building
+      # natively on a per-arch runner gives the right init with no cross-compile.
+      - name: Build init (static, native arch)
+        shell: bash
+        run: cc -O2 -static -Wall -o init/init init/init.c init/dhcp.c
+
+      # Partial RELRO (lazy binding) instead of the default full RELRO/BIND_NOW:
+      # combined with the patchelf step below, it lets one GPU-enabled libkrun
+      # load on hosts WITHOUT virglrenderer — the virgl symbols bind lazily only
+      # if the GPU path runs. The consumer (smolvm) dlopens with RTLD_LAZY and
+      # preloads virglrenderer by soname when present. krun_input and aws-nitro
+      # are excluded: they have deps that don't resolve in this setup.
+      - name: Build libkrun (GPU=1, partial RELRO)
+        shell: bash
+        run: |
+          RUSTFLAGS="-C relro-level=partial" \
+          KRUN_INIT_BINARY_PATH="$(realpath init/init)" \
+          cargo build --release --features blk,net,gpu \
+            --workspace --exclude krun_input --exclude aws-nitro
+
+      # Strip the hard NEEDED on virglrenderer so a host without it can dlopen
+      # libkrun. GPU hosts have it system-wide and it is loaded by soname at
+      # runtime; non-GPU hosts never reference the symbols.
+      - name: Make virglrenderer optional at runtime
+        shell: bash
+        run: |
+          for lk in target/release/libkrun.so*; do
+            [ -f "$lk" ] && [ ! -L "$lk" ] || continue
+            if patchelf --print-needed "$lk" | grep -q libvirglrenderer; then
+              patchelf --remove-needed libvirglrenderer.so.1 "$lk"
+              echo "stripped libvirglrenderer NEEDED from $lk"
+            fi
+          done
+
+      # The checks that catch the build mistakes that bite local builds: wrong
+      # init arch, missing virgl strip, eager binding sneaking back in.
+      - name: Validate artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          lk="$(readlink -f target/release/libkrun.so)"
+          fail=0
+          file init/init | grep -q "${{ matrix.file_arch }}" \
+            && echo "OK: init is ${{ matrix.file_arch }}" || { echo "FAIL: init arch"; fail=1; }
+          file "$lk" | grep -q "${{ matrix.file_arch }}" \
+            && echo "OK: libkrun is ${{ matrix.file_arch }}" || { echo "FAIL: libkrun arch"; fail=1; }
+          if readelf -d "$lk" | grep -qi virglrenderer; then echo "FAIL: virglrenderer still NEEDED"; fail=1; else echo "OK: no virglrenderer NEEDED"; fi
+          if readelf -d "$lk" | grep -q BIND_NOW; then echo "FAIL: BIND_NOW present (lazy binding lost)"; fail=1; else echo "OK: lazy binding (no BIND_NOW)"; fi
+          exit $fail
+
+      - name: Package
+        shell: bash
+        run: |
+          out="libkrun-linux-${{ matrix.arch }}"
+          mkdir -p "dist/$out"
+          cp -a target/release/libkrun.so* "dist/$out/"
+          cp -a init/init "dist/$out/init"
+          ( cd dist && tar czf "$out.tar.gz" "$out" )
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libkrun-linux-${{ matrix.arch }}
+          path: dist/libkrun-linux-${{ matrix.arch }}.tar.gz
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/libkrun-linux-${{ matrix.arch }}.tar.gz
