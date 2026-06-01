@@ -19,8 +19,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use imago::{
-    file::File as ImagoFile, qcow2::Qcow2, raw::Raw, vmdk::Vmdk, DynStorage, FormatDriverBuilder,
-    PermissiveImplicitOpenGate, Storage, StorageOpenOptions, SyncFormatAccess,
+    file::File as ImagoFile, qcow2::Qcow2, raw::Raw, vmdk::Vmdk, DynStorage, FormatCreateBuilder,
+    FormatDriverBuilder, PermissiveImplicitOpenGate, Storage, StorageCreateOptions,
+    StorageOpenOptions, SyncFormatAccess,
 };
 use log::{error, warn};
 use utils::eventfd::{EventFd, EFD_NONBLOCK};
@@ -228,6 +229,98 @@ pub struct Block {
     pub(crate) partuuid: Option<String>,
 }
 
+/// Open `path` as the given image format, returning the format accessor together
+/// with the backing file's discard alignment. Shared by [`Block::new`] and
+/// [`create_overlay`] so both agree on raw/qcow2/vmdk open semantics (including
+/// recursive backing-chain resolution for qcow2).
+fn open_disk_format(
+    path: &str,
+    format: ImageType,
+    writable: bool,
+    direct_io: bool,
+    relaxed_sync: bool,
+) -> io::Result<(SyncFormatAccess<Box<dyn DynStorage>>, usize)> {
+    let file_opts = StorageOpenOptions::new()
+        .write(writable)
+        .filename(path)
+        .direct(direct_io);
+    #[cfg(target_os = "macos")]
+    let file_opts = file_opts.relaxed_sync(relaxed_sync);
+    #[cfg(not(target_os = "macos"))]
+    let _ = relaxed_sync;
+    let file = ImagoFile::open_sync(file_opts)?;
+    let discard_alignment = file.discard_align();
+
+    let disk_image = match format {
+        ImageType::Qcow2 => {
+            let mut qcow2 =
+                Qcow2::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::open_image_sync(
+                    Box::new(file),
+                    writable,
+                )?;
+            qcow2.open_implicit_dependencies_sync()?;
+            SyncFormatAccess::new(qcow2)?
+        }
+        ImageType::Raw => {
+            let raw = Raw::<Box<dyn DynStorage>>::open_image_sync(Box::new(file), writable)?;
+            SyncFormatAccess::new(raw)?
+        }
+        ImageType::Vmdk => {
+            let vmdk =
+                Vmdk::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::builder(Box::new(file))
+                    .open_sync(PermissiveImplicitOpenGate::default())?;
+            SyncFormatAccess::new(vmdk)?
+        }
+    };
+    Ok((disk_image, discard_alignment))
+}
+
+/// Create a qcow2 overlay at `overlay_path` backed by `base_path` (format
+/// `base_format`). The overlay starts near-empty and grows only with writes;
+/// reads fall through to the read-only backing image — copy-on-write block
+/// cloning for fork clones, independent of the host filesystem.
+///
+/// `base_path` is written verbatim into the qcow2 header, so it MUST be
+/// absolute: imago resolves a relative backing path against the overlay's own
+/// directory, which differs from the base's.
+pub fn create_overlay(
+    overlay_path: &str,
+    base_path: &str,
+    base_format: ImageType,
+) -> io::Result<()> {
+    // The overlay's virtual size must equal the base's.
+    let (base, _discard) = open_disk_format(base_path, base_format, false, false, false)?;
+    let virtual_size = base.size();
+    drop(base);
+
+    let backing_format = match base_format {
+        ImageType::Raw => "raw",
+        ImageType::Qcow2 => "qcow2",
+        ImageType::Vmdk => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "vmdk backing images are not supported for overlays",
+            ));
+        }
+    };
+
+    // imago's create path is async-only (it has a sync wrapper for open, not
+    // create); drive it on a current-thread runtime, as imago's own sync
+    // wrappers do internally.
+    let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+    runtime.block_on(async {
+        let storage =
+            ImagoFile::create_open(StorageCreateOptions::new().filename(overlay_path)).await?;
+        Qcow2::<Box<dyn DynStorage>, Arc<imago::FormatAccess<Box<dyn DynStorage>>>>::create_builder(
+            Box::new(storage),
+        )
+        .size(virtual_size)
+        .backing(base_path.to_string(), backing_format.to_string())
+        .create()
+        .await
+    })
+}
+
 impl Block {
     /// Create a new virtio block device that operates on the given file.
     ///
@@ -250,41 +343,23 @@ impl Block {
 
         let disk_image_id = DiskProperties::build_disk_image_id(&disk_image);
 
-        let file_opts = StorageOpenOptions::new()
-            .write(!is_disk_read_only)
-            .filename(disk_image_path)
-            .direct(direct_io);
-
-        #[cfg(target_os = "macos")]
-        let file_opts = file_opts.relaxed_sync(sync_mode == SyncMode::Relaxed);
-        let file = ImagoFile::open_sync(file_opts)?;
-        let discard_alignment = file.discard_align();
-
-        let disk_image = match disk_image_format {
-            ImageType::Qcow2 => {
-                let mut qcow2 =
-                    Qcow2::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::open_image_sync(
-                        Box::new(file),
-                        !is_disk_read_only,
-                    )?;
-                qcow2.open_implicit_dependencies_sync()?;
-                SyncFormatAccess::new(qcow2)?
+        let relaxed_sync = {
+            #[cfg(target_os = "macos")]
+            {
+                sync_mode == SyncMode::Relaxed
             }
-            ImageType::Raw => {
-                let raw = Raw::<Box<dyn DynStorage>>::open_image_sync(
-                    Box::new(file),
-                    !is_disk_read_only,
-                )?;
-                SyncFormatAccess::new(raw)?
-            }
-            ImageType::Vmdk => {
-                let vmdk = Vmdk::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::builder(
-                    Box::new(file),
-                )
-                .open_sync(PermissiveImplicitOpenGate::default())?;
-                SyncFormatAccess::new(vmdk)?
+            #[cfg(not(target_os = "macos"))]
+            {
+                false
             }
         };
+        let (disk_image, discard_alignment) = open_disk_format(
+            &disk_image_path,
+            disk_image_format,
+            !is_disk_read_only,
+            direct_io,
+            relaxed_sync,
+        )?;
 
         let disk_image = Arc::new(Mutex::new(disk_image));
 
@@ -525,10 +600,57 @@ impl VirtioDevice for Block {
     /// `save_state` can capture the indices at a clean boundary.
     fn quiesce_for_snapshot(&mut self) {
         self.quiesce_worker();
+        // Force buffered writes durable so a fork clone's copy-on-write overlay
+        // sees a consistent backing image. `DiskProperties::Drop` already does
+        // this, but a forked golden stays frozen (never dropped) while clones
+        // attach overlays over its disk, so it must happen here too.
+        if self.cache_type == CacheType::Writeback {
+            let img = self.disk_image.lock().unwrap();
+            if img.flush().is_err() {
+                error!("block: failed to flush before snapshot");
+            }
+            if img.sync().is_err() {
+                error!("block: failed to sync before snapshot");
+            }
+        }
     }
 
     /// Re-arm the worker after a checkpoint/restore (resumes I/O).
     fn rearm_after_snapshot(&mut self) {
         self.rearm_worker();
+    }
+}
+
+#[cfg(test)]
+mod overlay_tests {
+    use super::*;
+    use utils::tempfile::TempFile;
+
+    #[test]
+    fn create_overlay_over_raw_base() {
+        // A 4 MiB raw base image.
+        let base = TempFile::new().unwrap();
+        let base_path = base.as_path().to_str().unwrap().to_string();
+        let size = 4 * 1024 * 1024u64;
+        base.as_file().set_len(size).unwrap();
+
+        let overlay_path = format!("{base_path}.overlay.qcow2");
+        create_overlay(&overlay_path, &base_path, ImageType::Raw).unwrap();
+
+        // Reopening the overlay must resolve the backing chain and report the
+        // base's virtual size.
+        let (overlay, _discard) =
+            open_disk_format(&overlay_path, ImageType::Qcow2, false, false, false).unwrap();
+        assert_eq!(overlay.size(), size);
+        drop(overlay);
+
+        // The overlay file is just qcow2 metadata — far smaller than the base.
+        let overlay_len = std::fs::metadata(&overlay_path).unwrap().len();
+        assert!(
+            overlay_len < size,
+            "overlay {overlay_len} should be far smaller than base {size}"
+        );
+
+        std::fs::remove_file(&overlay_path).ok();
     }
 }

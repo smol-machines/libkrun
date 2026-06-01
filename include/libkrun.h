@@ -284,6 +284,30 @@ int32_t krun_add_disk2(uint32_t ctx_id,
                        uint32_t sync_mode);
 
 /**
+ * Creates a copy-on-write qcow2 overlay backed by an existing disk image.
+ *
+ * The overlay starts near-empty and grows only with writes; reads fall through
+ * to the read-only backing image. This is a pure filesystem operation and is
+ * not tied to a configuration context, so it takes no ctx_id.
+ *
+ * The backing path is written verbatim into the overlay header, so it must be
+ * absolute (a relative path would be resolved against the overlay's own
+ * directory). The backing image must remain present and unmodified while the
+ * overlay is in use.
+ *
+ * Arguments:
+ *  "overlay_path" - a null-terminated string with the path of the overlay to create.
+ *  "base_path"    - a null-terminated, absolute path to the backing disk image.
+ *  "base_format"  - the backing image format (i.e. KRUN_DISK_FORMAT_{RAW, QCOW2}).
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ */
+int32_t krun_create_disk_overlay(const char *overlay_path,
+                                 const char *base_path,
+                                 uint32_t base_format);
+
+/**
  * NO LONGER SUPPORTED. DO NOT USE.
  *
  * Configures the mapped volumes for the microVM. Only supported on macOS, on Linux use

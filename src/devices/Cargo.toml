@@ -42,6 +42,10 @@ utils = { path = "../utils" }
 polly = { path = "../polly" }
 rutabaga_gfx = { path = "../rutabaga_gfx", features = ["virgl_renderer", "virgl_renderer_next"], optional = true }
 imago = { version = "0.2.2", features = ["sync-wrappers", "vm-memory"] }
+# Drives imago's async `create` for qcow2 overlays (imago has a sync wrapper for
+# open but not create); a current-thread runtime is enough. Already in the tree
+# transitively via imago.
+tokio = { version = "1", features = ["rt"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 hvf = { path = "../hvf" }

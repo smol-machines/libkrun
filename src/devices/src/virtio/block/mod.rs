@@ -4,7 +4,7 @@
 pub mod device;
 mod worker;
 
-pub use self::device::{Block, BlockState, CacheType};
+pub use self::device::{create_overlay, Block, BlockState, CacheType};
 
 use vm_memory::GuestMemoryError;
 
@@ -36,7 +36,7 @@ pub enum Error {
 }
 
 /// Supported disk image formats
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImageType {
     Raw,
     Qcow2,

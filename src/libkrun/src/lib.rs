@@ -1097,6 +1097,45 @@ pub unsafe extern "C" fn krun_add_disk2(
     KRUN_SUCCESS
 }
 
+/// Create a copy-on-write qcow2 overlay at `c_overlay_path` whose backing image
+/// is `c_base_path`. `base_format` uses the same values as `krun_add_disk2`
+/// (0 = raw, 1 = qcow2). The overlay starts near-empty and grows only with
+/// writes; reads fall through to the read-only backing image. The base path is
+/// written verbatim into the overlay header, so it must be absolute. This is a
+/// pure filesystem operation and is not tied to a VM context. Returns 0 on
+/// success or a negative errno on failure.
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+#[cfg(feature = "blk")]
+pub unsafe extern "C" fn krun_create_disk_overlay(
+    c_overlay_path: *const c_char,
+    c_base_path: *const c_char,
+    base_format: u32,
+) -> i32 {
+    let overlay_path = match CStr::from_ptr(c_overlay_path).to_str() {
+        Ok(path) => path,
+        Err(_) => return -libc::EINVAL,
+    };
+
+    let base_path = match CStr::from_ptr(c_base_path).to_str() {
+        Ok(path) => path,
+        Err(_) => return -libc::EINVAL,
+    };
+
+    let format = match ImageType::try_from(base_format) {
+        Ok(fmt) => fmt,
+        Err(_) => return -libc::EINVAL,
+    };
+
+    match devices::virtio::block::create_overlay(overlay_path, base_path, format) {
+        Ok(()) => KRUN_SUCCESS,
+        Err(e) => {
+            error!("Error creating disk overlay {overlay_path}: {e}");
+            -libc::EIO
+        }
+    }
+}
+
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
 #[cfg(feature = "blk")]
