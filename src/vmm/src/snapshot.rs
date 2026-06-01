@@ -201,12 +201,17 @@ pub fn cow_clone_guest_memory(parent: &GuestMemoryMmap) -> std::io::Result<Guest
 /// clone can open `/proc/<pid>/fd/<fd>` and `mmap(MAP_PRIVATE)` it. `fd < 0` marks
 /// an anonymous region (device SHM/GPU) the clone cannot CoW-share — it gets a
 /// fresh zeroed mapping.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemfdRegionDesc {
     pub gpa: u64,
     pub len: u64,
     pub fd: i32,
     pub offset: u64,
+    /// macOS only: filesystem path of the backing guest-RAM file (recovered via
+    /// `F_GETPATH`), used by a clone to open + `mmap(MAP_PRIVATE)` it. Empty on
+    /// Linux, where the clone instead reaches the backing memfd through
+    /// `/proc/<owner_pid>/fd/<fd>`. Empty path == anonymous region (no CoW).
+    pub path: String,
 }
 
 /// Enumerate the guest-memory regions of a (memfd-backed) VM for fork: returns
@@ -227,6 +232,49 @@ pub fn memfd_region_descs(mem: &GuestMemoryMmap) -> Vec<MemfdRegionDesc> {
                 len: region.len(),
                 fd,
                 offset,
+                path: String::new(),
+            }
+        })
+        .collect()
+}
+
+/// macOS variant of [`memfd_region_descs`]: records each region's backing-file
+/// path (recovered via `F_GETPATH` on the open fd) so a clone can open + CoW-map
+/// it. macOS has no `/proc/<pid>/fd`, so cross-process sharing goes through the
+/// file path instead; the owner must stay alive (frozen) and the file must
+/// remain on disk for the clone's lifetime. Anonymous regions get an empty path.
+#[cfg(target_os = "macos")]
+pub fn memfd_region_descs(mem: &GuestMemoryMmap) -> Vec<MemfdRegionDesc> {
+    use std::os::fd::AsRawFd;
+    mem.iter()
+        .map(|region| {
+            let (path, offset) = match region.file_offset() {
+                Some(fo) => {
+                    let mut buf = [0i8; libc::PATH_MAX as usize];
+                    let rc = unsafe {
+                        libc::fcntl(
+                            fo.file().as_raw_fd(),
+                            libc::F_GETPATH,
+                            buf.as_mut_ptr(),
+                        )
+                    };
+                    let path = if rc == 0 {
+                        unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }
+                            .to_string_lossy()
+                            .into_owned()
+                    } else {
+                        String::new()
+                    };
+                    (path, fo.start())
+                }
+                None => (String::new(), 0),
+            };
+            MemfdRegionDesc {
+                gpa: region.start_addr().raw_value(),
+                len: region.len(),
+                fd: if path.is_empty() { -1 } else { 0 },
+                offset,
+                path,
             }
         })
         .collect()
@@ -263,6 +311,61 @@ pub fn open_cow_memory_from_pid(
             let flags = libc::MAP_PRIVATE;
             // Safety: mapping `size` bytes of the owner's memfd at `offset`; the
             // mapping holds its own reference, so `file` may be dropped after.
+            let ptr = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    size,
+                    prot,
+                    flags,
+                    file.as_raw_fd(),
+                    d.offset as libc::off_t,
+                )
+            };
+            (ptr, flags)
+        } else {
+            let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
+            let ptr = unsafe { libc::mmap(std::ptr::null_mut(), size, prot, flags, -1, 0) };
+            (ptr, flags)
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        let mmap_region = unsafe { MmapRegion::build_raw(ptr as *mut u8, size, prot, flags) }
+            .map_err(|e| io_err(format!("build_raw: {e:?}")))?;
+        let guest_region = GuestRegionMmap::new(mmap_region, GuestAddress(d.gpa))
+            .ok_or_else(|| io_err("guest region address overflow".to_string()))?;
+        regions.push(guest_region);
+    }
+
+    GuestMemoryMmap::from_regions(regions).map_err(|e| io_err(format!("from_regions: {e:?}")))
+}
+
+/// macOS variant of [`open_cow_memory_from_pid`]: opens each region's backing
+/// file *by path* and `mmap(MAP_PRIVATE)`s it (clean pages shared CoW with the
+/// frozen owner → density; writes copy on demand). Anonymous regions (empty
+/// path) get a fresh zeroed private mapping. The owner process must be alive and
+/// frozen and the backing files must remain on disk for the clone's lifetime.
+#[cfg(target_os = "macos")]
+pub fn open_cow_memory_from_paths(descs: &[MemfdRegionDesc]) -> io::Result<GuestMemoryMmap> {
+    use std::os::fd::AsRawFd;
+    use vm_memory::mmap::MmapRegion;
+    use vm_memory::GuestRegionMmap;
+
+    let prot = libc::PROT_READ | libc::PROT_WRITE;
+    let io_err = |m: String| io::Error::new(io::ErrorKind::Other, m);
+    let mut regions: Vec<GuestRegionMmap> = Vec::with_capacity(descs.len());
+
+    for d in descs {
+        let size = d.len as usize;
+        let (ptr, flags) = if !d.path.is_empty() {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&d.path)
+                .map_err(|e| io_err(format!("open {}: {e}", d.path)))?;
+            let flags = libc::MAP_PRIVATE;
+            // Safety: mapping `size` bytes of the owner's guest-RAM file at
+            // `offset`; the mapping holds its own reference, so `file` may drop.
             let ptr = unsafe {
                 libc::mmap(
                     std::ptr::null_mut(),

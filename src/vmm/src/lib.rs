@@ -220,7 +220,7 @@ pub struct VmCheckpoint {
     pub devices: devices::virtio::persist::VmDevicesState,
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(all(target_os = "linux", target_arch = "x86_64"), all(target_os = "macos", target_arch = "aarch64")))]
 impl VmCheckpoint {
     /// Serialize the checkpoint (VM + vCPU + device state, *not* guest RAM —
     /// that is shared/streamed separately) into a single blob for cross-process
@@ -368,7 +368,7 @@ impl Vmm {
     /// the guest handshake (a restored guest resumes past boot). Used by
     /// restore-into-a-fresh-VM (cross-process fork); not used by in-place rewind
     /// (there the devices are already activated).
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(any(all(target_os = "linux", target_arch = "x86_64"), all(target_os = "macos", target_arch = "aarch64")))]
     pub fn restore_activate_devices(
         &self,
         state: &devices::virtio::persist::VmDevicesState,
@@ -381,7 +381,7 @@ impl Vmm {
     /// restored image: restore VM-level state, re-activate the virtio devices
     /// from saved queue state, and load the vCPU registers. The caller resumes
     /// (e.g. [`Self::resume`]) to start the clone running.
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(any(all(target_os = "linux", target_arch = "x86_64"), all(target_os = "macos", target_arch = "aarch64")))]
     pub fn apply_restore(&mut self, checkpoint: VmCheckpoint) -> Result<()> {
         self.vm
             .restore_state(&checkpoint.vm_state)
@@ -411,7 +411,7 @@ impl Vmm {
     /// Spawn the vCPU threads but leave them **paused** (Linux: they sit in the
     /// paused state machine). Used by restore-into-a-fresh-VM so VM/device/vCPU
     /// state can be restored before the guest runs; resume via [`Self::resume`].
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(any(all(target_os = "linux", target_arch = "x86_64"), all(target_os = "macos", target_arch = "aarch64")))]
     pub fn start_vcpus_paused(&mut self, vcpus: Vec<Vcpu>) -> Result<()> {
         self.start_vcpus_inner(vcpus, false)
     }
@@ -435,6 +435,13 @@ impl Vmm {
 
         for mut vcpu in vcpus.drain(..) {
             vcpu.set_mmio_bus(self.mmio_device_manager.bus.clone());
+
+            // HVF (macOS): vCPU threads run guest code immediately after spawn,
+            // so a restore-into-a-clone (paused) start must mark the vCPU to hold
+            // in its paused event loop until the orchestrator restores registers
+            // and resumes. On KVM the paused state machine handles this already.
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            vcpu.set_start_paused(!resume_after);
 
             self.vcpus_handles
                 .push(vcpu.start_threaded().map_err(Error::VcpuHandle)?);
@@ -717,7 +724,7 @@ impl Vmm {
     /// guest-RAM region descriptors (gpa/len/memfd-fd/offset) a clone needs to
     /// reach the fds via `/proc/<this_pid>/fd`. The caller keeps this process
     /// alive as the golden base.
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(any(all(target_os = "linux", target_arch = "x86_64"), all(target_os = "macos", target_arch = "aarch64")))]
     pub fn checkpoint_for_fork(
         &mut self,
     ) -> Result<(VmCheckpoint, Vec<snapshot::MemfdRegionDesc>)> {

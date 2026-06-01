@@ -88,6 +88,9 @@ pub struct MMIODeviceManager {
     /// Handles to the registered virtio devices, kept so checkpoint/fork can
     /// snapshot/restore their runtime state (see [`Self::snapshot_devices`]).
     virtio_devices: Vec<Arc<Mutex<dyn devices::virtio::VirtioDevice>>>,
+    /// Handles to the MMIO transports, kept so a restored clone can re-activate
+    /// each device from saved queue state (see [`Self::restore_activate_devices`]).
+    mmio_transports: Vec<Arc<Mutex<devices::virtio::MmioTransport>>>,
 }
 
 impl MMIODeviceManager {
@@ -104,6 +107,7 @@ impl MMIODeviceManager {
             bus: devices::Bus::new(),
             id_to_dev_info: HashMap::new(),
             virtio_devices: Vec::new(),
+            mmio_transports: Vec::new(),
         }
     }
 
@@ -159,6 +163,49 @@ impl MMIODeviceManager {
         Ok(())
     }
 
+    /// Re-activate devices on a freshly-built clone from a checkpoint: for each
+    /// saved device snapshot, find a not-yet-consumed transport of the matching
+    /// device type and re-activate it from the saved queue state + features
+    /// (bypassing the guest handshake). Used by restore-into-a-fresh-VM (fork).
+    /// Errors if a snapshot has no matching transport. Mirrors the KVM manager.
+    pub fn restore_activate_devices(
+        &self,
+        state: &VmDevicesState,
+    ) -> std::result::Result<(), String> {
+        let mut used = vec![false; self.mmio_transports.len()];
+        for snap in &state.devices {
+            let want = snap.device_type();
+            let queue_states = snap.queue_states();
+            let acked = snap.acked_features();
+            let mut applied = false;
+            for (i, transport) in self.mmio_transports.iter().enumerate() {
+                if used[i] {
+                    continue;
+                }
+                let mut t = transport.lock().expect("poisoned transport lock");
+                if t.locked_device().device_type() != want {
+                    continue;
+                }
+                // Restore device-level runtime state (e.g. the virtiofs FUSE
+                // inode/handle maps) onto the not-yet-activated device first, so
+                // the subsequent `activate` rebuilds its worker from that state.
+                restore_device(&mut *t.locked_device(), snap)?;
+                t.restore_and_activate(&queue_states, acked)?;
+                // Devices that defer worker startup past `activate` (the console
+                // starts each port's worker only on the guest's PORT_OPEN, which
+                // a restored guest never re-sends) restart their workers here.
+                t.locked_device().finish_restore_activation();
+                used[i] = true;
+                applied = true;
+                break;
+            }
+            if !applied {
+                return Err(format!("no matching transport to restore device type {want}"));
+            }
+        }
+        Ok(())
+    }
+
     /// Register an already created MMIO device to be used via MMIO transport.
     pub fn register_mmio_device(
         &mut self,
@@ -172,11 +219,14 @@ impl MMIODeviceManager {
 
         mmio_device.set_irq_line(self.irq);
 
-        // Track the underlying virtio device for checkpoint/fork snapshots.
+        // Track the underlying virtio device + transport for checkpoint/fork
+        // (the transport is what re-activates the device from saved state).
         self.virtio_devices.push(mmio_device.device());
+        let transport = Arc::new(Mutex::new(mmio_device));
+        self.mmio_transports.push(transport.clone());
 
         self.bus
-            .insert(Arc::new(Mutex::new(mmio_device)), self.mmio_base, MMIO_LEN)
+            .insert(transport, self.mmio_base, MMIO_LEN)
             .map_err(Error::BusError)?;
         let ret = (self.mmio_base, self.irq);
         self.id_to_dev_info.insert(

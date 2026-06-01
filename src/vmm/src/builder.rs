@@ -1174,7 +1174,7 @@ pub fn build_microvm(
             // Restore-into-a-fresh-clone: start vCPUs paused, apply the
             // checkpoint (VM + device re-activation + vCPU registers), then
             // resume so the clone runs from the checkpoint instruction.
-            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            #[cfg(any(all(target_os = "linux", target_arch = "x86_64"), all(target_os = "macos", target_arch = "aarch64")))]
             {
                 let checkpoint = super::VmCheckpoint::deserialize(&_ctx.checkpoint)
                     .map_err(StartMicrovmError::GuestMemoryMmap)?;
@@ -1193,11 +1193,11 @@ pub fn build_microvm(
                 vmm.resume().map_err(StartMicrovmError::Internal)?;
                 vmm_timing!("vcpus restored + running");
             }
-            #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+            #[cfg(not(any(all(target_os = "linux", target_arch = "x86_64"), all(target_os = "macos", target_arch = "aarch64"))))]
             {
                 let _ = vcpus;
                 return Err(StartMicrovmError::GuestMemoryMmap(
-                    "restore-from-snapshot is only supported on linux/x86_64".to_string(),
+                    "restore-from-snapshot is not supported on this platform".to_string(),
                 ));
             }
         }
@@ -1532,8 +1532,12 @@ pub struct PayloadConfig {
 
 /// Whether guest RAM should be `memfd`-backed (CoW-fork-cloneable) instead of
 /// anonymous. Opt-in via `SMOLVM_FORKABLE=1`; Linux-only (`memfd_create`).
+/// True when guest RAM should be backed by a real, CoW-cloneable file object
+/// (for fast VM fork): a `memfd` on Linux, a regular temp file on macOS (which
+/// has no `memfd`, but a file mmap'd `MAP_PRIVATE` gives the same cross-process
+/// CoW — validated against HVF). Gated on the per-VM `SMOLVM_FORKABLE` opt-in.
 fn memfd_backed_ram_enabled() -> bool {
-    cfg!(target_os = "linux")
+    (cfg!(target_os = "linux") || cfg!(target_os = "macos"))
         && std::env::var_os("SMOLVM_FORKABLE").is_some_and(|v| v == "1")
 }
 
@@ -1556,9 +1560,35 @@ pub(crate) fn create_guest_ram_memfd(size: usize) -> std::result::Result<File, S
     Ok(file)
 }
 
-#[cfg(not(target_os = "linux"))]
+/// macOS has no `memfd`; back the guest-RAM region with a regular temp file
+/// instead. mmap'd `MAP_SHARED` it serves the golden's RAM, and a clone re-opens
+/// the same path and maps it `MAP_PRIVATE` for copy-on-write (validated: HVF
+/// honors the host CoW on guest writes). The path is recovered at fork time via
+/// `fcntl(F_GETPATH)`. The file is NOT unlinked (clones re-open it by path);
+/// it is cleaned up when the forkable golden is torn down.
+#[cfg(target_os = "macos")]
+pub(crate) fn create_guest_ram_memfd(size: usize) -> std::result::Result<File, String> {
+    use std::os::fd::FromRawFd;
+    let dir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
+    let mut template = format!("{}/smolvm-guest-ram-XXXXXX", dir.trim_end_matches('/'))
+        .into_bytes();
+    template.push(0);
+    // Safety: `template` is a NUL-terminated, writable buffer; mkstemp fills in
+    // the XXXXXX and returns an owned fd to the freshly-created file.
+    let fd = unsafe { libc::mkstemp(template.as_mut_ptr() as *mut libc::c_char) };
+    if fd < 0 {
+        return Err(format!("mkstemp guest-RAM file: {}", std::io::Error::last_os_error()));
+    }
+    // Safety: `fd` is a fresh, owned fd from mkstemp.
+    let file = unsafe { File::from_raw_fd(fd) };
+    file.set_len(size as u64)
+        .map_err(|e| format!("sizing guest-RAM file to {size}: {e}"))?;
+    Ok(file)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn create_guest_ram_memfd(_size: usize) -> std::result::Result<File, String> {
-    Err("memfd-backed guest RAM is Linux-only".to_string())
+    Err("forkable guest RAM is Linux/macOS-only".to_string())
 }
 
 /// Build the `(GuestAddress, size, Option<FileOffset>)` list for

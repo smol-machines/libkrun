@@ -226,6 +226,12 @@ pub struct Vcpu {
 
     vcpu_list: Arc<VcpuList>,
     nested_enabled: bool,
+    /// When set, the vCPU thread does NOT run guest code after thread setup; it
+    /// sits in the paused event loop until a `Resume` arrives. Used by the
+    /// restore-into-a-fresh-clone path so the orchestrator can load the saved
+    /// register state before the guest executes (the KVM analogue is starting
+    /// the vCPU in its paused state machine).
+    start_paused: bool,
 }
 
 impl Vcpu {
@@ -319,7 +325,14 @@ impl Vcpu {
             response_sender,
             vcpu_list,
             nested_enabled,
+            start_paused: false,
         })
+    }
+
+    /// Mark this vCPU to start paused (see [`Vcpu::start_paused`]). Call before
+    /// [`Vcpu::start_threaded`] on the restore-into-a-clone path.
+    pub fn set_start_paused(&mut self, v: bool) {
+        self.start_paused = v;
     }
 
     /// Returns the cpu index as seen by the guest OS.
@@ -486,6 +499,16 @@ impl Vcpu {
             .set_initial_state(entry_addr, self.fdt_addr)
             .unwrap_or_else(|_| panic!("Can't set HVF vCPU {hvf_vcpuid} initial state"));
 
+        // Restore-into-a-clone: hold here in the paused event loop (handling the
+        // orchestrator's RestoreState) until a Resume arrives, so the saved
+        // register state is loaded BEFORE the guest executes. set_initial_state
+        // above still ran to program the VMM-managed EL2/HCR state (which is not
+        // part of the snapshot); the restore overwrites PC/CPSR/EL1/GP/SIMD.
+        if self.start_paused && !self.run_paused_loop(hvf_vcpuid) {
+            self.exit(FC_EXIT_CODE_GENERIC_ERROR);
+            return;
+        }
+
         loop {
             if !self.handle_pending_event(false, hvf_vcpuid) {
                 self.exit(FC_EXIT_CODE_GENERIC_ERROR);
@@ -545,6 +568,56 @@ impl Vcpu {
         }
     }
 
+    /// Block in the paused event loop: handle Pause/SaveState/RestoreState and
+    /// return `true` on Resume (caller proceeds to run the guest) or `false` on
+    /// error / channel close (caller exits). Shared by the `Pause` event handler
+    /// and the restore-into-a-clone paused start (see [`Vcpu::start_paused`]).
+    fn run_paused_loop(&mut self, hvf_vcpuid: u64) -> bool {
+        loop {
+            match self.event_receiver.recv() {
+                Ok(VcpuEvent::Resume { paused_ns }) => {
+                    if hvf::vcpu_adjust_vtimer_offset(hvf_vcpuid, paused_ns).is_err() {
+                        return false;
+                    }
+                    self.response_sender
+                        .send(VcpuResponse::Resumed)
+                        .expect("failed to send resume status");
+                    return true;
+                }
+                Ok(VcpuEvent::Pause) => {
+                    self.response_sender
+                        .send(VcpuResponse::Paused)
+                        .expect("failed to send pause status");
+                }
+                // Checkpoint: capture register state while paused (the safe
+                // boundary). Stays paused afterwards.
+                #[cfg(target_arch = "aarch64")]
+                Ok(VcpuEvent::SaveState) => match hvf::vcpu_save_state(hvf_vcpuid) {
+                    Ok(state) => self
+                        .response_sender
+                        .send(VcpuResponse::SavedState(Box::new(state)))
+                        .expect("failed to send saved vcpu state"),
+                    Err(e) => {
+                        error!("failed to capture HVF vcpu state: {e:?}");
+                        return false;
+                    }
+                },
+                // Restore: load captured register state onto the paused vCPU.
+                #[cfg(target_arch = "aarch64")]
+                Ok(VcpuEvent::RestoreState(state)) => {
+                    if let Err(e) = hvf::vcpu_restore_state(hvf_vcpuid, &state) {
+                        error!("failed to restore HVF vcpu state: {e:?}");
+                        return false;
+                    }
+                    self.response_sender
+                        .send(VcpuResponse::RestoredState)
+                        .expect("failed to send restored vcpu ack");
+                }
+                Err(_) => return false,
+            }
+        }
+    }
+
     fn handle_pending_event(&mut self, block: bool, hvf_vcpuid: u64) -> bool {
         let event = if block {
             match self.event_receiver.recv() {
@@ -564,49 +637,7 @@ impl Vcpu {
                 self.response_sender
                     .send(VcpuResponse::Paused)
                     .expect("failed to send pause status");
-                loop {
-                    match self.event_receiver.recv() {
-                        Ok(VcpuEvent::Resume { paused_ns }) => {
-                            if hvf::vcpu_adjust_vtimer_offset(hvf_vcpuid, paused_ns).is_err() {
-                                return false;
-                            }
-                            self.response_sender
-                                .send(VcpuResponse::Resumed)
-                                .expect("failed to send resume status");
-                            return true;
-                        }
-                        Ok(VcpuEvent::Pause) => {
-                            self.response_sender
-                                .send(VcpuResponse::Paused)
-                                .expect("failed to send pause status");
-                        }
-                        // Checkpoint: capture register state while paused (the
-                        // safe boundary). Stays paused afterwards.
-                        #[cfg(target_arch = "aarch64")]
-                        Ok(VcpuEvent::SaveState) => match hvf::vcpu_save_state(hvf_vcpuid) {
-                            Ok(state) => self
-                                .response_sender
-                                .send(VcpuResponse::SavedState(Box::new(state)))
-                                .expect("failed to send saved vcpu state"),
-                            Err(e) => {
-                                error!("failed to capture HVF vcpu state: {e:?}");
-                                return false;
-                            }
-                        },
-                        // Restore: load captured register state onto the paused vCPU.
-                        #[cfg(target_arch = "aarch64")]
-                        Ok(VcpuEvent::RestoreState(state)) => {
-                            if let Err(e) = hvf::vcpu_restore_state(hvf_vcpuid, &state) {
-                                error!("failed to restore HVF vcpu state: {e:?}");
-                                return false;
-                            }
-                            self.response_sender
-                                .send(VcpuResponse::RestoredState)
-                                .expect("failed to send restored vcpu ack");
-                        }
-                        Err(_) => return false,
-                    }
-                }
+                self.run_paused_loop(hvf_vcpuid)
             }
             Some(VcpuEvent::Resume { paused_ns }) => {
                 if hvf::vcpu_adjust_vtimer_offset(hvf_vcpuid, paused_ns).is_err() {
@@ -655,6 +686,21 @@ pub type VcpuState = hvf::HvfVcpuState;
 #[cfg(target_arch = "aarch64")]
 #[derive(Clone, Debug)]
 pub struct VmState {}
+
+#[cfg(target_arch = "aarch64")]
+impl VmState {
+    /// Serialize to a byte blob. Empty on HVF — there is no in-kernel VM-level
+    /// state to capture (mirrors the KVM `VmState::serialize` signature so the
+    /// cross-platform [`crate::VmCheckpoint`] can call it uniformly).
+    pub fn serialize(&self) -> Vec<u8> {
+        Vec::new()
+    }
+
+    /// Reconstruct from a blob produced by [`Self::serialize`] (always empty).
+    pub fn deserialize(_bytes: &[u8]) -> std::result::Result<VmState, String> {
+        Ok(VmState {})
+    }
+}
 
 #[derive(Debug)]
 /// List of events that the Vcpu can receive.

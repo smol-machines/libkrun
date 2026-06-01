@@ -275,6 +275,74 @@ pub struct HvfVcpuState {
     pub sys: Vec<(u16, u64)>,
 }
 
+impl HvfVcpuState {
+    /// Serialize to a self-describing little-endian byte blob for cross-process
+    /// fork / on-disk checkpoint. No cross-version compatibility promised.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for &g in &self.gp {
+            out.extend_from_slice(&g.to_le_bytes());
+        }
+        out.extend_from_slice(&self.pc.to_le_bytes());
+        out.extend_from_slice(&self.cpsr.to_le_bytes());
+        out.extend_from_slice(&self.fpcr.to_le_bytes());
+        out.extend_from_slice(&self.fpsr.to_le_bytes());
+        for &q in &self.simd {
+            out.extend_from_slice(&q.to_le_bytes());
+        }
+        out.extend_from_slice(&(self.sys.len() as u32).to_le_bytes());
+        for &(reg, val) in &self.sys {
+            out.extend_from_slice(&reg.to_le_bytes());
+            out.extend_from_slice(&val.to_le_bytes());
+        }
+        out
+    }
+
+    /// Reconstruct from a blob produced by [`Self::serialize`].
+    pub fn deserialize(bytes: &[u8]) -> std::result::Result<HvfVcpuState, String> {
+        let mut pos = 0usize;
+        let take = |b: &[u8], pos: &mut usize, n: usize| -> std::result::Result<Vec<u8>, String> {
+            if *pos + n > b.len() {
+                return Err("HvfVcpuState blob truncated".to_string());
+            }
+            let s = b[*pos..*pos + n].to_vec();
+            *pos += n;
+            Ok(s)
+        };
+        let u64_at = |b: &[u8], pos: &mut usize| -> std::result::Result<u64, String> {
+            Ok(u64::from_le_bytes(take(b, pos, 8)?.try_into().unwrap()))
+        };
+        let mut gp = [0u64; 31];
+        for slot in gp.iter_mut() {
+            *slot = u64_at(bytes, &mut pos)?;
+        }
+        let pc = u64_at(bytes, &mut pos)?;
+        let cpsr = u64_at(bytes, &mut pos)?;
+        let fpcr = u64_at(bytes, &mut pos)?;
+        let fpsr = u64_at(bytes, &mut pos)?;
+        let mut simd = [0u128; 32];
+        for slot in simd.iter_mut() {
+            *slot = u128::from_le_bytes(take(bytes, &mut pos, 16)?.try_into().unwrap());
+        }
+        let n = u32::from_le_bytes(take(bytes, &mut pos, 4)?.try_into().unwrap()) as usize;
+        let mut sys = Vec::with_capacity(n);
+        for _ in 0..n {
+            let reg = u16::from_le_bytes(take(bytes, &mut pos, 2)?.try_into().unwrap());
+            let val = u64_at(bytes, &mut pos)?;
+            sys.push((reg, val));
+        }
+        Ok(HvfVcpuState {
+            gp,
+            pc,
+            cpsr,
+            fpcr,
+            fpsr,
+            simd,
+            sys,
+        })
+    }
+}
+
 /// The writable EL1 system registers captured/restored for a faithful guest
 /// state snapshot (MMU config, exception state, thread pointers, etc.).
 #[cfg(target_arch = "aarch64")]

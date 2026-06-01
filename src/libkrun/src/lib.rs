@@ -520,12 +520,19 @@ fn handle_restore(vmm: &Arc<Mutex<vmm::Vmm>>, id: &str) -> String {
 }
 
 /// Magic for the fork manifest ("SMOLFORK").
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 const FORK_MANIFEST_MAGIC: u64 = 0x534d4f4c464f524b;
 
 /// Serialize the fork manifest: owner pid + guest-RAM region descriptors
-/// (gpa/len/memfd-fd/offset) so a clone can reach the fds via /proc.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+/// (gpa/len/memfd-fd/offset + backing-file path) so a clone can reach the
+/// backing RAM — via `/proc/<pid>/fd` on Linux, or the file path on macOS.
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 fn write_fork_manifest(
     path: &std::path::Path,
     owner_pid: i32,
@@ -540,12 +547,18 @@ fn write_fork_manifest(
         buf.extend_from_slice(&d.len.to_le_bytes());
         buf.extend_from_slice(&d.fd.to_le_bytes());
         buf.extend_from_slice(&d.offset.to_le_bytes());
+        let pb = d.path.as_bytes();
+        buf.extend_from_slice(&(pb.len() as u32).to_le_bytes());
+        buf.extend_from_slice(pb);
     }
     std::fs::write(path, buf)
 }
 
 /// Parse a manifest written by [`write_fork_manifest`].
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 fn read_fork_manifest(
     path: &std::path::Path,
 ) -> std::io::Result<(i32, Vec<vmm::snapshot::MemfdRegionDesc>)> {
@@ -575,17 +588,24 @@ fn read_fork_manifest(
         let len = u64::from_le_bytes(take(&b, &mut p, 8)?.try_into().unwrap());
         let fd = i32::from_le_bytes(take(&b, &mut p, 4)?.try_into().unwrap());
         let offset = u64::from_le_bytes(take(&b, &mut p, 8)?.try_into().unwrap());
+        let plen = u32::from_le_bytes(take(&b, &mut p, 4)?.try_into().unwrap()) as usize;
+        let path = String::from_utf8(take(&b, &mut p, plen)?)
+            .map_err(|_| err("fork manifest: non-UTF8 region path"))?;
         descs.push(vmm::snapshot::MemfdRegionDesc {
             gpa,
             len,
             fd,
             offset,
+            path,
         });
     }
     Ok((owner_pid, descs))
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 fn handle_fork(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
     if dir.is_empty() {
         return "ERR EINVAL fork snapshot dir required\n".to_string();
@@ -614,15 +634,23 @@ fn handle_fork(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
 }
 
 /// Build a [`vmm::builder::RestoreCtx`] from a fork snapshot directory: parse the
-/// manifest, CoW-map the golden VM's guest RAM from `/proc/<pid>/fd`, and load
-/// the serialized checkpoint.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+/// manifest, CoW-map the golden VM's guest RAM (Linux: via `/proc/<pid>/fd`;
+/// macOS: by the backing-file path recorded in the manifest), and load the
+/// serialized checkpoint.
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 fn build_restore_ctx(dir: &std::path::Path) -> std::result::Result<vmm::builder::RestoreCtx, String> {
-    let (owner_pid, descs) =
+    let (_owner_pid, descs) =
         read_fork_manifest(&dir.join("manifest.bin")).map_err(|e| format!("manifest: {e}"))?;
     let checkpoint =
         std::fs::read(dir.join("checkpoint.bin")).map_err(|e| format!("checkpoint: {e}"))?;
-    let guest_memory = vmm::snapshot::open_cow_memory_from_pid(owner_pid, &descs)
+    #[cfg(target_os = "linux")]
+    let guest_memory = vmm::snapshot::open_cow_memory_from_pid(_owner_pid, &descs)
+        .map_err(|e| format!("cow-map guest memory: {e}"))?;
+    #[cfg(target_os = "macos")]
+    let guest_memory = vmm::snapshot::open_cow_memory_from_paths(&descs)
         .map_err(|e| format!("cow-map guest memory: {e}"))?;
     Ok(vmm::builder::RestoreCtx {
         guest_memory,
@@ -671,7 +699,7 @@ fn handle_control_stream(mut stream: UnixStream, vmm: &Arc<Mutex<vmm::Vmm>>) {
                 // process then boots from <dir> via krun_set_snapshot, mapping this
                 // VM's guest-RAM memfd MAP_PRIVATE. Requires memfd-backed RAM
                 // (SMOLVM_FORKABLE=1).
-                #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+                #[cfg(any(all(target_os = "linux", target_arch = "x86_64"), all(target_os = "macos", target_arch = "aarch64")))]
                 "FORK" => handle_fork(vmm, arg),
                 _ => "ERR EINVAL unknown command\n".to_string(),
             }
@@ -3134,7 +3162,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     // Fork clone: build a RestoreCtx from the snapshot dir (CoW-map the golden
     // VM's guest RAM + load its checkpoint) so build_microvm restores instead of
     // cold-booting.
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(any(all(target_os = "linux", target_arch = "x86_64"), all(target_os = "macos", target_arch = "aarch64")))]
     let restore_ctx = match ctx_cfg.snapshot_dir.take() {
         Some(dir) => match build_restore_ctx(&dir) {
             Ok(rc) => Some(rc),
@@ -3145,7 +3173,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         },
         None => None,
     };
-    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    #[cfg(not(any(all(target_os = "linux", target_arch = "x86_64"), all(target_os = "macos", target_arch = "aarch64"))))]
     let restore_ctx: Option<vmm::builder::RestoreCtx> = None;
 
     lk_timing!("before build_microvm");
