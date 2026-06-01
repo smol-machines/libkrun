@@ -32,7 +32,7 @@ fn build_default_init() -> PathBuf {
     let cc = cc_parts.next().expect("CC_LINUX/CC must not be empty");
     let status = Command::new(cc)
         .args(cc_parts)
-        .args(&init_cc_flags)
+        .args(init_cc_flags)
         .arg("-o")
         .arg(&init_bin)
         .arg(&init_src)

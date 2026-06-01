@@ -182,7 +182,10 @@ impl Fs {
                 .as_ref()
                 .map(|w| w.save_queue_states().into_iter().map(Some).collect())
                 .unwrap_or_default(),
-            fuse: self.quiesced_worker.as_ref().and_then(|w| w.save_fuse_state()),
+            fuse: self
+                .quiesced_worker
+                .as_ref()
+                .and_then(|w| w.save_fuse_state()),
         }
     }
 

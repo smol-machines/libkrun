@@ -17,10 +17,10 @@ use crate::virtio::console::console_control::{
 };
 use crate::virtio::console::defs::QUEUE_SIZE;
 use crate::virtio::console::port::Port;
-use crate::virtio::queue::QueueState;
 use crate::virtio::console::port_queue_mapping::{
     num_queues, port_id_to_queue_idx, QueueDirection,
 };
+use crate::virtio::queue::QueueState;
 use crate::virtio::{InterruptTransport, PortDescription, VmmExitObserver};
 
 pub(crate) const CONTROL_RXQ_INDEX: usize = 2;

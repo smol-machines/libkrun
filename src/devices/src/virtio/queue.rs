@@ -1037,7 +1037,11 @@ pub(crate) mod tests {
         restored.restore_state(&snap).expect("restore");
 
         assert_eq!(restored.save_state(), snap, "roundtrip must be lossless");
-        assert_eq!(restored.next_avail, Wrapping(42), "consumer index preserved");
+        assert_eq!(
+            restored.next_avail,
+            Wrapping(42),
+            "consumer index preserved"
+        );
         assert_eq!(restored.next_used, Wrapping(40), "producer index preserved");
         assert_eq!(restored.desc_table, GuestAddress(0x4000_0000));
         assert!(restored.event_idx_enabled && restored.ready);
@@ -1045,7 +1049,10 @@ pub(crate) mod tests {
 
         // A snapshot whose selected size exceeds the device maximum is rejected.
         let mut small = Queue::new(64);
-        assert!(small.restore_state(&snap).is_err(), "size > max_size must be rejected");
+        assert!(
+            small.restore_state(&snap).is_err(),
+            "size > max_size must be rejected"
+        );
     }
 
     #[test]

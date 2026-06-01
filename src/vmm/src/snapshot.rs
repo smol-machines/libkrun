@@ -52,9 +52,9 @@ pub fn write_guest_memory<W: Write>(
     for region in mem.iter() {
         let gpa = region.start_addr();
         let len = region.len();
-        let host = mem.get_host_address(gpa).map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("get_host_address: {e:?}"))
-        })?;
+        let host = mem
+            .get_host_address(gpa)
+            .map_err(|e| io::Error::other(format!("get_host_address: {e:?}")))?;
         // Safety: `host` points to `len` bytes of live guest RAM owned by the
         // mmap region currently being iterated. The VM is paused, so the bytes
         // are stable for the duration of the copy.
@@ -80,9 +80,9 @@ pub fn read_guest_memory_into<R: Read>(
     inp: &mut R,
 ) -> io::Result<()> {
     for desc in descs {
-        let host = mem.get_host_address(GuestAddress(desc.gpa)).map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("get_host_address: {e:?}"))
-        })?;
+        let host = mem
+            .get_host_address(GuestAddress(desc.gpa))
+            .map_err(|e| io::Error::other(format!("get_host_address: {e:?}")))?;
         // Safety: `host` points to `desc.len` bytes of guest RAM for this
         // region, and the VM is not yet running, so writing into it is sound.
         let dst = unsafe { std::slice::from_raw_parts_mut(host, desc.len as usize) };
@@ -102,7 +102,7 @@ pub fn memory_image_len(descs: &[MemoryRegionDesc]) -> u64 {
 /// back into the live, KVM-registered guest memory — the bounded counterpart to
 /// streaming through [`write_guest_memory`]/[`read_guest_memory_into`].
 pub fn copy_guest_memory(src: &GuestMemoryMmap, dst: &GuestMemoryMmap) -> io::Result<()> {
-    let io_err = |m: String| io::Error::new(io::ErrorKind::Other, m);
+    let io_err = |m: String| io::Error::other(m);
     for region in src.iter() {
         let gpa = region.start_addr();
         let len = region.len() as usize;
@@ -138,7 +138,7 @@ pub fn cow_clone_guest_memory(parent: &GuestMemoryMmap) -> std::io::Result<Guest
     use vm_memory::GuestRegionMmap;
 
     let prot = libc::PROT_READ | libc::PROT_WRITE;
-    let io_err = |m: String| io::Error::new(io::ErrorKind::Other, m);
+    let io_err = |m: String| io::Error::other(m);
 
     let mut regions: Vec<GuestRegionMmap> = Vec::new();
     for region in parent.iter() {
@@ -169,8 +169,7 @@ pub fn cow_clone_guest_memory(parent: &GuestMemoryMmap) -> std::io::Result<Guest
             // Anonymous region (device SHM/GPU): fresh private map + byte copy.
             None => {
                 let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
-                let ptr =
-                    unsafe { libc::mmap(std::ptr::null_mut(), size, prot, flags, -1, 0) };
+                let ptr = unsafe { libc::mmap(std::ptr::null_mut(), size, prot, flags, -1, 0) };
                 if ptr == libc::MAP_FAILED {
                     return Err(io::Error::last_os_error());
                 }
@@ -252,11 +251,7 @@ pub fn memfd_region_descs(mem: &GuestMemoryMmap) -> Vec<MemfdRegionDesc> {
                 Some(fo) => {
                     let mut buf = [0i8; libc::PATH_MAX as usize];
                     let rc = unsafe {
-                        libc::fcntl(
-                            fo.file().as_raw_fd(),
-                            libc::F_GETPATH,
-                            buf.as_mut_ptr(),
-                        )
+                        libc::fcntl(fo.file().as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr())
                     };
                     let path = if rc == 0 {
                         unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }
@@ -295,7 +290,7 @@ pub fn open_cow_memory_from_pid(
     use vm_memory::GuestRegionMmap;
 
     let prot = libc::PROT_READ | libc::PROT_WRITE;
-    let io_err = |m: String| io::Error::new(io::ErrorKind::Other, m);
+    let io_err = |m: String| io::Error::other(m);
     let mut regions: Vec<GuestRegionMmap> = Vec::with_capacity(descs.len());
 
     for d in descs {
@@ -352,7 +347,7 @@ pub fn open_cow_memory_from_paths(descs: &[MemfdRegionDesc]) -> io::Result<Guest
     use vm_memory::GuestRegionMmap;
 
     let prot = libc::PROT_READ | libc::PROT_WRITE;
-    let io_err = |m: String| io::Error::new(io::ErrorKind::Other, m);
+    let io_err = |m: String| io::Error::other(m);
     let mut regions: Vec<GuestRegionMmap> = Vec::with_capacity(descs.len());
 
     for d in descs {
@@ -475,7 +470,9 @@ mod tests {
         .expect("memfd-backed parent");
 
         // Base pattern in the parent.
-        parent.write_slice(&[0xAA; 0x10000], GuestAddress(0)).unwrap();
+        parent
+            .write_slice(&[0xAA; 0x10000], GuestAddress(0))
+            .unwrap();
 
         // CoW clone shares the parent's pages → sees the same bytes.
         let clone = cow_clone_guest_memory(&parent).expect("cow clone");
@@ -496,7 +493,11 @@ mod tests {
         parent.write_slice(&[0xCC; 16], GuestAddress(0)).unwrap();
         let mut c2 = vec![0u8; 16];
         clone.read_slice(&mut c2, GuestAddress(0)).unwrap();
-        assert_eq!(c2, vec![0xBB; 16], "clone isolated from later parent writes");
+        assert_eq!(
+            c2,
+            vec![0xBB; 16],
+            "clone isolated from later parent writes"
+        );
     }
 
     // Pool density: N CoW clones of a faulted-in base must cost only the pages
@@ -524,7 +525,9 @@ mod tests {
         )])
         .expect("parent");
         // Fault the whole base in so it counts toward RSS.
-        parent.write_slice(&vec![0x5A; base], GuestAddress(0)).unwrap();
+        parent
+            .write_slice(&vec![0x5A; base], GuestAddress(0))
+            .unwrap();
 
         let rss_before = rss_bytes();
 
@@ -533,14 +536,15 @@ mod tests {
         let mut clones = Vec::new();
         for _ in 0..N {
             let c = cow_clone_guest_memory(&parent).expect("clone");
-            c.write_slice(&vec![0xA5; 1024 * 1024], GuestAddress(0)).unwrap();
+            c.write_slice(&vec![0xA5; 1024 * 1024], GuestAddress(0))
+                .unwrap();
             clones.push(c);
         }
 
         let added = rss_bytes().saturating_sub(rss_before);
         let naive = (N * base) as u64; // what 8 full copies would cost (512 MiB)
-        // Clones should add only ~N MiB (their dirtied pages) + slop, far below
-        // a naive 512 MiB. Generous bound to stay robust across machines.
+                                       // Clones should add only ~N MiB (their dirtied pages) + slop, far below
+                                       // a naive 512 MiB. Generous bound to stay robust across machines.
         assert!(
             added < 64 * 1024 * 1024,
             "8 CoW clones of 64 MiB added {added} bytes (naive full copy = {naive}); \

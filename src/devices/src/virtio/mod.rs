@@ -21,7 +21,6 @@ pub mod console;
 pub mod descriptor_utils;
 pub mod device;
 pub mod file_traits;
-pub mod persist;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 pub mod fs;
 #[cfg(feature = "gpu")]
@@ -32,6 +31,7 @@ pub mod linux_errno;
 mod mmio;
 #[cfg(feature = "net")]
 pub mod net;
+pub mod persist;
 mod queue;
 #[cfg(not(feature = "tee"))]
 pub mod rng;

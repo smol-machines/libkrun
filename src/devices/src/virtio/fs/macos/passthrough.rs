@@ -581,13 +581,7 @@ impl PassthroughFs {
         // rootfs).  O_NOFOLLOW on the final path component would return ELOOP, which
         // linux_error maps to Linux errno 40, which macOS strerror then mis-formats as
         // "Message too long" (EMSGSIZE) causing a confusing BadActivate panic.
-        let fd = unsafe {
-            libc::openat(
-                libc::AT_FDCWD,
-                root.as_ptr(),
-                libc::O_CLOEXEC,
-            )
-        };
+        let fd = unsafe { libc::openat(libc::AT_FDCWD, root.as_ptr(), libc::O_CLOEXEC) };
         if fd < 0 {
             return Err(linux_error(io::Error::last_os_error()));
         }

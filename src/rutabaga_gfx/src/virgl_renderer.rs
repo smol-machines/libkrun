@@ -233,7 +233,10 @@ unsafe extern "C" fn get_server_fd(cookie: *mut c_void, version: u32) -> c_int {
         assert!(!cookie.is_null());
         let cookie = &mut *(cookie as *mut RutabagaCookie);
 
-        log::info!("get_server_fd called: version={version}, has_fd={}", cookie.render_server_fd.is_some());
+        log::info!(
+            "get_server_fd called: version={version}, has_fd={}",
+            cookie.render_server_fd.is_some()
+        );
 
         if version != 0 {
             log::warn!("get_server_fd: unsupported version {version}, returning -1");
@@ -501,7 +504,11 @@ impl RutabagaComponent for VirglRenderer {
         // virgl_renderer_context_destroy, so callers must deregister it from any
         // poll set before calling destroy.
         let fd = unsafe { virgl_renderer_context_get_poll_fd(ctx_id) };
-        if fd >= 0 { Some(fd) } else { None }
+        if fd >= 0 {
+            Some(fd)
+        } else {
+            None
+        }
     }
 
     fn poll_descriptor(&self) -> Option<SafeDescriptor> {

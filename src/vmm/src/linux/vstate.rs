@@ -14,6 +14,8 @@ use std::fmt::{Display, Formatter};
 use std::io;
 use std::ops::Range;
 
+// Only needed by the x86_64 kvmclock ioctl below (aarch64 uses a local import).
+#[cfg(target_arch = "x86_64")]
 use std::os::fd::AsRawFd;
 use std::os::unix::io::RawFd;
 
@@ -1705,20 +1707,18 @@ impl Vcpu {
             // only safe point — KVM_GET_VCPU_EVENTS is unsafe while other vCPUs
             // run). Stays paused afterwards.
             #[cfg(target_arch = "x86_64")]
-            Ok(VcpuEvent::SaveState) => {
-                match self.save_state() {
-                    Ok(state) => {
-                        self.response_sender
-                            .send(VcpuResponse::SavedState(Box::new(state)))
-                            .expect("failed to send saved vcpu state");
-                        StateMachine::next(Self::paused)
-                    }
-                    Err(e) => {
-                        error!("failed to capture vcpu state: {e:?}");
-                        self.exit(FC_EXIT_CODE_GENERIC_ERROR)
-                    }
+            Ok(VcpuEvent::SaveState) => match self.save_state() {
+                Ok(state) => {
+                    self.response_sender
+                        .send(VcpuResponse::SavedState(Box::new(state)))
+                        .expect("failed to send saved vcpu state");
+                    StateMachine::next(Self::paused)
                 }
-            }
+                Err(e) => {
+                    error!("failed to capture vcpu state: {e:?}");
+                    self.exit(FC_EXIT_CODE_GENERIC_ERROR)
+                }
+            },
             // Restore: load captured register state onto the paused vCPU.
             #[cfg(target_arch = "x86_64")]
             Ok(VcpuEvent::RestoreState(state)) => {
@@ -1887,10 +1887,9 @@ impl VcpuState {
         let mut pos = 0usize;
         let cpuid_entries: Vec<kvm_bindings::kvm_cpuid_entry2> = de_fam(bytes, &mut pos)?;
         let msr_entries: Vec<kvm_bindings::kvm_msr_entry> = de_fam(bytes, &mut pos)?;
-        let cpuid = CpuId::from_entries(&cpuid_entries)
-            .map_err(|e| format!("rebuild CpuId: {e:?}"))?;
-        let msrs =
-            Msrs::from_entries(&msr_entries).map_err(|e| format!("rebuild Msrs: {e:?}"))?;
+        let cpuid =
+            CpuId::from_entries(&cpuid_entries).map_err(|e| format!("rebuild CpuId: {e:?}"))?;
+        let msrs = Msrs::from_entries(&msr_entries).map_err(|e| format!("rebuild Msrs: {e:?}"))?;
         let state = VcpuState {
             cpuid,
             msrs,
@@ -2299,8 +2298,7 @@ mod tests {
         // and that the result is a KVM-acceptable register state.
         let blob = state.serialize();
         assert!(!blob.is_empty(), "serialized vcpu state must be non-empty");
-        let restored =
-            VcpuState::deserialize(&blob).expect("failed to deserialize vcpu state");
+        let restored = VcpuState::deserialize(&blob).expect("failed to deserialize vcpu state");
 
         handle
             .send_event(VcpuEvent::RestoreState(Box::new(restored)))

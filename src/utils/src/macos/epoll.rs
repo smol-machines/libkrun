@@ -8,7 +8,6 @@ use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::ptr;
 
-
 use bitflags::bitflags;
 use log::debug;
 

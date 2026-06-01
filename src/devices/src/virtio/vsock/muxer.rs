@@ -318,7 +318,7 @@ impl VsockMuxer {
         let removed = {
             let mut map = self.proxy_map.write().unwrap();
             let before = map.len();
-            map.retain(|_id, proxy| proxy.lock().unwrap().is_listener());
+            map.retain(|_id, proxy| proxy.get_mut().unwrap().is_listener());
             before - map.len()
         };
         self.rxq.lock().unwrap().clear();

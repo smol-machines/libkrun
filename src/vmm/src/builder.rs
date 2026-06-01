@@ -1167,14 +1167,18 @@ pub fn build_microvm(
 
     match restore {
         None => {
-            vmm.start_vcpus(vcpus).map_err(StartMicrovmError::Internal)?;
+            vmm.start_vcpus(vcpus)
+                .map_err(StartMicrovmError::Internal)?;
             vmm_timing!("vcpus running");
         }
         Some(_ctx) => {
             // Restore-into-a-fresh-clone: start vCPUs paused, apply the
             // checkpoint (VM + device re-activation + vCPU registers), then
             // resume so the clone runs from the checkpoint instruction.
-            #[cfg(any(all(target_os = "linux", target_arch = "x86_64"), all(target_os = "macos", target_arch = "aarch64")))]
+            #[cfg(any(
+                all(target_os = "linux", target_arch = "x86_64"),
+                all(target_os = "macos", target_arch = "aarch64")
+            ))]
             {
                 let checkpoint = super::VmCheckpoint::deserialize(&_ctx.checkpoint)
                     .map_err(StartMicrovmError::GuestMemoryMmap)?;
@@ -1193,7 +1197,10 @@ pub fn build_microvm(
                 vmm.resume().map_err(StartMicrovmError::Internal)?;
                 vmm_timing!("vcpus restored + running");
             }
-            #[cfg(not(any(all(target_os = "linux", target_arch = "x86_64"), all(target_os = "macos", target_arch = "aarch64"))))]
+            #[cfg(not(any(
+                all(target_os = "linux", target_arch = "x86_64"),
+                all(target_os = "macos", target_arch = "aarch64")
+            )))]
             {
                 let _ = vcpus;
                 return Err(StartMicrovmError::GuestMemoryMmap(
@@ -1422,8 +1429,9 @@ fn load_payload(
                 // kernel image in) so its runtime-mutated pages (.data/.bss) are
                 // CoW-shareable to clones — a `build_raw` view of libkrunfw's
                 // buffer is anonymous and would be zeroed on a clone.
-                let memfd = create_guest_ram_memfd(kernel_size)
-                    .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("kernel memfd: {e}")))?;
+                let memfd = create_guest_ram_memfd(kernel_size).map_err(|e| {
+                    StartMicrovmError::GuestMemoryMmap(format!("kernel memfd: {e}"))
+                })?;
                 let region = MmapRegion::from_file(FileOffset::new(memfd, 0), kernel_size)
                     .map_err(StartMicrovmError::InvalidKernelBundle)?;
                 // Safety: copy `kernel_size` bytes from libkrunfw's kernel buffer
@@ -1570,14 +1578,17 @@ pub(crate) fn create_guest_ram_memfd(size: usize) -> std::result::Result<File, S
 pub(crate) fn create_guest_ram_memfd(size: usize) -> std::result::Result<File, String> {
     use std::os::fd::FromRawFd;
     let dir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
-    let mut template = format!("{}/smolvm-guest-ram-XXXXXX", dir.trim_end_matches('/'))
-        .into_bytes();
+    let mut template =
+        format!("{}/smolvm-guest-ram-XXXXXX", dir.trim_end_matches('/')).into_bytes();
     template.push(0);
     // Safety: `template` is a NUL-terminated, writable buffer; mkstemp fills in
     // the XXXXXX and returns an owned fd to the freshly-created file.
     let fd = unsafe { libc::mkstemp(template.as_mut_ptr() as *mut libc::c_char) };
     if fd < 0 {
-        return Err(format!("mkstemp guest-RAM file: {}", std::io::Error::last_os_error()));
+        return Err(format!(
+            "mkstemp guest-RAM file: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     // Safety: `fd` is a fresh, owned fd from mkstemp.
     let file = unsafe { File::from_raw_fd(fd) };

@@ -19,10 +19,10 @@ use super::super::{
     VirtioDevice,
 };
 use super::muxer::VsockMuxer;
-use crate::virtio::queue::QueueState;
 use super::packet::VsockPacket;
 use super::TsiFlags;
 use super::{defs, defs::uapi};
+use crate::virtio::queue::QueueState;
 use crate::virtio::InterruptTransport;
 
 pub(crate) const RXQ_INDEX: usize = 0;

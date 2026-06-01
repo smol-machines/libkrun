@@ -121,9 +121,7 @@ impl MMIODeviceManager {
                 snapshots.push(snap);
             }
         }
-        VmDevicesState {
-            devices: snapshots,
-        }
+        VmDevicesState { devices: snapshots }
     }
 
     /// Quiesce every virtio device to a clean boundary before snapshotting.
@@ -200,7 +198,9 @@ impl MMIODeviceManager {
                 break;
             }
             if !applied {
-                return Err(format!("no matching transport to restore device type {want}"));
+                return Err(format!(
+                    "no matching transport to restore device type {want}"
+                ));
             }
         }
         Ok(())

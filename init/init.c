@@ -1005,7 +1005,8 @@ void clock_worker()
         gtime_ns = gtime.tv_sec * NANOS_IN_SECOND;
         gtime_ns += gtime.tv_nsec;
 
-        uint64_t delta_ns = htime_ns > gtime_ns ? htime_ns - gtime_ns : gtime_ns - htime_ns;
+        uint64_t delta_ns =
+            htime_ns > gtime_ns ? htime_ns - gtime_ns : gtime_ns - htime_ns;
         if (delta_ns > DELTA_SYNC) {
             htime.tv_sec = htime_ns / NANOS_IN_SECOND;
             htime.tv_nsec = htime_ns % NANOS_IN_SECOND;
@@ -1240,8 +1241,10 @@ static int exec_via_memfd(const char *path, char **exec_argv)
     /* fexecve only returns on failure; fall through to return -1. */
 
 out:
-    if (mem_fd >= 0) close(mem_fd);
-    if (src_fd >= 0) close(src_fd);
+    if (mem_fd >= 0)
+        close(mem_fd);
+    if (src_fd >= 0)
+        close(src_fd);
     free(buf);
     return ret;
 }
@@ -1276,7 +1279,6 @@ int main(int argc, char **argv)
 
     open_console();
 #endif
-
 
 #ifdef TDX
     if (mkdir("/tmp", 0755) < 0 && errno != EEXIST) {

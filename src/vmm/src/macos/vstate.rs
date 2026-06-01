@@ -750,7 +750,8 @@ impl VmState {
             *pos += n;
             Ok(s)
         };
-        let n = u32::from_le_bytes(take(bytes, &mut pos, 4)?.try_into().map_err(|_| err())?) as usize;
+        let n =
+            u32::from_le_bytes(take(bytes, &mut pos, 4)?.try_into().map_err(|_| err())?) as usize;
         let mut gic_distributor = Vec::with_capacity(n);
         for _ in 0..n {
             let reg = u32::from_le_bytes(take(bytes, &mut pos, 4)?.try_into().map_err(|_| err())?);
@@ -799,6 +800,9 @@ pub struct VcpuHandle {
     response_receiver: Receiver<VcpuResponse>,
     hvf_vcpuid: u64,
     vcpu_list: Arc<VcpuList>,
+    // Held to own the vCPU thread's JoinHandle for the lifetime of the handle
+    // (so the thread isn't detached); not read back.
+    #[allow(dead_code)]
     vcpu_thread: Option<thread::JoinHandle<()>>,
 }
 

@@ -319,9 +319,7 @@ impl MMIODeviceManager {
                 snapshots.push(snap);
             }
         }
-        VmDevicesState {
-            devices: snapshots,
-        }
+        VmDevicesState { devices: snapshots }
     }
 
     /// Re-activate devices on a freshly-built clone from a checkpoint: for each
@@ -329,7 +327,13 @@ impl MMIODeviceManager {
     /// device type and re-activate it from the saved queue state + features
     /// (bypassing the guest handshake). Used by restore-into-a-fresh-VM (fork).
     /// Errors if a snapshot has no matching transport.
-    pub fn restore_activate_devices(&self, state: &VmDevicesState) -> std::result::Result<(), String> {
+    // The fork restore path (Vmm::restore_activate_devices) is x86_64-only on
+    // Linux, so this is unused on aarch64-linux.
+    #[cfg(target_arch = "x86_64")]
+    pub fn restore_activate_devices(
+        &self,
+        state: &VmDevicesState,
+    ) -> std::result::Result<(), String> {
         let mut used = vec![false; self.mmio_transports.len()];
         for snap in &state.devices {
             let want = snap.device_type();

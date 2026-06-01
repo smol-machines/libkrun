@@ -624,10 +624,7 @@ impl Proxy for UnixProxy {
                 }
 
                 if self.status == ProxyStatus::PeerClosed {
-                    debug!(
-                        "process_event: peer closed, sending reset: id={}",
-                        self.id
-                    );
+                    debug!("process_event: peer closed, sending reset: id={}", self.id);
                     // Send RST instead of SHUTDOWN — see tsi_stream.rs HANG_UP handler.
                     self.push_reset();
                     self.status = ProxyStatus::Closed;

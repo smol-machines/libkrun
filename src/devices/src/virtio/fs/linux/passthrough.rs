@@ -487,7 +487,11 @@ impl PassthroughFs {
         // the root dir may be a symlink to the real rootfs; statx on a symlink fd
         // would otherwise record the symlink's inode rather than the target's.
         let fd = unsafe {
-            libc::openat(libc::AT_FDCWD, root.as_ptr(), libc::O_PATH | libc::O_CLOEXEC)
+            libc::openat(
+                libc::AT_FDCWD,
+                root.as_ptr(),
+                libc::O_PATH | libc::O_CLOEXEC,
+            )
         };
         if fd < 0 {
             return Err(io::Error::last_os_error());
@@ -596,7 +600,11 @@ impl PassthroughFs {
                     )
                 };
                 if fd < 0 {
-                    warn!("fs restore: reopen {} failed: {}", snap.path, io::Error::last_os_error());
+                    warn!(
+                        "fs restore: reopen {} failed: {}",
+                        snap.path,
+                        io::Error::last_os_error()
+                    );
                     continue;
                 }
                 // SAFETY: we just opened this fd.

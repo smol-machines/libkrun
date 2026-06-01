@@ -286,8 +286,7 @@ impl VirtioGpu {
         // parent's read(exec_read_fd) blocks until that happens, giving a
         // deterministic exec-completed signal before the Vulkan-init sleep.
         let mut exec_pipe_fds: [libc::c_int; 2] = [-1, -1];
-        let pipe_ok =
-            unsafe { libc::pipe2(exec_pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) } == 0;
+        let pipe_ok = unsafe { libc::pipe2(exec_pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) } == 0;
         if !pipe_ok {
             warn!(
                 "pipe2 for exec-ready detection failed: {}; \
@@ -346,9 +345,7 @@ impl VirtioGpu {
                 // exponential backoff.
                 if exec_read_fd >= 0 {
                     let mut buf = [0u8; 1];
-                    unsafe {
-                        libc::read(exec_read_fd, buf.as_mut_ptr() as *mut libc::c_void, 1)
-                    };
+                    unsafe { libc::read(exec_read_fd, buf.as_mut_ptr() as *mut libc::c_void, 1) };
                     unsafe { libc::close(exec_read_fd) };
                 }
                 // The server runs as an orphaned subprocess; dropping `_child`
@@ -454,7 +451,7 @@ impl VirtioGpu {
         let retry_fds: Vec<RutabagaDescriptor> = if has_render_server {
             render_server_fd
                 .as_ref()
-                .and_then(|fd| {
+                .map(|fd| {
                     let mut fds = Vec::new();
                     // Backoff schedule: 10ms, 50ms, 200ms.  Total worst-case
                     // wait ≈ 260ms, similar to the old fixed 300ms but adaptive.
@@ -464,7 +461,7 @@ impl VirtioGpu {
                             Err(_) => break,
                         }
                     }
-                    Some(fds)
+                    fds
                 })
                 .unwrap_or_default()
         } else {
@@ -486,7 +483,10 @@ impl VirtioGpu {
                 );
                 unsafe {
                     libc::nanosleep(
-                        &libc::timespec { tv_sec: 0, tv_nsec: ns },
+                        &libc::timespec {
+                            tv_sec: 0,
+                            tv_nsec: ns,
+                        },
                         std::ptr::null_mut(),
                     );
                 }
@@ -596,6 +596,8 @@ impl VirtioGpu {
     ///
     /// Call this when the poll descriptor becomes readable so that render-server
     /// responses are processed and fence callbacks fire, unblocking the guest.
+    // Used by the Linux virtio-gpu epoll worker; unused on macOS.
+    #[allow(dead_code)]
     pub fn event_poll(&self) {
         self.rutabaga.event_poll();
     }
@@ -605,6 +607,7 @@ impl VirtioGpu {
     ///
     /// Returns `None` when virglrenderer is not the active component or when
     /// `virgl_renderer_get_poll_fd()` returns -1.
+    #[allow(dead_code)]
     pub fn poll_descriptor(&self) -> Option<RutabagaDescriptor> {
         self.rutabaga.poll_descriptor()
     }
@@ -615,6 +618,7 @@ impl VirtioGpu {
     /// `event_poll()` has no effect on fence signaling.  Calling this for each
     /// active Venus context ID processes render-server responses and fires
     /// `write_context_fence` callbacks, advancing the seqno that Venus's cpu sync waits on.
+    #[allow(dead_code)]
     pub fn context_event_poll(&self, ctx_id: u32) {
         self.rutabaga.context_event_poll(ctx_id);
     }
@@ -625,6 +629,7 @@ impl VirtioGpu {
     /// has completed work for this context.  Register it with epoll and call
     /// `context_event_poll(ctx_id)` on the event.  Returns `None` if virglrenderer
     /// does not provide a per-context poll fd for this context.
+    #[allow(dead_code)]
     pub fn context_poll_fd(&self, ctx_id: u32) -> Option<i32> {
         self.rutabaga.context_poll_fd(ctx_id)
     }

@@ -11,20 +11,24 @@
 //! unaware of snapshots, and devices without a Persist impl yet (balloon, rng,
 //! fs, gpu, snd, input) are simply skipped.
 
-use crate::virtio::{
-    Console, ConsoleState, Fs, FsState, Rng, RngState, VirtioDevice, Vsock, VsockState,
-};
 #[cfg(feature = "blk")]
 use crate::virtio::{block::BlockState, Block};
 #[cfg(feature = "net")]
 use crate::virtio::{net::NetState, Net};
+use crate::virtio::{Console, ConsoleState, VirtioDevice, Vsock, VsockState};
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+use crate::virtio::{Fs, FsState};
+#[cfg(not(feature = "tee"))]
+use crate::virtio::{Rng, RngState};
 
 /// Snapshot of a single virtio device's runtime state.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DeviceSnapshot {
     Console(ConsoleState),
     Vsock(VsockState),
+    #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
     Fs(FsState),
+    #[cfg(not(feature = "tee"))]
     Rng(RngState),
     #[cfg(feature = "blk")]
     Block(BlockState),
@@ -40,7 +44,9 @@ impl DeviceSnapshot {
         match self {
             DeviceSnapshot::Console(_) => TYPE_CONSOLE,
             DeviceSnapshot::Vsock(_) => TYPE_VSOCK,
+            #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
             DeviceSnapshot::Fs(_) => TYPE_FS,
+            #[cfg(not(feature = "tee"))]
             DeviceSnapshot::Rng(_) => TYPE_RNG,
             #[cfg(feature = "blk")]
             DeviceSnapshot::Block(_) => TYPE_BLOCK,
@@ -54,7 +60,9 @@ impl DeviceSnapshot {
         match self {
             DeviceSnapshot::Console(s) => s.acked_features,
             DeviceSnapshot::Vsock(s) => s.acked_features,
+            #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
             DeviceSnapshot::Fs(s) => s.acked_features,
+            #[cfg(not(feature = "tee"))]
             DeviceSnapshot::Rng(s) => s.acked_features,
             #[cfg(feature = "blk")]
             DeviceSnapshot::Block(s) => s.acked_features,
@@ -69,7 +77,9 @@ impl DeviceSnapshot {
         match self {
             DeviceSnapshot::Console(s) => s.queues.clone(),
             DeviceSnapshot::Vsock(s) => vec![s.queue_rx.clone(), s.queue_tx.clone()],
+            #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
             DeviceSnapshot::Fs(s) => s.queues.clone(),
+            #[cfg(not(feature = "tee"))]
             DeviceSnapshot::Rng(s) => vec![s.queue.clone()],
             #[cfg(feature = "blk")]
             DeviceSnapshot::Block(s) => vec![s.queue.clone()],
@@ -110,9 +120,11 @@ pub fn snapshot_device(dev: &dyn VirtioDevice) -> Option<DeviceSnapshot> {
     if let Some(d) = any.downcast_ref::<Vsock>() {
         return Some(DeviceSnapshot::Vsock(d.save_state()));
     }
+    #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
     if let Some(d) = any.downcast_ref::<Fs>() {
         return Some(DeviceSnapshot::Fs(d.save_state()));
     }
+    #[cfg(not(feature = "tee"))]
     if let Some(d) = any.downcast_ref::<Rng>() {
         return Some(DeviceSnapshot::Rng(d.save_state()));
     }
@@ -140,10 +152,12 @@ pub fn restore_device(dev: &mut dyn VirtioDevice, snap: &DeviceSnapshot) -> Resu
             .downcast_mut::<Vsock>()
             .ok_or_else(|| "snapshot/device mismatch: expected Vsock".to_string())?
             .restore_state(s),
+        #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
         DeviceSnapshot::Fs(s) => any
             .downcast_mut::<Fs>()
             .ok_or_else(|| "snapshot/device mismatch: expected Fs".to_string())?
             .restore_state(s),
+        #[cfg(not(feature = "tee"))]
         DeviceSnapshot::Rng(s) => any
             .downcast_mut::<Rng>()
             .ok_or_else(|| "snapshot/device mismatch: expected Rng".to_string())?
@@ -212,6 +226,9 @@ mod tests {
 
         let bytes = state.to_bytes().expect("serialize");
         let restored = VmDevicesState::from_bytes(&bytes).expect("deserialize");
-        assert_eq!(state, restored, "device state must round-trip through bytes");
+        assert_eq!(
+            state, restored,
+            "device state must round-trip through bytes"
+        );
     }
 }

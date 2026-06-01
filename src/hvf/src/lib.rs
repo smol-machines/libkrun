@@ -301,7 +301,8 @@ const GIC_REDIST_REGS: &[u32] = &[
 struct GicRegBindings {
     get_dist: libloading::Symbol<'static, unsafe extern "C" fn(u16, *mut u64) -> hv_return_t>,
     set_dist: libloading::Symbol<'static, unsafe extern "C" fn(u16, u64) -> hv_return_t>,
-    get_redist: libloading::Symbol<'static, unsafe extern "C" fn(u64, u32, *mut u64) -> hv_return_t>,
+    get_redist:
+        libloading::Symbol<'static, unsafe extern "C" fn(u64, u32, *mut u64) -> hv_return_t>,
     set_redist: libloading::Symbol<'static, unsafe extern "C" fn(u64, u32, u64) -> hv_return_t>,
     get_icc: libloading::Symbol<'static, unsafe extern "C" fn(u64, u16, *mut u64) -> hv_return_t>,
     set_icc: libloading::Symbol<'static, unsafe extern "C" fn(u64, u16, u64) -> hv_return_t>,
@@ -310,10 +311,18 @@ struct GicRegBindings {
 #[cfg(target_arch = "aarch64")]
 static GIC_REGS: LazyLock<GicRegBindings> = LazyLock::new(|| unsafe {
     GicRegBindings {
-        get_dist: HVF.get(b"hv_gic_get_distributor_reg").expect("hv_gic_get_distributor_reg"),
-        set_dist: HVF.get(b"hv_gic_set_distributor_reg").expect("hv_gic_set_distributor_reg"),
-        get_redist: HVF.get(b"hv_gic_get_redistributor_reg").expect("hv_gic_get_redistributor_reg"),
-        set_redist: HVF.get(b"hv_gic_set_redistributor_reg").expect("hv_gic_set_redistributor_reg"),
+        get_dist: HVF
+            .get(b"hv_gic_get_distributor_reg")
+            .expect("hv_gic_get_distributor_reg"),
+        set_dist: HVF
+            .get(b"hv_gic_set_distributor_reg")
+            .expect("hv_gic_set_distributor_reg"),
+        get_redist: HVF
+            .get(b"hv_gic_get_redistributor_reg")
+            .expect("hv_gic_get_redistributor_reg"),
+        set_redist: HVF
+            .get(b"hv_gic_set_redistributor_reg")
+            .expect("hv_gic_set_redistributor_reg"),
         get_icc: HVF.get(b"hv_gic_get_icc_reg").expect("hv_gic_get_icc_reg"),
         set_icc: HVF.get(b"hv_gic_set_icc_reg").expect("hv_gic_set_icc_reg"),
     }
@@ -400,16 +409,17 @@ impl HvfVcpuState {
             let val = u64_at(bytes, &mut pos)?;
             sys.push((reg, val));
         }
-        let read_u32_pairs = |bytes: &[u8], pos: &mut usize| -> std::result::Result<Vec<(u32, u64)>, String> {
-            let n = u32::from_le_bytes(take(bytes, pos, 4)?.try_into().unwrap()) as usize;
-            let mut v = Vec::with_capacity(n);
-            for _ in 0..n {
-                let reg = u32::from_le_bytes(take(bytes, pos, 4)?.try_into().unwrap());
-                let val = u64::from_le_bytes(take(bytes, pos, 8)?.try_into().unwrap());
-                v.push((reg, val));
-            }
-            Ok(v)
-        };
+        let read_u32_pairs =
+            |bytes: &[u8], pos: &mut usize| -> std::result::Result<Vec<(u32, u64)>, String> {
+                let n = u32::from_le_bytes(take(bytes, pos, 4)?.try_into().unwrap()) as usize;
+                let mut v = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let reg = u32::from_le_bytes(take(bytes, pos, 4)?.try_into().unwrap());
+                    let val = u64::from_le_bytes(take(bytes, pos, 8)?.try_into().unwrap());
+                    v.push((reg, val));
+                }
+                Ok(v)
+            };
         let gic_redist = read_u32_pairs(bytes, &mut pos)?;
         let gic_icc = read_u32_pairs(bytes, &mut pos)?;
         Ok(HvfVcpuState {
@@ -501,8 +511,13 @@ pub fn vcpu_save_state(vcpuid: u64) -> Result<HvfVcpuState, Error> {
     let mut simd = [0u128; 32];
     for (i, slot) in simd.iter_mut().enumerate() {
         let mut v: hv_simd_fp_uchar16_t = 0;
-        let ret =
-            unsafe { hv_vcpu_get_simd_fp_reg(vcpuid, hv_simd_fp_reg_t_HV_SIMD_FP_REG_Q0 + i as u32, &mut v) };
+        let ret = unsafe {
+            hv_vcpu_get_simd_fp_reg(
+                vcpuid,
+                hv_simd_fp_reg_t_HV_SIMD_FP_REG_Q0 + i as u32,
+                &mut v,
+            )
+        };
         if ret != HV_SUCCESS {
             return Err(Error::VcpuReadRegister);
         }
@@ -580,8 +595,9 @@ pub fn vcpu_restore_state(vcpuid: u64, state: &HvfVcpuState) -> Result<(), Error
     write_reg(hv_reg_t_HV_REG_FPCR, state.fpcr)?;
     write_reg(hv_reg_t_HV_REG_FPSR, state.fpsr)?;
     for (i, &v) in state.simd.iter().enumerate() {
-        let ret =
-            unsafe { hv_vcpu_set_simd_fp_reg(vcpuid, hv_simd_fp_reg_t_HV_SIMD_FP_REG_Q0 + i as u32, v) };
+        let ret = unsafe {
+            hv_vcpu_set_simd_fp_reg(vcpuid, hv_simd_fp_reg_t_HV_SIMD_FP_REG_Q0 + i as u32, v)
+        };
         if ret != HV_SUCCESS {
             return Err(Error::VcpuSetRegister);
         }

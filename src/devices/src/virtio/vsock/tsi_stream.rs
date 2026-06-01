@@ -631,7 +631,10 @@ impl Proxy for TsiStreamProxy {
         // while the guest was idle), send RST immediately so the guest gets a clean
         // error instead of writing into the void and timing out.
         if self.status == ProxyStatus::Closed || self.status == ProxyStatus::PeerClosed {
-            debug!("sendmsg: proxy closed/peer-closed, sending RST: id={}", self.id);
+            debug!(
+                "sendmsg: proxy closed/peer-closed, sending RST: id={}",
+                self.id
+            );
             self.push_reset();
             return ProxyUpdate {
                 signal_queue: true,
@@ -917,10 +920,7 @@ impl Proxy for TsiStreamProxy {
                 }
 
                 if self.status == ProxyStatus::PeerClosed {
-                    debug!(
-                        "process_event: peer closed, sending reset: id={}",
-                        self.id
-                    );
+                    debug!("process_event: peer closed, sending reset: id={}", self.id);
                     // Send RST instead of SHUTDOWN — see HANG_UP handler comment.
                     self.push_reset();
                     self.status = ProxyStatus::Closed;
