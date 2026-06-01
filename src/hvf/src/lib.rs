@@ -507,7 +507,7 @@ pub fn vcpu_save_state(vcpuid: u64) -> Result<HvfVcpuState, Error> {
     let mut gic_icc = Vec::with_capacity(GIC_ICC_REGS.len());
     for &reg in GIC_ICC_REGS {
         let mut v = 0u64;
-        let ret = unsafe { hv_gic_get_icc_reg(vcpuid, reg, &mut v) };
+        let ret = unsafe { hv_gic_get_icc_reg(vcpuid, reg as u16, &mut v) };
         if ret != HV_SUCCESS {
             return Err(Error::VcpuReadSystemRegister);
         }
@@ -569,7 +569,7 @@ pub fn vcpu_restore_state(vcpuid: u64, state: &HvfVcpuState) -> Result<(), Error
         }
     }
     for &(reg, val) in &state.gic_icc {
-        let ret = unsafe { hv_gic_set_icc_reg(vcpuid, reg, val) };
+        let ret = unsafe { hv_gic_set_icc_reg(vcpuid, reg as u16, val) };
         if ret != HV_SUCCESS {
             return Err(Error::VcpuSetSystemRegister(0, val));
         }
@@ -586,7 +586,7 @@ pub fn gic_save_distributor() -> Result<Vec<(u32, u64)>, Error> {
     let mut regs = Vec::new();
     for reg in gic_distributor_regs() {
         let mut v = 0u64;
-        let ret = unsafe { hv_gic_get_distributor_reg(reg, &mut v) };
+        let ret = unsafe { hv_gic_get_distributor_reg(reg as u16, &mut v) };
         if ret != HV_SUCCESS {
             return Err(Error::VcpuReadSystemRegister);
         }
@@ -601,7 +601,7 @@ pub fn gic_save_distributor() -> Result<Vec<(u32, u64)>, Error> {
 #[cfg(target_arch = "aarch64")]
 pub fn gic_restore_distributor(regs: &[(u32, u64)]) -> Result<(), Error> {
     for &(reg, val) in regs.iter().filter(|(r, _)| *r != 0) {
-        let ret = unsafe { hv_gic_set_distributor_reg(reg, val) };
+        let ret = unsafe { hv_gic_set_distributor_reg(reg as u16, val) };
         if ret != HV_SUCCESS {
             return Err(Error::VcpuSetSystemRegister(0, val));
         }
