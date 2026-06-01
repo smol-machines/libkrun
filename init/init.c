@@ -955,8 +955,6 @@ cleanup_fd:
     return ret;
 }
 
-#ifdef __TIMESYNC__
-
 #define TSYNC_PORT 123
 #define BUFSIZE 8
 #define NANOS_IN_SECOND 1000000000
@@ -1007,14 +1005,14 @@ void clock_worker()
         gtime_ns = gtime.tv_sec * NANOS_IN_SECOND;
         gtime_ns += gtime.tv_nsec;
 
-        if (llabs(htime_ns - gtime_ns) > DELTA_SYNC) {
+        uint64_t delta_ns = htime_ns > gtime_ns ? htime_ns - gtime_ns : gtime_ns - htime_ns;
+        if (delta_ns > DELTA_SYNC) {
             htime.tv_sec = htime_ns / NANOS_IN_SECOND;
             htime.tv_nsec = htime_ns % NANOS_IN_SECOND;
             clock_settime(CLOCK_REALTIME, &htime);
         }
     }
 }
-#endif
 
 int reopen_fd(int fd, char *path, int flags)
 {
@@ -1464,12 +1462,10 @@ int main(int argc, char **argv)
         init_pid1 = true;
     }
 
-#ifdef __TIMESYNC__
     if (fork() == 0) {
         clock_worker();
         _exit(1);
     }
-#endif
 
     if (init_pid1) {
         goto exec_init;
