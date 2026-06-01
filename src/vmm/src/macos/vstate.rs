@@ -124,12 +124,25 @@ impl Vm {
     /// symmetry with the KVM `Vm::save_state`.
     #[cfg(target_arch = "aarch64")]
     pub fn save_state(&self) -> Result<VmState> {
-        Ok(VmState {})
+        // Capture the in-kernel HVF GIC distributor state (SPI group/priority/
+        // config/routing + set-enables). A restored clone is a fresh hv_vm_create
+        // whose vGIC is in reset state, so without this its device IRQs (e.g.
+        // vsock) are masked and never wake the guest from WFI. Best-effort: if
+        // there is no in-kernel GIC (emulated fallback), leave it empty — the
+        // in-place pause/resume checkpoint path does not need it.
+        let gic_distributor = hvf::gic_save_distributor().unwrap_or_default();
+        Ok(VmState { gic_distributor })
     }
 
-    /// Restore VM-level state (no-op on HVF; see [`Self::save_state`]).
+    /// Restore VM-level state: replay the GIC distributor registers onto the
+    /// clone's fresh vGIC (GICD_CTLR enabled last). No-op if empty.
     #[cfg(target_arch = "aarch64")]
-    pub fn restore_state(&self, _state: &VmState) -> Result<()> {
+    pub fn restore_state(&self, state: &VmState) -> Result<()> {
+        if !state.gic_distributor.is_empty() {
+            if let Err(e) = hvf::gic_restore_distributor(&state.gic_distributor) {
+                error!("failed to restore GIC distributor state: {e:?}");
+            }
+        }
         Ok(())
     }
 
@@ -688,21 +701,51 @@ pub type VcpuState = hvf::HvfVcpuState;
 /// VM-level state for a checkpoint. Empty on HVF (no in-kernel PIC/PIT/clock to
 /// serialize); see [`Vm::save_state`].
 #[cfg(target_arch = "aarch64")]
-#[derive(Clone, Debug)]
-pub struct VmState {}
+#[derive(Clone, Debug, Default)]
+pub struct VmState {
+    /// In-kernel HVF GIC distributor registers as (reg-offset, value) pairs
+    /// (see [`Vm::save_state`]). Empty when there is no in-kernel GIC.
+    pub gic_distributor: Vec<(u32, u64)>,
+}
 
 #[cfg(target_arch = "aarch64")]
 impl VmState {
-    /// Serialize to a byte blob. Empty on HVF — there is no in-kernel VM-level
-    /// state to capture (mirrors the KVM `VmState::serialize` signature so the
+    /// Serialize the VM-level state (the HVF GIC distributor registers) to a
+    /// byte blob (mirrors the KVM `VmState::serialize` signature so the
     /// cross-platform [`crate::VmCheckpoint`] can call it uniformly).
     pub fn serialize(&self) -> Vec<u8> {
-        Vec::new()
+        let mut out = Vec::with_capacity(4 + self.gic_distributor.len() * 12);
+        out.extend_from_slice(&(self.gic_distributor.len() as u32).to_le_bytes());
+        for &(reg, val) in &self.gic_distributor {
+            out.extend_from_slice(&reg.to_le_bytes());
+            out.extend_from_slice(&val.to_le_bytes());
+        }
+        out
     }
 
-    /// Reconstruct from a blob produced by [`Self::serialize`] (always empty).
-    pub fn deserialize(_bytes: &[u8]) -> std::result::Result<VmState, String> {
-        Ok(VmState {})
+    /// Reconstruct from a blob produced by [`Self::serialize`].
+    pub fn deserialize(bytes: &[u8]) -> std::result::Result<VmState, String> {
+        if bytes.is_empty() {
+            return Ok(VmState::default());
+        }
+        let err = || "macOS VmState blob truncated".to_string();
+        let mut pos = 0usize;
+        let take = |b: &[u8], pos: &mut usize, n: usize| -> std::result::Result<Vec<u8>, String> {
+            if *pos + n > b.len() {
+                return Err("macOS VmState blob truncated".to_string());
+            }
+            let s = b[*pos..*pos + n].to_vec();
+            *pos += n;
+            Ok(s)
+        };
+        let n = u32::from_le_bytes(take(bytes, &mut pos, 4)?.try_into().map_err(|_| err())?) as usize;
+        let mut gic_distributor = Vec::with_capacity(n);
+        for _ in 0..n {
+            let reg = u32::from_le_bytes(take(bytes, &mut pos, 4)?.try_into().map_err(|_| err())?);
+            let val = u64::from_le_bytes(take(bytes, &mut pos, 8)?.try_into().map_err(|_| err())?);
+            gic_distributor.push((reg, val));
+        }
+        Ok(VmState { gic_distributor })
     }
 }
 

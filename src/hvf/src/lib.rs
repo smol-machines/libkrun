@@ -273,7 +273,40 @@ pub struct HvfVcpuState {
     pub simd: [u128; 32],
     /// Writable EL1 system registers as (hv_sys_reg_t, value) pairs.
     pub sys: Vec<(u16, u64)>,
+    /// This vCPU's GIC redistributor registers (SGI/PPI group/enable/priority/
+    /// config) as (hv_gic_redistributor_reg_t, value) pairs.
+    pub gic_redist: Vec<(u32, u64)>,
+    /// This vCPU's GIC CPU-interface (ICC) registers (PMR/BPR/CTLR/SRE/IGRPEN…)
+    /// as (hv_gic_icc_reg_t, value) pairs. Without these the restored vCPU's
+    /// interrupt interface is in reset state and the guest is never woken from
+    /// WFI by a device IRQ.
+    pub gic_icc: Vec<(u32, u64)>,
 }
+
+/// GIC redistributor registers captured per-vCPU (offsets == `hv_gic_redistributor_reg_t`).
+/// Config (group/priority/cfg) is restored before the set-enable register.
+#[cfg(target_arch = "aarch64")]
+const GIC_REDIST_REGS: &[u32] = &[
+    65664, // GICR_IGROUPR0
+    66560, 66564, 66568, 66572, 66576, 66580, 66584, 66588, // GICR_IPRIORITYR0..7
+    68608, 68612, // GICR_ICFGR0..1
+    65792, // GICR_ISENABLER0  (enable LAST)
+];
+
+/// GIC CPU-interface (ICC) registers captured per-vCPU (values == `hv_gic_icc_reg_t`).
+/// SRE first (enables sysreg access), group-enables last.
+#[cfg(target_arch = "aarch64")]
+const GIC_ICC_REGS: &[u32] = &[
+    50789, // ICC_SRE_EL1   (first)
+    49712, // ICC_PMR_EL1
+    50755, // ICC_BPR0_EL1
+    50787, // ICC_BPR1_EL1
+    50756, // ICC_AP0R0_EL1
+    50760, // ICC_AP1R0_EL1
+    50788, // ICC_CTLR_EL1
+    50790, // ICC_IGRPEN0_EL1 (enable LAST)
+    50791, // ICC_IGRPEN1_EL1 (enable LAST)
+];
 
 impl HvfVcpuState {
     /// Serialize to a self-describing little-endian byte blob for cross-process
@@ -292,6 +325,16 @@ impl HvfVcpuState {
         }
         out.extend_from_slice(&(self.sys.len() as u32).to_le_bytes());
         for &(reg, val) in &self.sys {
+            out.extend_from_slice(&reg.to_le_bytes());
+            out.extend_from_slice(&val.to_le_bytes());
+        }
+        out.extend_from_slice(&(self.gic_redist.len() as u32).to_le_bytes());
+        for &(reg, val) in &self.gic_redist {
+            out.extend_from_slice(&reg.to_le_bytes());
+            out.extend_from_slice(&val.to_le_bytes());
+        }
+        out.extend_from_slice(&(self.gic_icc.len() as u32).to_le_bytes());
+        for &(reg, val) in &self.gic_icc {
             out.extend_from_slice(&reg.to_le_bytes());
             out.extend_from_slice(&val.to_le_bytes());
         }
@@ -331,6 +374,18 @@ impl HvfVcpuState {
             let val = u64_at(bytes, &mut pos)?;
             sys.push((reg, val));
         }
+        let read_u32_pairs = |bytes: &[u8], pos: &mut usize| -> std::result::Result<Vec<(u32, u64)>, String> {
+            let n = u32::from_le_bytes(take(bytes, pos, 4)?.try_into().unwrap()) as usize;
+            let mut v = Vec::with_capacity(n);
+            for _ in 0..n {
+                let reg = u32::from_le_bytes(take(bytes, pos, 4)?.try_into().unwrap());
+                let val = u64::from_le_bytes(take(bytes, pos, 8)?.try_into().unwrap());
+                v.push((reg, val));
+            }
+            Ok(v)
+        };
+        let gic_redist = read_u32_pairs(bytes, &mut pos)?;
+        let gic_icc = read_u32_pairs(bytes, &mut pos)?;
         Ok(HvfVcpuState {
             gp,
             pc,
@@ -339,6 +394,8 @@ impl HvfVcpuState {
             fpsr,
             simd,
             sys,
+            gic_redist,
+            gic_icc,
         })
     }
 }
@@ -436,6 +493,27 @@ pub fn vcpu_save_state(vcpuid: u64) -> Result<HvfVcpuState, Error> {
         sys.push((reg, v));
     }
 
+    // Per-vCPU GIC state: redistributor (SGI/PPI) + CPU interface (ICC). Must be
+    // read on the owning vCPU thread (this fn runs there via the SaveState event).
+    let mut gic_redist = Vec::with_capacity(GIC_REDIST_REGS.len());
+    for &reg in GIC_REDIST_REGS {
+        let mut v = 0u64;
+        let ret = unsafe { hv_gic_get_redistributor_reg(vcpuid, reg, &mut v) };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuReadSystemRegister);
+        }
+        gic_redist.push((reg, v));
+    }
+    let mut gic_icc = Vec::with_capacity(GIC_ICC_REGS.len());
+    for &reg in GIC_ICC_REGS {
+        let mut v = 0u64;
+        let ret = unsafe { hv_gic_get_icc_reg(vcpuid, reg, &mut v) };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuReadSystemRegister);
+        }
+        gic_icc.push((reg, v));
+    }
+
     Ok(HvfVcpuState {
         gp,
         pc,
@@ -444,6 +522,8 @@ pub fn vcpu_save_state(vcpuid: u64) -> Result<HvfVcpuState, Error> {
         fpsr,
         simd,
         sys,
+        gic_redist,
+        gic_icc,
     })
 }
 
@@ -480,7 +560,74 @@ pub fn vcpu_restore_state(vcpuid: u64, state: &HvfVcpuState) -> Result<(), Error
             return Err(Error::VcpuSetRegister);
         }
     }
+    // Per-vCPU GIC state. The captured order is config-before-enable (redist
+    // ISENABLER0 last; ICC SRE first, IGRPEN last), so replay in order.
+    for &(reg, val) in &state.gic_redist {
+        let ret = unsafe { hv_gic_set_redistributor_reg(vcpuid, reg, val) };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuSetSystemRegister(0, val));
+        }
+    }
+    for &(reg, val) in &state.gic_icc {
+        let ret = unsafe { hv_gic_set_icc_reg(vcpuid, reg, val) };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuSetSystemRegister(0, val));
+        }
+    }
     Ok(())
+}
+
+/// Capture the global GIC distributor state (interrupt group/priority/config,
+/// SPI routing, and set-enables) for fork. Returns (reg-offset, value) pairs;
+/// `gic_restore_distributor` replays them with `GICD_CTLR` written last. The
+/// distributor is global (not per-vCPU), so this may run on any thread.
+#[cfg(target_arch = "aarch64")]
+pub fn gic_save_distributor() -> Result<Vec<(u32, u64)>, Error> {
+    let mut regs = Vec::new();
+    for reg in gic_distributor_regs() {
+        let mut v = 0u64;
+        let ret = unsafe { hv_gic_get_distributor_reg(reg, &mut v) };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuReadSystemRegister);
+        }
+        regs.push((reg, v));
+    }
+    Ok(regs)
+}
+
+/// Restore distributor state captured by [`gic_save_distributor`]. Writes all
+/// config/routing/enable registers first, then `GICD_CTLR` (offset 0) last so
+/// the distributor is only enabled once its configuration is in place.
+#[cfg(target_arch = "aarch64")]
+pub fn gic_restore_distributor(regs: &[(u32, u64)]) -> Result<(), Error> {
+    for &(reg, val) in regs.iter().filter(|(r, _)| *r != 0) {
+        let ret = unsafe { hv_gic_set_distributor_reg(reg, val) };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuSetSystemRegister(0, val));
+        }
+    }
+    if let Some(&(_, ctlr)) = regs.iter().find(|(r, _)| *r == 0) {
+        let ret = unsafe { hv_gic_set_distributor_reg(0, ctlr) };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuSetSystemRegister(0, ctlr));
+        }
+    }
+    Ok(())
+}
+
+/// GIC distributor register offsets to snapshot (offset == `hv_gic_distributor_reg_t`):
+/// GICD_CTLR, IGROUPR0..31, IPRIORITYR0..255, ICFGR0..63, IROUTER32..1019 (64-bit
+/// SPI routing), ISENABLER0..31. Read-only (TYPER/PIDR2) and clear/transient
+/// registers (IC*, IS/ICPENDR, IS/ICACTIVER) are intentionally excluded.
+#[cfg(target_arch = "aarch64")]
+fn gic_distributor_regs() -> Vec<u32> {
+    let mut regs = vec![0u32]; // GICD_CTLR
+    regs.extend((0..32).map(|i| 0x80 + i * 4)); // IGROUPR0..31
+    regs.extend((0..256).map(|i| 0x400 + i * 4)); // IPRIORITYR0..255
+    regs.extend((0..64).map(|i| 0xC00 + i * 4)); // ICFGR0..63
+    regs.extend((32..1020).map(|i| 0x6000 + i * 8)); // IROUTER32..1019 (64-bit)
+    regs.extend((0..32).map(|i| 0x100 + i * 4)); // ISENABLER0..31
+    regs
 }
 
 /// Checks if Nested Virtualization is supported on the current system. Only
