@@ -371,6 +371,21 @@ const SNAPSHOT_SYS_REGS: &[u16] = &[
     hv_sys_reg_t_HV_SYS_REG_CSSELR_EL1,
     hv_sys_reg_t_HV_SYS_REG_ACTLR_EL1,
     hv_sys_reg_t_HV_SYS_REG_MDSCR_EL1,
+    // Pointer-authentication keys (per-boot/per-task secrets). The guest signs
+    // return addresses with these and authenticates them with AUTIASP/AUTIBSP;
+    // if a restored clone has different keys, the first authentication faults
+    // (FPAC) and the kernel panics ("Attempted to kill the idle task"). They
+    // must be captured + restored so signed pointers remain valid.
+    hv_sys_reg_t_HV_SYS_REG_APIAKEYLO_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APIAKEYHI_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APIBKEYLO_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APIBKEYHI_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APDAKEYLO_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APDAKEYHI_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APDBKEYLO_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APDBKEYHI_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APGAKEYLO_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APGAKEYHI_EL1,
 ];
 
 /// Capture the full register state of a (paused) HVF vCPU by its id. The macOS
