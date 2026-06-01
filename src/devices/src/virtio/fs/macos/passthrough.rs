@@ -600,6 +600,48 @@ impl PassthroughFs {
         })
     }
 
+    /// Establish the root inode (nodeid `ROOT_ID`) in the inode map. Normally
+    /// done as part of `init` (the guest's FUSE_INIT), but also called directly
+    /// by [`Self::restore`] because a restored, already-booted clone never
+    /// re-sends FUSE_INIT. Idempotent: a later call replaces the entry.
+    fn setup_root_inode(&self) -> io::Result<()> {
+        let root = CString::new(self.cfg.root_dir.as_str()).expect("CString::new failed");
+
+        // Safe because this doesn't modify any memory and we check the return value.
+        // Note: O_NOFOLLOW is intentionally omitted — the root dir may be a symlink
+        // (e.g. a dev symlink to a cached rootfs). O_NOFOLLOW on the final path
+        // component returns ELOOP, which causes the FUSE session init to fail, which
+        // causes the guest to be unable to mount its rootfs.
+        let fd = unsafe { libc::openat(libc::AT_FDCWD, root.as_ptr(), libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        // Safe because we just opened this fd above.
+        let f = unsafe { File::from_raw_fd(fd) };
+
+        let st = fstat(f.as_raw_fd(), true)?;
+
+        let mut inodes = self.inodes.write().unwrap();
+
+        // Not sure why the root inode gets a refcount of 2 but that's what libfuse does.
+        inodes.insert(
+            fuse::ROOT_ID,
+            InodeAltKey {
+                ino: st.st_ino,
+                dev: st.st_dev,
+            },
+            Arc::new(InodeData {
+                inode: fuse::ROOT_ID,
+                ino: st.st_ino,
+                dev: st.st_dev,
+                refcount: AtomicU64::new(2),
+                unlinked_fd: AtomicI64::new(-1),
+            }),
+        );
+        Ok(())
+    }
+
     /// Capture the FUSE server's logical state for cross-process fork (the macOS
     /// analogue of the Linux `snapshot`). This passthrough addresses every inode
     /// by its host `(dev, ino)` via volfs (`/.vol/{dev}/{ino}`) rather than by a
@@ -1242,48 +1284,6 @@ fn forget_one(
 impl FileSystem for PassthroughFs {
     type Inode = Inode;
     type Handle = Handle;
-
-    /// Establish the root inode (nodeid `ROOT_ID`) in the inode map. Normally
-    /// done as part of `init` (the guest's FUSE_INIT), but also called directly
-    /// by [`Self::restore`] because a restored, already-booted clone never
-    /// re-sends FUSE_INIT. Idempotent: a later call replaces the entry.
-    fn setup_root_inode(&self) -> io::Result<()> {
-        let root = CString::new(self.cfg.root_dir.as_str()).expect("CString::new failed");
-
-        // Safe because this doesn't modify any memory and we check the return value.
-        // Note: O_NOFOLLOW is intentionally omitted — the root dir may be a symlink
-        // (e.g. a dev symlink to a cached rootfs). O_NOFOLLOW on the final path
-        // component returns ELOOP, which causes the FUSE session init to fail, which
-        // causes the guest to be unable to mount its rootfs.
-        let fd = unsafe { libc::openat(libc::AT_FDCWD, root.as_ptr(), libc::O_CLOEXEC) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        // Safe because we just opened this fd above.
-        let f = unsafe { File::from_raw_fd(fd) };
-
-        let st = fstat(f.as_raw_fd(), true)?;
-
-        let mut inodes = self.inodes.write().unwrap();
-
-        // Not sure why the root inode gets a refcount of 2 but that's what libfuse does.
-        inodes.insert(
-            fuse::ROOT_ID,
-            InodeAltKey {
-                ino: st.st_ino,
-                dev: st.st_dev,
-            },
-            Arc::new(InodeData {
-                inode: fuse::ROOT_ID,
-                ino: st.st_ino,
-                dev: st.st_dev,
-                refcount: AtomicU64::new(2),
-                unlinked_fd: AtomicI64::new(-1),
-            }),
-        );
-        Ok(())
-    }
 
     fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
         // Safe because this doesn't modify any memory and there is no need to check the return
