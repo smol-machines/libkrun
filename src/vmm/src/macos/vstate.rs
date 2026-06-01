@@ -130,7 +130,19 @@ impl Vm {
         // vsock) are masked and never wake the guest from WFI. Best-effort: if
         // there is no in-kernel GIC (emulated fallback), leave it empty — the
         // in-place pause/resume checkpoint path does not need it.
-        let gic_distributor = hvf::gic_save_distributor().unwrap_or_default();
+        let gic_distributor = match hvf::gic_save_distributor() {
+            Ok(regs) => {
+                debug!("captured {} GIC distributor registers", regs.len());
+                regs
+            }
+            Err(e) => {
+                // Not fatal for in-place pause/resume (no in-kernel GIC to
+                // transfer), but a fork clone will not receive device IRQs
+                // without it — surface it rather than failing silently.
+                warn!("GIC distributor capture failed ({e:?}); a fork clone may not wake on device IRQs");
+                Vec::new()
+            }
+        };
         Ok(VmState { gic_distributor })
     }
 
