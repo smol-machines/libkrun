@@ -73,6 +73,11 @@ pub trait Proxy: Send + AsRawFd {
     fn id(&self) -> u64;
     #[allow(dead_code)]
     fn status(&self) -> ProxyStatus;
+    /// Whether this proxy is a UDP/datagram proxy. The muxer uses this to gate
+    /// DNS interception to datagram sockets only.
+    fn is_dgram(&self) -> bool {
+        false
+    }
     fn connect(&mut self, pkt: &VsockPacket, req: TsiConnectReq) -> ProxyUpdate;
     fn confirm_connect(&mut self, _pkt: &VsockPacket) -> Option<ProxyUpdate> {
         None

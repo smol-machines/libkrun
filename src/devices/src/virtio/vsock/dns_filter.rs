@@ -1,0 +1,748 @@
+//! Egress DNS filtering for TSI networking.
+//!
+//! When an egress policy carries an allow-host list plus one or more trusted
+//! upstream resolvers, guest UDP DNS queries (destination port 53) are
+//! intercepted here instead of reaching the host network directly:
+//!
+//!   * The query name is checked against the allow-host list. A denied name
+//!     gets an NXDOMAIN answer and never touches an upstream.
+//!   * An allowed name is forwarded to a HOST-TRUSTED resolver — never the
+//!     resolver IP the guest chose. This is the crux of the security model: a
+//!     malicious guest cannot point DNS at its own server to map an allowed
+//!     hostname onto an arbitrary IP, because libkrun ignores the guest's
+//!     chosen destination and only ever queries the configured resolvers.
+//!   * A/AAAA answers from an allowed response are "learned" as temporary
+//!     egress entries (TTL-clamped), so the subsequent connect to that IP
+//!     passes the egress check.
+//!
+//! The blocking upstream resolution runs on a dedicated worker thread
+//! ([`DnsWorker`], modelled on the vsock reaper) so it never stalls the muxer
+//! thread that services all host<->guest vsock traffic.
+
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+use std::sync::{Arc, Mutex, RwLock};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use crossbeam_channel::Receiver;
+use nix::sys::socket::SockaddrStorage;
+use vm_memory::GuestMemoryMmap;
+
+use super::super::Queue as VirtQueue;
+use super::muxer::{push_packet, MuxerRx};
+use super::muxer_rxq::MuxerRxQ;
+use crate::virtio::InterruptTransport;
+
+pub(super) const DNS_PORT: u16 = 53;
+const DNS_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_DNS_PACKET_SIZE: usize = 65_535;
+// Learned IPs live at least this long (smooths sub-second TTLs) and at most
+// this long (bounds how long a single answer keeps an IP reachable before the
+// guest must resolve again).
+const MIN_LEARNED_TTL: u64 = 60;
+const MAX_LEARNED_TTL: u64 = 3600;
+
+const DNS_HEADER_LEN: usize = 12;
+const DNS_ID_LEN: usize = 2;
+const DNS_U16_LEN: usize = 2;
+const DNS_U32_LEN: usize = 4;
+const DNS_FLAGS_OFFSET: usize = 2;
+const DNS_QDCOUNT_OFFSET: usize = 4;
+const DNS_ANCOUNT_OFFSET: usize = 6;
+const DNS_QUESTION_FIXED_LEN: usize = 4;
+const DNS_RR_FIXED_LEN: usize = 10;
+const DNS_RR_TYPE_OFFSET: usize = 0;
+const DNS_RR_CLASS_OFFSET: usize = 2;
+const DNS_RR_TTL_OFFSET: usize = 4;
+const DNS_RR_RDLEN_OFFSET: usize = 8;
+const DNS_CLASS_IN: u16 = 1;
+const DNS_TYPE_A: u16 = 1;
+const DNS_TYPE_AAAA: u16 = 28;
+const DNS_A_RDATA_LEN: usize = 4;
+const DNS_AAAA_RDATA_LEN: usize = 16;
+const DNS_RCODE_SERVFAIL: u16 = 2;
+const DNS_RCODE_NXDOMAIN: u16 = 3;
+const DNS_RCODE_MASK: u16 = 0x000f;
+const DNS_COUNT_ZERO: u16 = 0;
+const DNS_ONE_QUESTION: u16 = 1;
+const DNS_FLAG_RESPONSE: u16 = 0x8000;
+const DNS_FLAG_RECURSION_DESIRED: u16 = 0x0100;
+const DNS_FLAG_RECURSION_AVAILABLE: u16 = 0x0080;
+const DNS_POINTER_TAG: u8 = 0xc0;
+const DNS_POINTER_MASK: u8 = 0xc0;
+const DNS_POINTER_OFFSET_MASK: u8 = 0x3f;
+const DNS_MAX_COMPRESSION_JUMPS: usize = 16;
+const DNS_MAX_LABEL_LEN: usize = 63;
+
+/// Shared egress policy: static CIDR allow-list, DNS allow-host list, the
+/// host-trusted resolvers, and the IPs learned from allowed DNS answers.
+#[derive(Debug)]
+pub(super) struct EgressPolicy {
+    /// Static allowed CIDRs. Empty means "no CIDR is statically allowed"
+    /// (egress is then gated entirely by learned IPs).
+    allowed_cidrs: Vec<(IpAddr, u8)>,
+    /// Allow-host list (normalized). `None` = no DNS filtering.
+    allowed_hosts: Option<Vec<String>>,
+    /// Host-trusted upstream resolvers. DNS queries are forwarded ONLY here.
+    resolvers: Vec<IpAddr>,
+    /// IPs learned from allowed DNS answers → expiry instant.
+    allowed_ips: HashMap<IpAddr, Instant>,
+}
+
+#[derive(Debug)]
+struct DnsQuestion {
+    name: String,
+    end: usize,
+}
+
+impl EgressPolicy {
+    /// Build a policy. Returns `None` when there is nothing to enforce (no
+    /// CIDRs and no hosts) — callers treat `None` as "allow all", preserving
+    /// the pre-existing no-policy behavior.
+    pub(super) fn new(
+        allowed_cidrs: Option<Vec<(IpAddr, u8)>>,
+        egress_hosts: Option<Vec<String>>,
+        resolvers: Option<Vec<IpAddr>>,
+    ) -> Option<Self> {
+        if allowed_cidrs.is_none() && egress_hosts.is_none() {
+            return None;
+        }
+
+        let allowed_hosts = egress_hosts.map(|hosts| {
+            hosts
+                .into_iter()
+                .filter_map(|host| normalize_hostname(&host))
+                .collect()
+        });
+
+        Some(Self {
+            allowed_cidrs: allowed_cidrs.unwrap_or_default(),
+            allowed_hosts,
+            resolvers: resolvers.unwrap_or_default(),
+            allowed_ips: HashMap::new(),
+        })
+    }
+
+    /// DNS interception is active only when both an allow-host list and at
+    /// least one trusted resolver are configured.
+    pub(super) fn dns_active(&self) -> bool {
+        self.allowed_hosts.is_some() && !self.resolvers.is_empty()
+    }
+
+    pub(super) fn resolvers(&self) -> Vec<IpAddr> {
+        self.resolvers.clone()
+    }
+
+    /// Egress allow check for a connect/sendto destination: a statically
+    /// allowed CIDR, or an unexpired learned IP. Non-IP addresses are allowed
+    /// (matches prior behavior for e.g. unix sockets).
+    pub(super) fn is_addr_allowed(&self, addr: &SockaddrStorage) -> bool {
+        let Some(ip) = sockaddr_ip(addr) else {
+            return true;
+        };
+
+        if ip_matches_cidrs(ip, &self.allowed_cidrs) {
+            return true;
+        }
+
+        self.allowed_ips
+            .get(&ip)
+            .is_some_and(|expires_at| *expires_at > Instant::now())
+    }
+
+    fn is_hostname_allowed(&self, hostname: &str) -> bool {
+        let Some(allowed_hosts) = &self.allowed_hosts else {
+            return true;
+        };
+        let Some(hostname) = normalize_hostname(hostname) else {
+            return false;
+        };
+        allowed_hosts.iter().any(|allowed| {
+            hostname == *allowed
+                || hostname
+                    .strip_suffix(allowed)
+                    .is_some_and(|prefix| prefix.ends_with('.'))
+        })
+    }
+
+    fn learn_ips(&mut self, ips: Vec<(IpAddr, u32)>) {
+        let now = Instant::now();
+        self.prune_allowed_ips(now);
+        for (ip, ttl) in ips {
+            let ttl = u64::from(ttl).clamp(MIN_LEARNED_TTL, MAX_LEARNED_TTL);
+            let expires_at = now + Duration::from_secs(ttl);
+            self.allowed_ips
+                .entry(ip)
+                .and_modify(|existing| *existing = (*existing).max(expires_at))
+                .or_insert(expires_at);
+        }
+    }
+
+    fn prune_allowed_ips(&mut self, now: Instant) {
+        self.allowed_ips.retain(|_, expires_at| *expires_at > now);
+    }
+}
+
+/// Work item handed from the muxer thread to the DNS worker thread. Carries an
+/// owned copy of the query and the vsock addressing needed to deliver the
+/// response — no shared handles, so passing it is cheap and lock-free.
+pub(super) struct DnsRequest {
+    pub query: Vec<u8>,
+    pub peer_port: u32,
+    pub fwd_cnt: u32,
+    pub cid: u64,
+}
+
+/// Dedicated worker that performs the blocking upstream DNS resolution off the
+/// muxer thread and pushes the answer back onto the guest RX queue. Modelled on
+/// [`super::reaper::ReaperThread`].
+pub(super) struct DnsWorker {
+    receiver: Receiver<DnsRequest>,
+    policy: Arc<RwLock<EgressPolicy>>,
+    mem: GuestMemoryMmap,
+    queue: Arc<Mutex<VirtQueue>>,
+    rxq: Arc<Mutex<MuxerRxQ>>,
+    interrupt: InterruptTransport,
+}
+
+impl DnsWorker {
+    pub(super) fn new(
+        receiver: Receiver<DnsRequest>,
+        policy: Arc<RwLock<EgressPolicy>>,
+        mem: GuestMemoryMmap,
+        queue: Arc<Mutex<VirtQueue>>,
+        rxq: Arc<Mutex<MuxerRxQ>>,
+        interrupt: InterruptTransport,
+    ) -> Self {
+        Self {
+            receiver,
+            policy,
+            mem,
+            queue,
+            rxq,
+            interrupt,
+        }
+    }
+
+    pub(super) fn run(self) {
+        thread::Builder::new()
+            .name("vsock dns".into())
+            .spawn(move || self.work())
+            .unwrap();
+    }
+
+    fn work(self) {
+        for req in self.receiver.iter() {
+            let response = handle_dns_query(&self.policy, &req.query);
+            push_packet(
+                req.cid,
+                MuxerRx::DgramDataDnsResponse {
+                    peer_port: req.peer_port,
+                    data: response,
+                    fwd_cnt: req.fwd_cnt,
+                },
+                &self.rxq,
+                &self.queue,
+                &self.mem,
+            );
+            self.interrupt.signal_used_queue();
+        }
+    }
+}
+
+/// Resolve a guest DNS query against the policy, forwarding allowed queries to
+/// the host-trusted resolvers only. Returns the raw DNS response bytes to hand
+/// back to the guest.
+fn handle_dns_query(policy: &Arc<RwLock<EgressPolicy>>, query: &[u8]) -> Vec<u8> {
+    let question = match parse_question(query) {
+        Ok(question) => question,
+        Err(_) => return build_error_response(query, DNS_RCODE_SERVFAIL),
+    };
+
+    // Snapshot the allow decision and the trusted resolvers under a short read
+    // lock; never hold the lock across the blocking upstream I/O below.
+    let (allowed, resolvers) = match policy.read() {
+        Ok(policy) => (
+            policy.is_hostname_allowed(&question.name),
+            policy.resolvers(),
+        ),
+        Err(_) => return build_error_response(query, DNS_RCODE_SERVFAIL),
+    };
+
+    if !allowed {
+        return build_error_response(query, DNS_RCODE_NXDOMAIN);
+    }
+
+    for resolver in resolvers {
+        let target = SocketAddr::new(resolver, DNS_PORT);
+        match forward_dns_udp(query, target) {
+            Ok(response) => {
+                if let Ok(ips) = parse_answer_ips(&response) {
+                    if let Ok(mut policy) = policy.write() {
+                        policy.learn_ips(ips);
+                    }
+                }
+                return response;
+            }
+            Err(err) => debug!("DNS upstream {target} failed: {err}"),
+        }
+    }
+
+    build_error_response(query, DNS_RCODE_SERVFAIL)
+}
+
+pub(super) fn sockaddr_port(addr: &SockaddrStorage) -> Option<u16> {
+    match (addr.as_sockaddr_in(), addr.as_sockaddr_in6()) {
+        (Some(sin), _) => Some(sin.port()),
+        (_, Some(sin6)) => Some(sin6.port()),
+        _ => None,
+    }
+}
+
+fn sockaddr_ip(addr: &SockaddrStorage) -> Option<IpAddr> {
+    match (addr.as_sockaddr_in(), addr.as_sockaddr_in6()) {
+        (Some(sin), _) => Some(IpAddr::V4(sin.ip())),
+        (_, Some(sin6)) => Some(IpAddr::V6(sin6.ip())),
+        _ => None,
+    }
+}
+
+/// CIDR membership test. Public to the vsock module so the muxer can reuse it.
+pub(super) fn ip_matches_cidrs(ip: IpAddr, cidrs: &[(IpAddr, u8)]) -> bool {
+    for (cidr_ip, prefix_len) in cidrs {
+        match (ip, cidr_ip) {
+            (IpAddr::V4(addr_v4), IpAddr::V4(cidr_v4)) => {
+                let mask = match *prefix_len {
+                    0 => 0u32,
+                    p if p >= 32 => u32::MAX,
+                    _ => u32::MAX << (32 - prefix_len),
+                };
+                if u32::from(addr_v4) & mask == u32::from(*cidr_v4) & mask {
+                    return true;
+                }
+            }
+            (IpAddr::V6(addr_v6), IpAddr::V6(cidr_v6)) => {
+                let mask = match *prefix_len {
+                    0 => 0u128,
+                    p if p >= 128 => u128::MAX,
+                    _ => u128::MAX << (128 - prefix_len),
+                };
+                if u128::from(addr_v6) & mask == u128::from(*cidr_v6) & mask {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn normalize_hostname(hostname: &str) -> Option<String> {
+    let hostname = hostname.trim_end_matches('.').to_ascii_lowercase();
+    if hostname.is_empty() {
+        None
+    } else {
+        Some(hostname)
+    }
+}
+
+fn forward_dns_udp(query: &[u8], resolver: SocketAddr) -> std::io::Result<Vec<u8>> {
+    let bind_addr = if resolver.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    let socket = UdpSocket::bind(bind_addr)?;
+    socket.set_read_timeout(Some(DNS_TIMEOUT))?;
+    socket.set_write_timeout(Some(DNS_TIMEOUT))?;
+    socket.connect(resolver)?;
+    socket.send(query)?;
+
+    let mut response = vec![0u8; MAX_DNS_PACKET_SIZE];
+    let len = socket.recv(&mut response)?;
+    response.truncate(len);
+    Ok(response)
+}
+
+fn parse_question(packet: &[u8]) -> Result<DnsQuestion, ()> {
+    if packet.len() < DNS_HEADER_LEN || read_u16(packet, DNS_QDCOUNT_OFFSET)? != DNS_ONE_QUESTION {
+        return Err(());
+    }
+
+    let (name, after_name) = read_name(packet, DNS_HEADER_LEN)?;
+    if after_name + DNS_QUESTION_FIXED_LEN > packet.len() {
+        return Err(());
+    }
+
+    Ok(DnsQuestion {
+        name,
+        end: after_name + DNS_QUESTION_FIXED_LEN,
+    })
+}
+
+fn parse_answer_ips(packet: &[u8]) -> Result<Vec<(IpAddr, u32)>, ()> {
+    if packet.len() < DNS_HEADER_LEN {
+        return Err(());
+    }
+
+    let qdcount = read_u16(packet, DNS_QDCOUNT_OFFSET)? as usize;
+    let ancount = read_u16(packet, DNS_ANCOUNT_OFFSET)? as usize;
+    let mut offset = DNS_HEADER_LEN;
+
+    for _ in 0..qdcount {
+        let (_, after_name) = read_name(packet, offset)?;
+        if after_name + DNS_QUESTION_FIXED_LEN > packet.len() {
+            return Err(());
+        }
+        offset = after_name + DNS_QUESTION_FIXED_LEN;
+    }
+
+    let mut ips = Vec::new();
+    for _ in 0..ancount {
+        let (_, after_name) = read_name(packet, offset)?;
+        if after_name + DNS_RR_FIXED_LEN > packet.len() {
+            return Err(());
+        }
+        offset = after_name;
+
+        let rr_type = read_u16(packet, offset + DNS_RR_TYPE_OFFSET)?;
+        let class = read_u16(packet, offset + DNS_RR_CLASS_OFFSET)?;
+        let ttl = read_u32(packet, offset + DNS_RR_TTL_OFFSET)?;
+        let rdlen = read_u16(packet, offset + DNS_RR_RDLEN_OFFSET)? as usize;
+        offset += DNS_RR_FIXED_LEN;
+
+        if offset + rdlen > packet.len() {
+            return Err(());
+        }
+
+        if class == DNS_CLASS_IN && rr_type == DNS_TYPE_A && rdlen == DNS_A_RDATA_LEN {
+            ips.push((
+                IpAddr::V4(Ipv4Addr::new(
+                    packet[offset],
+                    packet[offset + 1],
+                    packet[offset + 2],
+                    packet[offset + 3],
+                )),
+                ttl,
+            ));
+        } else if class == DNS_CLASS_IN && rr_type == DNS_TYPE_AAAA && rdlen == DNS_AAAA_RDATA_LEN {
+            ips.push((
+                IpAddr::V6(Ipv6Addr::from(
+                    <[u8; DNS_AAAA_RDATA_LEN]>::try_from(
+                        &packet[offset..offset + DNS_AAAA_RDATA_LEN],
+                    )
+                    .map_err(|_| ())?,
+                )),
+                ttl,
+            ));
+        }
+
+        offset += rdlen;
+    }
+
+    Ok(ips)
+}
+
+fn build_error_response(query: &[u8], rcode: u16) -> Vec<u8> {
+    let id = if query.len() >= DNS_ID_LEN {
+        &query[..DNS_ID_LEN]
+    } else {
+        &[0, 0]
+    };
+    let req_flags = if query.len() >= DNS_FLAGS_OFFSET + DNS_U16_LEN {
+        read_u16(query, DNS_FLAGS_OFFSET).unwrap_or(0)
+    } else {
+        0
+    };
+    let flags = DNS_FLAG_RESPONSE
+        | (req_flags & DNS_FLAG_RECURSION_DESIRED)
+        | DNS_FLAG_RECURSION_AVAILABLE
+        | (rcode & DNS_RCODE_MASK);
+
+    let question = parse_question(query).ok();
+    let mut response =
+        Vec::with_capacity(question.as_ref().map(|q| q.end).unwrap_or(DNS_HEADER_LEN));
+    response.extend_from_slice(id);
+    response.extend_from_slice(&flags.to_be_bytes());
+    if let Some(question) = question {
+        response.extend_from_slice(&DNS_ONE_QUESTION.to_be_bytes());
+        response.extend_from_slice(&DNS_COUNT_ZERO.to_be_bytes());
+        response.extend_from_slice(&DNS_COUNT_ZERO.to_be_bytes());
+        response.extend_from_slice(&DNS_COUNT_ZERO.to_be_bytes());
+        response.extend_from_slice(&query[DNS_HEADER_LEN..question.end]);
+    } else {
+        for _ in 0..4 {
+            response.extend_from_slice(&DNS_COUNT_ZERO.to_be_bytes());
+        }
+    }
+    response
+}
+
+fn read_name(packet: &[u8], offset: usize) -> Result<(String, usize), ()> {
+    let mut labels = Vec::new();
+    let mut pos = offset;
+    let mut next_offset = offset;
+    let mut jumped = false;
+    let mut jumps = 0;
+
+    loop {
+        if pos >= packet.len() {
+            return Err(());
+        }
+
+        let len = packet[pos];
+        if len & DNS_POINTER_MASK == DNS_POINTER_TAG {
+            if pos + 1 >= packet.len() {
+                return Err(());
+            }
+            let pointer =
+                (((len & DNS_POINTER_OFFSET_MASK) as usize) << 8) | packet[pos + 1] as usize;
+            if pointer >= packet.len() {
+                return Err(());
+            }
+            if !jumped {
+                next_offset = pos + DNS_U16_LEN;
+            }
+            pos = pointer;
+            jumped = true;
+            jumps += 1;
+            if jumps > DNS_MAX_COMPRESSION_JUMPS {
+                return Err(());
+            }
+            continue;
+        }
+
+        if len & DNS_POINTER_MASK != 0 {
+            return Err(());
+        }
+
+        pos += 1;
+        if len == 0 {
+            if !jumped {
+                next_offset = pos;
+            }
+            break;
+        }
+
+        let len = len as usize;
+        if len > DNS_MAX_LABEL_LEN || pos + len > packet.len() {
+            return Err(());
+        }
+
+        let label = std::str::from_utf8(&packet[pos..pos + len]).map_err(|_| ())?;
+        labels.push(label.to_ascii_lowercase());
+        pos += len;
+        if !jumped {
+            next_offset = pos;
+        }
+    }
+
+    Ok((labels.join("."), next_offset))
+}
+
+fn read_u16(buf: &[u8], offset: usize) -> Result<u16, ()> {
+    let bytes = buf.get(offset..offset + DNS_U16_LEN).ok_or(())?;
+    Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
+}
+
+fn read_u32(buf: &[u8], offset: usize) -> Result<u32, ()> {
+    let bytes = buf.get(offset..offset + DNS_U32_LEN).ok_or(())?;
+    Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nix::sys::socket::{SockaddrIn, SockaddrLike};
+
+    fn query_for(name: &str) -> Vec<u8> {
+        let mut query = vec![
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        for label in name.split('.') {
+            query.push(label.len() as u8);
+            query.extend_from_slice(label.as_bytes());
+        }
+        query.push(0);
+        query.extend_from_slice(&1u16.to_be_bytes());
+        query.extend_from_slice(&1u16.to_be_bytes());
+        query
+    }
+
+    fn response_with_a(name: &str, ip: [u8; 4], ttl: u32) -> Vec<u8> {
+        let mut response = query_for(name);
+        response[2] = 0x81;
+        response[3] = 0x80;
+        response[6] = 0x00;
+        response[7] = 0x01;
+        response.extend_from_slice(&[0xc0, 0x0c]);
+        response.extend_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&ttl.to_be_bytes());
+        response.extend_from_slice(&4u16.to_be_bytes());
+        response.extend_from_slice(&ip);
+        response
+    }
+
+    fn sockaddr_v4(a: u8, b: u8, c: u8, d: u8, port: u16) -> SockaddrStorage {
+        let sa = SockaddrIn::new(a, b, c, d, port);
+        unsafe { SockaddrStorage::from_raw(sa.as_ptr(), Some(sa.len())).unwrap() }
+    }
+
+    fn host_policy(hosts: Vec<&str>) -> EgressPolicy {
+        EgressPolicy::new(
+            None,
+            Some(hosts.into_iter().map(String::from).collect()),
+            Some(vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))]),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn hostname_matching_allows_exact_and_subdomain_only() {
+        let policy = host_policy(vec!["Example.COM."]);
+        assert!(policy.is_hostname_allowed("example.com"));
+        assert!(policy.is_hostname_allowed("api.example.com"));
+        assert!(!policy.is_hostname_allowed("badexample.com"));
+        assert!(!policy.is_hostname_allowed("example.org"));
+    }
+
+    #[test]
+    fn empty_allow_list_blocks_all_hostnames() {
+        let policy = EgressPolicy::new(
+            None,
+            Some(vec![]),
+            Some(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]),
+        )
+        .unwrap();
+        assert!(!policy.is_hostname_allowed("example.com"));
+    }
+
+    #[test]
+    fn dns_active_requires_hosts_and_resolvers() {
+        // hosts but no resolvers → not active
+        assert!(!EgressPolicy::new(None, Some(vec!["a.com".into()]), None)
+            .unwrap()
+            .dns_active());
+        // cidrs only → not active
+        assert!(!EgressPolicy::new(
+            Some(vec![(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 8)]),
+            None,
+            None
+        )
+        .unwrap()
+        .dns_active());
+        // both → active
+        assert!(host_policy(vec!["a.com"]).dns_active());
+    }
+
+    #[test]
+    fn parses_dns_query_name() {
+        let question = parse_question(&query_for("api.example.com")).unwrap();
+        assert_eq!(question.name, "api.example.com");
+    }
+
+    #[test]
+    fn builds_nxdomain_with_original_question() {
+        let query = query_for("blocked.example.com");
+        let response = build_error_response(&query, DNS_RCODE_NXDOMAIN);
+        assert_eq!(&response[..DNS_ID_LEN], &query[..DNS_ID_LEN]);
+        assert_eq!(
+            read_u16(&response, DNS_QDCOUNT_OFFSET).unwrap(),
+            DNS_ONE_QUESTION
+        );
+        assert_eq!(
+            read_u16(&response, DNS_ANCOUNT_OFFSET).unwrap(),
+            DNS_COUNT_ZERO
+        );
+        assert_eq!(
+            read_u16(&response, DNS_FLAGS_OFFSET).unwrap() & DNS_RCODE_MASK,
+            DNS_RCODE_NXDOMAIN
+        );
+        assert_eq!(&response[DNS_HEADER_LEN..], &query[DNS_HEADER_LEN..]);
+    }
+
+    #[test]
+    fn builds_servfail_for_malformed_query() {
+        let response = build_error_response(&[0xab, 0xcd], DNS_RCODE_SERVFAIL);
+        assert_eq!(&response[..2], &[0xab, 0xcd]);
+        assert_eq!(
+            read_u16(&response, DNS_FLAGS_OFFSET).unwrap() & DNS_RCODE_MASK,
+            DNS_RCODE_SERVFAIL
+        );
+    }
+
+    #[test]
+    fn parses_compressed_a_answer() {
+        let response = response_with_a("allowed.example.com", [203, 0, 113, 5], 60);
+        let ips = parse_answer_ips(&response).unwrap();
+        assert_eq!(ips, vec![(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)), 60)]);
+    }
+
+    #[test]
+    fn dns_policy_denies_before_learn_and_allows_after_learn() {
+        let mut policy = host_policy(vec!["example.com"]);
+        let addr = sockaddr_v4(203, 0, 113, 10, 443);
+        assert!(!policy.is_addr_allowed(&addr));
+        policy.learn_ips(vec![(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)), 60)]);
+        assert!(policy.is_addr_allowed(&addr));
+    }
+
+    #[test]
+    fn learn_ips_prunes_expired_ips() {
+        let mut policy = host_policy(vec!["example.com"]);
+        let now = Instant::now();
+        policy.allowed_ips.insert(
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 22)),
+            now - Duration::from_secs(1),
+        );
+        policy.allowed_ips.insert(
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 23)),
+            now + Duration::from_secs(60),
+        );
+        policy.learn_ips(vec![]);
+        assert!(!policy.is_addr_allowed(&sockaddr_v4(203, 0, 113, 22, 443)));
+        assert!(policy.is_addr_allowed(&sockaddr_v4(203, 0, 113, 23, 443)));
+    }
+
+    #[test]
+    fn allowed_cidrs_still_allow_with_dns_filter_enabled() {
+        let policy = EgressPolicy::new(
+            Some(vec![(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 8)]),
+            Some(vec!["example.com".into()]),
+            Some(vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))]),
+        )
+        .unwrap();
+        assert!(policy.is_addr_allowed(&sockaddr_v4(10, 1, 2, 3, 443)));
+        assert!(!policy.is_addr_allowed(&sockaddr_v4(11, 1, 2, 3, 443)));
+    }
+
+    #[test]
+    fn resolver_is_pinned_and_independent_of_guest() {
+        // The trusted resolver(s) come only from the policy; nothing the guest
+        // supplies (no dest field exists on DnsRequest) can change them.
+        let policy = host_policy(vec!["example.com"]);
+        assert_eq!(
+            policy.resolvers(),
+            vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))]
+        );
+    }
+
+    #[test]
+    fn blocked_query_returns_nxdomain_without_learning() {
+        let policy = Arc::new(RwLock::new(host_policy(vec!["allowed.example.com"])));
+        let response = handle_dns_query(&policy, &query_for("blocked.example.com"));
+        assert_eq!(
+            read_u16(&response, DNS_FLAGS_OFFSET).unwrap() & DNS_RCODE_MASK,
+            DNS_RCODE_NXDOMAIN
+        );
+        assert!(policy.read().unwrap().allowed_ips.is_empty());
+    }
+
+    #[test]
+    fn sockaddr_port_extracts_port() {
+        assert_eq!(sockaddr_port(&sockaddr_v4(1, 1, 1, 1, 53)), Some(53));
+        assert_eq!(sockaddr_port(&sockaddr_v4(1, 1, 1, 1, 853)), Some(853));
+    }
+}

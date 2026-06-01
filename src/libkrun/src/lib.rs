@@ -159,6 +159,8 @@ struct ContextConfig {
     tee_config_file: Option<PathBuf>,
     unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
     egress_cidrs: Option<Vec<(std::net::IpAddr, u8)>>,
+    egress_hosts: Option<Vec<String>>,
+    egress_resolvers: Option<Vec<std::net::IpAddr>>,
     shutdown_efd: Option<EventFd>,
     gpu_virgl_flags: Option<u32>,
     gpu_shm_size: Option<usize>,
@@ -1570,62 +1572,150 @@ pub unsafe extern "C" fn krun_set_port_map(ctx_id: u32, c_port_map: *const *cons
     KRUN_SUCCESS
 }
 
-/// Set the egress policy for TSI networking.
-///
-/// Accepts a null-terminated array of CIDR strings (e.g., "10.0.0.0/8", "1.1.1.1/32").
-/// When set, only outbound connections to matching IP ranges are allowed.
-/// Bare IPs without a prefix are treated as /32 (IPv4) or /128 (IPv6).
-#[allow(clippy::missing_safety_doc)]
-#[no_mangle]
-pub unsafe extern "C" fn krun_set_egress_policy(ctx_id: u32, c_cidrs: *const *const c_char) -> i32 {
+unsafe fn parse_egress_cidrs(
+    c_cidrs: *const *const c_char,
+) -> Result<Option<Vec<(std::net::IpAddr, u8)>>, i32> {
     use std::net::IpAddr;
 
     if c_cidrs.is_null() {
-        return -libc::EINVAL;
+        return Ok(None);
     }
 
     let mut parsed = Vec::new();
     let array: &[*const c_char] = slice::from_raw_parts(c_cidrs, MAX_ARGS);
-    for item in array.iter().take(MAX_ARGS) {
-        if item.is_null() {
-            break;
-        }
-        let s = match CStr::from_ptr(*item).to_str() {
-            Ok(s) => s,
-            Err(_) => return -libc::EINVAL,
-        };
+    for item in array
+        .iter()
+        .take(MAX_ARGS)
+        .take_while(|item| !item.is_null())
+    {
+        let s = CStr::from_ptr(*item).to_str().map_err(|_| -libc::EINVAL)?;
 
         // Parse "IP/prefix" or bare "IP"
         let (ip, prefix_len) = if let Some((ip_part, prefix_part)) = s.split_once('/') {
-            let prefix: u8 = match prefix_part.parse() {
-                Ok(p) => p,
-                Err(_) => return -libc::EINVAL,
-            };
-            let ip: IpAddr = match ip_part.parse() {
-                Ok(ip) => ip,
-                Err(_) => return -libc::EINVAL,
-            };
+            let prefix: u8 = prefix_part.parse().map_err(|_| -libc::EINVAL)?;
+            let ip: IpAddr = ip_part.parse().map_err(|_| -libc::EINVAL)?;
             (ip, prefix)
         } else {
-            let ip: IpAddr = match s.parse() {
-                Ok(ip) => ip,
-                Err(_) => return -libc::EINVAL,
-            };
+            let ip: IpAddr = s.parse().map_err(|_| -libc::EINVAL)?;
             let prefix = if ip.is_ipv4() { 32u8 } else { 128u8 };
             (ip, prefix)
         };
 
-        // Validate prefix length
         match ip {
-            IpAddr::V4(_) if prefix_len > 32 => return -libc::EINVAL,
-            IpAddr::V6(_) if prefix_len > 128 => return -libc::EINVAL,
+            IpAddr::V4(_) if prefix_len > 32 => return Err(-libc::EINVAL),
+            IpAddr::V6(_) if prefix_len > 128 => return Err(-libc::EINVAL),
             _ => {}
         }
 
         parsed.push((ip, prefix_len));
     }
 
-    let cidrs = parsed;
+    Ok(Some(parsed))
+}
+
+unsafe fn parse_egress_hosts(c_hosts: *const *const c_char) -> Result<Option<Vec<String>>, i32> {
+    if c_hosts.is_null() {
+        return Ok(None);
+    }
+
+    let mut hosts = Vec::new();
+    let array: &[*const c_char] = slice::from_raw_parts(c_hosts, MAX_ARGS);
+    for item in array
+        .iter()
+        .take(MAX_ARGS)
+        .take_while(|item| !item.is_null())
+    {
+        let host = CStr::from_ptr(*item)
+            .to_str()
+            .map_err(|_| -libc::EINVAL)?
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        // A hostname can never contain ':' — reject obvious garbage (e.g. an
+        // "ip:port" passed by mistake) instead of treating it as a host.
+        if host.is_empty() || host.contains(':') {
+            return Err(-libc::EINVAL);
+        }
+        hosts.push(host);
+    }
+
+    Ok(Some(hosts))
+}
+
+unsafe fn parse_egress_resolvers(
+    c_resolvers: *const *const c_char,
+) -> Result<Option<Vec<std::net::IpAddr>>, i32> {
+    use std::net::IpAddr;
+
+    if c_resolvers.is_null() {
+        return Ok(None);
+    }
+
+    let mut resolvers = Vec::new();
+    let array: &[*const c_char] = slice::from_raw_parts(c_resolvers, MAX_ARGS);
+    for item in array
+        .iter()
+        .take(MAX_ARGS)
+        .take_while(|item| !item.is_null())
+    {
+        let ip: IpAddr = CStr::from_ptr(*item)
+            .to_str()
+            .map_err(|_| -libc::EINVAL)?
+            .parse()
+            .map_err(|_| -libc::EINVAL)?;
+        resolvers.push(ip);
+    }
+
+    Ok(Some(resolvers))
+}
+
+/// Set the egress policy for TSI networking.
+///
+/// Accepts optional null-terminated arrays of CIDR strings, allowed DNS
+/// hostnames, and trusted DNS resolver IPs. Explicit CIDRs are always allowed.
+/// Hostnames enable interception of guest UDP DNS queries (port 53): allowed
+/// names are forwarded ONLY to the trusted resolvers (never the resolver the
+/// guest chose), and A/AAAA answers are learned as temporary allowed IPs.
+///
+/// Bare IPs without a prefix are treated as /32 (IPv4) or /128 (IPv6). Any of
+/// the three pointers may be NULL ("not set"). Returns -EINVAL if both CIDRs
+/// and hostnames are NULL, if any entry is invalid, or if hostnames are given
+/// without at least one resolver (hostname allow-listing is unsafe without a
+/// trusted upstream).
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+pub unsafe extern "C" fn krun_set_egress_policy(
+    ctx_id: u32,
+    c_cidrs: *const *const c_char,
+    c_egress_hosts: *const *const c_char,
+    c_dns_resolvers: *const *const c_char,
+) -> i32 {
+    use std::net::IpAddr;
+
+    let cidrs = match parse_egress_cidrs(c_cidrs) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let hosts = match parse_egress_hosts(c_egress_hosts) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let resolvers: Option<Vec<IpAddr>> = match parse_egress_resolvers(c_dns_resolvers) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    if cidrs.is_none() && hosts.is_none() {
+        return -libc::EINVAL;
+    }
+
+    // Hostname allow-listing is meaningless (and unsafe) without a trusted
+    // resolver: the guest could otherwise dictate name->IP mappings. Refuse the
+    // configuration rather than silently degrade.
+    let hosts_present = hosts.as_ref().is_some_and(|h| !h.is_empty());
+    let resolvers_present = resolvers.as_ref().is_some_and(|r| !r.is_empty());
+    if hosts_present && !resolvers_present {
+        return -libc::EINVAL;
+    }
 
     let mut map = match CTX_MAP.lock() {
         Ok(map) => map,
@@ -1637,7 +1727,9 @@ pub unsafe extern "C" fn krun_set_egress_policy(ctx_id: u32, c_cidrs: *const *co
             if cfg.vsock_config == VsockConfig::Disabled {
                 return -libc::ENODEV;
             }
-            cfg.egress_cidrs = Some(cidrs);
+            cfg.egress_cidrs = cidrs;
+            cfg.egress_hosts = hosts;
+            cfg.egress_resolvers = resolvers;
         }
         Entry::Vacant(_) => return -libc::ENOENT,
     }
@@ -3118,6 +3210,8 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     }
 
     let egress_cidrs = ctx_cfg.egress_cidrs.take();
+    let egress_hosts = ctx_cfg.egress_hosts.take();
+    let egress_resolvers = ctx_cfg.egress_resolvers.take();
 
     match &ctx_cfg.vsock_config {
         VsockConfig::Disabled => (),
@@ -3129,6 +3223,8 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
                 unix_ipc_port_map: ctx_cfg.unix_ipc_port_map.clone(),
                 tsi_flags: *tsi_flags,
                 egress_cidrs,
+                egress_hosts,
+                egress_resolvers,
             };
             ctx_cfg.vmr.set_vsock_device(vsock_device_config).unwrap();
         }
@@ -3156,6 +3252,8 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
                     unix_ipc_port_map: ctx_cfg.unix_ipc_port_map.clone(),
                     tsi_flags,
                     egress_cidrs,
+                    egress_hosts,
+                    egress_resolvers,
                 };
                 ctx_cfg.vmr.set_vsock_device(vsock_device_config).unwrap();
             }

@@ -920,23 +920,37 @@ int32_t krun_add_vsock(uint32_t ctx_id, uint32_t tsi_features);
 /**
  * Set the egress policy for TSI networking.
  *
- * When set, only outbound connections to IP addresses matching the specified
- * CIDR ranges are allowed. All other egress is denied at the TSI muxer layer.
+ * When set, outbound connections are allowed only when their destination IP
+ * matches an explicit CIDR or an IP learned from an allowed DNS answer. All
+ * other egress is denied at the TSI muxer layer.
  *
  * Arguments:
- *  "ctx_id"  - the configuration context ID.
- *  "c_cidrs" - a null-terminated array of null-terminated CIDR strings
- *              (e.g., "10.0.0.0/8", "1.1.1.1/32"). Bare IPs without a
- *              prefix are treated as /32 (IPv4) or /128 (IPv6).
- *              An empty array (just the null terminator) means deny all.
+ *  "ctx_id"         - the configuration context ID.
+ *  "c_cidrs"        - optional null-terminated array of null-terminated CIDR
+ *                     strings (e.g., "10.0.0.0/8", "1.1.1.1/32"). Bare IPs
+ *                     without a prefix are treated as /32 (IPv4) or /128
+ *                     (IPv6). NULL means no explicit CIDR rules.
+ *  "c_egress_hosts" - optional null-terminated array of null-terminated
+ *                     hostnames. Guest UDP DNS queries to port 53 are
+ *                     intercepted and filtered against this list; A/AAAA
+ *                     answers from allowed responses are learned as temporary
+ *                     egress entries. NULL means no DNS hostname filtering.
+ *  "c_dns_resolvers"- null-terminated array of null-terminated trusted DNS
+ *                     resolver IPs (e.g., "1.1.1.1"). Allowed DNS queries are
+ *                     forwarded ONLY to these resolvers, never to the resolver
+ *                     the guest chose. Required when c_egress_hosts is set.
  *
  * Returns:
  *  Zero on success or a negative error number on failure.
- *  -EINVAL if c_cidrs is NULL or contains an invalid CIDR string.
+ *  -EINVAL if both c_cidrs and c_egress_hosts are NULL, if an entry is
+ *          invalid, or if c_egress_hosts is set without any resolver.
  *  -ENOENT if ctx_id is invalid.
  *  -ENODEV if vsock is disabled.
  */
-int32_t krun_set_egress_policy(uint32_t ctx_id, const char **c_cidrs);
+int32_t krun_set_egress_policy(uint32_t ctx_id,
+                               const char **c_cidrs,
+                               const char **c_egress_hosts,
+                               const char **c_dns_resolvers);
 
 /**
  * Returns the eventfd file descriptor to signal the guest to shut down orderly. This must be

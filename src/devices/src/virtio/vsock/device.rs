@@ -58,6 +58,8 @@ impl Vsock {
         unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
         tsi_flags: TsiFlags,
         egress_cidrs: Option<Vec<(IpAddr, u8)>>,
+        egress_hosts: Option<Vec<String>>,
+        egress_resolvers: Option<Vec<IpAddr>>,
     ) -> super::Result<Vsock> {
         Ok(Vsock {
             cid,
@@ -67,6 +69,8 @@ impl Vsock {
                 unix_ipc_port_map,
                 tsi_flags,
                 egress_cidrs,
+                egress_hosts,
+                egress_resolvers,
             ),
             queue_rx: None,
             queue_tx: None,

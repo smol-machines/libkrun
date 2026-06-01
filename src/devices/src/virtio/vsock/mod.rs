@@ -6,6 +6,7 @@
 // found in the THIRD-PARTY file.
 
 mod device;
+mod dns_filter;
 mod event_handler;
 mod muxer;
 mod muxer_rxq;

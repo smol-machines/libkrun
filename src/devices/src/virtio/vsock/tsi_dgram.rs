@@ -16,12 +16,14 @@ use super::super::linux_errno::linux_errno_raw;
 use super::super::Queue as VirtQueue;
 use super::defs;
 use super::defs::uapi;
+use super::dns_filter::{sockaddr_port, DnsRequest, DNS_PORT};
 use super::muxer::{push_packet, MuxerRx};
 use super::muxer_rxq::MuxerRxQ;
 use super::packet::{
     TsiAcceptReq, TsiConnectReq, TsiGetnameRsp, TsiListenReq, TsiSendtoAddr, VsockPacket,
 };
 use super::proxy::{Proxy, ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate, RecvPkt};
+use crossbeam_channel::Sender;
 use utils::epoll::EventSet;
 
 use vm_memory::GuestMemoryMmap;
@@ -42,9 +44,15 @@ pub struct TsiDgramProxy {
     tx_cnt: Wrapping<u32>,
     peer_buf_alloc: u32,
     peer_fwd_cnt: Wrapping<u32>,
+    /// Sender to the DNS worker; `Some` only when DNS filtering is active.
+    dns_sender: Option<Sender<DnsRequest>>,
+    /// Set when this socket was `connect()`ed to a resolver (port 53) and is
+    /// being intercepted — sends on it are routed to the DNS worker.
+    connected_dns: bool,
 }
 
 impl TsiDgramProxy {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: u64,
         cid: u64,
@@ -53,6 +61,7 @@ impl TsiDgramProxy {
         mem: GuestMemoryMmap,
         queue: Arc<Mutex<VirtQueue>>,
         rxq: Arc<Mutex<MuxerRxQ>>,
+        dns_sender: Option<Sender<DnsRequest>>,
     ) -> Result<Self, ProxyError> {
         let family = match family {
             defs::LINUX_AF_INET => AddressFamily::Inet,
@@ -109,7 +118,25 @@ impl TsiDgramProxy {
             tx_cnt: Wrapping(0),
             peer_buf_alloc: 0,
             peer_fwd_cnt: Wrapping(0),
+            dns_sender,
+            connected_dns: false,
         })
+    }
+
+    /// Hand a guest DNS query to the worker thread instead of sending it out the
+    /// host socket. `tx_cnt` is advanced by the query length so the response's
+    /// `fwd_cnt` stays monotonic — identical to the normal send paths — without
+    /// the worker ever touching per-proxy state.
+    fn send_dns_query(&mut self, buf: &[u8]) {
+        self.tx_cnt += Wrapping(buf.len() as u32);
+        if let Some(sender) = &self.dns_sender {
+            let _ = sender.send(DnsRequest {
+                query: buf.to_vec(),
+                peer_port: self.peer_port,
+                fwd_cnt: self.tx_cnt.0,
+                cid: self.cid,
+            });
+        }
     }
 
     fn init_pkt(&self, pkt: &mut VsockPacket) {
@@ -239,21 +266,38 @@ impl Proxy for TsiDgramProxy {
         self.status
     }
 
+    fn is_dgram(&self) -> bool {
+        true
+    }
+
     fn connect(&mut self, pkt: &VsockPacket, req: TsiConnectReq) -> ProxyUpdate {
         debug!("connect: addr={}", req.addr);
-        let res = match connect(self.fd.as_raw_fd(), &req.addr) {
-            Ok(()) => {
-                debug!("connect: Connected");
-                self.status = ProxyStatus::Connected;
-                0
-            }
-            Err(e) => {
-                debug!("Error connecting: {e}");
-                #[cfg(target_os = "macos")]
-                let errno = -linux_errno_raw(e as i32);
-                #[cfg(target_os = "linux")]
-                let errno = -(e as i32);
-                errno
+
+        // A connected DNS socket is intercepted: we never open a host socket to
+        // the (guest-chosen) resolver. Sends are routed to the DNS worker, which
+        // queries only the host-trusted resolvers.
+        let intercept = self.dns_sender.is_some() && sockaddr_port(&req.addr) == Some(DNS_PORT);
+        let (res, poll_host_socket) = if intercept {
+            debug!("connect: intercepting DNS socket (no host connect)");
+            self.connected_dns = true;
+            self.status = ProxyStatus::Connected;
+            (0, false)
+        } else {
+            self.connected_dns = false;
+            match connect(self.fd.as_raw_fd(), &req.addr) {
+                Ok(()) => {
+                    debug!("connect: Connected");
+                    self.status = ProxyStatus::Connected;
+                    (0, true)
+                }
+                Err(e) => {
+                    debug!("Error connecting: {e}");
+                    #[cfg(target_os = "macos")]
+                    let errno = -linux_errno_raw(e as i32);
+                    #[cfg(target_os = "linux")]
+                    let errno = -(e as i32);
+                    (errno, false)
+                }
             }
         };
 
@@ -269,7 +313,7 @@ impl Proxy for TsiDgramProxy {
         push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
 
         let mut update = ProxyUpdate::default();
-        if res == 0 && !self.listening {
+        if poll_host_socket && !self.listening {
             update.polling = Some((self.id, self.fd.as_raw_fd(), EventSet::IN));
         }
         update
@@ -309,6 +353,15 @@ impl Proxy for TsiDgramProxy {
 
     fn sendmsg(&mut self, pkt: &VsockPacket) -> ProxyUpdate {
         debug!("sendmsg");
+
+        // Connected DNS socket: route the query to the worker; the worker pushes
+        // the response and signals the guest asynchronously.
+        if self.connected_dns {
+            if let Some(buf) = pkt.buf() {
+                self.send_dns_query(buf);
+            }
+            return ProxyUpdate::default();
+        }
 
         let ret = if let Some(buf) = pkt.buf() {
             #[cfg(target_os = "macos")]
@@ -359,6 +412,13 @@ impl Proxy for TsiDgramProxy {
 
         if let Some(addr) = self.sendto_addr {
             if let Some(buf) = pkt.buf() {
+                // Unconnected DNS query (sendto a resolver:53): route to the
+                // worker instead of the host socket.
+                if self.dns_sender.is_some() && sockaddr_port(&addr) == Some(DNS_PORT) {
+                    self.send_dns_query(buf);
+                    return;
+                }
+
                 #[cfg(target_os = "macos")]
                 let flags = MsgFlags::empty();
                 #[cfg(target_os = "linux")]
