@@ -30,7 +30,7 @@ use super::super::filesystem::{
 };
 use super::super::fuse;
 use super::super::multikey::MultikeyBTreeMap;
-use super::super::FuseServerState;
+use super::super::{FuseHandleSnap, FuseInodeSnap, FuseServerState};
 
 const INIT_CSTR: &[u8] = b"init.krun\0";
 const XATTR_KEY: &[u8] = b"user.containers.override_stat\0";
@@ -600,23 +600,123 @@ impl PassthroughFs {
         })
     }
 
-    /// Capture the FUSE server's logical state for cross-process fork.
-    ///
-    /// TODO(F5-macos): the macOS cross-process fork path (vm_remap memory
-    /// sharing + hvf device re-activation) is not wired up yet, so a clone never
-    /// transfers FUSE state. This returns empty state for now — enough for the
-    /// shared device code to compile and for in-process checkpoint/restore
-    /// (which keeps the same server, so it transfers no FUSE state) to work.
-    /// When the macOS fork path lands, mirror the Linux `snapshot`, but using
-    /// the volfs `(dev, ino)` addressing this passthrough already relies on
-    /// (`/.vol/{dev}/{ino}`) instead of `/proc/self/fd` path recovery.
+    /// Capture the FUSE server's logical state for cross-process fork (the macOS
+    /// analogue of the Linux `snapshot`). This passthrough addresses every inode
+    /// by its host `(dev, ino)` via volfs (`/.vol/{dev}/{ino}`) rather than by a
+    /// held fd, so the snapshot records that identity per nodeid; a clone rebuilds
+    /// the map and reopens lazily through volfs. The root inode is re-seeded from
+    /// `cfg.root_dir` on restore, and the synthetic boot-time init-binary inode is
+    /// not needed by an already-booted clone — both are skipped here.
     pub fn snapshot(&self) -> FuseServerState {
-        FuseServerState::default()
+        let mut inode_snaps = Vec::new();
+        {
+            let inodes = self.inodes.read().unwrap();
+            for (nodeid, data) in inodes.iter() {
+                if *nodeid == fuse::ROOT_ID || *nodeid == self.init_inode {
+                    continue;
+                }
+                inode_snaps.push(FuseInodeSnap {
+                    nodeid: *nodeid,
+                    // Encode the volfs identity this passthrough already uses;
+                    // `restore` parses (dev, ino) back out of it.
+                    path: format!("/.vol/{}/{}", data.dev, data.ino),
+                    refcount: data.refcount.load(Ordering::Relaxed),
+                });
+            }
+        }
+        let mut handle_snaps = Vec::new();
+        {
+            let handles = self.handles.read().unwrap();
+            for (handle, data) in handles.iter() {
+                handle_snaps.push(FuseHandleSnap {
+                    handle: *handle,
+                    nodeid: data.inode,
+                    // HandleData does not retain the original open flags; the
+                    // restore path reopens with an RDWR→RDONLY ladder, so this is
+                    // advisory only.
+                    flags: libc::O_RDWR,
+                });
+            }
+        }
+        FuseServerState {
+            inodes: inode_snaps,
+            handles: handle_snaps,
+            next_inode: self.next_inode.load(Ordering::Relaxed),
+            next_handle: self.next_handle.load(Ordering::Relaxed),
+            writeback: self.writeback.load(Ordering::Relaxed),
+            announce_submounts: self.announce_submounts.load(Ordering::Relaxed),
+        }
     }
 
-    /// Restore FUSE server state on a clone. See [`Self::snapshot`] — not yet
-    /// implemented for macOS; a no-op until the macOS fork path exists.
-    pub fn restore(&self, _state: &FuseServerState) -> io::Result<()> {
+    /// Restore FUSE server state (captured by [`Self::snapshot`]) onto this clone's
+    /// freshly-built passthrough: re-seed the root inode, rebuild the inode map
+    /// from the saved volfs `(dev, ino)` identities, restore the id counters and
+    /// flags, then reopen the saved handles (best-effort RDWR→RDONLY since the
+    /// original open flags are not retained). Unknown/failed entries are skipped;
+    /// the guest re-walks from root on a miss.
+    pub fn restore(&self, state: &FuseServerState) -> io::Result<()> {
+        // A restored, already-booted clone never re-sends FUSE_INIT, so seed root
+        // explicitly (mirrors the Linux restore).
+        self.setup_root_inode()?;
+
+        {
+            let mut inodes = self.inodes.write().unwrap();
+            for snap in &state.inodes {
+                // `path` is "/.vol/{dev}/{ino}" (see `snapshot`); recover (dev, ino).
+                let rest = snap.path.strip_prefix("/.vol/").unwrap_or(&snap.path);
+                let (dev, ino) = match rest.split_once('/') {
+                    Some((d, i)) => match (d.parse::<i32>(), i.parse::<u64>()) {
+                        (Ok(d), Ok(i)) => (d, i),
+                        _ => continue,
+                    },
+                    None => continue,
+                };
+                inodes.insert(
+                    snap.nodeid,
+                    InodeAltKey { ino, dev },
+                    Arc::new(InodeData {
+                        inode: snap.nodeid,
+                        ino,
+                        dev,
+                        refcount: AtomicU64::new(snap.refcount),
+                        unlinked_fd: AtomicI64::new(-1),
+                    }),
+                );
+            }
+        }
+
+        // Counters must be restored before reopening handles so newly-allocated
+        // ids don't collide with the restored ones.
+        self.next_inode.store(state.next_inode, Ordering::Relaxed);
+        self.next_handle.store(state.next_handle, Ordering::Relaxed);
+        self.writeback.store(state.writeback, Ordering::Relaxed);
+        self.announce_submounts
+            .store(state.announce_submounts, Ordering::Relaxed);
+
+        for snap in &state.handles {
+            // open_inode reopens via volfs on demand. Try RDWR, then RDONLY
+            // (directories and read-only files reject RDWR).
+            let file = match self.open_inode(snap.nodeid, libc::O_RDWR) {
+                Ok(f) => Some(f),
+                Err(_) => self.open_inode(snap.nodeid, libc::O_RDONLY).ok(),
+            };
+            match file {
+                Some(file) => {
+                    self.handles.write().unwrap().insert(
+                        snap.handle,
+                        Arc::new(HandleData {
+                            inode: snap.nodeid,
+                            file: RwLock::new(file),
+                            dirstream: Mutex::new(DirStream::new()),
+                        }),
+                    );
+                }
+                None => warn!(
+                    "fs restore: reopen handle {} (nodeid {}) failed",
+                    snap.handle, snap.nodeid
+                ),
+            }
+        }
         Ok(())
     }
 
@@ -1143,7 +1243,11 @@ impl FileSystem for PassthroughFs {
     type Inode = Inode;
     type Handle = Handle;
 
-    fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
+    /// Establish the root inode (nodeid `ROOT_ID`) in the inode map. Normally
+    /// done as part of `init` (the guest's FUSE_INIT), but also called directly
+    /// by [`Self::restore`] because a restored, already-booted clone never
+    /// re-sends FUSE_INIT. Idempotent: a later call replaces the entry.
+    fn setup_root_inode(&self) -> io::Result<()> {
         let root = CString::new(self.cfg.root_dir.as_str()).expect("CString::new failed");
 
         // Safe because this doesn't modify any memory and we check the return value.
@@ -1151,13 +1255,7 @@ impl FileSystem for PassthroughFs {
         // (e.g. a dev symlink to a cached rootfs). O_NOFOLLOW on the final path
         // component returns ELOOP, which causes the FUSE session init to fail, which
         // causes the guest to be unable to mount its rootfs.
-        let fd = unsafe {
-            libc::openat(
-                libc::AT_FDCWD,
-                root.as_ptr(),
-                libc::O_CLOEXEC,
-            )
-        };
+        let fd = unsafe { libc::openat(libc::AT_FDCWD, root.as_ptr(), libc::O_CLOEXEC) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -1166,11 +1264,6 @@ impl FileSystem for PassthroughFs {
         let f = unsafe { File::from_raw_fd(fd) };
 
         let st = fstat(f.as_raw_fd(), true)?;
-
-        // Safe because this doesn't modify any memory and there is no need to check the return
-        // value because this system call always succeeds. We need to clear the umask here because
-        // we want the client to be able to set all the bits in the mode.
-        unsafe { libc::umask(0o000) };
 
         let mut inodes = self.inodes.write().unwrap();
 
@@ -1189,6 +1282,16 @@ impl FileSystem for PassthroughFs {
                 unlinked_fd: AtomicI64::new(-1),
             }),
         );
+        Ok(())
+    }
+
+    fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
+        // Safe because this doesn't modify any memory and there is no need to check the return
+        // value because this system call always succeeds. We need to clear the umask here because
+        // we want the client to be able to set all the bits in the mode.
+        unsafe { libc::umask(0o000) };
+
+        self.setup_root_inode()?;
 
         let mut opts = FsOptions::empty();
         if self.cfg.writeback && capable.contains(FsOptions::WRITEBACK_CACHE) {
