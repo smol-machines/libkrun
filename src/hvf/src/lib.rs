@@ -293,6 +293,32 @@ const GIC_REDIST_REGS: &[u32] = &[
     65792, // GICR_ISENABLER0  (enable LAST)
 ];
 
+/// Runtime-resolved GIC register accessors. The Hypervisor framework does not
+/// export the `hv_gic_*` symbols for static linking on this platform (arm64
+/// chained fixups would fail to bind them at dylib load → SIGKILL), so — like
+/// [`crate::HvfGicV3`] — they are looked up via `dlsym` at runtime.
+#[cfg(target_arch = "aarch64")]
+struct GicRegBindings {
+    get_dist: libloading::Symbol<'static, unsafe extern "C" fn(u16, *mut u64) -> hv_return_t>,
+    set_dist: libloading::Symbol<'static, unsafe extern "C" fn(u16, u64) -> hv_return_t>,
+    get_redist: libloading::Symbol<'static, unsafe extern "C" fn(u64, u32, *mut u64) -> hv_return_t>,
+    set_redist: libloading::Symbol<'static, unsafe extern "C" fn(u64, u32, u64) -> hv_return_t>,
+    get_icc: libloading::Symbol<'static, unsafe extern "C" fn(u64, u16, *mut u64) -> hv_return_t>,
+    set_icc: libloading::Symbol<'static, unsafe extern "C" fn(u64, u16, u64) -> hv_return_t>,
+}
+
+#[cfg(target_arch = "aarch64")]
+static GIC_REGS: LazyLock<GicRegBindings> = LazyLock::new(|| unsafe {
+    GicRegBindings {
+        get_dist: HVF.get(b"hv_gic_get_distributor_reg").expect("hv_gic_get_distributor_reg"),
+        set_dist: HVF.get(b"hv_gic_set_distributor_reg").expect("hv_gic_set_distributor_reg"),
+        get_redist: HVF.get(b"hv_gic_get_redistributor_reg").expect("hv_gic_get_redistributor_reg"),
+        set_redist: HVF.get(b"hv_gic_set_redistributor_reg").expect("hv_gic_set_redistributor_reg"),
+        get_icc: HVF.get(b"hv_gic_get_icc_reg").expect("hv_gic_get_icc_reg"),
+        set_icc: HVF.get(b"hv_gic_set_icc_reg").expect("hv_gic_set_icc_reg"),
+    }
+});
+
 /// GIC CPU-interface (ICC) registers captured per-vCPU (values == `hv_gic_icc_reg_t`).
 /// SRE first (enables sysreg access), group-enables last.
 #[cfg(target_arch = "aarch64")]
@@ -498,7 +524,7 @@ pub fn vcpu_save_state(vcpuid: u64) -> Result<HvfVcpuState, Error> {
     let mut gic_redist = Vec::with_capacity(GIC_REDIST_REGS.len());
     for &reg in GIC_REDIST_REGS {
         let mut v = 0u64;
-        let ret = unsafe { hv_gic_get_redistributor_reg(vcpuid, reg, &mut v) };
+        let ret = unsafe { (GIC_REGS.get_redist)(vcpuid, reg, &mut v) };
         if ret != HV_SUCCESS {
             return Err(Error::VcpuReadSystemRegister);
         }
@@ -507,7 +533,7 @@ pub fn vcpu_save_state(vcpuid: u64) -> Result<HvfVcpuState, Error> {
     let mut gic_icc = Vec::with_capacity(GIC_ICC_REGS.len());
     for &reg in GIC_ICC_REGS {
         let mut v = 0u64;
-        let ret = unsafe { hv_gic_get_icc_reg(vcpuid, reg as u16, &mut v) };
+        let ret = unsafe { (GIC_REGS.get_icc)(vcpuid, reg as u16, &mut v) };
         if ret != HV_SUCCESS {
             return Err(Error::VcpuReadSystemRegister);
         }
@@ -563,13 +589,13 @@ pub fn vcpu_restore_state(vcpuid: u64, state: &HvfVcpuState) -> Result<(), Error
     // Per-vCPU GIC state. The captured order is config-before-enable (redist
     // ISENABLER0 last; ICC SRE first, IGRPEN last), so replay in order.
     for &(reg, val) in &state.gic_redist {
-        let ret = unsafe { hv_gic_set_redistributor_reg(vcpuid, reg, val) };
+        let ret = unsafe { (GIC_REGS.set_redist)(vcpuid, reg, val) };
         if ret != HV_SUCCESS {
             return Err(Error::VcpuSetSystemRegister(0, val));
         }
     }
     for &(reg, val) in &state.gic_icc {
-        let ret = unsafe { hv_gic_set_icc_reg(vcpuid, reg as u16, val) };
+        let ret = unsafe { (GIC_REGS.set_icc)(vcpuid, reg as u16, val) };
         if ret != HV_SUCCESS {
             return Err(Error::VcpuSetSystemRegister(0, val));
         }
@@ -586,7 +612,7 @@ pub fn gic_save_distributor() -> Result<Vec<(u32, u64)>, Error> {
     let mut regs = Vec::new();
     for reg in gic_distributor_regs() {
         let mut v = 0u64;
-        let ret = unsafe { hv_gic_get_distributor_reg(reg as u16, &mut v) };
+        let ret = unsafe { (GIC_REGS.get_dist)(reg as u16, &mut v) };
         if ret != HV_SUCCESS {
             return Err(Error::VcpuReadSystemRegister);
         }
@@ -601,13 +627,13 @@ pub fn gic_save_distributor() -> Result<Vec<(u32, u64)>, Error> {
 #[cfg(target_arch = "aarch64")]
 pub fn gic_restore_distributor(regs: &[(u32, u64)]) -> Result<(), Error> {
     for &(reg, val) in regs.iter().filter(|(r, _)| *r != 0) {
-        let ret = unsafe { hv_gic_set_distributor_reg(reg as u16, val) };
+        let ret = unsafe { (GIC_REGS.set_dist)(reg as u16, val) };
         if ret != HV_SUCCESS {
             return Err(Error::VcpuSetSystemRegister(0, val));
         }
     }
     if let Some(&(_, ctlr)) = regs.iter().find(|(r, _)| *r == 0) {
-        let ret = unsafe { hv_gic_set_distributor_reg(0, ctlr) };
+        let ret = unsafe { (GIC_REGS.set_dist)(0, ctlr) };
         if ret != HV_SUCCESS {
             return Err(Error::VcpuSetSystemRegister(0, ctlr));
         }
