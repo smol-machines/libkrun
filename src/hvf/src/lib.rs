@@ -609,14 +609,24 @@ pub fn vcpu_restore_state(vcpuid: u64, state: &HvfVcpuState) -> Result<(), Error
 /// distributor is global (not per-vCPU), so this may run on any thread.
 #[cfg(target_arch = "aarch64")]
 pub fn gic_save_distributor() -> Result<Vec<(u32, u64)>, Error> {
+    // Read GICD_TYPER (offset 4) to learn how many interrupt lines the GIC
+    // actually implements; reading per-IRQ registers beyond that range faults
+    // HVF. ITLinesNumber (bits [4:0]) ⇒ num_irqs = 32*(ITLinesNumber+1).
+    let mut typer = 0u64;
+    let ret = unsafe { (GIC_REGS.get_dist)(4, &mut typer) };
+    if ret != HV_SUCCESS {
+        return Err(Error::VcpuReadSystemRegister);
+    }
+    let num_irqs = 32 * (((typer & 0x1f) as u32) + 1);
+
     let mut regs = Vec::new();
-    for reg in gic_distributor_regs() {
+    for reg in gic_distributor_regs(num_irqs) {
         let mut v = 0u64;
         let ret = unsafe { (GIC_REGS.get_dist)(reg as u16, &mut v) };
-        if ret != HV_SUCCESS {
-            return Err(Error::VcpuReadSystemRegister);
+        // Skip registers the GIC rejects rather than aborting the whole save.
+        if ret == HV_SUCCESS {
+            regs.push((reg, v));
         }
-        regs.push((reg, v));
     }
     Ok(regs)
 }
@@ -641,18 +651,22 @@ pub fn gic_restore_distributor(regs: &[(u32, u64)]) -> Result<(), Error> {
     Ok(())
 }
 
-/// GIC distributor register offsets to snapshot (offset == `hv_gic_distributor_reg_t`):
-/// GICD_CTLR, IGROUPR0..31, IPRIORITYR0..255, ICFGR0..63, IROUTER32..1019 (64-bit
-/// SPI routing), ISENABLER0..31. Read-only (TYPER/PIDR2) and clear/transient
-/// registers (IC*, IS/ICPENDR, IS/ICACTIVER) are intentionally excluded.
+/// GIC distributor register offsets to snapshot (offset == `hv_gic_distributor_reg_t`),
+/// bounded to the `num_irqs` the GIC implements (per-IRQ ranges past that fault):
+/// GICD_CTLR, IGROUPR, IPRIORITYR, ICFGR, IROUTER (64-bit SPI routing, SPIs 32+),
+/// ISENABLER. Read-only (TYPER/PIDR2) and clear/transient registers (IC*,
+/// IS/ICPENDR, IS/ICACTIVER) are intentionally excluded.
 #[cfg(target_arch = "aarch64")]
-fn gic_distributor_regs() -> Vec<u32> {
+fn gic_distributor_regs(num_irqs: u32) -> Vec<u32> {
+    let n32 = num_irqs / 32; // 1 bit per IRQ  (IGROUPR / ISENABLER)
+    let n4 = num_irqs / 4; //   8 bits per IRQ (IPRIORITYR)
+    let n16 = num_irqs / 16; //  2 bits per IRQ (ICFGR)
     let mut regs = vec![0u32]; // GICD_CTLR
-    regs.extend((0..32).map(|i| 0x80 + i * 4)); // IGROUPR0..31
-    regs.extend((0..256).map(|i| 0x400 + i * 4)); // IPRIORITYR0..255
-    regs.extend((0..64).map(|i| 0xC00 + i * 4)); // ICFGR0..63
-    regs.extend((32..1020).map(|i| 0x6000 + i * 8)); // IROUTER32..1019 (64-bit)
-    regs.extend((0..32).map(|i| 0x100 + i * 4)); // ISENABLER0..31
+    regs.extend((0..n32).map(|i| 0x80 + i * 4)); // IGROUPR
+    regs.extend((0..n4).map(|i| 0x400 + i * 4)); // IPRIORITYR
+    regs.extend((0..n16).map(|i| 0xC00 + i * 4)); // ICFGR
+    regs.extend((32..num_irqs).map(|i| 0x6000 + i * 8)); // IROUTER (SPIs only, 64-bit)
+    regs.extend((0..n32).map(|i| 0x100 + i * 4)); // ISENABLER
     regs
 }
 
