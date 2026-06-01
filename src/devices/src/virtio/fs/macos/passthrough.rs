@@ -30,6 +30,7 @@ use super::super::filesystem::{
 };
 use super::super::fuse;
 use super::super::multikey::MultikeyBTreeMap;
+use super::super::FuseServerState;
 
 const INIT_CSTR: &[u8] = b"init.krun\0";
 const XATTR_KEY: &[u8] = b"user.containers.override_stat\0";
@@ -597,6 +598,26 @@ impl PassthroughFs {
             announce_submounts: AtomicBool::new(false),
             cfg,
         })
+    }
+
+    /// Capture the FUSE server's logical state for cross-process fork.
+    ///
+    /// TODO(F5-macos): the macOS cross-process fork path (vm_remap memory
+    /// sharing + hvf device re-activation) is not wired up yet, so a clone never
+    /// transfers FUSE state. This returns empty state for now — enough for the
+    /// shared device code to compile and for in-process checkpoint/restore
+    /// (which keeps the same server, so it transfers no FUSE state) to work.
+    /// When the macOS fork path lands, mirror the Linux `snapshot`, but using
+    /// the volfs `(dev, ino)` addressing this passthrough already relies on
+    /// (`/.vol/{dev}/{ino}`) instead of `/proc/self/fd` path recovery.
+    pub fn snapshot(&self) -> FuseServerState {
+        FuseServerState::default()
+    }
+
+    /// Restore FUSE server state on a clone. See [`Self::snapshot`] — not yet
+    /// implemented for macOS; a no-op until the macOS fork path exists.
+    pub fn restore(&self, _state: &FuseServerState) -> io::Result<()> {
+        Ok(())
     }
 
     fn inode_to_handle(&self, inode: Inode, supports_fd: bool) -> io::Result<InodeHandle> {
