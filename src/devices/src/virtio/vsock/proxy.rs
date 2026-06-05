@@ -6,7 +6,31 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use super::muxer::MuxerRx;
 use super::packet::{TsiAcceptReq, TsiConnectReq, TsiListenReq, TsiSendtoAddr, VsockPacket};
 use nix::sys::socket::AddressFamily;
+use serde::{Deserialize, Serialize};
 use utils::epoll::EventSet;
+
+/// Snapshot of a live TSI inbound-port-forward listener, captured so a
+/// cross-process fork clone can re-establish it. The guest's `listen()` is
+/// intercepted by TSI and only ever issued once, so a snapshot-restored clone
+/// (whose app is already past `listen()`) never re-arms the host-side listener —
+/// the muxer's `proxy_map` is not part of the device snapshot. On restore the
+/// muxer rebuilds each listener from this descriptor using the *clone's* own
+/// host port map, so its remapped inbound port works. `peer_port`/`control_port`
+/// are the guest socket's TSI ports (preserved verbatim so host-accepted
+/// connections route to the guest's still-listening, CoW-restored socket).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListenerDesc {
+    /// Address family as a Linux AF_* value (`defs::LINUX_AF_INET`/`INET6`).
+    pub family: u16,
+    /// Guest socket's TSI port (the `id` high word).
+    pub peer_port: u32,
+    /// Guest control port for this proxy (`pkt.src_port()` at create time).
+    pub control_port: u32,
+    /// Guest listen port — the key into the host port map.
+    pub guest_port: u16,
+    /// Listen backlog the guest requested.
+    pub backlog: i32,
+}
 
 #[derive(Debug)]
 pub enum RecvPkt {
@@ -108,5 +132,12 @@ pub trait Proxy: Send + AsRawFd {
     /// (see [`super::muxer::VsockMuxer::reset_connections`]).
     fn is_listener(&self) -> bool {
         false
+    }
+    /// If this proxy is a live TSI inbound-port-forward listener, return its
+    /// descriptor so it can be snapshotted and re-established on a fork clone
+    /// (see [`ListenerDesc`]). `None` for everything else (connections, the
+    /// agent unix acceptor, datagram proxies).
+    fn listener_desc(&self) -> Option<ListenerDesc> {
+        None
     }
 }

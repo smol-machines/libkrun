@@ -20,6 +20,7 @@ use super::super::{
 };
 use super::muxer::VsockMuxer;
 use super::packet::VsockPacket;
+use super::proxy::ListenerDesc;
 use super::TsiFlags;
 use super::{defs, defs::uapi};
 use crate::virtio::queue::QueueState;
@@ -48,6 +49,9 @@ pub struct Vsock {
     pub(crate) acked_features: u64,
     pub(crate) activate_evt: EventFd,
     pub(crate) device_state: DeviceState,
+    /// Inbound listeners staged by `restore_state`, re-established once the muxer
+    /// worker is live in `finish_restore_activation` (fork-clone path).
+    pending_restore_listeners: Vec<ListenerDesc>,
 }
 
 impl Vsock {
@@ -80,6 +84,7 @@ impl Vsock {
             activate_evt: EventFd::new(utils::eventfd::EFD_NONBLOCK)
                 .map_err(super::VsockError::EventFd)?,
             device_state: DeviceState::Inactive,
+            pending_restore_listeners: Vec::new(),
         })
     }
 
@@ -218,6 +223,11 @@ pub struct VsockState {
     pub activated: bool,
     pub queue_rx: Option<QueueState>,
     pub queue_tx: Option<QueueState>,
+    /// Live TSI inbound-port-forward listeners at snapshot time, re-established
+    /// on a fork clone against its own host port map (see [`ListenerDesc`]).
+    /// `#[serde(default)]` keeps older snapshots (without this field) loadable.
+    #[serde(default)]
+    pub listeners: Vec<ListenerDesc>,
 }
 
 impl Vsock {
@@ -232,6 +242,7 @@ impl Vsock {
             activated: matches!(self.device_state, DeviceState::Activated(..)),
             queue_rx: q(&self.queue_rx),
             queue_tx: q(&self.queue_tx),
+            listeners: self.muxer.snapshot_listeners(),
         }
     }
 
@@ -254,6 +265,9 @@ impl Vsock {
         // model — for a fresh-device restore the proxy_map is already empty, so
         // this is a no-op there.
         self.muxer.reset_connections();
+        // Stash inbound listeners; they are re-established in
+        // `finish_restore_activation`, after the muxer worker/epoll is live.
+        self.pending_restore_listeners = state.listeners.clone();
         Ok(())
     }
 }
@@ -261,6 +275,16 @@ impl Vsock {
 impl VirtioDevice for Vsock {
     fn avail_features(&self) -> u64 {
         self.avail_features
+    }
+
+    /// Fork-clone restore: the muxer worker + epoll are live now, so rebuild the
+    /// inbound-port-forward listeners staged by `restore_state` against this
+    /// clone's own host port map. A no-op for a normal boot (none staged).
+    fn finish_restore_activation(&mut self) {
+        if !self.pending_restore_listeners.is_empty() {
+            let listeners = std::mem::take(&mut self.pending_restore_listeners);
+            self.muxer.restore_listeners(listeners);
+        }
     }
 
     fn acked_features(&self) -> u64 {

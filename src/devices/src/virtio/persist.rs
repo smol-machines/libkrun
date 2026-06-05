@@ -220,6 +220,7 @@ mod tests {
                     activated: true,
                     queue_rx: Some(qs.clone()),
                     queue_tx: Some(qs),
+                    listeners: Vec::new(),
                 }),
             ],
         };

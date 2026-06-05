@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -11,7 +11,7 @@ use super::dns_filter::{sockaddr_port, DnsRequest, DnsWorker, EgressPolicy};
 use super::muxer_rxq::{rx_to_pkt, MuxerRxQ};
 use super::muxer_thread::MuxerThread;
 use super::packet::{TsiConnectReq, TsiGetnameRsp, VsockPacket};
-use super::proxy::{Proxy, ProxyRemoval, ProxyUpdate};
+use super::proxy::{ListenerDesc, Proxy, ProxyRemoval, ProxyUpdate};
 use super::reaper::ReaperThread;
 #[cfg(target_os = "macos")]
 use super::timesync::TimesyncThread;
@@ -328,6 +328,77 @@ impl VsockMuxer {
         };
         self.rxq.lock().unwrap().clear();
         info!("vsock muxer reset on restore: dropped {removed} connection proxy(ies)");
+    }
+
+    /// Capture every live TSI inbound-port-forward listener for VM checkpoint/fork
+    /// (see [`ListenerDesc`]). The muxer's `proxy_map` is otherwise not part of the
+    /// device snapshot, so without this a fork clone loses all inbound forwards.
+    pub(crate) fn snapshot_listeners(&self) -> Vec<ListenerDesc> {
+        self.proxy_map
+            .read()
+            .unwrap()
+            .values()
+            .filter_map(|p| p.lock().unwrap().listener_desc())
+            .collect()
+    }
+
+    /// Re-establish inbound-port-forward listeners on a freshly-restored clone,
+    /// binding each to the *clone's* own `host_port_map`. The guest's listening
+    /// sockets are already restored in RAM (CoW) but never re-issue `TSI_LISTEN`,
+    /// so the host side must be rebuilt here. Must run after [`Self::activate`]
+    /// (needs `mem`/`queue`). Preserves each listener's `peer_port`/`control_port`
+    /// so host-accepted connections route to the guest's existing socket.
+    pub(crate) fn restore_listeners(&self, descs: Vec<ListenerDesc>) {
+        let mem = match self.mem.as_ref() {
+            Some(m) => m.clone(),
+            None => {
+                warn!(
+                    "restore_listeners before activation; skipping {} listener(s)",
+                    descs.len()
+                );
+                return;
+            }
+        };
+        let queue = match self.queue.as_ref() {
+            Some(q) => q.clone(),
+            None => return,
+        };
+        for d in descs {
+            let id = ((d.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
+            match TsiStreamProxy::new(
+                id,
+                self.cid,
+                d.family,
+                defs::TSI_PROXY_PORT,
+                d.peer_port,
+                d.control_port,
+                mem.clone(),
+                queue.clone(),
+                self.rxq.clone(),
+            ) {
+                Ok(mut proxy) => {
+                    let rc = proxy.relisten(d.guest_port, d.backlog, &self.host_port_map);
+                    if rc == 0 {
+                        let fd = proxy.as_raw_fd();
+                        self.proxy_map
+                            .write()
+                            .unwrap()
+                            .insert(id, Mutex::new(Box::new(proxy)));
+                        self.update_polling(id, fd, EventSet::IN);
+                        info!(
+                            "restored TSI inbound listener: guest_port={} (id={:#x})",
+                            d.guest_port, id
+                        );
+                    } else {
+                        warn!(
+                            "failed to restore TSI listener guest_port={}: errno {}",
+                            d.guest_port, -rc
+                        );
+                    }
+                }
+                Err(e) => warn!("failed to recreate TSI listener proxy: {e}"),
+            }
+        }
     }
 
     pub fn update_polling(&self, id: u64, fd: RawFd, evset: EventSet) {
