@@ -254,9 +254,12 @@ pub fn vcpu_adjust_vtimer_offset(vcpuid: u64, delta_ns: u64) -> Result<(), Error
 /// analogue of KVM's `VcpuState`. Holds the general-purpose registers, program
 /// state, NEON/FP registers, and the writable EL1 system registers that define
 /// guest execution + MMU state. Read-only ID registers, EL2 (VMM-managed)
-/// state, debug breakpoints, and the virtual-timer registers are intentionally
-/// excluded — the timer is re-aligned via [`vcpu_adjust_vtimer_offset`] on
-/// resume, exactly as the pause/resume path does.
+/// state, and debug breakpoints are intentionally excluded. The virtual-timer
+/// *offset* (`CNTVOFF`) IS captured (see [`HvfVcpuState::vtimer_offset`]): an
+/// in-process pause/resume keeps the live vCPU's offset and only nudges it via
+/// [`vcpu_adjust_vtimer_offset`], but a cross-process fork builds a fresh
+/// `hv_vcpu` with an unrelated default offset, so the absolute offset must be
+/// restored or the guest clock jumps on resume.
 #[derive(Clone, Debug)]
 pub struct HvfVcpuState {
     /// X0..X30.
@@ -281,6 +284,17 @@ pub struct HvfVcpuState {
     /// interrupt interface is in reset state and the guest is never woken from
     /// WFI by a device IRQ.
     pub gic_icc: Vec<(u32, u64)>,
+    /// Virtual-timer offset (`CNTVOFF`, raw counter ticks): `virtual_counter =
+    /// physical_counter - offset`. Captured so a cross-process fork clone — whose
+    /// vCPU is a fresh `hv_vcpu` with an unrelated default offset — restores the
+    /// guest's virtual counter to continue from the snapshot. The offset is
+    /// relative to the host physical counter, which is a single hardware counter
+    /// shared across all processes, so applying the golden's offset to the clone
+    /// makes the guest clock continue seamlessly (golden time + real fork
+    /// elapsed). Without it the guest `CLOCK_MONOTONIC` jumps on resume and
+    /// time-based guest code (e.g. the agent's deadline loops) wedges, so the
+    /// guest accepts vsock connections at the kernel level but never replies.
+    pub vtimer_offset: u64,
 }
 
 /// GIC redistributor registers captured per-vCPU (offsets == `hv_gic_redistributor_reg_t`).
@@ -373,6 +387,7 @@ impl HvfVcpuState {
             out.extend_from_slice(&reg.to_le_bytes());
             out.extend_from_slice(&val.to_le_bytes());
         }
+        out.extend_from_slice(&self.vtimer_offset.to_le_bytes());
         out
     }
 
@@ -422,6 +437,13 @@ impl HvfVcpuState {
             };
         let gic_redist = read_u32_pairs(bytes, &mut pos)?;
         let gic_icc = read_u32_pairs(bytes, &mut pos)?;
+        // Trailing field; tolerate older blobs that predate it (default 0 → no
+        // offset, the prior behavior).
+        let vtimer_offset = if pos < bytes.len() {
+            u64_at(bytes, &mut pos)?
+        } else {
+            0
+        };
         Ok(HvfVcpuState {
             gp,
             pc,
@@ -432,6 +454,7 @@ impl HvfVcpuState {
             sys,
             gic_redist,
             gic_icc,
+            vtimer_offset,
         })
     }
 }
@@ -464,6 +487,17 @@ const SNAPSHOT_SYS_REGS: &[u16] = &[
     hv_sys_reg_t_HV_SYS_REG_CSSELR_EL1,
     hv_sys_reg_t_HV_SYS_REG_ACTLR_EL1,
     hv_sys_reg_t_HV_SYS_REG_MDSCR_EL1,
+    // Virtual-timer compare + control + EL1 timer access. A cross-process fork
+    // builds a fresh vCPU whose timer registers are at reset, so the guest's
+    // per-CPU scheduler tick (armed via CNTV_CVAL_EL0 + CNTV_CTL_EL0) would never
+    // fire after resume — the guest services device IRQs but never schedules
+    // userspace, so the agent accepts vsock connections at the kernel level but
+    // never runs to reply. Restored alongside CNTVOFF (see vtimer_offset) so the
+    // armed deadline lines up with the continued virtual counter. CVAL before
+    // CTL so the compare is set before the timer is (re-)enabled.
+    hv_sys_reg_t_HV_SYS_REG_CNTKCTL_EL1,
+    hv_sys_reg_t_HV_SYS_REG_CNTV_CVAL_EL0,
+    hv_sys_reg_t_HV_SYS_REG_CNTV_CTL_EL0,
     // Pointer-authentication keys (per-boot/per-task secrets). The guest signs
     // return addresses with these and authenticates them with AUTIASP/AUTIBSP;
     // if a restored clone has different keys, the first authentication faults
@@ -555,6 +589,14 @@ pub fn vcpu_save_state(vcpuid: u64) -> Result<HvfVcpuState, Error> {
         gic_icc.push((reg, v));
     }
 
+    // Virtual-timer offset (CNTVOFF). Restored absolutely on a fork clone so the
+    // guest's virtual counter continues from the snapshot (see HvfVcpuState).
+    let mut vtimer_offset = 0u64;
+    let ret = unsafe { hv_vcpu_get_vtimer_offset(vcpuid, &mut vtimer_offset) };
+    if ret != HV_SUCCESS {
+        return Err(Error::VcpuGetVtimerOffset);
+    }
+
     Ok(HvfVcpuState {
         gp,
         pc,
@@ -565,6 +607,7 @@ pub fn vcpu_save_state(vcpuid: u64) -> Result<HvfVcpuState, Error> {
         sys,
         gic_redist,
         gic_icc,
+        vtimer_offset,
     })
 }
 
@@ -615,6 +658,16 @@ pub fn vcpu_restore_state(vcpuid: u64, state: &HvfVcpuState) -> Result<(), Error
         if ret != HV_SUCCESS {
             return Err(Error::VcpuSetSystemRegister(0, val));
         }
+    }
+    // Restore the virtual-timer offset so the clone's guest virtual counter
+    // continues from the snapshot. Set absolutely (not via
+    // `vcpu_adjust_vtimer_offset`, which only nudges an existing offset by a delta
+    // and is a no-op on the delta==0 fork path) — a fresh fork clone's `hv_vcpu`
+    // has an unrelated default offset, so without this the guest clock jumps on
+    // resume and time-based guest code hangs. See [`HvfVcpuState::vtimer_offset`].
+    let ret = unsafe { hv_vcpu_set_vtimer_offset(vcpuid, state.vtimer_offset) };
+    if ret != HV_SUCCESS {
+        return Err(Error::VcpuSetVtimerOffset);
     }
     Ok(())
 }
