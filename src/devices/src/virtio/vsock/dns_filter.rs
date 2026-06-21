@@ -840,7 +840,12 @@ mod tests {
 
     #[test]
     fn floor_off_blocks_nothing() {
-        for ip in [ip4(8, 8, 8, 8), ip4(169, 254, 169, 254), ip4(192, 168, 1, 5), ip4(127, 0, 0, 1)] {
+        for ip in [
+            ip4(8, 8, 8, 8),
+            ip4(169, 254, 169, 254),
+            ip4(192, 168, 1, 5),
+            ip4(127, 0, 0, 1),
+        ] {
             assert!(!is_floored(ip, FloorMode::Off));
         }
     }
@@ -848,20 +853,43 @@ mod tests {
     #[test]
     fn floor_metadata_only_blocks_just_link_local() {
         assert!(is_floored(ip4(169, 254, 169, 254), FloorMode::MetadataOnly));
-        for ip in [ip4(8, 8, 8, 8), ip4(192, 168, 1, 5), ip4(10, 0, 0, 7), ip4(127, 0, 0, 1)] {
-            assert!(!is_floored(ip, FloorMode::MetadataOnly), "{ip} reachable locally");
+        for ip in [
+            ip4(8, 8, 8, 8),
+            ip4(192, 168, 1, 5),
+            ip4(10, 0, 0, 7),
+            ip4(127, 0, 0, 1),
+        ] {
+            assert!(
+                !is_floored(ip, FloorMode::MetadataOnly),
+                "{ip} reachable locally"
+            );
         }
-        assert!(is_floored("::ffff:169.254.169.254".parse().unwrap(), FloorMode::MetadataOnly));
+        assert!(is_floored(
+            "::ffff:169.254.169.254".parse().unwrap(),
+            FloorMode::MetadataOnly
+        ));
     }
 
     #[test]
     fn floor_strict_blocks_internal_and_metadata() {
-        for ip in [ip4(169, 254, 169, 254), ip4(192, 168, 1, 5), ip4(10, 0, 0, 7), ip4(127, 0, 0, 1), ip4(100, 64, 0, 1)] {
-            assert!(is_floored(ip, FloorMode::Strict), "{ip} floored under Strict");
+        for ip in [
+            ip4(169, 254, 169, 254),
+            ip4(192, 168, 1, 5),
+            ip4(10, 0, 0, 7),
+            ip4(127, 0, 0, 1),
+            ip4(100, 64, 0, 1),
+        ] {
+            assert!(
+                is_floored(ip, FloorMode::Strict),
+                "{ip} floored under Strict"
+            );
         }
         assert!(!is_floored(ip4(8, 8, 8, 8), FloorMode::Strict));
         assert!(!is_floored(ip4(100, 128, 0, 1), FloorMode::Strict));
         assert!(is_floored("fe80::1".parse().unwrap(), FloorMode::Strict));
-        assert!(is_floored("::ffff:10.0.0.1".parse().unwrap(), FloorMode::Strict));
+        assert!(is_floored(
+            "::ffff:10.0.0.1".parse().unwrap(),
+            FloorMode::Strict
+        ));
     }
 }
