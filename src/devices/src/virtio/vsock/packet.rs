@@ -486,6 +486,17 @@ impl VsockPacket {
 
     #[cfg(target_os = "linux")]
     fn parse_address(buf: &[u8], addr_len: u32) -> Option<SockaddrStorage> {
+        // `addr_len` is guest-controlled; `from_raw` reads that many bytes from
+        // the raw pointer, so reject any length that would run past the buffer
+        // (an OOB read of host memory otherwise).
+        let len = addr_len as usize;
+        if len == 0 || len > buf.len() {
+            warn!(
+                "parse_address: addr_len {addr_len} out of bounds for {}-byte buffer",
+                buf.len()
+            );
+            return None;
+        }
         let sockaddr: SockaddrStorage = unsafe {
             SockaddrStorage::from_raw(&buf[0] as *const _ as *const sockaddr, Some(addr_len))?
         };
@@ -509,17 +520,28 @@ impl VsockPacket {
 
     #[cfg(target_os = "macos")]
     fn parse_address(buf: &[u8], _addr_len: u32) -> Option<SockaddrStorage> {
+        // `buf` is guest-controlled and may be short; bounds-check before every
+        // fixed-offset read so a truncated address can't panic the VMM.
+        if buf.len() < 2 {
+            return None;
+        }
         let family: u16 = byte_order::read_le_u16(&buf[0..2]);
 
         match family {
             defs::LINUX_AF_INET => {
                 debug!("parse_address: AF_INET");
+                if buf.len() < 8 {
+                    return None;
+                }
                 let in_port: u16 = byte_order::read_be_u16(&buf[2..4]);
                 let in_addr = Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7]);
                 Some(SocketAddrV4::new(in_addr, in_port).into())
             }
             defs::LINUX_AF_INET6 => {
                 debug!("parse_address: AF_INET6");
+                if buf.len() < 28 {
+                    return None;
+                }
                 let in_port: u16 = byte_order::read_be_u16(&buf[2..4]);
                 let flowinfo: u32 = byte_order::read_be_u32(&buf[4..8]);
                 let in6_addr = Ipv6Addr::new(
@@ -562,7 +584,7 @@ impl VsockPacket {
     }
 
     pub fn read_connect_req(&self) -> Option<TsiConnectReq> {
-        if self.buf_size >= 4 {
+        if self.buf_size >= 8 {
             let buf = self.buf().unwrap();
             let peer_port: u32 = byte_order::read_le_u32(&buf[0..]);
             let addr_len: u32 = byte_order::read_le_u32(&buf[4..]);
@@ -626,7 +648,7 @@ impl VsockPacket {
     }
 
     pub fn read_sendto_addr(&self) -> Option<TsiSendtoAddr> {
-        if self.buf_size >= 4 {
+        if self.buf_size >= 8 {
             let buf = self.buf().unwrap();
             let peer_port: u32 = byte_order::read_le_u32(&buf[0..]);
             let addr_len: u32 = byte_order::read_le_u32(&buf[4..]);
@@ -639,7 +661,7 @@ impl VsockPacket {
     }
 
     pub fn read_listen_req(&self) -> Option<TsiListenReq> {
-        if self.buf_size >= 12 {
+        if self.buf_size >= 16 {
             let buf = self.buf().unwrap();
             let peer_port: u32 = byte_order::read_le_u32(&buf[0..]);
             let vm_port: u32 = byte_order::read_le_u32(&buf[4..]);
