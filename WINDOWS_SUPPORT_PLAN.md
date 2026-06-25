@@ -533,3 +533,34 @@ build/packaging plumbing, and re-homing smolvm's Unix-specific features.
 - MSVC or GNU ABI for shipped `krun.dll`?
 - Which WHP-capable host(s) do we have for CI / manual testing?
 - Minimum viable Windows feature set — is "boot + console + INET net" acceptable for v1?
+
+## Seventh pass (2026-06-25): workload reliability + exec-from-passthrough EACCES
+
+After the userspace-shell milestone, exercising real workloads via libkrun on the Windows 10
+1909 thinkpad surfaced two issues:
+
+1. **VM teardown hung the process (fixed, `dd87c46`).** A workload ran and printed correctly,
+   but libkrun never exited. The console RX thread fills a guest buffer with a blocking
+   `ReadFile` on stdin; with no input it blocks forever and neither `unpark` nor the stop
+   eventfd interrupts a blocking `ReadFile`, so the console exit-observer's `join()` hung
+   before `_exit`. Fixed by waiting on input+stopfd together and bailing on stop. Workloads
+   now run *and* exit cleanly (5/5).
+
+2. **exec of a passthrough binary returns EACCES (open).** The shell (or init directly)
+   `execve`-ing a real passthrough file (`/bin/busybox`, `uname`, `ls`) fails with EACCES, so
+   single-program workloads work (init execs the entrypoint via the memfd fast-path) but
+   multi-process ones do not. On-hardware diagnostics ruled out every host-observable cause:
+
+   - mode is `0o755`, root-owned; FUSE `access()` is never called; FUSE `open()` succeeds.
+   - the root mount is `rw,relatime` — **not** noexec — and `mmap(PROT_EXEC)` of the binary
+     *succeeds* (which would fail on a noexec mount), so it is definitively not noexec.
+   - `cache_policy`/`DIRECT_IO`, `KEEP_CACHE`, the O_RDONLY→GENERIC_READ mapping, and nlink
+     were all excluded.
+   - **`fexecve` from a virtiofs fd → EACCES, but `fexecve` from a memfd (tmpfs) with the same
+     bytes → works.** And a *virtual* AugmentFs file (`init.krun`) execs from virtiofs fine,
+     while *passthrough* files do not. Exec from the passthrough also works on macOS/Linux.
+
+   So the failure is specific to exec'ing a file served by the **Windows PassthroughFs** —
+   the kernel refuses the exec after the permission check passes and mmap works. The next step
+   is in-guest kernel tracing (ftrace on `do_execveat_common`/`begin_new_exec`, or diffing the
+   FUSE message sequence against the working macOS passthrough); host-side checks are exhausted.
