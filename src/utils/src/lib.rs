@@ -4,10 +4,10 @@
 #[cfg(unix)]
 pub use vmm_sys_util::{errno, tempdir, tempfile, terminal};
 // vmm-sys-util is Unix-only; provide a compatible `errno` shim on Windows.
-#[cfg(target_os = "windows")]
-pub use windows::errno;
 #[cfg(target_os = "linux")]
 pub use vmm_sys_util::{eventfd, ioctl};
+#[cfg(target_os = "windows")]
+pub use windows::errno;
 
 pub mod byte_order;
 #[cfg(target_os = "linux")]

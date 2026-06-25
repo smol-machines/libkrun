@@ -10,11 +10,6 @@ use std::sync::Arc;
 
 use log::{debug, error};
 use windows_sys::Win32::Foundation::S_OK;
-use windows_sys::core::HRESULT;
-use windows_sys::Win32::System::Hypervisor::{
-    WHV_EMULATOR_IO_ACCESS_INFO, WHV_EMULATOR_MEMORY_ACCESS_INFO, WHV_TRANSLATE_GVA_FLAGS,
-    WHV_TRANSLATE_GVA_RESULT, WHV_TRANSLATE_GVA_RESULT_CODE, WHvTranslateGva,
-};
 use windows_sys::Win32::System::Hypervisor::{
     WHV_CAPABILITY, WHV_EMULATOR_CALLBACKS, WHV_EMULATOR_STATUS, WHV_MEMORY_ACCESS_CONTEXT,
     WHV_PARTITION_HANDLE, WHV_PARTITION_PROPERTY, WHV_PARTITION_PROPERTY_CODE,
@@ -40,7 +35,12 @@ use windows_sys::Win32::System::Hypervisor::{
     WHvX64RegisterRcx, WHvX64RegisterRdx, WHvX64RegisterRflags, WHvX64RegisterRip,
     WHvX64RegisterRsp,
 };
+use windows_sys::Win32::System::Hypervisor::{
+    WHV_EMULATOR_IO_ACCESS_INFO, WHV_EMULATOR_MEMORY_ACCESS_INFO, WHV_TRANSLATE_GVA_FLAGS,
+    WHV_TRANSLATE_GVA_RESULT, WHV_TRANSLATE_GVA_RESULT_CODE, WHvTranslateGva,
+};
 use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
+use windows_sys::core::HRESULT;
 
 #[derive(Debug)]
 pub enum Error {
@@ -963,7 +963,14 @@ unsafe extern "system" fn emu_translate_cb(
     let mut result: WHV_TRANSLATE_GVA_RESULT = unsafe { mem::zeroed() };
     let mut out_gpa: u64 = 0;
     let hr = unsafe {
-        WHvTranslateGva(ctx.partition, ctx.vp_index, gva, flags, &mut result, &mut out_gpa)
+        WHvTranslateGva(
+            ctx.partition,
+            ctx.vp_index,
+            gva,
+            flags,
+            &mut result,
+            &mut out_gpa,
+        )
     };
     if hr == S_OK {
         unsafe {
@@ -1189,11 +1196,7 @@ impl WhpVcpu {
     /// A short dump of the architectural state most useful for diagnosing a
     /// fault: instruction pointer, stack pointer and flags.
     pub fn debug_state(&self) -> String {
-        match self.get_registers64([
-            WHvX64RegisterRip,
-            WHvX64RegisterRsp,
-            WHvX64RegisterRflags,
-        ]) {
+        match self.get_registers64([WHvX64RegisterRip, WHvX64RegisterRsp, WHvX64RegisterRflags]) {
             Ok([rip, rsp, rflags]) => {
                 format!("rip={rip:#x} rsp={rsp:#x} rflags={rflags:#x}")
             }
