@@ -388,7 +388,14 @@ fn metadata_to_stat64(meta: &fs::Metadata, ino: u64, path: &Path, n_link: u32) -
     } else if is_directory {
         (libc::S_IFDIR | 0o755, 2u32)
     } else {
-        (libc::S_IFREG | 0o644, n_link)
+        // Windows has no Unix execute bit, so a regular file would otherwise be
+        // reported as non-executable (0o644) and the guest could not exec any
+        // binary served from the passthrough (execve fails with EACCES — e.g.
+        // /bin/sh and its ld-musl interpreter, leaving the workload dead at
+        // exit 126). Default regular files to 0o755 like other filesystems that
+        // cannot track the execute bit (WSL drvfs, vboxsf). A precise mode can
+        // still be supplied through the ADS-backed override below.
+        (libc::S_IFREG | 0o755, n_link)
     };
 
     let size = meta.len() as i64;
