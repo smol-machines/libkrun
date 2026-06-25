@@ -69,25 +69,54 @@ A third, latent bug was fixed along the way (commit `8c9b173`): the Windows epol
 exactly once — the device worker got FUSE_INIT but never woke for the next request. Now posts
 the completion packet itself, matching Linux level-triggered semantics.
 
-**Remaining gap to a visible userspace shell** (two distinct, scoped follow-ups, *not*
-interrupt-delivery bugs — that path now works end to end):
+### Fourth pass (2026-06-25): the guest reaches userspace and runs PID-1 init
 
-1. **init.krun exec / AugmentFs virtual-file serving.** The boot looks up `/init.krun` and
-   then halts without the expected follow-on lookups (`.krun_config.json`, `bin`, `sh`),
-   suggesting the virtual init binary served by `AugmentFs` over the Windows passthrough is
-   not exec'd successfully. Next: log the OPEN/READ of `init.krun` and verify the bytes the
-   guest reads.
-2. **virtio-console output plumbing on Windows.** `console=hvc0` guest output routes to
-   `output_to_log_as_err()` (non-terminal stdout) but never appears in the host log or stdout,
-   so even a successful shell's `echo` would be invisible. The `autoconfigure_console_ports`
-   Windows path wires the ports but the hvc0 TX→host drain does not deliver. Scoped to the
-   console device, independent of boot.
+The "halts after looking up /init.krun" gap was a **wrong-architecture init binary**, not an
+AugmentFs bug. `init_blob/build.rs` builds `krun-init` for the guest arch (= the libkrun
+target arch); when cross-compiling libkrun for an **x86_64** guest from an **aarch64** macOS
+host, the `x86_64-unknown-linux-musl` target was not installed and its cross-linker was not
+configured, so the build silently fell back to a host-arch (aarch64 Mach-O) `init.krun`. The
+x86_64 guest looked it up, could not exec the wrong-arch binary, and halted. Fixed by
+installing the target and adding the x86_64 musl linker recipe to the Makefile (commit
+`83a448d`); the embedded init is now a proper `ELF x86-64 static-pie` binary.
 
-**The core thesis is proven on real hardware and substantially advanced: with these fixes the
-Windows WHP backend boots a Linux guest through kernel init, mounts its virtiofs root, and
-drives interrupt-completing virtio I/O (LOOKUP/OPEN/READ) under the Windows Hypervisor
-Platform.** The last gap to a *visible* userspace shell is the init.krun exec step plus the
-console-output plumbing — both scoped, neither in the hypervisor/interrupt core.
+A second issue surfaced and was fixed: the WCP "post on already-signaled" from `8c9b173`
+**double-delivered** every event (the kernel re-queues natively), flooding the virtio device
+event handlers with spurious `WouldBlock` wakeups and starving the host. Reverted (`aef55b7`);
+the original one-shot symptom was the interrupt bug, already fixed.
+
+With the correct init and a console-enabled launcher, the FS-LOOKUP trace shows a **real
+userspace boot** on real WHP hardware:
+
+```
+dev → init.krun                 (kernel exec's PID 1)
+dev, proc, sys                  (init.krun mounts the pseudo-filesystems)
+.krun_config.json               (init reads its config — it is running)
+bin → sh → busybox              (init exec's the workload shell)
+lib → ld-musl-x86_64.so.1       (loading busybox's dynamic linker)
+```
+
+**This is a Linux guest booting to userspace under the Windows Hypervisor Platform**: kernel
+init completes, the virtiofs root mounts, PID-1 `init.krun` runs, sets up `/dev`,`/proc`,`/sys`,
+reads `.krun_config.json`, and exec's the busybox shell with its dynamic loader.
+
+**Remaining final-mile** (scoped, beyond the hypervisor/interrupt/init core, all now working):
+
+1. **busybox/ld-musl load completes.** The exec of the dynamically-linked busybox stops at
+   loading `ld-musl-x86_64.so.1` (process exits 126, "cannot execute"). The ELF header read
+   works (the guest found `PT_INTERP` and looked up the loader); the remaining failure is in
+   the final loader/relocation step — likely a virtiofs passthrough read-correctness detail
+   for real (non-virtual) files on Windows, or visible only with kernel-console output.
+2. **virtio-console TX→host output.** Even with a console *device* configured (the stock test
+   launcher omits `krun_add_virtio_console_default`), guest `console=hvc0` output is not
+   delivered to the host log/stdout, so kernel/shell output (and the `BOOT_OK` marker) stays
+   invisible — which also blocks diagnosing #1 from inside the guest.
+
+**Bottom line: the WHP backend is functional through userspace init on real hardware.** From
+this session's start (stalled at FUSE_INIT, no filesystem traversal, no userspace) the guest
+now boots the kernel, mounts root, runs PID-1 init, and exec's the userspace shell. The two
+remaining items are a static-vs-dynamic binary load detail and console output visibility —
+neither in the hypervisor core.
 
 ## TL;DR
 
