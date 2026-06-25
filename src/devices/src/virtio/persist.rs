@@ -14,14 +14,14 @@
 #[cfg(feature = "blk")]
 use crate::virtio::{Block, block::BlockState};
 use crate::virtio::{Console, ConsoleState, VirtioDevice};
-#[cfg(not(target_os = "windows"))]
-use crate::virtio::{Vsock, VsockState};
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use crate::virtio::{Fs, FsState};
 #[cfg(feature = "net")]
 use crate::virtio::{Net, net::NetState};
 #[cfg(not(feature = "tee"))]
 use crate::virtio::{Rng, RngState};
+#[cfg(not(target_os = "windows"))]
+use crate::virtio::{Vsock, VsockState};
 
 /// Snapshot of a single virtio device's runtime state.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

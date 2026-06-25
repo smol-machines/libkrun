@@ -36,31 +36,31 @@ use super::{Error, Vmm};
 #[cfg(target_arch = "x86_64")]
 use crate::device_manager::legacy::PortIODeviceManager;
 use crate::device_manager::mmio::MMIODeviceManager;
+#[cfg(not(target_os = "windows"))]
+use crate::resources::TsiFlags;
 use crate::resources::{
     DefaultVirtioConsoleConfig, PortConfig, VirtioConsoleConfigMode, VmResources,
 };
-#[cfg(not(target_os = "windows"))]
-use crate::resources::TsiFlags;
 use crate::vmm_config::external_kernel::{ExternalKernel, KernelFormat};
 #[cfg(feature = "net")]
 use crate::vmm_config::net::NetBuilder;
 #[cfg(target_arch = "x86_64")]
 use devices::legacy::Cmos;
-#[cfg(all(target_os = "linux", target_arch = "riscv64"))]
-use devices::legacy::KvmAia;
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-use devices::legacy::KvmIoapic;
-#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
-use devices::legacy::WhpIoapic;
-use devices::legacy::Serial;
-#[cfg(target_os = "macos")]
-use devices::legacy::VcpuList;
-#[cfg(target_os = "macos")]
-use devices::legacy::{GicV3, HvfGicV3};
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 use devices::legacy::IoApic;
 #[cfg(target_arch = "x86_64")]
 use devices::legacy::IrqChipT;
+#[cfg(all(target_os = "linux", target_arch = "riscv64"))]
+use devices::legacy::KvmAia;
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+use devices::legacy::KvmIoapic;
+use devices::legacy::Serial;
+#[cfg(target_os = "macos")]
+use devices::legacy::VcpuList;
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+use devices::legacy::WhpIoapic;
+#[cfg(target_os = "macos")]
+use devices::legacy::{GicV3, HvfGicV3};
 use devices::legacy::{IrqChip, IrqChipDevice};
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 use devices::legacy::{KvmGicV2, KvmGicV3};
@@ -668,10 +668,7 @@ pub fn build_microvm(
     // WHP needs the virtual-processor count at partition-creation time.
     #[cfg(all(not(feature = "tee"), target_os = "windows"))]
     #[allow(unused_mut)]
-    let mut vm = setup_vm(
-        &guest_memory,
-        vm_resources.vm_config().vcpu_count.unwrap(),
-    )?;
+    let mut vm = setup_vm(&guest_memory, vm_resources.vm_config().vcpu_count.unwrap())?;
     #[cfg(not(feature = "tee"))]
     vmm_timing!("vm created (HVF+mmap)");
 
@@ -2335,12 +2332,9 @@ fn create_vcpus_x86_64_whp(
 ) -> super::Result<Vec<Vcpu>> {
     let mut vcpus = Vec::with_capacity(vcpu_config.vcpu_count as usize);
     for cpu_index in 0..vcpu_config.vcpu_count {
-        let mut vcpu = Vcpu::new_x86_64(
-            cpu_index,
-            vm,
-            exit_evt.try_clone().map_err(Error::EventFd)?,
-        )
-        .map_err(Error::Vcpu)?;
+        let mut vcpu =
+            Vcpu::new_x86_64(cpu_index, vm, exit_evt.try_clone().map_err(Error::EventFd)?)
+                .map_err(Error::Vcpu)?;
         vcpu.set_io_bus(io_bus.clone());
         vcpu.configure_x86_64(guest_mem, entry_addr.raw_value())
             .map_err(Error::Vcpu)?;

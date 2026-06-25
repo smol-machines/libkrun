@@ -41,8 +41,8 @@ use std::os::windows::io::BorrowedHandle;
 use std::path::PathBuf;
 use std::slice;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicI32, Ordering};
 // Arc is only used by the (Unix-only) control-socket / vsock paths.
 #[cfg(not(target_os = "windows"))]
 use std::sync::Arc;

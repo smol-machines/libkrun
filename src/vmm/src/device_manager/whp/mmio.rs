@@ -233,7 +233,9 @@ impl MMIODeviceManager {
                 break;
             }
             if !applied {
-                return Err(format!("no matching transport to restore device type {want}"));
+                return Err(format!(
+                    "no matching transport to restore device type {want}"
+                ));
             }
         }
         Ok(())

@@ -225,14 +225,9 @@ impl Vcpu {
     /// backend (`arch::x86_64::windows`), mirroring the KVM/HVF `configure_x86_64`
     /// ordering. TODO(whp-host): validate the programmed state actually boots a
     /// guest on real WHP hardware.
-    pub fn configure_x86_64(
-        &mut self,
-        guest_mem: &GuestMemoryMmap,
-        entry_addr: u64,
-    ) -> Result<()> {
+    pub fn configure_x86_64(&mut self, guest_mem: &GuestMemoryMmap, entry_addr: u64) -> Result<()> {
         self.boot_entry_addr = entry_addr;
-        arch::x86_64::windows::msr::setup_msrs(&self.whp_vcpu)
-            .map_err(Error::ConfigureMsrs)?;
+        arch::x86_64::windows::msr::setup_msrs(&self.whp_vcpu).map_err(Error::ConfigureMsrs)?;
         arch::x86_64::windows::regs::setup_sregs(guest_mem, &self.whp_vcpu)
             .map_err(Error::ConfigureRegisters)?;
         arch::x86_64::windows::regs::setup_regs(&self.whp_vcpu, entry_addr)
@@ -282,7 +277,9 @@ impl Vcpu {
                 } else {
                     self.io_bus.read(0, port, &mut bytes[..size]);
                     let rax = u64::from_le_bytes(bytes);
-                    self.whp_vcpu.complete_io_in(rax).map_err(Error::VcpuRegisters)?;
+                    self.whp_vcpu
+                        .complete_io_in(rax)
+                        .map_err(Error::VcpuRegisters)?;
                 }
                 Ok(true)
             }
@@ -351,11 +348,17 @@ impl Vcpu {
                 match self.whp_vcpu.interrupts_enabled() {
                     Ok(true) => Ok(true),
                     Ok(false) => {
-                        info!("WHP vCPU {} halted with interrupts masked; stopping", self.id);
+                        info!(
+                            "WHP vCPU {} halted with interrupts masked; stopping",
+                            self.id
+                        );
                         Ok(false)
                     }
                     Err(e) => {
-                        error!("WHP vCPU {} HLT: cannot read RFLAGS: {e}; stopping", self.id);
+                        error!(
+                            "WHP vCPU {} HLT: cannot read RFLAGS: {e}; stopping",
+                            self.id
+                        );
                         Ok(false)
                     }
                 }
@@ -513,7 +516,9 @@ impl VcpuHandle {
     }
 
     pub fn send_event(&self, event: VcpuEvent) -> Result<()> {
-        self.event_sender.send(event).map_err(|_| Error::VcpuEvent)?;
+        self.event_sender
+            .send(event)
+            .map_err(|_| Error::VcpuEvent)?;
         // Cancel the running virtual processor so it exits `WHvRunVirtualProcessor`
         // promptly and services the event (the WHP analogue of KVM's immediate
         // exit / HVF's vcpu_request_exit).

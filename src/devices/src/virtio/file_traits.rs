@@ -465,11 +465,7 @@ impl FileReadWriteAtVolatile for File {
         Ok(total)
     }
 
-    fn read_vectored_at_volatile(
-        &self,
-        bufs: &[VolatileSlice],
-        offset: u64,
-    ) -> Result<usize> {
+    fn read_vectored_at_volatile(&self, bufs: &[VolatileSlice], offset: u64) -> Result<usize> {
         // Fill every buffer in order (the default impl only fills the first),
         // so a single FUSE read that spans multiple descriptors returns the
         // full requested length rather than a short read.

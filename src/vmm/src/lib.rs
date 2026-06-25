@@ -32,9 +32,9 @@ mod linux;
 use crate::linux::vstate;
 #[cfg(target_os = "macos")]
 mod macos;
+mod terminal;
 #[cfg(target_os = "windows")]
 mod windows;
-mod terminal;
 pub mod worker;
 
 #[cfg(target_os = "macos")]
@@ -46,11 +46,11 @@ use std::fmt::{Display, Formatter};
 use std::io;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
-#[cfg(target_os = "windows")]
-use utils::windows::AsRawFd;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+#[cfg(target_os = "windows")]
+use utils::windows::AsRawFd;
 
 #[cfg(target_arch = "x86_64")]
 use crate::device_manager::legacy::PortIODeviceManager;
