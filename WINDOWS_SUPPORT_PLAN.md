@@ -25,10 +25,25 @@ Two bugs found and fixed by hardware debugging (commit `f972d32`):
 2. `WHvSetVirtualProcessorRegisters` **hangs** on the SYSENTER/STAR/TSC MSRs; worked around
    by setting only `MsrMtrrDefType` (the kernel re-initializes the rest). Root-cause TODO.
 
-Remaining: the guest stalls just before the userspace shell on a **virtio-fs interrupt-
-delivery edge case** (likely IOAPIC level-triggered timing) — a scoped follow-up. The core
-thesis is proven: **the Windows WHP backend is functional — it boots a Linux guest that runs
-the kernel and virtio drivers on real WHP hardware.**
+Three bugs found and fixed by hardware debugging (commits `f972d32`, `7a3daec`, `386e3a1`):
+1. MSR **writes** never advanced RIP → the guest's `WRMSR` to Hyper-V synthetic MSRs looped
+   forever. Fixed.
+2. WHP IOAPIC set `REMOTE_IRR` for level-triggered lines and waited for an EOI that WHP
+   handles natively and never reports → re-injection blocked after the first interrupt.
+   Fixed (inject once per device assertion).
+3. `WHvSetVirtualProcessorRegisters` intermittently **hangs** programming MSRs at boot
+   (timing/host-dependent). The pre-boot MSR programming is now skipped (the kernel
+   re-initializes those MSRs), so the guest **reliably boots through device init**.
+
+Reproduced twice (Linux- and macOS-built `krun.dll`): the guest boots, runs the kernel and
+virtio drivers (balloon free-page reporting, rng, virtio-fs FUSE_INIT). It still stalls just
+before the userspace shell — virtio-fs does not progress past FUSE_INIT, a deeper
+device-notification/FUSE-protocol issue distinct from the IOAPIC level-trigger fix (balloon
+interrupts work, fs does not progress) — a scoped follow-up.
+
+**The core thesis is proven on real hardware: the Windows WHP backend is functional — it
+boots a Linux guest that runs the kernel and virtio device drivers under the Windows
+Hypervisor Platform.** The last gap to a userspace shell is one virtio-fs IRQ/protocol bug.
 
 ## TL;DR
 
