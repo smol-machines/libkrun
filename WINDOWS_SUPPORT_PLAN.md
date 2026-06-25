@@ -564,3 +564,39 @@ After the userspace-shell milestone, exercising real workloads via libkrun on th
    the kernel refuses the exec after the permission check passes and mmap works. The next step
    is in-guest kernel tracing (ftrace on `do_execveat_common`/`begin_new_exec`, or diffing the
    FUSE message sequence against the working macOS passthrough); host-side checks are exhausted.
+
+## Eighth pass (2026-06-25): exec-from-passthrough EACCES root-caused and FIXED
+
+The exec EACCES from the seventh pass is **solved** (commit `130a446`). Root cause was
+**not** in the guest kernel or the exec/mmap machinery — every inode-level check passes:
+on-hardware diagnostics confirmed the binary is a regular file (`mode=100755`, correct
+`size`), `access(X_OK)=0`, `open(O_RDONLY)` works, and `mmap(PROT_READ|PROT_EXEC, MAP_PRIVATE)`
+succeeds (proving the mount is not noexec and the loader's `elf_map` would work). Yet
+`execve`/`fexecve` both returned EACCES while a memfd (tmpfs) copy of the same bytes exec'd
+fine.
+
+A host-side FUSE-opcode trace pinned it exactly: during `execve` the guest kernel issues a
+**GETXATTR for `security.capability`** (via `get_vfs_caps_from_disk`, to compute file
+capabilities) — an xattr it never reads on a plain open/read/mmap, which is why only exec
+broke. The Windows passthrough `getxattr` deliberately short-circuited `security.capability`
+(and the internal `user.containers.override_stat`) with **EACCES** to "hide" them from the
+guest. But `get_vfs_caps_from_disk` only swallows **ENODATA/ENOTSUP** ("no capabilities") and
+**propagates any other error**, so the EACCES became the `execve` return value. macOS/Linux
+passthrough return ENODATA here, which is why exec worked there.
+
+Fix: return **ENODATA** instead of EACCES — `security.capability` now falls through to its
+ADS-backed stream (real value if set, ENODATA if not), and `override_stat` is hidden with
+ENODATA. Verified on real Windows 10 1909 WHP hardware: a busybox shell launched as the
+workload now `execve`s passthrough binaries (`uname -a`, `ls -la`, `echo`) successfully, with
+a clean VM exit:
+
+```
+SHELL-UP
+Linux localhost 6.12.91 #1 SMP PREEMPT_DYNAMIC ... x86_64 Linux
+-rwxr-xr-x    1 root     root        808712 Jun 25  2026 /bin/busybox
+MULTIPROC-OK
+```
+
+**Bottom line: multi-process Linux workloads now run on the Windows Hypervisor Platform.** The
+guest boots the kernel, mounts the virtiofs root, runs PID-1 init, execs the shell, and the
+shell forks and execs further passthrough binaries — the full process model works.
