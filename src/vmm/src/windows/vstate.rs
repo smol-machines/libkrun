@@ -339,12 +339,41 @@ impl Vcpu {
                 Ok(true)
             }
             VcpuExitReason::Halt => {
-                info!("WHP vCPU {} halted", self.id);
-                Ok(false)
+                // The guest executed HLT. Older WHP (e.g. Windows 10 1909)
+                // surfaces idle HLTs as exits rather than handling them inside
+                // WHvRunVirtualProcessor; treating every HLT as terminal kills
+                // the vCPU the first time the guest idles, long before userspace.
+                // If interrupts are enabled this is an idle wait — re-enter the
+                // run loop so WHP blocks until a wake interrupt (timer or a
+                // device IRQ injected from a watcher thread) resumes the vCPU.
+                // Only a HLT with interrupts masked is a real, unrecoverable
+                // shutdown halt that should stop the vCPU.
+                match self.whp_vcpu.interrupts_enabled() {
+                    Ok(true) => Ok(true),
+                    Ok(false) => {
+                        info!("WHP vCPU {} halted with interrupts masked; stopping", self.id);
+                        Ok(false)
+                    }
+                    Err(e) => {
+                        error!("WHP vCPU {} HLT: cannot read RFLAGS: {e}; stopping", self.id);
+                        Ok(false)
+                    }
+                }
             }
             VcpuExitReason::Canceled => {
                 // Woken to service a pending event (pause/resume/exit).
                 Ok(true)
+            }
+            VcpuExitReason::UnrecoverableException
+            | VcpuExitReason::InvalidVpRegisterValue
+            | VcpuExitReason::UnsupportedFeature => {
+                error!(
+                    "WHP vCPU {} fatal exit {:?}: {}",
+                    self.id,
+                    reason,
+                    self.whp_vcpu.debug_state()
+                );
+                Err(Error::VcpuUnhandledExit(reason))
             }
             other => {
                 error!("WHP vCPU {} unhandled exit: {other:?}", self.id);
