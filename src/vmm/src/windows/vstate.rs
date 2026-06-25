@@ -324,10 +324,14 @@ impl Vcpu {
                 Ok(true)
             }
             VcpuExitReason::MsrAccess => {
-                // TODO(whp-host): emulate the specific MSR. Default to returning
-                // zero for reads so the guest can make forward progress.
+                // Unhandled MSRs (e.g. Hyper-V synthetic MSRs in the 0x4000_00xx
+                // range, since WHP presents a Hyper-V interface). Reads return 0;
+                // writes are ignored. Both MUST advance RIP past the RD/WRMSR, or
+                // the instruction re-executes forever.
                 let info = self.whp_vcpu.msr_exit_info();
-                if !info.is_write {
+                if info.is_write {
+                    self.whp_vcpu.advance_rip().map_err(Error::VcpuRegisters)?;
+                } else {
                     self.whp_vcpu
                         .complete_msr_read(0, 0)
                         .map_err(Error::VcpuRegisters)?;
