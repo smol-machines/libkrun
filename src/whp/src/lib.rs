@@ -37,7 +37,8 @@ use windows_sys::Win32::System::Hypervisor::{
     WHvRunVpExitReasonX64MsrAccess, WHvSetPartitionProperty, WHvSetVirtualProcessorRegisters,
     WHvSetupPartition, WHvX64LocalApicEmulationModeXApic,
     WHvX64RegisterDeliverabilityNotifications, WHvX64RegisterRax, WHvX64RegisterRbx,
-    WHvX64RegisterRcx, WHvX64RegisterRdx, WHvX64RegisterRip,
+    WHvX64RegisterRcx, WHvX64RegisterRdx, WHvX64RegisterRflags, WHvX64RegisterRip,
+    WHvX64RegisterRsp,
 };
 use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 
@@ -310,16 +311,26 @@ impl WhpVm {
         // Configure how MSRs are handled
         // We just set the bit 0 (UnhandledMsrs) so that any MSR read/write does not automatically fail
         // but it triggers an exit that we can handle
-        Self::set_property(handle, WHvPartitionPropertyCodeX64MsrExitBitmap, |p| {
+        Self::set_property_optional(handle, WHvPartitionPropertyCodeX64MsrExitBitmap, |p| {
             p.X64MsrExitBitmap.AsUINT64 = 0b01; // bit 0 = UnhandledMsrs
         })?;
 
         // Set invariant TSC support
         // First we need to retrieve the processor features banks and re-set them with the invariant TSC support
-        // otherwise they get lost
-        let processor_features_banks = get_processor_features_banks()?;
+        // otherwise they get lost.
+        //
+        // The ProcessorFeaturesBanks capability/property is a later WHP addition
+        // and is unknown to older Windows (e.g. Windows 10 1909), where the
+        // capability query returns WHV_E_UNKNOWN_CAPABILITY. Treat it as
+        // best-effort: on failure fall back to a zeroed banks struct (BanksCount
+        // 0) so every `BanksCount >= 2` guard below — here and in the CPUID
+        // invariant-TSC leaf — simply skips.
+        let processor_features_banks = get_processor_features_banks().unwrap_or_else(|e| {
+            log::warn!("processor features banks unavailable ({e}); skipping invariant-TSC setup");
+            unsafe { MaybeUninit::<WHV_PROCESSOR_FEATURES_BANKS>::zeroed().assume_init() }
+        });
         if processor_features_banks.BanksCount >= 2 {
-            Self::set_property(
+            Self::set_property_optional(
                 handle,
                 WHvPartitionPropertyCodeProcessorFeaturesBanks,
                 |p| {
@@ -333,7 +344,7 @@ impl WhpVm {
         }
 
         // This unlocks the MSRs you are advertising in CPUID.
-        Self::set_property(
+        Self::set_property_optional(
             handle,
             WHvPartitionPropertyCodeSyntheticProcessorFeaturesBanks,
             |p| {
@@ -437,17 +448,21 @@ impl WhpVm {
             Edx: 0,
         });
 
-        // invariant tsc
-        if processor_features_banks.BanksCount >= 2 {
-            cpuid_results.push(WHV_X64_CPUID_RESULT {
-                Function: 0x80000007,
-                Reserved: [0; 3],
-                Eax: 0,
-                Ebx: 0,
-                Ecx: 0,
-                Edx: 0x100, // bit 8 (Invariant TSC / nonstop_tsc)
-            });
-        }
+        // Advertise an invariant TSC to the guest (CPUID 0x80000007, EDX bit 8).
+        // WHP only runs on hardware whose TSC is invariant, so this is always
+        // true. It must NOT be gated on the ProcessorFeaturesBanks property
+        // (which is unavailable on older Windows, e.g. 1909): without the
+        // invariant-TSC bit the guest cannot use the TSC as a stable clock
+        // source and early timekeeping/clocksource setup can fail, crashing the
+        // boot before userspace.
+        cpuid_results.push(WHV_X64_CPUID_RESULT {
+            Function: 0x80000007,
+            Reserved: [0; 3],
+            Eax: 0,
+            Ebx: 0,
+            Ecx: 0,
+            Edx: 0x100, // bit 8 (Invariant TSC / nonstop_tsc)
+        });
 
         // Standard Intel CPUID leaves (Intel's SDM Vol. 2A)
         if tsc_freq_hz > 0 {
@@ -509,9 +524,35 @@ impl WhpVm {
             )
         };
         if hr != S_OK {
+            log::error!("WHvSetPartitionProperty(code={code}) failed: HRESULT 0x{hr:08x}");
             Err(Error::SetPartitionProperty(hr))
         } else {
             Ok(())
+        }
+    }
+
+    /// Like [`Self::set_property`], but tolerates the property being unknown to
+    /// the host (`WHV_E_UNKNOWN_PROPERTY`, 0x80370302). Several partition
+    /// properties (the MSR-exit bitmap, the processor/synthetic feature banks)
+    /// were added to the Windows Hypervisor Platform after the first release and
+    /// are rejected on older Windows (e.g. Windows 10 1909). They are refinements
+    /// on top of capabilities already negotiated through other properties, so a
+    /// host that does not recognize them can still run the guest — log and skip.
+    fn set_property_optional(
+        handle: WHV_PARTITION_HANDLE,
+        code: WHV_PARTITION_PROPERTY_CODE,
+        configure: impl FnOnce(&mut WHV_PARTITION_PROPERTY),
+    ) -> Result<(), Error> {
+        const WHV_E_UNKNOWN_PROPERTY: i32 = 0x8037_0302u32 as i32;
+        match Self::set_property(handle, code, configure) {
+            Err(Error::SetPartitionProperty(hr)) if hr == WHV_E_UNKNOWN_PROPERTY => {
+                log::warn!(
+                    "WHvSetPartitionProperty(code={code}) not supported on this host \
+                     (0x{WHV_E_UNKNOWN_PROPERTY:08x}); continuing without it"
+                );
+                Ok(())
+            }
+            other => other,
         }
     }
 
@@ -1135,6 +1176,29 @@ impl WhpVcpu {
     ) -> Result<[u64; N], Error> {
         let values = self.get_registers(names)?;
         Ok(values.map(|v| unsafe { v.Reg64 }))
+    }
+
+    /// Returns true if the guest currently has interrupts enabled (RFLAGS.IF).
+    /// Used to tell an idle `HLT` (waiting for an interrupt, so the vCPU should
+    /// keep running) from a dead `HLT` with interrupts masked (shutdown).
+    pub fn interrupts_enabled(&self) -> Result<bool, Error> {
+        let [rflags] = self.get_registers64([WHvX64RegisterRflags])?;
+        Ok(rflags & (1 << 9) != 0)
+    }
+
+    /// A short dump of the architectural state most useful for diagnosing a
+    /// fault: instruction pointer, stack pointer and flags.
+    pub fn debug_state(&self) -> String {
+        match self.get_registers64([
+            WHvX64RegisterRip,
+            WHvX64RegisterRsp,
+            WHvX64RegisterRflags,
+        ]) {
+            Ok([rip, rsp, rflags]) => {
+                format!("rip={rip:#x} rsp={rsp:#x} rflags={rflags:#x}")
+            }
+            Err(e) => format!("<failed to read registers: {e}>"),
+        }
     }
 
     fn set_whp_registers(
