@@ -32,6 +32,20 @@ pub(crate) fn process_rx(
         };
 
         let head_index = head.index;
+
+        // On Windows the input read is a blocking `ReadFile`, which neither
+        // `unpark` nor the stop eventfd can interrupt. Before reading, wait until
+        // the input is actually readable *or* the stop signal fires, and bail out
+        // on stop — otherwise a shutdown join() would block forever in ReadFile
+        // waiting for stdin input that never arrives, hanging process teardown.
+        #[cfg(windows)]
+        {
+            input.wait_until_readable(Some(&stopfd));
+            if stop.load(Ordering::Acquire) {
+                return queue;
+            }
+        }
+
         let mut bytes_read = 0;
         for chain in head.into_iter().writable() {
             match read_to_desc(chain, input.as_mut(), &mut eof) {
