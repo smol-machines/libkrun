@@ -2177,7 +2177,15 @@ fn attach_legacy_devices(
         .map_err(Error::LegacyIOBus)
         .map_err(StartMicrovmError::Internal)?;
 
-    if split_irqchip {
+    // On WHP the IOAPIC is always a software device reached over MMIO: WHP
+    // emulates the LAPIC but not the IOAPIC, so the guest must be able to
+    // program the redirection table through our bus. Without this the guest's
+    // writes to 0xFEC00000 are dropped, every virtio pin stays masked at reset,
+    // and device-completion interrupts (e.g. the FUSE_INIT reply) are never
+    // delivered — the guest hangs mounting its rootfs before reaching init.
+    // On KVM/HVF the in-kernel/userspace split-irqchip option governs this.
+    let register_ioapic = split_irqchip || cfg!(target_os = "windows");
+    if register_ioapic {
         mmio_device_manager
             .register_mmio_ioapic(intc)
             .map_err(Error::RegisterMMIODevice)
