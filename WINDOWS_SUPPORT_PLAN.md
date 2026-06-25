@@ -147,10 +147,38 @@ next step is to trap the first exception via `WHvPartitionPropertyCodeExceptionE
 (if 1909 supports it) to recover the faulting vector/error-code/RIP, since the triple fault
 itself is silent.
 
-**Status:** the WHP backend boots a Linux guest **to userspace on newer Windows (Server
-2022)** and **through kernel init on older Windows (10 1909)**, where an early, silent,
-version-specific triple fault remains. The 1909 partition-feature and HLT fixes are real
-portability improvements regardless.
+### Sixth pass (2026-06-25): FULL USERSPACE SHELL on Windows 10 1909
+
+The early 1909 fault was the kernel's `check_timer` panic ("IO-APIC + timer doesn't work!");
+`no_timer_check` skips it (the WHP-emulated LAPIC timer works). Past that, two filesystem
+bugs blocked userspace, both fixed:
+
+- **Passthrough files were non-executable.** Windows has no Unix execute bit, so every file
+  was reported `0o644`; `execve` failed with EACCES (exit 126). Default to `0o755`.
+- **Short reads corrupted demand-paged binaries.** The Windows positioned read returned fewer
+  bytes than requested and the default vectored read filled only the first buffer, so mmap'd
+  pages of the dynamic loader were partly zero-filled → SIGSEGV (exit 139). Static binaries
+  (init) were fine; dynamic ones (`/bin/sh` + ld-musl) crashed. Loop the read to full length.
+
+With these, on a real **Windows 10 Pro 1909** laptop (i7-9700, reached over Tailscale SSH, no
+cloud) the guest **boots all the way to a userspace shell**, reproducibly (3/3, clean exit 0):
+
+```
+===BOOT_OK_FROM_GUEST=== shell-is-alive-on-WHP
+```
+
+i.e. kernel boot → mount virtiofs root → PID-1 init → exec `/bin/sh` (busybox + ld-musl) → the
+shell runs and writes to the host console, then powers off.
+
+**Status: the Windows Hypervisor Platform backend boots a Linux guest to a working userspace
+shell, validated on real hardware (Windows 10 1909, and through userspace init on Server
+2022).** Minor remaining items: busybox applet re-exec via `/proc/self/exe` fails when init
+launched the shell from a memfd (a fast-path artifact, not a boot failure), and the
+virtio-console kernel-message stream isn't drained to the host log (the workload's stdout via
+the krun-stdout port works). The chain of fixes — IOAPIC-over-MMIO, edge IRQ injection,
+guest-arch init, WCP re-arm, older-WHP partition/HLT tolerance, `no_timer_check`, executable
+mode, full-length reads — is what carries the guest from "won't create a partition" to a live
+shell.
 
 ## TL;DR
 
