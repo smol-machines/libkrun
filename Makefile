@@ -105,9 +105,18 @@ debug: $(LIBRARY_DEBUG_$(OS)) libkrun.pc
 
 ifeq ($(OS),Darwin)
     # Cross-linker for musl targets on macOS (brew install llvm for lld).
+    # The guest init (krun-init) is built for the *guest* arch, which matches
+    # the libkrun target arch — so when cross-compiling libkrun for a different
+    # guest (e.g. an x86_64 Windows/WHP build from an aarch64 host) the matching
+    # musl target's linker must also be configured, otherwise the init binary
+    # silently falls back to the host arch and the guest cannot exec it.
     export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER = $(CLANG)
     export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS = \
         -C link-arg=-target -C link-arg=aarch64-linux-gnu \
+        -C link-arg=-fuse-ld=lld -C link-arg=-Wl,-strip-debug
+    export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER = $(CLANG)
+    export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS = \
+        -C link-arg=-target -C link-arg=x86_64-linux-gnu \
         -C link-arg=-fuse-ld=lld -C link-arg=-Wl,-strip-debug
 endif
 
