@@ -17,8 +17,8 @@ use utils::eventfd::EventFd;
 
 use super::ioapic::{
     IOAPIC_DM_EXTINT, IOAPIC_DM_MASK, IOAPIC_LVT_DELIV_MODE_SHIFT, IOAPIC_LVT_DEST_MODE_SHIFT,
-    IOAPIC_LVT_MASKED_SHIFT, IOAPIC_LVT_REMOTE_IRR, IOAPIC_LVT_TRIGGER_MODE_SHIFT, IOAPIC_NUM_PINS,
-    IOAPIC_TRIGGER_EDGE, IOAPIC_VECTOR_MASK, IoApicBackend, IoApicRegs, Ioapic,
+    IOAPIC_LVT_MASKED_SHIFT, IOAPIC_LVT_TRIGGER_MODE_SHIFT, IOAPIC_NUM_PINS, IOAPIC_TRIGGER_EDGE,
+    IOAPIC_VECTOR_MASK, IoApicBackend, IoApicRegs, Ioapic,
 };
 
 const IOAPIC_LVT_DEST_IDX_SHIFT: u64 = 56;
@@ -51,17 +51,17 @@ impl WhpIoapicBackend {
                 continue;
             }
 
-            if trigger == IOAPIC_TRIGGER_EDGE {
-                regs.irr &= !mask;
-            } else {
-                if entry & IOAPIC_LVT_REMOTE_IRR != 0 {
-                    continue;
-                }
-                regs.ioredtbl[i] |= IOAPIC_LVT_REMOTE_IRR;
-                // Clear IRR to prevent infinite interrupt storms since we don't
-                // have a mechanism to track line de-assertion for level-triggered IRQs.
-                regs.irr &= !mask;
-            }
+            // Clear IRR after injecting (both edge and level). WHP emulates the
+            // LAPIC and handles guest EOI natively WITHOUT notifying this software
+            // IOAPIC, so the remote-IRR/EOI handshake for level-triggered lines
+            // cannot be tracked here: setting REMOTE_IRR and waiting for an EOI
+            // that never arrives would block all further interrupts on the pin
+            // (this stalled virtio-fs after FUSE_INIT on real WHP hardware).
+            // Instead, inject once per device assertion (`set_irq`) and rely on
+            // the device re-asserting for the next interrupt — virtio devices
+            // signal once per batch of completions, so every batch is delivered
+            // without an interrupt storm.
+            regs.irr &= !mask;
 
             let req = InterruptRequest {
                 interrupt_type: match deliv_mode {
