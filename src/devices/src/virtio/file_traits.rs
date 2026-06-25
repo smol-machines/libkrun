@@ -448,7 +448,40 @@ impl FileReadWriteAtVolatile for File {
         use std::os::windows::fs::FileExt;
         let buf =
             unsafe { std::slice::from_raw_parts_mut(slice.ptr_guard_mut().as_ptr(), slice.len()) };
-        self.seek_read(buf, offset)
+        // `seek_read` (ReadFile) may return a short read; loop until the whole
+        // slice is filled or EOF. A short virtiofs read leaves the rest of an
+        // mmap'd page zero-filled in the guest, which corrupts code/data pages
+        // of demand-paged binaries (the dynamic loader and its targets) and
+        // crashes them. The FUSE protocol expects a full-length reply up to EOF.
+        let mut total = 0;
+        while total < buf.len() {
+            match self.seek_read(&mut buf[total..], offset + total as u64) {
+                Ok(0) => break, // EOF
+                Ok(n) => total += n,
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(total)
+    }
+
+    fn read_vectored_at_volatile(
+        &self,
+        bufs: &[VolatileSlice],
+        offset: u64,
+    ) -> Result<usize> {
+        // Fill every buffer in order (the default impl only fills the first),
+        // so a single FUSE read that spans multiple descriptors returns the
+        // full requested length rather than a short read.
+        let mut total = 0u64;
+        for slice in bufs {
+            let n = self.read_at_volatile(*slice, offset + total)?;
+            total += n as u64;
+            if n < slice.len() {
+                break; // short read / EOF: stop, the guest re-reads from here
+            }
+        }
+        Ok(total as usize)
     }
 
     fn write_at_volatile(&self, slice: VolatileSlice, offset: u64) -> Result<usize> {
