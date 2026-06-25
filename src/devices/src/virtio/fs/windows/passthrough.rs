@@ -1076,6 +1076,22 @@ impl PassthroughFs {
         })
     }
 
+    /// Capture the passthrough server's logical state for checkpoint/fork.
+    ///
+    /// TODO(whp-host): snapshot/fork is not yet supported on Windows; capturing
+    /// the inode/handle maps (the Windows analogue of the Linux `/proc/self/fd`
+    /// path recovery) is left for the snapshot port. Returns an empty state so
+    /// the (Unix-only) snapshot machinery can compile on Windows.
+    pub fn snapshot(&self) -> super::super::device::FuseServerState {
+        super::super::device::FuseServerState::default()
+    }
+
+    /// Restore a previously captured passthrough state. No-op on Windows until
+    /// snapshot/fork is ported.
+    pub fn restore(&self, _state: &super::super::device::FuseServerState) -> io::Result<()> {
+        Ok(())
+    }
+
     fn inode_data(&self, inode: Inode) -> io::Result<Arc<InodeData>> {
         self.inodes
             .read()

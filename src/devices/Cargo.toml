@@ -52,6 +52,12 @@ tokio = { version = "1", features = ["rt"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.30.1", features = ["ioctl", "net", "poll", "socket", "fs"] }
+# vm-memory's `rawfd` feature provides FileReadWriteVolatile (read_volatile/
+# write_volatile) on file descriptors, used by the console port I/O. It is
+# Unix-only (vm-memory hard-errors on `rawfd` for Windows targets), so enable it
+# here rather than at the unconditional dep. Keeping it off the Windows build is
+# also why linux-loader is patched not to pull vm-memory's defaults.
+vm-memory = { version = "0.17", default-features = false, features = ["backend-mmap", "rawfd"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 hvf = { package = "krun-hvf", version = "=0.1.0-2.0.0-dev", path = "../hvf" }
@@ -69,9 +75,13 @@ vm-fdt = ">= 0.2.0"
 [target.'cfg(target_os = "windows")'.dependencies]
 whp = { package = "krun-whp", version = "=0.1.0-2.0.0-dev", path = "../whp" }
 windows-sys = { version = "0.61.2", features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
+    "Win32_System_IO",
     "Win32_System_Memory",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }

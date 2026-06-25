@@ -53,6 +53,55 @@ pub type ino64_t = libc::ino_t;
 #[cfg(target_os = "linux")]
 pub use libc::ino64_t;
 
+// Windows has no libc `stat64`/`statvfs64`. The Linux guest's virtio-fs protocol
+// still speaks these shapes, so the Windows passthrough backend
+// (`fs/windows/passthrough.rs`) fills these structs from Win32 metadata. Field
+// names/types match what that backend constructs and what `fuse::Attr`/`Kstatfs`
+// read back (via `as`/`into` casts).
+#[cfg(target_os = "windows")]
+pub type off64_t = i64;
+#[cfg(target_os = "windows")]
+pub type ino64_t = u64;
+
+#[cfg(target_os = "windows")]
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct stat64 {
+    pub st_dev: u64,
+    pub st_ino: u64,
+    pub st_nlink: u32,
+    pub st_mode: u32,
+    pub st_uid: u32,
+    pub st_gid: u32,
+    pub st_rdev: u64,
+    pub st_size: i64,
+    pub st_atime: i64,
+    pub st_atime_nsec: u32,
+    pub st_mtime: i64,
+    pub st_mtime_nsec: u32,
+    pub st_ctime: i64,
+    pub st_ctime_nsec: u32,
+    pub st_blksize: i64,
+    pub st_blocks: i64,
+}
+
+#[cfg(target_os = "windows")]
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct statvfs64 {
+    pub f_bsize: u64,
+    pub f_frsize: u64,
+    pub f_blocks: u64,
+    pub f_bfree: u64,
+    pub f_bavail: u64,
+    pub f_files: u64,
+    pub f_ffree: u64,
+    pub f_favail: u64,
+    pub f_fsid: u64,
+    pub f_flag: u64,
+    pub f_namemax: u64,
+}
+
 #[cfg(target_os = "linux")]
 pub unsafe fn pread64(
     fd: libc::c_int,

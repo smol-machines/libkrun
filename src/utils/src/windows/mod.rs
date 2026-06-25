@@ -2,6 +2,7 @@ use windows_sys::Win32::Foundation::HANDLE;
 
 pub(crate) mod bindings;
 pub mod epoll;
+pub mod errno;
 pub mod eventfd;
 
 /// Cross-platform alias used by the rest of the codebase.  On Windows this
@@ -11,6 +12,13 @@ pub type RawFd = HANDLE;
 /// Windows equivalent of [`std::os::unix::io::AsRawFd`].
 pub trait AsRawFd {
     fn as_raw_fd(&self) -> RawFd;
+}
+
+impl AsRawFd for std::fs::File {
+    fn as_raw_fd(&self) -> RawFd {
+        use std::os::windows::io::AsRawHandle;
+        self.as_raw_handle() as RawFd
+    }
 }
 
 /// A thin wrapper around a raw `HANDLE` that implements [`Send`].

@@ -37,8 +37,10 @@ use super::{Error, Vmm};
 use crate::device_manager::legacy::PortIODeviceManager;
 use crate::device_manager::mmio::MMIODeviceManager;
 use crate::resources::{
-    DefaultVirtioConsoleConfig, PortConfig, TsiFlags, VirtioConsoleConfigMode, VmResources,
+    DefaultVirtioConsoleConfig, PortConfig, VirtioConsoleConfigMode, VmResources,
 };
+#[cfg(not(target_os = "windows"))]
+use crate::resources::TsiFlags;
 use crate::vmm_config::external_kernel::{ExternalKernel, KernelFormat};
 #[cfg(feature = "net")]
 use crate::vmm_config::net::NetBuilder;
@@ -46,19 +48,25 @@ use crate::vmm_config::net::NetBuilder;
 use devices::legacy::Cmos;
 #[cfg(all(target_os = "linux", target_arch = "riscv64"))]
 use devices::legacy::KvmAia;
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 use devices::legacy::KvmIoapic;
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+use devices::legacy::WhpIoapic;
 use devices::legacy::Serial;
 #[cfg(target_os = "macos")]
 use devices::legacy::VcpuList;
 #[cfg(target_os = "macos")]
 use devices::legacy::{GicV3, HvfGicV3};
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+use devices::legacy::IoApic;
 #[cfg(target_arch = "x86_64")]
-use devices::legacy::{IoApic, IrqChipT};
+use devices::legacy::IrqChipT;
 use devices::legacy::{IrqChip, IrqChipDevice};
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 use devices::legacy::{KvmGicV2, KvmGicV3};
-use devices::virtio::{MmioTransport, PortDescription, VirtioDevice, Vsock, port_io};
+#[cfg(not(target_os = "windows"))]
+use devices::virtio::Vsock;
+use devices::virtio::{MmioTransport, PortDescription, VirtioDevice, port_io};
 
 #[cfg(feature = "tee")]
 use kbs_types::Tee;
@@ -117,9 +125,6 @@ use vm_memory::GuestRegionMmap;
 #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
 use vm_memory::mmap::MmapRegion;
 use vm_memory::{FileOffset, GuestAddress, GuestMemoryMmap};
-
-#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
-use arch::x86_64::layout::AP_TRAMPOLINE_START;
 
 /// Errors associated with starting the instance.
 #[derive(Debug)]
@@ -557,7 +562,11 @@ fn choose_payload(vm_resources: &VmResources) -> Result<Payload, StartMicrovmErr
         #[cfg(feature = "tee")]
         return Ok(Payload::Tee);
 
-        #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+        #[cfg(all(
+            any(target_os = "linux", target_os = "windows"),
+            target_arch = "x86_64",
+            not(feature = "tee")
+        ))]
         return Ok(Payload::KernelMmap);
 
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
@@ -653,9 +662,16 @@ pub fn build_microvm(
         kernel_cmdline.insert_str(cmdline).unwrap();
     }
 
-    #[cfg(not(feature = "tee"))]
+    #[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
     #[allow(unused_mut)]
     let mut vm = setup_vm(&guest_memory, vm_resources.nested_enabled)?;
+    // WHP needs the virtual-processor count at partition-creation time.
+    #[cfg(all(not(feature = "tee"), target_os = "windows"))]
+    #[allow(unused_mut)]
+    let mut vm = setup_vm(
+        &guest_memory,
+        vm_resources.vm_config().vcpu_count.unwrap(),
+    )?;
     #[cfg(not(feature = "tee"))]
     vmm_timing!("vm created (HVF+mmap)");
 
@@ -868,7 +884,7 @@ pub fn build_microvm(
     let intc: IrqChip;
     // For x86_64 we need to create the interrupt controller before calling `KVM_CREATE_VCPUS`
     // while on aarch64 we need to do it the other way around.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     {
         let ioapic: Box<dyn IrqChipT> = if vm_resources.split_irqchip {
             Box::new(
@@ -906,6 +922,33 @@ pub fn build_microvm(
             payload_config.pvh,
             #[cfg(feature = "tee")]
             _sender,
+        )
+        .map_err(StartMicrovmError::Internal)?;
+    }
+
+    // x86_64 on WHP: the interrupt controller is the WHP IOAPIC, and vCPUs are
+    // backed by WHP virtual processors (no KVM ioctls / cpuid/msr fixups here —
+    // WHP handles CPUID/MSR via run-loop exits).
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    {
+        let ioapic: Box<dyn IrqChipT> = Box::new(WhpIoapic::new(vm.whp_vm().clone()));
+        intc = Arc::new(Mutex::new(IrqChipDevice::new(ioapic)));
+
+        attach_legacy_devices(
+            &vm,
+            vm_resources.split_irqchip,
+            &mut pio_device_manager,
+            &mut mmio_device_manager,
+            Some(intc.clone()),
+        )?;
+
+        vcpus = create_vcpus_x86_64_whp(
+            &vm,
+            &vcpu_config,
+            &guest_memory,
+            payload_config.entry_addr,
+            &pio_device_manager.io_bus,
+            &exit_evt,
         )
         .map_err(StartMicrovmError::Internal)?;
     }
@@ -1127,6 +1170,8 @@ pub fn build_microvm(
     #[cfg(feature = "blk")]
     attach_block_devices(&mut vmm, &vm_resources.block, intc.clone())?;
 
+    // TSI/vsock is Unix-only.
+    #[cfg(not(target_os = "windows"))]
     if let Some(vsock) = vm_resources.vsock.get() {
         attach_unixsock_vsock_device(&mut vmm, vsock, event_manager, intc.clone())?;
         let tsi_flags = vm_resources.vsock.tsi_flags();
@@ -1283,6 +1328,17 @@ fn load_external_kernel(
             GuestAddress(0x8000_0000)
         }
         #[cfg(target_arch = "x86_64")]
+        // TODO(whp-host): linux-loader's ELF load needs `File: ReadVolatile`, which
+        // vm-memory only implements on Unix. Port external ELF kernel loading to
+        // Windows (e.g. read into a buffer and load from a `ReadVolatile` slice).
+        #[cfg(target_os = "windows")]
+        KernelFormat::Elf => {
+            return Err(StartMicrovmError::ElfOpenKernel(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "external ELF kernel loading is not yet supported on Windows (WHP)",
+            )));
+        }
+        #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
         KernelFormat::Elf => {
             let mut file = File::options()
                 .read(true)
@@ -1574,10 +1630,28 @@ fn load_payload(
             } else {
                 // SAFETY: kernel_host_addr points to valid kernel data of size kernel_size.
                 // The memory region is managed by the kernel bundle and remains valid.
-                unsafe {
+                #[cfg(not(target_os = "windows"))]
+                let region = unsafe {
                     MmapRegion::build_raw(kernel_host_addr as *mut u8, kernel_size, 0, 0)
                         .map_err(StartMicrovmError::InvalidKernelBundle)?
-                }
+                };
+                // vm-memory has no `build_raw` (raw-pointer view) on Windows; allocate a
+                // fresh anonymous region and copy the kernel image in.
+                // TODO(whp-host): a zero-copy view of libkrunfw's buffer would avoid the copy.
+                #[cfg(target_os = "windows")]
+                let region = {
+                    let region = MmapRegion::new(kernel_size)
+                        .map_err(StartMicrovmError::InvalidKernelBundle)?;
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            kernel_host_addr as *const u8,
+                            region.as_ptr(),
+                            kernel_size,
+                        );
+                    }
+                    region
+                };
+                region
             };
 
             Ok(LoadedPayload {
@@ -2052,6 +2126,22 @@ pub(crate) fn setup_vm(
     Ok(vm)
 }
 
+#[cfg(target_os = "windows")]
+pub(crate) fn setup_vm(
+    guest_memory: &GuestMemoryMmap,
+    vcpu_count: u8,
+) -> std::result::Result<Vm, StartMicrovmError> {
+    // WHP creates the partition (with the processor count fixed) up front, then
+    // maps guest memory into it.
+    let mut vm = Vm::new(u32::from(vcpu_count))
+        .map_err(Error::Vm)
+        .map_err(StartMicrovmError::Internal)?;
+    vm.memory_init(guest_memory)
+        .map_err(Error::Vm)
+        .map_err(StartMicrovmError::Internal)?;
+    Ok(vm)
+}
+
 /// Sets up the serial device.
 pub fn setup_serial_device(
     event_manager: &mut EventManager,
@@ -2094,6 +2184,12 @@ fn attach_legacy_devices(
             .map_err(StartMicrovmError::Internal)?;
     }
 
+    // KVM wires legacy-device IRQs through irqfds. WHP has no irqfd; the WHP
+    // IOAPIC injects these via `request_interrupt` from the run loop instead, so
+    // the registration is a no-op on Windows.
+    // TODO(whp-host): wire the legacy COM/keyboard interrupt lines into the WHP
+    // IOAPIC and validate on a real WHP host.
+    #[cfg(target_os = "linux")]
     macro_rules! register_irqfd_evt {
         ($evt: ident, $index: expr_2021) => {{
             vm.fd()
@@ -2104,6 +2200,12 @@ fn attach_legacy_devices(
                     ))
                 })
                 .map_err(StartMicrovmError::Internal)?;
+        }};
+    }
+    #[cfg(not(target_os = "linux"))]
+    macro_rules! register_irqfd_evt {
+        ($evt: ident, $index: expr_2021) => {{
+            let _ = (&vm, &pio_device_manager.$evt, $index);
         }};
     }
 
@@ -2179,7 +2281,7 @@ fn attach_legacy_devices(
     Ok(())
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[allow(clippy::too_many_arguments)]
 fn create_vcpus_x86_64(
     vm: &Vm,
@@ -2209,6 +2311,31 @@ fn create_vcpus_x86_64(
         vcpu.configure_x86_64(guest_mem, entry_addr, vcpu_config, kernel_boot, pvh)
             .map_err(Error::Vcpu)?;
 
+        vcpus.push(vcpu);
+    }
+    Ok(vcpus)
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+fn create_vcpus_x86_64_whp(
+    vm: &Vm,
+    vcpu_config: &VcpuConfig,
+    guest_mem: &GuestMemoryMmap,
+    entry_addr: GuestAddress,
+    io_bus: &devices::Bus,
+    exit_evt: &EventFd,
+) -> super::Result<Vec<Vcpu>> {
+    let mut vcpus = Vec::with_capacity(vcpu_config.vcpu_count as usize);
+    for cpu_index in 0..vcpu_config.vcpu_count {
+        let mut vcpu = Vcpu::new_x86_64(
+            cpu_index,
+            vm,
+            exit_evt.try_clone().map_err(Error::EventFd)?,
+        )
+        .map_err(Error::Vcpu)?;
+        vcpu.set_io_bus(io_bus.clone());
+        vcpu.configure_x86_64(guest_mem, entry_addr.raw_value())
+            .map_err(Error::Vcpu)?;
         vcpus.push(vcpu);
     }
     Ok(vcpus)
@@ -2316,6 +2443,10 @@ fn attach_mmio_device(
     intc: IrqChip,
     device: Arc<Mutex<dyn VirtioDevice>>,
 ) -> std::result::Result<(), device_manager::mmio::Error> {
+    // On WHP a host thread bridges the device's interrupt eventfd to the IOAPIC
+    // (no kernel-side irqfd); keep a handle to the IRQ chip for that watcher.
+    #[cfg(target_os = "windows")]
+    let irq_intc = intc.clone();
     let mmio_device = MmioTransport::new(vmm.guest_memory().clone(), intc, device)?;
 
     let type_id = mmio_device.locked_device().device_type();
@@ -2329,6 +2460,30 @@ fn attach_mmio_device(
     let (_mmio_base, _irq) =
         vmm.mmio_device_manager
             .register_mmio_device(mmio_device, type_id, id)?;
+    #[cfg(target_os = "windows")]
+    let (_mmio_base, _irq) = {
+        // Clone the device's interrupt eventfd before the transport is moved into
+        // the manager, then spawn a watcher that raises the IOAPIC line whenever
+        // the device signals an IRQ (the WHP analogue of KVM's irqfd).
+        let irq_evt = mmio_device
+            .interrupt_evt()
+            .try_clone()
+            .map_err(device_manager::mmio::Error::EventFd)?;
+        let (mmio_base, irq) =
+            vmm.mmio_device_manager
+                .register_mmio_device(mmio_device, type_id, id)?;
+        std::thread::Builder::new()
+            .name(format!("whp-irq-{irq}"))
+            .spawn(move || {
+                loop {
+                    if irq_evt.wait_timeout(u32::MAX) {
+                        let _ = irq_intc.lock().unwrap().set_irq(Some(irq), None);
+                    }
+                }
+            })
+            .map_err(device_manager::mmio::Error::EventFd)?;
+        (mmio_base, irq)
+    };
 
     #[cfg(target_arch = "x86_64")]
     vmm.mmio_device_manager
@@ -2491,13 +2646,12 @@ fn autoconfigure_console_ports(
     vmm: &mut Vmm,
     vm_resources: &VmResources,
     cfg: Option<&DefaultVirtioConsoleConfig>,
-    creating_implicit_console: bool,
 ) -> std::result::Result<Vec<PortDescription>, StartMicrovmError> {
     use self::StartMicrovmError::*;
 
     let mut console_output_path: Option<PathBuf> = None;
     if let Some(path) = vm_resources.console_output.clone() {
-        if !vm_resources.disable_implicit_console && creating_implicit_console {
+        if !vm_resources.disable_implicit_console {
             console_output_path = Some(path)
         }
     }
@@ -2794,6 +2948,7 @@ fn attach_net_devices(
     Ok(())
 }
 
+#[cfg(not(target_os = "windows"))]
 fn attach_unixsock_vsock_device(
     vmm: &mut Vmm,
     unix_vsock: &Arc<Mutex<Vsock>>,

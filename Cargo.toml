@@ -19,8 +19,14 @@ members = [
     "src/rutabaga_gfx",
     "src/whp",
 ]
-exclude = ["examples/gtk_display"]
+exclude = ["examples/gtk_display", "vendor/linux-loader"]
 resolver = "2"
+
+# Vendored linux-loader patched to pull vm-memory with default-features = false.
+# Upstream pulls vm-memory's default (Unix-only `rawfd`) feature, which breaks the
+# Windows build through global feature unification. See vendor/linux-loader.
+[patch.crates-io]
+linux-loader = { path = "vendor/linux-loader" }
 
 [profile.dev]
 #panic = "abort"

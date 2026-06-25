@@ -818,6 +818,7 @@ dependencies = [
  "krun-kernel",
  "krun-polly",
  "krun-utils",
+ "krun-whp",
  "kvm-bindings",
  "kvm-ioctls",
  "libc",
@@ -925,8 +926,6 @@ dependencies = [
 [[package]]
 name = "linux-loader"
 version = "0.13.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "de72cb02c55ecffcf75fe78295926f872eb6eb0a58d629c58a8c324dc26380f6"
 dependencies = [
  "vm-memory",
 ]

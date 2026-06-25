@@ -32,15 +32,22 @@ mod linux;
 use crate::linux::vstate;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "windows")]
+mod windows;
 mod terminal;
 pub mod worker;
 
 #[cfg(target_os = "macos")]
 use macos::vstate;
+#[cfg(target_os = "windows")]
+use windows::vstate;
 
 use std::fmt::{Display, Formatter};
 use std::io;
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
+#[cfg(target_os = "windows")]
+use utils::windows::AsRawFd;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};

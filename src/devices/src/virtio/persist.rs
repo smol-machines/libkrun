@@ -13,7 +13,9 @@
 
 #[cfg(feature = "blk")]
 use crate::virtio::{Block, block::BlockState};
-use crate::virtio::{Console, ConsoleState, VirtioDevice, Vsock, VsockState};
+use crate::virtio::{Console, ConsoleState, VirtioDevice};
+#[cfg(not(target_os = "windows"))]
+use crate::virtio::{Vsock, VsockState};
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use crate::virtio::{Fs, FsState};
 #[cfg(feature = "net")]
@@ -25,6 +27,7 @@ use crate::virtio::{Rng, RngState};
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DeviceSnapshot {
     Console(ConsoleState),
+    #[cfg(not(target_os = "windows"))]
     Vsock(VsockState),
     #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
     Fs(FsState),
@@ -43,6 +46,7 @@ impl DeviceSnapshot {
         use crate::virtio::*;
         match self {
             DeviceSnapshot::Console(_) => TYPE_CONSOLE,
+            #[cfg(not(target_os = "windows"))]
             DeviceSnapshot::Vsock(_) => TYPE_VSOCK,
             #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
             DeviceSnapshot::Fs(_) => TYPE_FS,
@@ -59,6 +63,7 @@ impl DeviceSnapshot {
     pub fn acked_features(&self) -> u64 {
         match self {
             DeviceSnapshot::Console(s) => s.acked_features,
+            #[cfg(not(target_os = "windows"))]
             DeviceSnapshot::Vsock(s) => s.acked_features,
             #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
             DeviceSnapshot::Fs(s) => s.acked_features,
@@ -76,6 +81,7 @@ impl DeviceSnapshot {
     pub fn queue_states(&self) -> Vec<Option<crate::virtio::queue::QueueState>> {
         match self {
             DeviceSnapshot::Console(s) => s.queues.clone(),
+            #[cfg(not(target_os = "windows"))]
             DeviceSnapshot::Vsock(s) => vec![s.queue_rx.clone(), s.queue_tx.clone()],
             #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
             DeviceSnapshot::Fs(s) => s.queues.clone(),
@@ -117,6 +123,7 @@ pub fn snapshot_device(dev: &dyn VirtioDevice) -> Option<DeviceSnapshot> {
     if let Some(d) = any.downcast_ref::<Console>() {
         return Some(DeviceSnapshot::Console(d.save_state()));
     }
+    #[cfg(not(target_os = "windows"))]
     if let Some(d) = any.downcast_ref::<Vsock>() {
         return Some(DeviceSnapshot::Vsock(d.save_state()));
     }
@@ -148,6 +155,7 @@ pub fn restore_device(dev: &mut dyn VirtioDevice, snap: &DeviceSnapshot) -> Resu
             .downcast_mut::<Console>()
             .ok_or_else(|| "snapshot/device mismatch: expected Console".to_string())?
             .restore_state(s),
+        #[cfg(not(target_os = "windows"))]
         DeviceSnapshot::Vsock(s) => any
             .downcast_mut::<Vsock>()
             .ok_or_else(|| "snapshot/device mismatch: expected Vsock".to_string())?

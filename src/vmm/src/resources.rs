@@ -30,6 +30,7 @@ use crate::vmm_config::kernel_cmdline::{KernelCmdlineConfig, KernelCmdlineConfig
 use crate::vmm_config::machine_config::{VmConfig, VmConfigError};
 #[cfg(feature = "net")]
 use crate::vmm_config::net::{NetBuilder, NetworkInterfaceConfig, NetworkInterfaceError};
+#[cfg(not(target_os = "windows"))]
 use crate::vmm_config::vsock::*;
 use crate::vstate::VcpuConfig;
 #[cfg(feature = "gpu")]
@@ -41,7 +42,8 @@ use krun_display::DisplayBackend;
 
 type Result<E> = std::result::Result<(), E>;
 
-// Re-export TsiFlags from devices crate
+// Re-export TsiFlags from devices crate (TSI/vsock is Unix-only).
+#[cfg(not(target_os = "windows"))]
 pub use devices::virtio::TsiFlags;
 
 #[cfg(feature = "vhost-user")]
@@ -76,6 +78,7 @@ pub enum Error {
     /// microVM vCpus or memory configuration error.
     VmConfig(VmConfigError),
     /// Vsock device configuration error.
+    #[cfg(not(target_os = "windows"))]
     VsockDevice(VsockConfigError),
 }
 
@@ -161,7 +164,8 @@ pub enum PortConfig {
     },
 }
 
-/// Configuration for the vsock device
+/// Configuration for the vsock device (TSI/vsock is Unix-only).
+#[cfg(not(target_os = "windows"))]
 #[derive(Debug, Default, Clone, Eq, PartialEq)]
 pub enum VsockConfig {
     /// No vsock device
@@ -194,7 +198,8 @@ pub struct VmResources {
     /// The fs device.
     #[cfg(not(feature = "tee"))]
     pub fs: Vec<FsDeviceConfig>,
-    /// The vsock device.
+    /// The vsock device (TSI/vsock is Unix-only).
+    #[cfg(not(target_os = "windows"))]
     pub vsock: VsockBuilder,
     /// The virtio-blk device.
     #[cfg(feature = "blk")]
@@ -220,6 +225,12 @@ pub struct VmResources {
     #[cfg(feature = "vhost-user")]
     /// Vhost-user device configurations
     pub vhost_user_devices: Vec<VhostUserDeviceConfig>,
+    /// Optional path the implicit console output is redirected to (Windows).
+    #[cfg(target_os = "windows")]
+    pub console_output: Option<std::path::PathBuf>,
+    /// Whether to suppress the implicit console output redirection (Windows).
+    #[cfg(target_os = "windows")]
+    pub disable_implicit_console: bool,
     /// SMBIOS OEM Strings
     pub smbios_oem_strings: Option<Vec<String>>,
     /// Whether to enable nested virtualization.
@@ -309,7 +320,15 @@ impl VmResources {
 
     pub fn set_kernel_bundle(&mut self, kernel_bundle: KernelBundle) -> Result<KernelBundleError> {
         // Safe because this call just returns the page size and doesn't have any side effects.
+        #[cfg(not(target_os = "windows"))]
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+        #[cfg(target_os = "windows")]
+        let page_size = {
+            use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+            let mut info: SYSTEM_INFO = unsafe { std::mem::zeroed() };
+            unsafe { GetSystemInfo(&mut info) };
+            info.dwPageSize as usize
+        };
 
         if kernel_bundle.host_addr == 0 || (kernel_bundle.host_addr as usize) & (page_size - 1) != 0
         {
@@ -372,7 +391,8 @@ impl VmResources {
         self.block.insert(config)
     }
 
-    /// Sets a vsock device to be attached when the VM starts.
+    /// Sets a vsock device to be attached when the VM starts (Unix-only).
+    #[cfg(not(target_os = "windows"))]
     pub fn set_vsock_device(&mut self, config: VsockDeviceConfig) -> Result<VsockConfigError> {
         self.vsock.insert(config)
     }
