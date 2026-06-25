@@ -3,6 +3,33 @@
 Status: **draft / scoping** — written 2026-06-24 after a build-driven assessment on the
 `windows-whp-fixes` branch (cross-compiling from macOS to `x86_64-pc-windows-gnu`).
 
+## VALIDATED ON REAL HARDWARE (2026-06-25)
+
+The WHP backend was **booted on a real Windows host** (AWS `z1d.metal`, Windows Server
+2022, Windows Hypervisor Platform enabled). Built the kernel + `libkrunfw.dll` + `krun.dll`
++ a launcher on a Linux instance, deployed via SSM/S3, and ran it. Result:
+
+- ✅ **WHP partition created, guest memory mapped, vCPU created** — all real WHP API calls.
+- ✅ **The Linux kernel boots**: runs at kernel virtual addresses (long mode + paging +
+  segments programmed correctly), executes PIO (PIT, CMOS/RTC, port 0x80), and **MMIO
+  instruction emulation drives the IOAPIC and virtio-mmio** via the `WHV_EMULATOR_CALLBACKS`
+  bridge.
+- ✅ **Interrupts deliver**: the per-device watcher → IOAPIC → `request_interrupt` path
+  works (balloon free-page reporting runs).
+- ✅ **virtio devices initialize and process I/O**: balloon, rng, and **virtio-fs reaches
+  FUSE_INIT** (the guest is mounting the rootfs).
+
+Two bugs found and fixed by hardware debugging (commit `f972d32`):
+1. MSR **writes** never advanced RIP → the guest's `WRMSR` to Hyper-V synthetic MSRs
+   (`0x4000_00xx`) looped forever. Fixed.
+2. `WHvSetVirtualProcessorRegisters` **hangs** on the SYSENTER/STAR/TSC MSRs; worked around
+   by setting only `MsrMtrrDefType` (the kernel re-initializes the rest). Root-cause TODO.
+
+Remaining: the guest stalls just before the userspace shell on a **virtio-fs interrupt-
+delivery edge case** (likely IOAPIC level-triggered timing) — a scoped follow-up. The core
+thesis is proven: **the Windows WHP backend is functional — it boots a Linux guest that runs
+the kernel and virtio drivers on real WHP hardware.**
+
 ## TL;DR
 
 **Update (2026-06-25): the entire libkrun stack now cross-compiles to a clean `krun.dll`
