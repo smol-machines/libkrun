@@ -227,7 +227,11 @@ impl FsWorker {
 
     fn handle_event(&mut self, queue_index: usize) {
         debug!("Fs: queue event: {queue_index}");
-        if let Err(e) = self.queue_evts[queue_index].read() {
+        // A drained eventfd reports WouldBlock on a spurious level-triggered
+        // wakeup (common with the Windows epoll shim) — expected, not an error.
+        if let Err(e) = self.queue_evts[queue_index].read()
+            && e.kind() != io::ErrorKind::WouldBlock
+        {
             error!("Failed to get queue event: {e:?}");
         }
 
