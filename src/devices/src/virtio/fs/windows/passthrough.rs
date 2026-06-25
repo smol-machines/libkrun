@@ -1068,7 +1068,15 @@ unsafe impl Send for PassthroughFs {}
 unsafe impl Sync for PassthroughFs {}
 
 impl PassthroughFs {
-    pub fn new(cfg: Config, inode_alloc: Arc<InodeAllocator>) -> io::Result<Self> {
+    pub fn new(mut cfg: Config, inode_alloc: Arc<InodeAllocator>) -> io::Result<Self> {
+        // `NtCreateFile` needs an absolute NT path; a relative `root_dir` (e.g.
+        // "rootfs") expands to the invalid `\??\rootfs` and fails with ENOENT,
+        // which aborts device activation. Canonicalize once up front so the root
+        // inode and every path derived from it are absolute. `fs::canonicalize`
+        // yields the `\\?\C:\...` verbatim form, which `path_to_nt_wide` handles.
+        if let Ok(abs) = fs::canonicalize(&cfg.root_dir) {
+            cfg.root_dir = abs.to_string_lossy().into_owned();
+        }
         let root_handle = openat(&cfg.root_dir)?;
 
         Ok(PassthroughFs {
