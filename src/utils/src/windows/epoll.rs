@@ -41,8 +41,7 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT as WAIT_TIMEOUT_CODE,
 };
 use windows_sys::Win32::System::IO::{
-    CreateIoCompletionPort, GetQueuedCompletionStatusEx, PostQueuedCompletionStatus,
-    OVERLAPPED_ENTRY,
+    CreateIoCompletionPort, GetQueuedCompletionStatusEx, OVERLAPPED_ENTRY,
 };
 use windows_sys::Win32::System::Threading::INFINITE;
 
@@ -207,25 +206,15 @@ fn associate_wcp(
         return Err(nt_status_err(status));
     }
 
-    // If the target handle was *already signaled* at association time, the
-    // kernel consumes the WCP as a one-shot and queues NO completion packet:
-    // `already_signaled` is set TRUE and the association does not persist for
-    // future signals. This is the trap that previously made level-triggered
-    // fds fire exactly once. The re-association in `wait` runs before the
-    // worker drains the eventfd, so the event is still signaled and the
-    // re-arm would silently vanish — e.g. virtio-fs received FUSE_INIT but
-    // never woke again for FUSE_LOOKUP, stalling the boot before userspace.
-    //
-    // Recover the lost edge by posting the completion packet ourselves with
-    // the same `key` the WCP would have carried. `wait` returns it, the
-    // handler drains the fd, and the next re-association (now against a reset
-    // event) arms a real wait. For a level-triggered fd that genuinely stays
-    // ready this keeps reporting it until drained — exactly Linux semantics.
-    if already_signaled != 0 {
-        unsafe {
-            PostQueuedCompletionStatus(iocp, 0, key as usize, ptr::null_mut());
-        }
-    }
+    // `NtAssociateWaitCompletionPacket` re-arms the wait even when the target
+    // is already signaled at association time: it sets `already_signaled` for
+    // information and still queues a completion packet for the pending signal.
+    // We therefore must NOT post a packet ourselves — doing so double-delivers
+    // every event, and because `wait` re-associates before the handler drains
+    // the eventfd (so the event is still signaled), it would post on *every*
+    // re-arm, flooding the IOCP with spurious wakeups (a busy-loop of
+    // `WouldBlock` reads that starves the host under load).
+    let _ = already_signaled;
     Ok(())
 }
 
