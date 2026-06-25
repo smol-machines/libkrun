@@ -10,6 +10,11 @@ use std::sync::Arc;
 
 use log::{debug, error};
 use windows_sys::Win32::Foundation::S_OK;
+use windows_sys::core::HRESULT;
+use windows_sys::Win32::System::Hypervisor::{
+    WHV_EMULATOR_IO_ACCESS_INFO, WHV_EMULATOR_MEMORY_ACCESS_INFO, WHV_TRANSLATE_GVA_FLAGS,
+    WHV_TRANSLATE_GVA_RESULT, WHV_TRANSLATE_GVA_RESULT_CODE, WHvTranslateGva,
+};
 use windows_sys::Win32::System::Hypervisor::{
     WHV_CAPABILITY, WHV_EMULATOR_CALLBACKS, WHV_EMULATOR_STATUS, WHV_MEMORY_ACCESS_CONTEXT,
     WHV_PARTITION_HANDLE, WHV_PARTITION_PROPERTY, WHV_PARTITION_PROPERTY_CODE,
@@ -193,6 +198,17 @@ pub struct MsrExitInfo {
     pub is_write: bool,
     pub rax: u64,
     pub rdx: u64,
+}
+
+/// Parsed IO-port exit context returned by [`WhpVcpu::io_port_exit_info`].
+#[derive(Debug, Clone)]
+pub struct IoPortExitInfo {
+    pub port: u16,
+    pub is_write: bool,
+    /// Access width in bytes (1, 2 or 4).
+    pub size: u8,
+    /// Current RAX (the source data for an `out`).
+    pub rax: u64,
 }
 
 pub struct WhpVm {
@@ -502,6 +518,7 @@ impl WhpVm {
     /// Detect the host TSC frequency in Hz.
     /// Tries CPUID 0x15, then 0x16 (Intel), then falls back to measuring
     /// via RDTSC over a short sleep (works on AMD and all other x86_64).
+    #[allow(unused_unsafe)]
     fn detect_tsc_frequency() -> u64 {
         unsafe {
             // Leaf 0 returns the maximum supported standard leaf in EAX.
@@ -751,10 +768,17 @@ impl WhpEmulator {
         vp_context: *const WHV_VP_EXIT_CONTEXT,
         io_context: *const WHV_X64_IO_PORT_ACCESS_CONTEXT,
     ) -> Result<(), Error> {
-        let mut status: WHV_EMULATOR_STATUS = mem::zeroed();
-        let hr =
-            WHvEmulatorTryIoEmulation(self.handle, context, vp_context, io_context, &mut status);
-        Self::check_emulation_result(hr, status, Error::IoEmulation)
+        unsafe {
+            let mut status: WHV_EMULATOR_STATUS = mem::zeroed();
+            let hr = WHvEmulatorTryIoEmulation(
+                self.handle,
+                context,
+                vp_context,
+                io_context,
+                &mut status,
+            );
+            Self::check_emulation_result(hr, status, Error::IoEmulation)
+        }
     }
 
     /// Attempts to emulate an x86 Memory-Mapped I/O (MMIO) instruction (e.g., `MOV eax, [mem]`).
@@ -771,16 +795,142 @@ impl WhpEmulator {
         vp_context: *const WHV_VP_EXIT_CONTEXT,
         mmio_context: *const WHV_MEMORY_ACCESS_CONTEXT,
     ) -> Result<(), Error> {
-        let mut status: WHV_EMULATOR_STATUS = mem::zeroed();
-        let hr = WHvEmulatorTryMmioEmulation(
-            self.handle,
-            context,
-            vp_context,
-            mmio_context,
-            &mut status,
-        );
-        Self::check_emulation_result(hr, status, Error::MmioEmulation)
+        unsafe {
+            let mut status: WHV_EMULATOR_STATUS = mem::zeroed();
+            let hr = WHvEmulatorTryMmioEmulation(
+                self.handle,
+                context,
+                vp_context,
+                mmio_context,
+                &mut status,
+            );
+            Self::check_emulation_result(hr, status, Error::MmioEmulation)
+        }
     }
+
+    /// Creates an emulator wired with default callbacks: memory accesses are
+    /// routed through the handler passed to [`Self::emulate_mmio`], and
+    /// register/translation queries are forwarded to the partition. This is the
+    /// constructor the VMM should use for MMIO instruction emulation.
+    pub fn with_mmio_callbacks() -> Result<Self, Error> {
+        let callbacks = WHV_EMULATOR_CALLBACKS {
+            Size: mem::size_of::<WHV_EMULATOR_CALLBACKS>() as u32,
+            Reserved: 0,
+            WHvEmulatorIoPortCallback: Some(emu_io_cb),
+            WHvEmulatorMemoryCallback: Some(emu_memory_cb),
+            WHvEmulatorGetVirtualProcessorRegisters: Some(emu_get_regs_cb),
+            WHvEmulatorSetVirtualProcessorRegisters: Some(emu_set_regs_cb),
+            WHvEmulatorTranslateGvaPage: Some(emu_translate_cb),
+        };
+        Self::new(callbacks)
+    }
+
+    /// Emulates the faulting MMIO instruction for `vcpu`, routing the device-side
+    /// memory access through `mem` (`(gpa, data, is_write)`; for writes `data`
+    /// holds the bytes to store, for reads the handler fills `data`). The
+    /// emulator advances RIP and updates the vCPU registers itself via the
+    /// register callbacks.
+    ///
+    /// # Safety
+    /// Call only after a `MemoryAccess` exit on `vcpu`; the emulator created with
+    /// [`Self::with_mmio_callbacks`].
+    pub unsafe fn emulate_mmio(
+        &self,
+        vcpu: &WhpVcpu,
+        mem: &mut dyn FnMut(u64, &mut [u8], bool),
+    ) -> Result<(), Error> {
+        let mut ctx = MmioEmuCtx {
+            partition: vcpu.partition_handle(),
+            vp_index: vcpu.index(),
+            mem,
+        };
+        unsafe {
+            self.try_mmio_emulation(
+                &mut ctx as *mut MmioEmuCtx as *const c_void,
+                vcpu.vp_exit_context(),
+                vcpu.memory_access_context(),
+            )
+        }
+    }
+}
+
+/// Opaque context handed to the WHP emulator callbacks; lives on the stack for
+/// the duration of a single [`WhpEmulator::emulate_mmio`] call.
+struct MmioEmuCtx<'a> {
+    partition: WHV_PARTITION_HANDLE,
+    vp_index: u32,
+    mem: &'a mut dyn FnMut(u64, &mut [u8], bool),
+}
+
+/// Memory-access callback: route the emulator's device-side access to `mem`.
+unsafe extern "system" fn emu_memory_cb(
+    context: *const c_void,
+    access: *mut WHV_EMULATOR_MEMORY_ACCESS_INFO,
+) -> HRESULT {
+    let ctx = unsafe { &mut *(context as *mut MmioEmuCtx) };
+    let access = unsafe { &mut *access };
+    let size = (access.AccessSize as usize).min(8);
+    let is_write = access.Direction != 0; // 0 = read, 1 = write
+    let mut buf = access.Data;
+    (ctx.mem)(access.GpaAddress, &mut buf[..size], is_write);
+    if !is_write {
+        access.Data[..size].copy_from_slice(&buf[..size]);
+    }
+    S_OK
+}
+
+/// PIO callback: string-IO to ports during MMIO emulation isn't produced by
+/// virtio-mmio devices. TODO(whp-host): route to the PIO bus if ever needed.
+unsafe extern "system" fn emu_io_cb(
+    _context: *const c_void,
+    _access: *mut WHV_EMULATOR_IO_ACCESS_INFO,
+) -> HRESULT {
+    S_OK
+}
+
+/// Register-read callback: forward to the partition.
+unsafe extern "system" fn emu_get_regs_cb(
+    context: *const c_void,
+    names: *const WHV_REGISTER_NAME,
+    count: u32,
+    values: *mut WHV_REGISTER_VALUE,
+) -> HRESULT {
+    let ctx = unsafe { &*(context as *const MmioEmuCtx) };
+    unsafe { WHvGetVirtualProcessorRegisters(ctx.partition, ctx.vp_index, names, count, values) }
+}
+
+/// Register-write callback: forward to the partition.
+unsafe extern "system" fn emu_set_regs_cb(
+    context: *const c_void,
+    names: *const WHV_REGISTER_NAME,
+    count: u32,
+    values: *const WHV_REGISTER_VALUE,
+) -> HRESULT {
+    let ctx = unsafe { &*(context as *const MmioEmuCtx) };
+    unsafe { WHvSetVirtualProcessorRegisters(ctx.partition, ctx.vp_index, names, count, values) }
+}
+
+/// GVA->GPA translation callback: forward to `WHvTranslateGva`.
+unsafe extern "system" fn emu_translate_cb(
+    context: *const c_void,
+    gva: u64,
+    flags: WHV_TRANSLATE_GVA_FLAGS,
+    result_code: *mut WHV_TRANSLATE_GVA_RESULT_CODE,
+    gpa: *mut u64,
+) -> HRESULT {
+    let ctx = unsafe { &*(context as *const MmioEmuCtx) };
+    let mut result: WHV_TRANSLATE_GVA_RESULT = unsafe { mem::zeroed() };
+    let mut out_gpa: u64 = 0;
+    let hr = unsafe {
+        WHvTranslateGva(ctx.partition, ctx.vp_index, gva, flags, &mut result, &mut out_gpa)
+    };
+    if hr == S_OK {
+        unsafe {
+            *result_code = result.ResultCode;
+            *gpa = out_gpa;
+        }
+    }
+    hr
 }
 
 impl Drop for WhpEmulator {
@@ -886,6 +1036,28 @@ impl WhpVcpu {
             rax: ctx.Rax,
             rdx: ctx.Rdx,
         }
+    }
+
+    /// Returns parsed IO-port exit info. Only valid after an `IoPortAccess` exit.
+    ///
+    /// The `WHV_X64_IO_PORT_ACCESS_INFO` bitfield packs `IsWrite` in bit 0 and the
+    /// access size in bytes (1/2/4) in bits 1-3.
+    pub fn io_port_exit_info(&self) -> IoPortExitInfo {
+        let ctx = unsafe { &self.exit_context.Anonymous.IoPortAccess };
+        let bits = unsafe { ctx.AccessInfo.Anonymous._bitfield };
+        IoPortExitInfo {
+            port: ctx.PortNumber,
+            is_write: bits & 1 != 0,
+            size: ((bits >> 1) & 0x7) as u8,
+            rax: ctx.Rax,
+        }
+    }
+
+    /// Writes the result of an IO-port `in` into RAX (preserving bytes outside the
+    /// access width) and advances RIP past the instruction.
+    pub fn complete_io_in(&self, rax: u64) -> Result<(), Error> {
+        let new_rip = self.exit_context.VpContext.Rip + self.instruction_length() as u64;
+        self.set_registers64([(WHvX64RegisterRax, rax), (WHvX64RegisterRip, new_rip)])
     }
 
     /// RIP at the time of the VM exit.

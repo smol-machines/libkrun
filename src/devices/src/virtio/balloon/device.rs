@@ -1,4 +1,6 @@
 use std::cmp;
+// TryInto is in the 2021 prelude; the explicit import is only needed on Unix.
+#[cfg(not(target_os = "windows"))]
 use std::convert::TryInto;
 use std::io::Write;
 

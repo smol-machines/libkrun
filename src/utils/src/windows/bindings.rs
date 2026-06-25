@@ -13,7 +13,7 @@ use windows_sys::Win32::Foundation::HANDLE;
 pub type NTSTATUS = i32;
 
 #[link(name = "ntdll")]
-extern "system" {
+unsafe extern "system" {
     pub fn NtCreateWaitCompletionPacket(
         WaitCompletionPacketHandle: *mut HANDLE,
         DesiredAccess: u32,

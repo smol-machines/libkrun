@@ -26,7 +26,10 @@ use std::env;
 use std::ffi::CString;
 use std::ffi::{CStr, c_void};
 use std::fs::File;
-use std::io::{IsTerminal, Read, Write};
+use std::io::IsTerminal;
+// Read/Write are only used by the (Unix-only) control-socket handler.
+#[cfg(not(target_os = "windows"))]
+use std::io::{Read, Write};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
@@ -39,16 +42,20 @@ use std::path::PathBuf;
 use std::slice;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
+// Arc is only used by the (Unix-only) control-socket / vsock paths.
+#[cfg(not(target_os = "windows"))]
+use std::sync::Arc;
 use utils::eventfd::EventFd;
-#[cfg(target_os = "windows")]
-use utils::windows::AsRawFd;
 #[cfg(target_os = "windows")]
 use utils::windows::SendHandle;
 use vmm::resources::{
-    DefaultVirtioConsoleConfig, PortConfig, SerialConsoleConfig, TsiFlags, VirtioConsoleConfigMode,
-    VmResources, VsockConfig,
+    DefaultVirtioConsoleConfig, PortConfig, SerialConsoleConfig, VirtioConsoleConfigMode,
+    VmResources,
 };
+// TSI/vsock is Unix-only.
+#[cfg(not(target_os = "windows"))]
+use vmm::resources::{TsiFlags, VsockConfig};
 #[cfg(feature = "blk")]
 use vmm::vmm_config::block::{BlockDeviceConfig, BlockRootConfig};
 #[cfg(not(feature = "tee"))]
@@ -64,6 +71,7 @@ use vmm::vmm_config::kernel_cmdline::{DEFAULT_KERNEL_CMDLINE, KernelCmdlineConfi
 use vmm::vmm_config::machine_config::VmConfig;
 #[cfg(feature = "net")]
 use vmm::vmm_config::net::NetworkInterfaceConfig;
+#[cfg(not(target_os = "windows"))]
 use vmm::vmm_config::vsock::VsockDeviceConfig;
 
 #[cfg(feature = "aws-nitro")]
@@ -91,6 +99,8 @@ const KRUNFW_NAME: &str = "libkrunfw-sev.so.5";
 const KRUNFW_NAME: &str = "libkrunfw-tdx.so.5";
 #[cfg(target_os = "macos")]
 const KRUNFW_NAME: &str = "libkrunfw.5.dylib";
+#[cfg(target_os = "windows")]
+const KRUNFW_NAME: &str = "libkrunfw.dll";
 
 #[cfg(feature = "aws-nitro")]
 static KRUN_NITRO_DEBUG: Mutex<bool> = Mutex::new(false);
@@ -170,6 +180,8 @@ struct ContextConfig {
     tsi_port_map: Option<HashMap<u16, u16>>,
     egress_cidrs: Option<Vec<(std::net::IpAddr, u8)>>,
     control_socket_path: Option<PathBuf>,
+    // TSI/vsock is Unix-only.
+    #[cfg(not(target_os = "windows"))]
     vsock_config: VsockConfig,
     #[cfg(feature = "blk")]
     block_cfgs: Vec<BlockDeviceConfig>,
@@ -186,8 +198,8 @@ struct ContextConfig {
     /// Console output path, only used by the aws-nitro TryFrom path.
     #[cfg(feature = "aws-nitro")]
     nitro_console_output: Option<PathBuf>,
-    vmm_uid: Option<libc::uid_t>,
-    vmm_gid: Option<libc::gid_t>,
+    vmm_uid: Option<u32>,
+    vmm_gid: Option<u32>,
     #[cfg(all(
         feature = "init-blob",
         not(any(feature = "tee", feature = "aws-nitro"))
@@ -329,11 +341,11 @@ impl ContextConfig {
         self.gpu_shm_size = Some(shm_size);
     }
 
-    fn set_vmm_uid(&mut self, vmm_uid: libc::uid_t) {
+    fn set_vmm_uid(&mut self, vmm_uid: u32) {
         self.vmm_uid = Some(vmm_uid);
     }
 
-    fn set_vmm_gid(&mut self, vmm_gid: libc::gid_t) {
+    fn set_vmm_gid(&mut self, vmm_gid: u32) {
         self.vmm_gid = Some(vmm_gid);
     }
 }
@@ -674,6 +686,7 @@ fn build_restore_ctx(
     })
 }
 
+#[cfg(not(target_os = "windows"))]
 fn handle_control_stream(mut stream: UnixStream, vmm: &Arc<Mutex<vmm::Vmm>>) {
     let mut buf = [0_u8; 128];
     let response = match stream.read(&mut buf) {
@@ -738,6 +751,7 @@ fn handle_control_stream(mut stream: UnixStream, vmm: &Arc<Mutex<vmm::Vmm>>) {
     let _ = stream.write_all(response.as_bytes());
 }
 
+#[cfg(not(target_os = "windows"))]
 fn start_control_socket(path: PathBuf, vmm: Arc<Mutex<vmm::Vmm>>) -> std::io::Result<()> {
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
@@ -787,8 +801,10 @@ mod log_defs {
 }
 
 #[allow(clippy::missing_safety_doc)]
+// On Windows the FromRawFd pipe arm is gated out, leaving the unsafe block empty.
+#[cfg_attr(target_os = "windows", allow(unused_unsafe))]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn krun_init_log(target: RawFd, level: u32, style: u32, options: u32) -> i32 {
+pub unsafe extern "C" fn krun_init_log(target: i32, level: u32, style: u32, options: u32) -> i32 {
     unsafe {
         let target = match target {
         ..-1 => return -libc::EINVAL,
@@ -796,7 +812,12 @@ pub unsafe extern "C" fn krun_init_log(target: RawFd, level: u32, style: u32, op
         0 /* stdin */ => return -libc::EINVAL,
         1 /* stdout */ => Target::Stdout,
         2 /* stderr */ => Target::Stderr,
+        // Arbitrary pipe fds are reattached via FromRawFd (Unix only).
+        // TODO(whp-host): support a Windows HANDLE pipe target.
+        #[cfg(not(target_os = "windows"))]
         fd => Target::Pipe(Box::new(File::from_raw_fd(fd))),
+        #[cfg(target_os = "windows")]
+        _fd => return -libc::EINVAL,
     };
 
         let filter = log_level_to_filter_str(level);
@@ -1450,6 +1471,7 @@ pub unsafe extern "C" fn krun_set_port_map(ctx_id: u32, c_port_map: *const *cons
         match CTX_MAP.lock().unwrap().entry(ctx_id) {
             Entry::Occupied(mut ctx_cfg) => {
                 let cfg = ctx_cfg.get_mut();
+                #[cfg(not(target_os = "windows"))]
                 if cfg.vsock_config == VsockConfig::Disabled {
                     return -libc::ENODEV;
                 }
@@ -1620,6 +1642,7 @@ pub unsafe extern "C" fn krun_set_egress_policy(
     match map.entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
             let cfg = ctx_cfg.get_mut();
+            #[cfg(not(target_os = "windows"))]
             if cfg.vsock_config == VsockConfig::Disabled {
                 return -libc::ENODEV;
             }
@@ -1860,6 +1883,7 @@ pub unsafe extern "C" fn krun_add_vsock_port2(
         match CTX_MAP.lock().unwrap().entry(ctx_id) {
             Entry::Occupied(mut ctx_cfg) => {
                 let cfg = ctx_cfg.get_mut();
+                #[cfg(not(target_os = "windows"))]
                 if cfg.vsock_config == VsockConfig::Disabled {
                     return -libc::ENODEV;
                 }
@@ -2304,6 +2328,14 @@ pub extern "C" fn krun_get_shutdown_eventfd(ctx_id: u32) -> i32 {
                 return efd.get_write_fd();
                 #[cfg(target_os = "linux")]
                 return efd.as_raw_fd();
+                // TODO(whp-host): exposing the shutdown eventfd's HANDLE as a C
+                // int isn't meaningful on Windows; returning it is left for the
+                // Windows event-handle story.
+                #[cfg(target_os = "windows")]
+                {
+                    let _ = efd;
+                    return -libc::ENOTSUP;
+                }
             } else {
                 -libc::EINVAL
             }
@@ -2552,6 +2584,7 @@ fn map_kernel(ctx_id: u32, kernel_path: &PathBuf) -> i32 {
 
     let kernel_size = file.metadata().unwrap().len();
 
+    #[cfg(not(target_os = "windows"))]
     let kernel_host_addr = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
@@ -2562,10 +2595,27 @@ fn map_kernel(ctx_id: u32, kernel_path: &PathBuf) -> i32 {
             0_i64,
         )
     };
+    #[cfg(not(target_os = "windows"))]
     if std::ptr::eq(kernel_host_addr, libc::MAP_FAILED) {
         error!("Can't load kernel into process map");
         return -libc::EINVAL;
     }
+
+    // No mmap on Windows: read the kernel into a leaked buffer so its pointer
+    // stays valid for the process lifetime, the way an mmap'd region would.
+    #[cfg(target_os = "windows")]
+    let kernel_host_addr = {
+        use std::io::Read;
+        let mut file = file;
+        let mut buf: Vec<u8> = Vec::with_capacity(kernel_size as usize);
+        if file.read_to_end(&mut buf).is_err() {
+            error!("Can't load kernel into process map");
+            return -libc::EINVAL;
+        }
+        let ptr = buf.as_ptr() as *mut std::ffi::c_void;
+        std::mem::forget(buf);
+        ptr
+    };
 
     let kernel_bundle = KernelBundle {
         host_addr: kernel_host_addr as u64,
@@ -2756,7 +2806,7 @@ unsafe fn load_krunfw_payload(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn krun_setuid(ctx_id: u32, uid: libc::uid_t) -> i32 {
+pub extern "C" fn krun_setuid(ctx_id: u32, uid: u32) -> i32 {
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
             let cfg = ctx_cfg.get_mut();
@@ -2769,7 +2819,7 @@ pub extern "C" fn krun_setuid(ctx_id: u32, uid: libc::uid_t) -> i32 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn krun_setgid(ctx_id: u32, gid: libc::gid_t) -> i32 {
+pub extern "C" fn krun_setgid(ctx_id: u32, gid: u32) -> i32 {
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
             let cfg = ctx_cfg.get_mut();
@@ -3077,6 +3127,7 @@ pub unsafe extern "C" fn krun_get_default_init(
     -libc::ENOTSUP
 }
 
+#[cfg(not(target_os = "windows"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn krun_add_vsock(ctx_id: u32, tsi_features: u32) -> i32 {
     let tsi_flags = match TsiFlags::from_bits(tsi_features) {
@@ -3101,6 +3152,13 @@ pub extern "C" fn krun_add_vsock(ctx_id: u32, tsi_features: u32) -> i32 {
     }
 
     KRUN_SUCCESS
+}
+
+// TSI/vsock networking is built on Unix sockets; not yet supported on Windows.
+#[cfg(target_os = "windows")]
+#[unsafe(no_mangle)]
+pub extern "C" fn krun_add_vsock(_ctx_id: u32, _tsi_features: u32) -> i32 {
+    -libc::ENOTSUP
 }
 
 #[cfg(unix)]
@@ -3524,6 +3582,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     let egress_hosts = ctx_cfg.egress_hosts.take();
     let egress_resolvers = ctx_cfg.egress_resolvers.take();
 
+    #[cfg(not(target_os = "windows"))]
     match &ctx_cfg.vsock_config {
         VsockConfig::Disabled => (),
         VsockConfig::Explicit { tsi_flags } => {
@@ -3540,6 +3599,8 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
             ctx_cfg.vmr.set_vsock_device(vsock_device_config).unwrap();
         }
     }
+    #[cfg(target_os = "windows")]
+    let _ = (egress_cidrs, egress_hosts, egress_resolvers);
 
     if let Some(virgl_flags) = ctx_cfg.gpu_virgl_flags {
         ctx_cfg.vmr.set_gpu_virgl_flags(virgl_flags);
@@ -3548,6 +3609,8 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         ctx_cfg.vmr.set_gpu_shm_size(shm_size);
     }
 
+    // setuid/setgid privilege dropping is Unix-only.
+    #[cfg(not(target_os = "windows"))]
     if let Some(gid) = ctx_cfg.vmm_gid
         && unsafe { libc::setgid(gid) } != 0
     {
@@ -3555,6 +3618,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         return -std::io::Error::last_os_error().raw_os_error().unwrap();
     }
 
+    #[cfg(not(target_os = "windows"))]
     if let Some(uid) = ctx_cfg.vmm_uid
         && unsafe { libc::setuid(uid) } != 0
     {

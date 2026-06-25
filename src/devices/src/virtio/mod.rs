@@ -37,6 +37,10 @@ mod queue;
 pub mod rng;
 #[cfg(feature = "vhost-user")]
 pub mod vhost_user;
+// vsock implements TSI (transparent socket impersonation) over host Unix domain
+// sockets, so it is Unix-only for now. A Windows port would need a Winsock-based
+// proxy backend.
+#[cfg(not(target_os = "windows"))]
 pub mod vsock;
 
 #[cfg(not(feature = "tee"))]
@@ -57,6 +61,7 @@ pub use self::queue::{Descriptor, DescriptorChain, Queue};
 pub use self::rng::*;
 #[cfg(feature = "vhost-user")]
 pub use self::vhost_user::VhostUserDevice;
+#[cfg(not(target_os = "windows"))]
 pub use self::vsock::*;
 
 /// When the driver initializes the device, it lets the device know about the
