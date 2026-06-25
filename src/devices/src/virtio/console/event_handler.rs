@@ -1,3 +1,4 @@
+use std::io;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 #[cfg(target_os = "windows")]
@@ -22,7 +23,11 @@ impl Console {
         }
 
         if let Err(e) = self.queue_events[queue_index].read() {
-            error!("Failed to read event from queue index {queue_index}: {e:?}");
+            // A drained eventfd reports WouldBlock on a spurious level-triggered
+            // wakeup (common with the Windows epoll shim) — expected, not an error.
+            if e.kind() != io::ErrorKind::WouldBlock {
+                error!("Failed to read event from queue index {queue_index}: {e:?}");
+            }
             return false;
         }
 
@@ -105,7 +110,11 @@ impl Console {
             warn!("Unexpected event {event_set:?}");
         }
 
-        if let Err(e) = self.control.queue_evt().read() {
+        // A drained eventfd reports WouldBlock on a spurious level-triggered
+        // wakeup (common with the Windows epoll shim) — expected, not an error.
+        if let Err(e) = self.control.queue_evt().read()
+            && e.kind() != io::ErrorKind::WouldBlock
+        {
             error!("Failed to read the ConsoleControl event: {e:?}");
         }
     }

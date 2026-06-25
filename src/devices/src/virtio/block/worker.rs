@@ -164,7 +164,11 @@ impl BlockWorker {
 
     fn process_queue_event(&mut self) {
         if let Err(e) = self.device_queue.event.read() {
-            error!("Failed to get queue event: {e:?}");
+            // A drained eventfd reports WouldBlock on a spurious level-triggered
+            // wakeup (common with the Windows epoll shim) — expected, not an error.
+            if e.kind() != io::ErrorKind::WouldBlock {
+                error!("Failed to get queue event: {e:?}");
+            }
         } else {
             self.process_virtio_queues();
         }
