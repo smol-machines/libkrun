@@ -17,8 +17,7 @@ use utils::eventfd::EventFd;
 
 use super::ioapic::{
     IOAPIC_DM_EXTINT, IOAPIC_DM_MASK, IOAPIC_LVT_DELIV_MODE_SHIFT, IOAPIC_LVT_DEST_MODE_SHIFT,
-    IOAPIC_LVT_MASKED_SHIFT, IOAPIC_LVT_TRIGGER_MODE_SHIFT, IOAPIC_NUM_PINS, IOAPIC_TRIGGER_EDGE,
-    IOAPIC_VECTOR_MASK, IoApicBackend, IoApicRegs, Ioapic,
+    IOAPIC_LVT_MASKED_SHIFT, IOAPIC_NUM_PINS, IOAPIC_VECTOR_MASK, IoApicBackend, IoApicRegs, Ioapic,
 };
 
 const IOAPIC_LVT_DEST_IDX_SHIFT: u64 = 56;
@@ -43,7 +42,6 @@ impl WhpIoapicBackend {
             let vector = (entry & IOAPIC_VECTOR_MASK) as u32;
             let dest = ((entry >> IOAPIC_LVT_DEST_IDX_SHIFT) & 0xff) as u32;
             let dest_mode = ((entry >> IOAPIC_LVT_DEST_MODE_SHIFT) & 1) as u8;
-            let trigger = (entry >> IOAPIC_LVT_TRIGGER_MODE_SHIFT) & 1;
             let deliv_mode = ((entry >> IOAPIC_LVT_DELIV_MODE_SHIFT) & IOAPIC_DM_MASK) as u8;
 
             if deliv_mode as u64 == IOAPIC_DM_EXTINT {
@@ -76,11 +74,18 @@ impl WhpIoapicBackend {
                 } else {
                     InterruptDestinationMode::Logical
                 },
-                trigger_mode: if trigger == IOAPIC_TRIGGER_EDGE {
-                    InterruptTriggerMode::Edge
-                } else {
-                    InterruptTriggerMode::Level
-                },
+                // Always inject as edge-triggered, even when the guest programmed
+                // the redirection entry as level-triggered. This backend uses a
+                // once-per-assertion model: `service` injects a single interrupt
+                // per `set_irq` and immediately clears IRR (it does not track
+                // remote-IRR, because WHP services guest EOIs natively in the
+                // LAPIC and never notifies this software IOAPIC). Requesting a
+                // *level* interrupt would tell WHP the line is held high with no
+                // matching de-assertion, so the LAPIC re-fires after every EOI —
+                // an interrupt storm that spins the guest. An edge pulse delivers
+                // exactly one interrupt per device assertion, which is what the
+                // virtio devices signal (once per batch of completions).
+                trigger_mode: InterruptTriggerMode::Edge,
                 destination: dest,
                 vector,
             };
