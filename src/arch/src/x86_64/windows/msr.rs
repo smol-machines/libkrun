@@ -27,7 +27,14 @@ const REGISTERS: [(WHV_REGISTER_NAME, u64); 9] = [
 
 /// Configure MSRs via the WHP API.
 pub fn setup_msrs(vcpu: &whp::WhpVcpu) -> Result<()> {
-    vcpu.set_registers64(REGISTERS).map_err(Error::SetMsrsWhp)
+    // Validated on a real WHP host: `WHvSetVirtualProcessorRegisters` hangs (never
+    // returns) when setting the SYSENTER/STAR/LSTAR/CSTAR/SFMASK/TSC MSRs, but
+    // accepts `MsrMtrrDefType`. Those MSRs reset to 0 and the guest kernel
+    // re-initializes them during boot, so set only the MTRR default type for now;
+    // with this the guest boots through device init under WHP.
+    // TODO(whp): root-cause the SYSENTER-MSR set hang and restore the full set.
+    let mtrr = REGISTERS[REGISTERS.len() - 1];
+    vcpu.set_registers64([mtrr]).map_err(Error::SetMsrsWhp)
 }
 
 #[cfg(test)]
