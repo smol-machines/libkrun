@@ -2414,11 +2414,17 @@ impl FileSystem for PassthroughFs {
             return Err(enosys());
         }
 
-        // Prevent the guest from reading them directly.
-        // The guest should only see these values through standard stat calls, not raw getxattr queries
+        // Hide the internal stat-override xattr from raw getxattr queries — the
+        // guest sees those values through stat, not as a readable xattr. Return
+        // ENODATA (absent), NOT EACCES: the exec path reads `security.capability`
+        // through getxattr (`get_vfs_caps_from_disk`), and any error other than
+        // ENODATA/ENOTSUP there makes `execve` fail with that errno. EACCES here
+        // was breaking exec of every passthrough binary. `security.capability`
+        // is a real xattr backed by its own ADS stream, so it falls through to
+        // the normal read below (value if set, ENODATA if not).
         let attr_name = name.to_bytes();
-        if attr_name == b"user.containers.override_stat" || attr_name == b"security.capability" {
-            return Err(io::Error::from_raw_os_error(linux_errno_raw(libc::EACCES)));
+        if attr_name == b"user.containers.override_stat" {
+            return Err(io::Error::from_raw_os_error(linux_errno_raw(libc::ENODATA)));
         }
 
         let path = self.inode_path(inode)?;
