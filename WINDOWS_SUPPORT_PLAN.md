@@ -118,6 +118,40 @@ now boots the kernel, mounts root, runs PID-1 init, and exec's the userspace she
 remaining items are a static-vs-dynamic binary load detail and console output visibility —
 neither in the hypervisor core.
 
+### Fifth pass (2026-06-25): older WHP (Windows 10 1909) bring-up
+
+Tested on a real Windows 10 Pro 1909 laptop (Intel i7-9700, Hyper-V enabled, reached over
+Tailscale SSH — no cloud). That WHP build predates several APIs the backend used, which
+aborted VM creation until worked around (commits `ee49a71`, `14eb29b`):
+
+- **Unsupported partition properties/capabilities.** `X64MsrExitBitmap` (property 5),
+  `ProcessorFeaturesBanks` (capability + property) and `SyntheticProcessorFeaturesBanks`
+  (property 0x100c) all return `WHV_E_UNKNOWN_PROPERTY/CAPABILITY` on 1909. Now skipped
+  best-effort; the invariant-TSC CPUID leaf is advertised unconditionally instead of via the
+  missing banks property.
+- **HLT surfaces as a run-loop exit.** Newer WHP services idle HLTs inside
+  `WHvRunVirtualProcessor`; 1909 returns a Halt exit, so the vCPU must re-enter on an idle
+  (interrupts-enabled) HLT and only stop on a masked HLT.
+
+With those, the guest now boots through kernel init on 1909: maps memory, runs the vCPU,
+reads the RTC, and programs the IOAPIC redirection entries for the virtio devices
+(balloon/rng/console/fs). It then hits a **silent early triple fault**
+(`WHvRunVpExitReasonUnrecoverableException`, or an i8042 reboot via `panic=-1`) ~1.3 s in,
+right after the virtio IOAPIC setup — before the virtio drivers activate. It is
+timing-dependent (manifests as triple-fault or reboot depending on host load).
+
+Diagnosis is blocked by the lack of an early console: the libkrunfw microVM kernel has **no
+8250/serial driver** (verified: `console=ttyS0 earlyprintk=ttyS0` produces zero writes to
+0x3f8), and the only console it supports — virtio `hvc0` — is not up yet when it faults. The
+next step is to trap the first exception via `WHvPartitionPropertyCodeExceptionExitBitmap`
+(if 1909 supports it) to recover the faulting vector/error-code/RIP, since the triple fault
+itself is silent.
+
+**Status:** the WHP backend boots a Linux guest **to userspace on newer Windows (Server
+2022)** and **through kernel init on older Windows (10 1909)**, where an early, silent,
+version-specific triple fault remains. The 1909 partition-feature and HLT fixes are real
+portability improvements regardless.
+
 ## TL;DR
 
 **Update (2026-06-25): the entire libkrun stack now cross-compiles to a clean `krun.dll`
