@@ -35,15 +35,59 @@ Three bugs found and fixed by hardware debugging (commits `f972d32`, `7a3daec`, 
    (timing/host-dependent). The pre-boot MSR programming is now skipped (the kernel
    re-initializes those MSRs), so the guest **reliably boots through device init**.
 
-Reproduced twice (Linux- and macOS-built `krun.dll`): the guest boots, runs the kernel and
-virtio drivers (balloon free-page reporting, rng, virtio-fs FUSE_INIT). It still stalls just
-before the userspace shell — virtio-fs does not progress past FUSE_INIT, a deeper
-device-notification/FUSE-protocol issue distinct from the IOAPIC level-trigger fix (balloon
-interrupts work, fs does not progress) — a scoped follow-up.
+### Third hardware-validation pass (2026-06-25): virtio-fs stall root-caused and fixed
 
-**The core thesis is proven on real hardware: the Windows WHP backend is functional — it
-boots a Linux guest that runs the kernel and virtio device drivers under the Windows
-Hypervisor Platform.** The last gap to a userspace shell is one virtio-fs IRQ/protocol bug.
+The "stalls at FUSE_INIT" gap above was chased to ground on real WHP hardware and resolved
+with three further fixes. The guest now boots **through kernel init into the init-exec
+sequence**, mounting and traversing its virtiofs root:
+
+- ✅ `FS-LOOKUP parent=1 name="dev"`, then `FS-LOOKUP parent=1 name="init.krun"` — the guest
+  kernel mounts the virtiofs root and looks up `/init.krun` (the libkrun PID-1 binary). Full
+  opcode flow observed: `FUSE_INIT(26) → GETATTR(3) → LOOKUP(1) → OPEN(14) → READ(15)`.
+- ✅ The VM **powers off with a clean exit code 0** (orderly HLT shutdown, not a watchdog
+  kill or panic-reboot loop).
+
+Root cause of the original FUSE_INIT stall was **two stacked WHP interrupt bugs**, not a FUSE
+issue (the balloon "interrupts work" signal was misleading — balloon free-page reporting is a
+guest kernel thread that runs without needing a completion IRQ):
+
+1. **The software IOAPIC was never on the MMIO bus** (commit `c9260fe`).
+   `attach_legacy_devices` only registered the IOAPIC window under `split_irqchip` (default
+   off). WHP does not emulate the IOAPIC, so the guest's writes to `0xFEC00000` to program the
+   redirection table were silently dropped → every virtio pin stayed masked at reset → no
+   device-completion interrupt was ever delivered → the guest hung waiting for the FUSE_INIT
+   reply. Now always registered on Windows.
+2. **Interrupts were injected level-triggered** (commit `b4d800f`). With the IOAPIC reachable,
+   `WHvRequestInterrupt(Level)` told WHP the line was held high with no de-assertion the
+   software IOAPIC could provide → the LAPIC re-fired after every EOI → an interrupt storm
+   that pinned a host core (and starved the SSM agent during debugging). The backend's
+   once-per-assertion model requires an **edge** pulse; switched to `InterruptTriggerMode::Edge`.
+
+A third, latent bug was fixed along the way (commit `8c9b173`): the Windows epoll shim's
+`NtAssociateWaitCompletionPacket` re-arm queued no packet when the target was already signaled
+(it sets `AlreadySignaled` and consumes the wait as a one-shot), so a level-triggered fd fired
+exactly once — the device worker got FUSE_INIT but never woke for the next request. Now posts
+the completion packet itself, matching Linux level-triggered semantics.
+
+**Remaining gap to a visible userspace shell** (two distinct, scoped follow-ups, *not*
+interrupt-delivery bugs — that path now works end to end):
+
+1. **init.krun exec / AugmentFs virtual-file serving.** The boot looks up `/init.krun` and
+   then halts without the expected follow-on lookups (`.krun_config.json`, `bin`, `sh`),
+   suggesting the virtual init binary served by `AugmentFs` over the Windows passthrough is
+   not exec'd successfully. Next: log the OPEN/READ of `init.krun` and verify the bytes the
+   guest reads.
+2. **virtio-console output plumbing on Windows.** `console=hvc0` guest output routes to
+   `output_to_log_as_err()` (non-terminal stdout) but never appears in the host log or stdout,
+   so even a successful shell's `echo` would be invisible. The `autoconfigure_console_ports`
+   Windows path wires the ports but the hvc0 TX→host drain does not deliver. Scoped to the
+   console device, independent of boot.
+
+**The core thesis is proven on real hardware and substantially advanced: with these fixes the
+Windows WHP backend boots a Linux guest through kernel init, mounts its virtiofs root, and
+drives interrupt-completing virtio I/O (LOOKUP/OPEN/READ) under the Windows Hypervisor
+Platform.** The last gap to a *visible* userspace shell is the init.krun exec step plus the
+console-output plumbing — both scoped, neither in the hypervisor/interrupt core.
 
 ## TL;DR
 
