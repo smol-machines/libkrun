@@ -600,3 +600,34 @@ MULTIPROC-OK
 **Bottom line: multi-process Linux workloads now run on the Windows Hypervisor Platform.** The
 guest boots the kernel, mounts the virtiofs root, runs PID-1 init, execs the shell, and the
 shell forks and execs further passthrough binaries — the full process model works.
+
+## Ninth pass (2026-06-25): capability validation + robustness
+
+With exec fixed, the local workload surface was exercised end-to-end on real Windows 10 1909
+WHP hardware. Working and verified:
+
+- **Process model**: boot → PID-1 init → shell → the shell forks and execs further passthrough
+  binaries (`uname`, `ls`, `cp`'d binaries). Multi-process workloads run.
+- **virtiofs passthrough**: read, write/create (`echo > /file`), directory traversal
+  (`find /etc -type f` → 124), unlink, and exec of copied binaries all work.
+- **Pipes / redirection / shell loops**: `cat | tr`, `wc -c <`, `for` loops — all work.
+- **virtio-blk** (`--features blk`): `/dev/vda` appears, raw read/write works, and data
+  **persists** to the host image across VM runs (a fresh VM reads back what a prior VM wrote).
+  The Windows block port was already correct; only validation was needed.
+
+Two robustness fixes landed this pass:
+- **Relative passthrough `root_dir`** (commit `eb13fc0`): `NtCreateFile` needs an absolute NT
+  path, so a relative `root_dir` produced `\??\rootfs`, failed `PassthroughFs::new` with
+  ENOENT, and aborted device activation with a `BadActivate` panic. Now canonicalized in
+  `new()`.
+- **WouldBlock log storm** (commit `8887070`): the Windows epoll shim re-fires level-triggered
+  wakeups on a drained eventfd; the console/fs/block queue-event readers now skip the error log
+  for `WouldBlock` (it just means "nothing pending").
+
+### Remaining gap: guest networking
+
+virtio-net is **not yet usable on Windows**. The net device's backends (`tap`, `unixgram`,
+`unixstream`) are all Unix-only (TAP devices / Unix-domain sockets), and the transparent-socket
+path (`TsiFlags`) is `#[cfg(not(target_os = "windows"))]`. Bringing networking up on WHP needs a
+new Windows host backend (a usermode NAT/slirp-style stack, or a host vNIC bridge) — a
+subsystem port, not a fix. This is the main blocker for the network-dependent e2e workloads.
