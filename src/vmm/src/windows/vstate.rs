@@ -331,56 +331,26 @@ impl Vcpu {
                 Ok(true)
             }
             VcpuExitReason::CpuidAccess => {
-                // Pass the hypervisor's default CPUID result through, with one
-                // edit: advertise the TSC-deadline LAPIC timer on leaf 0x1
-                // (ECX[24]). WHP exposes the deadline register but does not set
-                // the CPUID bit, and without it the guest's only clockevent is the
-                // periodic LAPIC timer, which can't be calibrated on WHP (no PIT)
-                // and so delivers no timer interrupts (`nanosleep`/timers hang).
+                // Pass the hypervisor's default CPUID result straight through.
                 // TODO(whp-host): apply libkrun's CPUID masking/templating here,
                 // the WHP analogue of `krun-cpuid`.
                 let info = self.whp_vcpu.cpuid_exit_info();
-                let mut ecx = info.default_ecx;
-                if info.leaf == 0x1 {
-                    ecx |= 1 << 24; // CPUID.01H:ECX[24] = TSC-Deadline
-                }
                 self.whp_vcpu
-                    .complete_cpuid(info.default_eax, info.default_ebx, ecx, info.default_edx)
+                    .complete_cpuid(
+                        info.default_eax,
+                        info.default_ebx,
+                        info.default_ecx,
+                        info.default_edx,
+                    )
                     .map_err(Error::VcpuRegisters)?;
                 Ok(true)
             }
             VcpuExitReason::MsrAccess => {
-                // IA32_TSC_DEADLINE (0x6E0): WHP surfaces this LAPIC-timer MSR as
-                // an unhandled-MSR exit rather than programming it internally, so
-                // route it to the WHP deadline register ourselves — otherwise the
-                // guest's TSC-deadline clockevent never arms and timers hang.
-                //
-                // Best-effort: WHvX64RegisterTscDeadline is unavailable on older
-                // WHP builds (e.g. Windows 10 1909), where the set/get fails with
-                // WHV_E_INVALID_VP_STATE. Treat that like any other unhandled MSR
-                // (ignore the write / read 0) so the guest still boots; on a host
-                // that supports the register the timer arms and fires normally.
-                const IA32_TSC_DEADLINE: u32 = 0x6E0;
+                // Unhandled MSRs (e.g. Hyper-V synthetic MSRs in the 0x4000_00xx
+                // range, since WHP presents a Hyper-V interface). Reads return 0;
+                // writes are ignored. Both MUST advance RIP past the RD/WRMSR, or
+                // the instruction re-executes forever.
                 let info = self.whp_vcpu.msr_exit_info();
-                if info.msr_number == IA32_TSC_DEADLINE {
-                    if info.is_write {
-                        let value = (info.rdx << 32) | (info.rax & 0xffff_ffff);
-                        if let Err(e) = self.whp_vcpu.set_tsc_deadline(value) {
-                            debug!("WHP TSC-deadline write unsupported, ignoring: {e}");
-                        }
-                        self.whp_vcpu.advance_rip().map_err(Error::VcpuRegisters)?;
-                    } else {
-                        let value = self.whp_vcpu.get_tsc_deadline().unwrap_or(0);
-                        self.whp_vcpu
-                            .complete_msr_read(value & 0xffff_ffff, value >> 32)
-                            .map_err(Error::VcpuRegisters)?;
-                    }
-                    return Ok(true);
-                }
-                // Other unhandled MSRs (e.g. Hyper-V synthetic MSRs in the
-                // 0x4000_00xx range, since WHP presents a Hyper-V interface).
-                // Reads return 0; writes are ignored. Both MUST advance RIP past
-                // the RD/WRMSR, or the instruction re-executes forever.
                 if info.is_write {
                     self.whp_vcpu.advance_rip().map_err(Error::VcpuRegisters)?;
                 } else {
