@@ -17,6 +17,12 @@ use std::mem::MaybeUninit;
 
 use socket2::Socket;
 
+/// Listen backlog clamp, matching the platform's `SOMAXCONN`.
+#[cfg(unix)]
+pub const SOMAXCONN: i32 = libc::SOMAXCONN;
+#[cfg(windows)]
+pub const SOMAXCONN: i32 = 0x7fff_ffff;
+
 /// Receive into an initialized byte slice, returning the number of bytes read.
 ///
 /// `socket2::Socket::recv` takes `&mut [MaybeUninit<u8>]`; viewing an already
