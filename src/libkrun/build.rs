@@ -20,4 +20,25 @@ fn main() {
         // no soname/install_name link args.
         _ => {}
     }
+
+    emit_snapshot_cfgs();
+}
+
+/// Mirrors `vmm`'s `snapshot_supported` / `fork_supported` cfgs so the C API
+/// layer gates its checkpoint/restore (snapshot) and fork entry points on the
+/// same predicate. See `src/vmm/build.rs` for the definitions.
+fn emit_snapshot_cfgs() {
+    println!("cargo:rustc-check-cfg=cfg(snapshot_supported)");
+    println!("cargo:rustc-check-cfg=cfg(fork_supported)");
+    let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let linux_x86 = os == "linux" && arch == "x86_64";
+    let macos_arm = os == "macos" && arch == "aarch64";
+    let windows_x86 = os == "windows" && arch == "x86_64";
+    if linux_x86 || macos_arm || windows_x86 {
+        println!("cargo:rustc-cfg=snapshot_supported");
+    }
+    if linux_x86 || macos_arm {
+        println!("cargo:rustc-cfg=fork_supported");
+    }
 }

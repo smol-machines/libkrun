@@ -1252,10 +1252,7 @@ pub fn build_microvm(
             // Restore-into-a-fresh-clone: start vCPUs paused, apply the
             // checkpoint (VM + device re-activation + vCPU registers), then
             // resume so the clone runs from the checkpoint instruction.
-            #[cfg(any(
-                all(target_os = "linux", target_arch = "x86_64"),
-                all(target_os = "macos", target_arch = "aarch64")
-            ))]
+            #[cfg(fork_supported)]
             {
                 let checkpoint = super::VmCheckpoint::deserialize(&_ctx.checkpoint)
                     .map_err(StartMicrovmError::GuestMemoryMmap)?;
@@ -1274,10 +1271,7 @@ pub fn build_microvm(
                 vmm.resume().map_err(StartMicrovmError::Internal)?;
                 vmm_timing!("vcpus restored + running");
             }
-            #[cfg(not(any(
-                all(target_os = "linux", target_arch = "x86_64"),
-                all(target_os = "macos", target_arch = "aarch64")
-            )))]
+            #[cfg(not(fork_supported))]
             {
                 let _ = vcpus;
                 return Err(StartMicrovmError::GuestMemoryMmap(

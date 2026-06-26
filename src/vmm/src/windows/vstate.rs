@@ -113,6 +113,19 @@ impl Vm {
         Ok(())
     }
 
+    /// Capture VM-level checkpoint state. WHP exposes no host-serializable
+    /// in-partition device state (no in-kernel IRQ chip/PIT analogue), so there
+    /// is nothing to capture — mirrors the empty macOS `VmState`.
+    pub fn save_state(&self) -> Result<VmState> {
+        Ok(VmState)
+    }
+
+    /// Restore VM-level checkpoint state. No-op for the same reason as
+    /// [`Self::save_state`].
+    pub fn restore_state(&self, _state: &VmState) -> Result<()> {
+        Ok(())
+    }
+
     /// Maps every guest-memory region into the WHP partition's guest physical
     /// address space.
     pub fn memory_init(&mut self, guest_mem: &GuestMemoryMmap) -> Result<()> {
@@ -392,20 +405,59 @@ impl Vcpu {
             match event {
                 VcpuEvent::Pause => {
                     let _ = self.response_sender.send(VcpuResponse::Paused);
-                    // Block until resumed.
-                    for event in self.event_receiver.iter() {
-                        if let VcpuEvent::Resume { .. } = event {
-                            let _ = self.response_sender.send(VcpuResponse::Resumed);
-                            break;
-                        }
+                    if !self.run_paused_loop() {
+                        return false;
                     }
                 }
                 VcpuEvent::Resume { .. } => {
                     let _ = self.response_sender.send(VcpuResponse::Resumed);
                 }
+                // Save/restore are only valid while paused; the orchestrator
+                // always pauses first, so receiving one here is a protocol error.
+                VcpuEvent::SaveState | VcpuEvent::RestoreState(_) => {
+                    error!("ignoring vcpu SaveState/RestoreState received while running");
+                }
             }
         }
         true
+    }
+
+    /// Block in the paused event loop: service Pause/SaveState/RestoreState and
+    /// return `true` on Resume (caller proceeds to run the guest) or `false` on
+    /// error / channel close (caller exits). The vCPU is quiescent here, which is
+    /// the safe boundary to capture/restore its WHP register + LAPIC + XSAVE
+    /// state for checkpoint/fork.
+    fn run_paused_loop(&self) -> bool {
+        loop {
+            match self.event_receiver.recv() {
+                Ok(VcpuEvent::Resume { .. }) => {
+                    let _ = self.response_sender.send(VcpuResponse::Resumed);
+                    return true;
+                }
+                Ok(VcpuEvent::Pause) => {
+                    let _ = self.response_sender.send(VcpuResponse::Paused);
+                }
+                Ok(VcpuEvent::SaveState) => match self.whp_vcpu.save_state() {
+                    Ok(state) => {
+                        let _ = self
+                            .response_sender
+                            .send(VcpuResponse::SavedState(Box::new(VcpuState(state))));
+                    }
+                    Err(e) => {
+                        error!("failed to capture WHP vcpu state: {e}");
+                        return false;
+                    }
+                },
+                Ok(VcpuEvent::RestoreState(state)) => {
+                    if let Err(e) = self.whp_vcpu.restore_state(&state.0) {
+                        error!("failed to restore WHP vcpu state: {e}");
+                        return false;
+                    }
+                    let _ = self.response_sender.send(VcpuResponse::RestoredState);
+                }
+                Err(_) => return false,
+            }
+        }
     }
 
     /// Main loop of the vCPU thread: run the WHP vCPU and handle its exits.
@@ -433,21 +485,18 @@ impl Vcpu {
     }
 }
 
-/// Per-vCPU register snapshot for checkpoint/restore.
-///
-/// TODO(whp-host): capture/restore the full WHP register set
-/// (`WHvGetVirtualProcessorRegisters`) needed for snapshot/fork. Empty until the
-/// snapshot path is ported to WHP.
+/// Per-vCPU architectural state for checkpoint/restore, wrapping the WHP
+/// register + LAPIC + XSAVE capture from the `whp` crate.
 #[derive(Clone, Debug, Default)]
-pub struct VcpuState;
+pub struct VcpuState(whp::WhpVcpuState);
 
 impl VcpuState {
     pub fn serialize(&self) -> Vec<u8> {
-        Vec::new()
+        self.0.to_bytes()
     }
 
-    pub fn deserialize(_bytes: &[u8]) -> result::Result<VcpuState, String> {
-        Ok(VcpuState)
+    pub fn deserialize(bytes: &[u8]) -> result::Result<VcpuState, String> {
+        Ok(VcpuState(whp::WhpVcpuState::from_bytes(bytes)?))
     }
 }
 
@@ -474,6 +523,10 @@ pub enum VcpuEvent {
     Pause,
     /// Resume the vCPU.
     Resume { paused_ns: u64 },
+    /// Capture the vCPU's architectural state (only valid while paused).
+    SaveState,
+    /// Restore previously-captured vCPU state (only valid while paused).
+    RestoreState(Box<VcpuState>),
 }
 
 #[derive(Debug)]
@@ -485,6 +538,10 @@ pub enum VcpuResponse {
     Resumed,
     /// vCPU stopped with the given exit code.
     Exited(u8),
+    /// Captured vCPU state, in reply to [`VcpuEvent::SaveState`].
+    SavedState(Box<VcpuState>),
+    /// Acknowledges a [`VcpuEvent::RestoreState`].
+    RestoredState,
 }
 
 /// Wrapper over the vCPU thread that hides the channel interactions, and (on

@@ -219,10 +219,7 @@ enum VmmRunState {
 /// separately because it is large). Combines the VM-level KVM state, per-vCPU
 /// register state, and virtio device state. Produced by [`Vmm::checkpoint`] and
 /// consumed by [`Vmm::restore`].
-#[cfg(any(
-    all(target_os = "linux", target_arch = "x86_64"),
-    all(target_os = "macos", target_arch = "aarch64")
-))]
+#[cfg(snapshot_supported)]
 pub struct VmCheckpoint {
     /// VM-level KVM state (PIT, clock, PIC/IOAPIC).
     pub vm_state: vstate::VmState,
@@ -232,10 +229,7 @@ pub struct VmCheckpoint {
     pub devices: devices::virtio::persist::VmDevicesState,
 }
 
-#[cfg(any(
-    all(target_os = "linux", target_arch = "x86_64"),
-    all(target_os = "macos", target_arch = "aarch64")
-))]
+#[cfg(snapshot_supported)]
 impl VmCheckpoint {
     /// Serialize the checkpoint (VM + vCPU + device state, *not* guest RAM —
     /// that is shared/streamed separately) into a single blob for cross-process
@@ -383,10 +377,7 @@ impl Vmm {
     /// the guest handshake (a restored guest resumes past boot). Used by
     /// restore-into-a-fresh-VM (cross-process fork); not used by in-place rewind
     /// (there the devices are already activated).
-    #[cfg(any(
-        all(target_os = "linux", target_arch = "x86_64"),
-        all(target_os = "macos", target_arch = "aarch64")
-    ))]
+    #[cfg(snapshot_supported)]
     pub fn restore_activate_devices(
         &self,
         state: &devices::virtio::persist::VmDevicesState,
@@ -399,10 +390,7 @@ impl Vmm {
     /// restored image: restore VM-level state, re-activate the virtio devices
     /// from saved queue state, and load the vCPU registers. The caller resumes
     /// (e.g. [`Self::resume`]) to start the clone running.
-    #[cfg(any(
-        all(target_os = "linux", target_arch = "x86_64"),
-        all(target_os = "macos", target_arch = "aarch64")
-    ))]
+    #[cfg(snapshot_supported)]
     pub fn apply_restore(&mut self, checkpoint: VmCheckpoint) -> Result<()> {
         self.vm
             .restore_state(&checkpoint.vm_state)
@@ -432,10 +420,7 @@ impl Vmm {
     /// Spawn the vCPU threads but leave them **paused** (Linux: they sit in the
     /// paused state machine). Used by restore-into-a-fresh-VM so VM/device/vCPU
     /// state can be restored before the guest runs; resume via [`Self::resume`].
-    #[cfg(any(
-        all(target_os = "linux", target_arch = "x86_64"),
-        all(target_os = "macos", target_arch = "aarch64")
-    ))]
+    #[cfg(snapshot_supported)]
     pub fn start_vcpus_paused(&mut self, vcpus: Vec<Vcpu>) -> Result<()> {
         self.start_vcpus_inner(vcpus, false)
     }
@@ -538,10 +523,7 @@ impl Vmm {
     /// the only safe point to issue the KVM GET ioctls (`KVM_GET_VCPU_EVENTS` is
     /// unsafe while other vCPUs run). Returns one [`vstate::VcpuState`] per vCPU,
     /// in vCPU-index order.
-    #[cfg(any(
-        all(target_os = "linux", target_arch = "x86_64"),
-        all(target_os = "macos", target_arch = "aarch64")
-    ))]
+    #[cfg(snapshot_supported)]
     pub fn save_vcpu_states(&mut self) -> Result<Vec<vstate::VcpuState>> {
         if self.run_state != VmmRunState::Paused {
             return Err(Error::VcpuSnapshot(
@@ -561,10 +543,7 @@ impl Vmm {
         Ok(states)
     }
 
-    #[cfg(any(
-        all(target_os = "linux", target_arch = "x86_64"),
-        all(target_os = "macos", target_arch = "aarch64")
-    ))]
+    #[cfg(snapshot_supported)]
     fn wait_for_saved_state(handle: &VcpuHandle, deadline: Instant) -> Result<vstate::VcpuState> {
         loop {
             let remaining = deadline
@@ -591,10 +570,7 @@ impl Vmm {
     /// during VM restore. `states` must hold exactly one entry per vCPU, in
     /// vCPU-index order (as produced by [`Self::save_vcpu_states`]). The vCPUs
     /// must be paused; the caller resumes them afterwards.
-    #[cfg(any(
-        all(target_os = "linux", target_arch = "x86_64"),
-        all(target_os = "macos", target_arch = "aarch64")
-    ))]
+    #[cfg(snapshot_supported)]
     pub fn restore_vcpu_states(&mut self, states: Vec<vstate::VcpuState>) -> Result<()> {
         if states.len() != self.vcpus_handles.len() {
             return Err(Error::VcpuSnapshot(format!(
@@ -629,10 +605,7 @@ impl Vmm {
     /// For the in-process fork fast path, capture once and clone the guest
     /// memory (CoW) per child instead of streaming it; the CPU/device state in
     /// [`VmCheckpoint`] is shared by all children (each then rejuvenated).
-    #[cfg(any(
-        all(target_os = "linux", target_arch = "x86_64"),
-        all(target_os = "macos", target_arch = "aarch64")
-    ))]
+    #[cfg(snapshot_supported)]
     pub fn checkpoint<W: std::io::Write>(
         &mut self,
         mem_out: &mut W,
@@ -666,10 +639,7 @@ impl Vmm {
     ///
     /// `self` must have been built with the same VM config as the checkpoint
     /// (vCPU count, memory layout, device set) so the layout matches.
-    #[cfg(any(
-        all(target_os = "linux", target_arch = "x86_64"),
-        all(target_os = "macos", target_arch = "aarch64")
-    ))]
+    #[cfg(snapshot_supported)]
     pub fn restore<R: std::io::Read>(
         &mut self,
         checkpoint: VmCheckpoint,
@@ -765,10 +735,7 @@ impl Vmm {
     /// guest-RAM region descriptors (gpa/len/memfd-fd/offset) a clone needs to
     /// reach the fds via `/proc/<this_pid>/fd`. The caller keeps this process
     /// alive as the golden base.
-    #[cfg(any(
-        all(target_os = "linux", target_arch = "x86_64"),
-        all(target_os = "macos", target_arch = "aarch64")
-    ))]
+    #[cfg(fork_supported)]
     pub fn checkpoint_for_fork(
         &mut self,
     ) -> Result<(VmCheckpoint, Vec<snapshot::MemfdRegionDesc>)> {

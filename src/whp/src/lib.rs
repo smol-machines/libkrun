@@ -1391,7 +1391,7 @@ const CHECKPOINT_REGS: &[WHV_REGISTER_NAME] = &[
 /// checkpoint/restore (snapshot and fork). Holds the saved register
 /// name/value pairs plus the opaque LAPIC and XSAVE blobs. Serializes to a
 /// flat byte buffer via [`WhpVcpuState::to_bytes`] / [`WhpVcpuState::from_bytes`].
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct WhpVcpuState {
     reg_names: Vec<WHV_REGISTER_NAME>,
     reg_values: Vec<[u8; 16]>,
