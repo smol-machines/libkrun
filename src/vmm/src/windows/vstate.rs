@@ -178,6 +178,10 @@ pub struct Vcpu {
     io_bus: devices::Bus,
     /// MMIO bus (virtio-over-MMIO and friends).
     mmio_bus: Option<devices::Bus>,
+    /// When set, the vCPU thread holds in its paused event loop before running
+    /// any guest code, so a restore-into-a-clone can load register state onto it
+    /// (and resume it) before the guest executes. Used by the fork clone path.
+    start_paused: bool,
     #[allow(dead_code)]
     exit_evt: EventFd,
 
@@ -205,6 +209,7 @@ impl Vcpu {
             boot_entry_addr: 0,
             io_bus: devices::Bus::new(),
             mmio_bus: None,
+            start_paused: false,
             exit_evt,
             event_receiver,
             event_sender: Some(event_sender),
@@ -215,6 +220,13 @@ impl Vcpu {
 
     pub fn cpu_index(&self) -> u8 {
         self.id
+    }
+
+    /// Mark this vCPU to start in its paused event loop (see the `start_paused`
+    /// field). Call before [`Self::start_threaded`]. Used by the fork clone path
+    /// so register state can be restored before the guest runs.
+    pub fn set_start_paused(&mut self, v: bool) {
+        self.start_paused = v;
     }
 
     /// On KVM this installs a signal handler used to kick the vCPU out of
@@ -462,6 +474,13 @@ impl Vcpu {
 
     /// Main loop of the vCPU thread: run the WHP vCPU and handle its exits.
     pub fn run(&mut self) {
+        // Fork clone restore: hold in the paused loop until the orchestrator has
+        // restored register state and sent Resume, so the guest never executes
+        // with cold (boot) registers.
+        if self.start_paused && !self.run_paused_loop() {
+            let _ = self.response_sender.send(VcpuResponse::Exited(0));
+            return;
+        }
         loop {
             if !self.service_events() {
                 break;

@@ -445,11 +445,15 @@ impl Vmm {
         for mut vcpu in vcpus.drain(..) {
             vcpu.set_mmio_bus(self.mmio_device_manager.bus.clone());
 
-            // HVF (macOS): vCPU threads run guest code immediately after spawn,
-            // so a restore-into-a-clone (paused) start must mark the vCPU to hold
-            // in its paused event loop until the orchestrator restores registers
-            // and resumes. On KVM the paused state machine handles this already.
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            // HVF (macOS) and WHP (Windows): vCPU threads run guest code
+            // immediately after spawn, so a restore-into-a-clone (paused) start
+            // must mark the vCPU to hold in its paused event loop until the
+            // orchestrator restores registers and resumes. On KVM the paused
+            // state machine handles this already.
+            #[cfg(any(
+                all(target_os = "macos", target_arch = "aarch64"),
+                all(target_os = "windows", target_arch = "x86_64")
+            ))]
             vcpu.set_start_paused(!resume_after);
 
             self.vcpus_handles
