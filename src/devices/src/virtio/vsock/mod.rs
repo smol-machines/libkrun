@@ -20,8 +20,8 @@ mod sys;
 mod timesync;
 mod tsi_dgram;
 mod tsi_stream;
-// AF_UNIX host-IPC proxy; Unix-only (Windows has no AF_UNIX over TSI).
-#[cfg(unix)]
+// AF_UNIX host-IPC proxy. Cross-platform via socket2 (Windows ships AF_UNIX);
+// the AF_UNIX-over-TSI hijack path remains Linux-only and lives elsewhere.
 mod unix;
 mod vsock_addr;
 

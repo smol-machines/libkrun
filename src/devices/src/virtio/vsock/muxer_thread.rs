@@ -10,9 +10,7 @@ use super::proxy::{NewProxyType, Proxy, ProxyRawHandle, ProxyRemoval, ProxyUpdat
 use super::tsi_stream::TsiStreamProxy;
 
 use crate::virtio::InterruptTransport;
-#[cfg(unix)]
 use crate::virtio::vsock::defs;
-#[cfg(unix)]
 use crate::virtio::vsock::unix::{UnixAcceptorProxy, UnixProxy};
 use crossbeam_channel::Sender;
 use rand::{Rng, rng, rngs::ThreadRng};
@@ -28,9 +26,7 @@ pub struct MuxerThread {
     queue: Arc<Mutex<VirtQueue>>,
     interrupt: InterruptTransport,
     reaper_sender: Sender<u64>,
-    /// AF_UNIX host-IPC listeners; consumed only by `create_lisening_ipc_sockets`
-    /// (Unix-only). Always empty on Windows.
-    #[cfg_attr(not(unix), allow(dead_code))]
+    /// AF_UNIX host-IPC listeners; consumed by `create_lisening_ipc_sockets`.
     unix_ipc_port_map: HashMap<u32, (PathBuf, bool)>,
 }
 
@@ -130,7 +126,6 @@ impl MuxerThread {
                     self.queue.clone(),
                     self.rxq.clone(),
                 )),
-                #[cfg(unix)]
                 NewProxyType::Unix => Box::new(UnixProxy::new_reverse(
                     new_id,
                     self.cid,
@@ -159,9 +154,8 @@ impl MuxerThread {
         }
     }
 
-    /// Set up AF_UNIX host-IPC listeners from `unix_ipc_port_map`. Unix-only;
-    /// Windows has no AF_UNIX so there is nothing to do.
-    #[cfg(unix)]
+    /// Set up AF_UNIX host-IPC listeners from `unix_ipc_port_map`. Cross-platform
+    /// (AF_UNIX is available on Unix and Windows via socket2).
     fn create_lisening_ipc_sockets(&self) {
         let start = std::time::Instant::now();
         info!(
@@ -216,7 +210,6 @@ impl MuxerThread {
         info!("[VSOCK_TIMING] MuxerThread work() started");
 
         let mut thread_rng = rng();
-        #[cfg(unix)]
         self.create_lisening_ipc_sockets();
 
         info!(

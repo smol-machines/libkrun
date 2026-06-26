@@ -11,7 +11,6 @@ use super::defs::uapi;
 use super::dns_filter::{DnsRequest, DnsWorker, EgressPolicy, sockaddr_port};
 use super::muxer_rxq::{MuxerRxQ, rx_to_pkt};
 use super::muxer_thread::MuxerThread;
-#[cfg(unix)]
 use super::packet::TsiConnectReq;
 use super::packet::{TsiGetnameRsp, VsockPacket};
 use super::proxy::ProxyRawHandle;
@@ -21,7 +20,6 @@ use super::reaper::ReaperThread;
 use super::timesync::TimesyncThread;
 use super::tsi_dgram::TsiDgramProxy;
 use super::tsi_stream::TsiStreamProxy;
-#[cfg(unix)]
 use super::unix::UnixProxy;
 use super::vsock_addr::VsockAddr;
 use crossbeam_channel::{Sender, unbounded};
@@ -756,8 +754,6 @@ impl VsockMuxer {
             pkt.src_port(),
             pkt.dst_port()
         );
-        // `mut` is only needed for the Unix AF_UNIX-IPC branch below.
-        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut proxy_map = self.proxy_map.write().unwrap();
 
         if let Some(proxy) = proxy_map.get(&id) {
@@ -765,9 +761,8 @@ impl VsockMuxer {
                 self.process_proxy_update(id, update);
             }
         } else {
-            // AF_UNIX host-IPC connect target (Unix-only; the map is always
-            // empty on Windows, which has no AF_UNIX over TSI).
-            #[cfg(unix)]
+            // AF_UNIX host-IPC connect target. AF_UNIX is available on both Unix
+            // and Windows (via socket2), so this path is cross-platform.
             if let Some(ipc_map) = &mut self.unix_ipc_port_map
                 && let Some((path, listen)) = ipc_map.get(&pkt.dst_port())
             {

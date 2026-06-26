@@ -107,7 +107,8 @@ pub enum ProxyRemoval {
 pub enum NewProxyType {
     #[default]
     Tcp,
-    #[cfg(unix)]
+    /// Host-IPC AF_UNIX connection accepted by `UnixAcceptorProxy`. Available on
+    /// all platforms with AF_UNIX support (Unix and Windows).
     Unix,
 }
 
