@@ -87,6 +87,13 @@ impl TsiStreamProxy {
         // choice for re-binding a listener).
         let _ = sock.set_reuse_address(true);
 
+        // Match Linux's default dual-stack behavior so an IPv6 wildcard listener
+        // (e.g. a guest binding `[::]`) also accepts IPv4. Linux defaults
+        // IPV6_V6ONLY off; Windows defaults it on. No-op for IPv4.
+        if family == Family::Inet6 {
+            let _ = sock.set_only_v6(false);
+        }
+
         // Enable TCP keepalive to prevent silent drops on idle INET connections.
         #[cfg(target_os = "linux")]
         let is_unix = family == Family::Unix;
