@@ -550,7 +550,19 @@ impl Epoll {
                 if rc != 0 {
                     EventSet::empty()
                 } else {
-                    wsa_events_to_set(nev.lNetworkEvents)
+                    let mut set = wsa_events_to_set(nev.lNetworkEvents);
+                    // A failed nonblocking connect signals FD_CONNECT with a
+                    // non-zero error in iErrorCode[FD_CONNECT_BIT]. Surface it as
+                    // HANG_UP (not OUT) so the proxy reports the connect failure
+                    // instead of mistaking FD_CONNECT for writability — otherwise
+                    // a guest connect() to a closed/unreachable port hangs.
+                    const FD_CONNECT_BIT: usize = 4;
+                    if (nev.lNetworkEvents as u32) & FD_CONNECT != 0
+                        && nev.iErrorCode[FD_CONNECT_BIT] != 0
+                    {
+                        set = (set - EventSet::OUT) | EventSet::HANG_UP;
+                    }
+                    set
                 }
             } else {
                 event_set & (EventSet::IN | EventSet::OUT)
