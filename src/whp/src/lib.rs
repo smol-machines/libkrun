@@ -20,7 +20,8 @@ use windows_sys::Win32::System::Hypervisor::{
     WHvDeletePartition, WHvDeleteVirtualProcessor, WHvEmulatorCreateEmulator,
     WHvEmulatorDestroyEmulator, WHvEmulatorTryIoEmulation, WHvEmulatorTryMmioEmulation,
     WHvGetCapability, WHvGetVirtualProcessorRegisters, WHvMapGpaRange, WHvMapGpaRangeFlagExecute,
-    WHvMapGpaRangeFlagRead, WHvMapGpaRangeFlagWrite, WHvPartitionPropertyCodeCpuidResultList,
+    WHvMapGpaRangeFlagRead, WHvMapGpaRangeFlagWrite, WHvPartitionPropertyCodeCpuidExitList,
+    WHvPartitionPropertyCodeCpuidResultList,
     WHvPartitionPropertyCodeExtendedVmExits, WHvPartitionPropertyCodeLocalApicEmulationMode,
     WHvPartitionPropertyCodeProcessorCount, WHvPartitionPropertyCodeProcessorFeaturesBanks,
     WHvPartitionPropertyCodeSyntheticProcessorFeaturesBanks,
@@ -33,7 +34,7 @@ use windows_sys::Win32::System::Hypervisor::{
     WHvSetupPartition, WHvX64LocalApicEmulationModeXApic,
     WHvX64RegisterDeliverabilityNotifications, WHvX64RegisterRax, WHvX64RegisterRbx,
     WHvX64RegisterRcx, WHvX64RegisterRdx, WHvX64RegisterRflags, WHvX64RegisterRip,
-    WHvX64RegisterRsp,
+    WHvX64RegisterRsp, WHvX64RegisterTscDeadline,
 };
 use windows_sys::Win32::System::Hypervisor::{
     WHV_EMULATOR_IO_ACCESS_INFO, WHV_EMULATOR_MEMORY_ACCESS_INFO, WHV_TRANSLATE_GVA_FLAGS,
@@ -318,10 +319,13 @@ impl WhpVm {
             },
         )?;
 
-        // Enable MSR exits (bit 1)
+        // Enable CPUID exits (bit 0) and MSR exits (bit 1). CPUID exits are
+        // gated to the leaves in CpuidExitList (set below, just leaf 0x1) so we
+        // can advertise the TSC-deadline timer; MSR exits let us service
+        // unhandled MSR reads/writes.
         // https://github.com/google/crosvm/blob/main/hypervisor/src/whpx/whpx_sys/WinHvPlatformDefs.h#L74
         Self::set_property(handle, WHvPartitionPropertyCodeExtendedVmExits, |p| {
-            p.ExtendedVmExits.AsUINT64 = 0b10; // bit 1 = X64MsrExit
+            p.ExtendedVmExits.AsUINT64 = 0b11; // bit 0 = X64CpuidExit, bit 1 = X64MsrExit
         })?;
 
         // Configure how MSRs are handled
@@ -510,6 +514,26 @@ impl WhpVm {
                 WHvPartitionPropertyCodeCpuidResultList,
                 cpuid_results.as_ptr() as *const _,
                 (cpuid_results.len() * mem::size_of::<WHV_X64_CPUID_RESULT>()) as u32,
+            )
+        };
+        if hr != S_OK {
+            return Err(Error::SetPartitionProperty(hr));
+        }
+
+        // Exit on CPUID leaf 0x1 so we can advertise the TSC-deadline LAPIC timer
+        // (ECX[24]) to the guest. WHP does not surface it by default, and without
+        // it the guest falls back to the periodic LAPIC timer, whose calibration
+        // fails on WHP (no PIT to calibrate against) — leaving the guest with no
+        // working clockevent, so `nanosleep`/timers hang. With TSC-deadline the
+        // guest programs IA32_TSC_DEADLINE (honored by WHP's LAPIC emulation,
+        // which exposes WHvX64RegisterTscDeadline) and needs no calibration.
+        let cpuid_exit_list: [u32; 1] = [0x1];
+        let hr = unsafe {
+            WHvSetPartitionProperty(
+                handle,
+                WHvPartitionPropertyCodeCpuidExitList,
+                cpuid_exit_list.as_ptr() as *const _,
+                std::mem::size_of_val(&cpuid_exit_list) as u32,
             )
         };
         if hr != S_OK {
@@ -1272,6 +1296,20 @@ impl WhpVcpu {
         }
 
         self.set_whp_registers(&names, &values)
+    }
+
+    /// Program the LAPIC TSC-deadline timer (the value the guest wrote to
+    /// `IA32_TSC_DEADLINE`). WHP's LAPIC fires the timer interrupt when the
+    /// guest TSC reaches `value` (0 disarms it).
+    pub fn set_tsc_deadline(&self, value: u64) -> Result<(), Error> {
+        self.set_registers64([(WHvX64RegisterTscDeadline, value)])
+    }
+
+    /// Read back the LAPIC TSC-deadline register (for a guest `IA32_TSC_DEADLINE`
+    /// read).
+    pub fn get_tsc_deadline(&self) -> Result<u64, Error> {
+        let [v] = self.get_registers64([WHvX64RegisterTscDeadline])?;
+        Ok(v)
     }
 
     pub fn vm(&self) -> &Arc<WhpVm> {
