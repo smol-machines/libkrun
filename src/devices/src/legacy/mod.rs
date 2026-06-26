@@ -61,8 +61,6 @@ pub use self::gpio::Gpio;
 pub use self::hvfgicv3::HvfGicV3;
 #[cfg(target_arch = "x86_64")]
 pub use self::i8042::{Error as I8042DeviceError, I8042Device};
-#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-pub use self::pit::Pit;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub use self::ioapic_kvm::IoApic;
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
@@ -78,6 +76,8 @@ pub use self::kvmgicv2::KvmGicV2;
 pub use self::kvmgicv3::KvmGicV3;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub use self::kvmioapic::KvmIoapic;
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+pub use self::pit::Pit;
 #[cfg(target_arch = "aarch64")]
 pub use self::rtc_pl031::RTC;
 pub use self::serial::Serial;

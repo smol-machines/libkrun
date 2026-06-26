@@ -44,13 +44,13 @@ use windows_sys::Win32::System::Hypervisor::{
     WHvGetVirtualProcessorInterruptControllerState, WHvGetVirtualProcessorXsaveState,
     WHvSetVirtualProcessorInterruptControllerState, WHvSetVirtualProcessorXsaveState,
     WHvX64RegisterApicBase, WHvX64RegisterCr0, WHvX64RegisterCr2, WHvX64RegisterCr3,
-    WHvX64RegisterCr4, WHvX64RegisterCr8, WHvX64RegisterCs, WHvX64RegisterCstar,
-    WHvX64RegisterDr0, WHvX64RegisterDr1, WHvX64RegisterDr2, WHvX64RegisterDr3, WHvX64RegisterDr6,
-    WHvX64RegisterDr7, WHvX64RegisterDs, WHvX64RegisterEfer, WHvX64RegisterEs, WHvX64RegisterFs,
-    WHvX64RegisterGdtr, WHvX64RegisterGs, WHvX64RegisterIdtr, WHvX64RegisterKernelGsBase,
-    WHvX64RegisterLdtr, WHvX64RegisterLstar, WHvX64RegisterPat, WHvX64RegisterR8, WHvX64RegisterR9,
-    WHvX64RegisterR10, WHvX64RegisterR11, WHvX64RegisterR12, WHvX64RegisterR13, WHvX64RegisterR14,
-    WHvX64RegisterR15, WHvX64RegisterRbp, WHvX64RegisterRdi, WHvX64RegisterRsi, WHvX64RegisterSfmask,
+    WHvX64RegisterCr4, WHvX64RegisterCr8, WHvX64RegisterCs, WHvX64RegisterCstar, WHvX64RegisterDr0,
+    WHvX64RegisterDr1, WHvX64RegisterDr2, WHvX64RegisterDr3, WHvX64RegisterDr6, WHvX64RegisterDr7,
+    WHvX64RegisterDs, WHvX64RegisterEfer, WHvX64RegisterEs, WHvX64RegisterFs, WHvX64RegisterGdtr,
+    WHvX64RegisterGs, WHvX64RegisterIdtr, WHvX64RegisterKernelGsBase, WHvX64RegisterLdtr,
+    WHvX64RegisterLstar, WHvX64RegisterPat, WHvX64RegisterR8, WHvX64RegisterR9, WHvX64RegisterR10,
+    WHvX64RegisterR11, WHvX64RegisterR12, WHvX64RegisterR13, WHvX64RegisterR14, WHvX64RegisterR15,
+    WHvX64RegisterRbp, WHvX64RegisterRdi, WHvX64RegisterRsi, WHvX64RegisterSfmask,
     WHvX64RegisterSs, WHvX64RegisterStar, WHvX64RegisterSysenterCs, WHvX64RegisterSysenterEip,
     WHvX64RegisterSysenterEsp, WHvX64RegisterTr, WHvX64RegisterTsc, WHvX64RegisterTscAux,
     WHvX64RegisterXCr0,
@@ -1572,9 +1572,8 @@ impl WhpVcpu {
                 WHvX64RegisterEfer,
             ];
             for (name, value) in state.reg_names.iter().zip(values.iter()) {
-                let hr = unsafe {
-                    WHvSetVirtualProcessorRegisters(part, self.index, name, 1, value)
-                };
+                let hr =
+                    unsafe { WHvSetVirtualProcessorRegisters(part, self.index, name, 1, value) };
                 if hr != S_OK {
                     if CORE.contains(name) {
                         error!("restoring core vCPU register {name} failed: HRESULT 0x{hr:08x}");
@@ -1609,9 +1608,7 @@ impl WhpVcpu {
                 )
             };
             if hr != S_OK {
-                error!(
-                    "WHvSetVirtualProcessorInterruptControllerState failed: HRESULT 0x{hr:08x}"
-                );
+                error!("WHvSetVirtualProcessorInterruptControllerState failed: HRESULT 0x{hr:08x}");
             }
         }
 
@@ -1620,10 +1617,7 @@ impl WhpVcpu {
 
     /// Reads a variable-length WHP state blob (LAPIC or XSAVE) into a right-sized
     /// `Vec`. Returns an empty vec if the host does not support the query.
-    fn get_state_blob(
-        &self,
-        get: impl Fn(*mut u8, u32, *mut u32) -> HRESULT,
-    ) -> Vec<u8> {
+    fn get_state_blob(&self, get: impl Fn(*mut u8, u32, *mut u32) -> HRESULT) -> Vec<u8> {
         let mut buf = vec![0u8; 4096];
         let mut written: u32 = 0;
         let hr = get(buf.as_mut_ptr(), buf.len() as u32, &mut written);

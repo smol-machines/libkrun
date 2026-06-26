@@ -71,7 +71,11 @@ impl Pit {
     }
 
     fn arm(&self, reload: u16) {
-        let ticks = if reload == 0 { 65_536 } else { u64::from(reload) };
+        let ticks = if reload == 0 {
+            65_536
+        } else {
+            u64::from(reload)
+        };
         let period_ns = (ticks * 1_000_000_000 / PIT_FREQ_HZ).max(1);
         let periodic = matches!(self.mode, 2 | 3);
         let _ = self.tx.send(Arm {

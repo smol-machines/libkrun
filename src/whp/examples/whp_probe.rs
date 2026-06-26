@@ -22,11 +22,11 @@ fn main() {
         WHV_PARTITION_HANDLE, WHV_REGISTER_VALUE, WHvCreatePartition, WHvCreateVirtualProcessor,
         WHvGetVirtualProcessorInterruptControllerState, WHvGetVirtualProcessorRegisters,
         WHvGetVirtualProcessorXsaveState, WHvMapGpaRange, WHvMapGpaRangeFlagExecute,
-        WHvMapGpaRangeFlagRead, WHvMapGpaRangeFlagWrite, WHvPartitionPropertyCodeLocalApicEmulationMode,
-        WHvPartitionPropertyCodeProcessorCount, WHvSetPartitionProperty,
-        WHvSetVirtualProcessorInterruptControllerState, WHvSetVirtualProcessorRegisters,
-        WHvSetVirtualProcessorXsaveState, WHvSetupPartition, WHvX64LocalApicEmulationModeXApic,
-        WHvX64RegisterRax,
+        WHvMapGpaRangeFlagRead, WHvMapGpaRangeFlagWrite,
+        WHvPartitionPropertyCodeLocalApicEmulationMode, WHvPartitionPropertyCodeProcessorCount,
+        WHvSetPartitionProperty, WHvSetVirtualProcessorInterruptControllerState,
+        WHvSetVirtualProcessorRegisters, WHvSetVirtualProcessorXsaveState, WHvSetupPartition,
+        WHvX64LocalApicEmulationModeXApic, WHvX64RegisterRax,
     };
     use windows_sys::Win32::System::Memory::{
         CreateFileMappingW, FILE_MAP_ALL_ACCESS, FILE_MAP_COPY, MapViewOfFile,
@@ -79,7 +79,11 @@ fn main() {
         let rax = getv.Reg64;
         println!(
             "1) REG-ROUNDTRIP set_hr=0x{sr:08x} get_hr=0x{gr:08x} rax=0x{rax:016x} -> {}",
-            if rax == 0xDEAD_BEEF_1234_5678 { "PASS" } else { "FAIL" }
+            if rax == 0xDEAD_BEEF_1234_5678 {
+                "PASS"
+            } else {
+                "FAIL"
+            }
         );
 
         // --- 2. LAPIC / interrupt-controller state round-trip ---
@@ -104,7 +108,11 @@ fn main() {
         };
         println!(
             "2) LAPIC-ROUNDTRIP get_hr=0x{lg:08x} bytes={written} set_hr=0x{ls:08x} -> {}",
-            if lg == S_OK && ls == S_OK { "PASS" } else { "FAIL" }
+            if lg == S_OK && ls == S_OK {
+                "PASS"
+            } else {
+                "FAIL"
+            }
         );
 
         // --- 2b. XSAVE (FPU/SSE) round-trip ---
@@ -124,7 +132,11 @@ fn main() {
         };
         println!(
             "2b) XSAVE-ROUNDTRIP get_hr=0x{xg:08x} bytes={xw} set_hr=0x{xs:08x} -> {}",
-            if xg == S_OK && xs == S_OK { "PASS" } else { "FAIL" }
+            if xg == S_OK && xs == S_OK {
+                "PASS"
+            } else {
+                "FAIL"
+            }
         );
 
         // --- 3. CoW guest RAM via PAGE_WRITECOPY + WHvMapGpaRange ---

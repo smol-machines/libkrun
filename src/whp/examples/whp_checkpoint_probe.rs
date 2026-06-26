@@ -12,10 +12,10 @@ fn main() {
 
 #[cfg(windows)]
 fn main() {
-    use std::sync::Arc;
     use krun_whp::{WhpVcpu, WhpVm};
+    use std::sync::Arc;
     use windows_sys::Win32::System::Hypervisor::{
-        WHvSetVirtualProcessorRegisters, WHvX64RegisterRax, WHvX64RegisterRip, WHV_REGISTER_VALUE,
+        WHV_REGISTER_VALUE, WHvSetVirtualProcessorRegisters, WHvX64RegisterRax, WHvX64RegisterRip,
     };
 
     println!("== WHP CHECKPOINT ROUND-TRIP PROBE ==");

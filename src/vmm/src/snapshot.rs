@@ -399,7 +399,9 @@ pub fn open_cow_memory_from_paths(descs: &[MemfdRegionDesc]) -> io::Result<Guest
 #[cfg(target_os = "windows")]
 pub fn memfd_region_descs(mem: &GuestMemoryMmap) -> Vec<MemfdRegionDesc> {
     use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{FILE_NAME_NORMALIZED, GetFinalPathNameByHandleW};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_NAME_NORMALIZED, GetFinalPathNameByHandleW,
+    };
     use windows_sys::Win32::System::Memory::FlushViewOfFile;
 
     mem.iter()
