@@ -140,6 +140,24 @@ Remaining genuinely-unsupported (not bugs): **AF_UNIX host-IPC over TSI** is
 Unix-only — Windows has no AF_UNIX, so `krun_add_vsock_port` (the UDS bridge)
 is a no-op there; INET TCP/UDP and port-forward are unaffected.
 
+## virtio-net feature parity (2026-06-26)
+
+In addition to TSI (the default, transparent backend), the **virtio-net device**
+now works on Windows for feature parity. The `unixstream` backend was ported to
+`socket2` (Windows 10 1809+ has native AF_UNIX SOCK_STREAM), and the device,
+worker, and `NetBackend` trait are cross-platform; the worker registers the
+backend socket with the IOCP epoll shim. `unixgram` (AF_UNIX datagram) and
+raw-fd passing stay Unix-only (Windows AF_UNIX is stream-only), and `tap` stays
+Linux-only.
+
+Hardware-validated on WHP: with `krun_add_net_unixstream(path)` pointed at a
+Windows AF_UNIX listener, the guest's `eth0` came up with the configured MAC and
+an IP, the backend connected to the socket, and a guest `ping` emitted an
+ethernet **ARP** frame (ethertype 0806, broadcast) that arrived intact at the
+host proxy. Full L3 connectivity over virtio-net needs a userspace network proxy
+(gvproxy/passt) on the host — exactly as on Unix; the device/backend/transport
+themselves are functional.
+
 ## Production QA (2026-06-26)
 
 All run on the Windows 10 1909 WHP thinkpad:
