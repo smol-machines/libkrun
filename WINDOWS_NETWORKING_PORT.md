@@ -1,6 +1,31 @@
 # Windows TSI/vsock Networking Port — Implementation Plan
 
-Status: **planning + phase 1 in progress** (2026-06-25)
+Status: **phases 1–2 done, phase 3 in progress** (2026-06-25)
+
+## Progress log
+
+- ✅ **Phase 1 — socket2 + VsockAddr** (`884d043`, `5f0b483`): the whole TSI proxy
+  set (`tsi_stream`, `tsi_dgram`, `packet`, `muxer`, `dns_filter`, `proxy`) is off
+  `nix` and on `socket2` + a host-neutral `VsockAddr`. `unix.rs` (AF_UNIX host
+  IPC) stays nix-based on Unix. Unix behavior unchanged; 78 devices tests pass.
+- ✅ **Phase 2 — Windows epoll SOCKET support** (`9e76c3e`): `utils/windows/epoll.rs`
+  bridges Winsock sockets into the IOCP via `WSAEventSelect` + `WSAEnumNetworkEvents`.
+  Cross-compiles for `x86_64-pc-windows-gnu`.
+- ✅ **Phase 3 (1/2) — cross-platform proxy handle** (`3fe9fa4`): `Proxy::poll_handle()`
+  + `ProxyRawHandle` replace the Unix-only `AsRawFd` supertrait.
+- ⏳ **Phase 3 (2/2) — remaining build wiring.** Next concrete steps:
+  1. `vsock/mod.rs`: gate `mod unix;` behind `#[cfg(unix)]`.
+  2. `muxer.rs` / `muxer_thread.rs`: gate the AF_UNIX bits for Windows — the
+     `UnixProxy` import + construction, `unix_ipc_port_map`, and
+     `create_lisening_ipc_sockets`; change `update_polling`'s `RawFd` param to
+     `ProxyRawHandle`.
+  3. `devices/src/virtio/mod.rs`: drop the `#[cfg(not(target_os = "windows"))]`
+     gates on `pub mod vsock` / `pub use vsock::*`.
+  4. `libkrun/src/lib.rs` + `vmm`: drop the `#[cfg(not(windows))]` gates on the
+     vsock device, `krun_add_vsock`, `krun_add_vsock_port*`, and `krun_set_port_map`.
+  5. Cross-compile `krun.dll` with vsock; fix residual Windows-only errors.
+- ⏳ **Phase 4 — hardware bring-up** on the WHP thinkpad: outbound TCP, DNS, UDP.
+
 
 Goal: bring the libkrun guest networking path (TSI — Transparent Socket Implementation,
 implemented in the virtio-vsock device) up on Windows/WHP, so guest TCP/UDP/DNS reaches the
