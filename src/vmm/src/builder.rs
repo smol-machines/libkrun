@@ -1811,12 +1811,22 @@ pub(crate) fn create_guest_ram_memfd(size: usize) -> std::result::Result<File, S
 /// Windows has no `memfd`; back the guest-RAM region with a regular temp file
 /// (the macOS model). vm-memory maps it `FILE_MAP_ALL_ACCESS` to serve the
 /// golden's RAM, and a clone re-opens the same path to read its image. The path
-/// is recovered at fork time via `GetFinalPathNameByHandleW`. The file is opened
-/// with share-read/write/delete (Rust's default) so a clone can open it
-/// concurrently; it is cleaned up when the forkable golden is torn down.
+/// is recovered at fork time via `GetFinalPathNameByHandleW`.
+///
+/// The file is opened `FILE_FLAG_DELETE_ON_CLOSE` with share read/write/delete,
+/// so the OS reclaims it once every handle is closed — i.e. when the frozen
+/// golden process dies (it is typically killed externally, so there is no clean
+/// shutdown hook to unlink it) and any clone that eager-copied it has finished.
+/// Without this the multi-hundred-MB RAM files leak into `%TEMP%` and fill the
+/// disk across forks.
 #[cfg(target_os = "windows")]
 pub(crate) fn create_guest_ram_memfd(size: usize) -> std::result::Result<File, String> {
+    use std::os::windows::fs::OpenOptionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    const FILE_SHARE_READ_WRITE_DELETE: u32 = 0x1 | 0x2 | 0x4;
+    const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let dir = std::env::temp_dir();
     let pid = std::process::id();
@@ -1827,6 +1837,8 @@ pub(crate) fn create_guest_ram_memfd(size: usize) -> std::result::Result<File, S
         .read(true)
         .write(true)
         .create_new(true)
+        .share_mode(FILE_SHARE_READ_WRITE_DELETE)
+        .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
         .open(&path)
         .map_err(|e| format!("create guest-RAM file {}: {e}", path.display()))?;
     file.set_len(size as u64)
