@@ -1,6 +1,7 @@
 use crate::virtio::net::backend::ConnectError;
 #[cfg(target_os = "linux")]
 use crate::virtio::net::tap::Tap;
+#[cfg(unix)]
 use crate::virtio::net::unixgram::Unixgram;
 use crate::virtio::net::unixstream::Unixstream;
 use crate::virtio::net::{MAX_BUFFER_SIZE, QUEUE_SIZE};
@@ -10,13 +11,18 @@ use super::VNET_HDR_LEN;
 use super::backend::{NetBackend, ReadError, WriteError};
 use super::device::{FrontendError, RxError, TxError, VirtioNetBackend};
 
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 #[cfg(target_os = "macos")]
 use std::os::fd::RawFd;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+#[cfg(unix)]
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::thread;
 use std::{cmp, result};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use utils::eventfd::EventFd;
+#[cfg(windows)]
+use utils::windows::AsRawFd;
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
 pub struct NetWorker {
@@ -50,21 +56,26 @@ impl NetWorker {
         stop_fd: EventFd,
     ) -> Result<Self, ConnectError> {
         let backend = match cfg_backend {
+            #[cfg(unix)]
             VirtioNetBackend::UnixstreamFd(fd) => {
                 // SAFETY: we need to trust that the library user has configured
                 // the backend with a healthy file descriptor.
                 let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
-                Box::new(Unixstream::new(owned_fd)) as Box<dyn NetBackend + Send>
+                Box::new(Unixstream::new(socket2::Socket::from(owned_fd)))
+                    as Box<dyn NetBackend + Send>
             }
             VirtioNetBackend::UnixstreamPath(path) => {
                 Box::new(Unixstream::open(path)?) as Box<dyn NetBackend + Send>
             }
+            #[cfg(unix)]
             VirtioNetBackend::UnixgramFd(fd) => {
                 // SAFETY: we need to trust that the library user has configured
                 // the backend with a healthy file descriptor.
                 let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
-                Box::new(Unixgram::new(owned_fd)) as Box<dyn NetBackend + Send>
+                Box::new(Unixgram::new(socket2::Socket::from(owned_fd)))
+                    as Box<dyn NetBackend + Send>
             }
+            #[cfg(unix)]
             VirtioNetBackend::UnixgramPath(path, vfkit_magic) => {
                 Box::new(Unixgram::open(path, vfkit_magic)?) as Box<dyn NetBackend + Send>
             }

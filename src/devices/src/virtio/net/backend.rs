@@ -1,17 +1,22 @@
 use std::io;
-use std::os::fd::RawFd;
+
+use super::sys::NetRawHandle;
 
 #[allow(dead_code)]
 #[derive(Debug)]
 pub enum ConnectError {
-    InvalidAddress(nix::Error),
-    CreateSocket(nix::Error),
-    Binding(nix::Error),
-    SendingMagic(nix::Error),
-    // Tap backend errors.
+    InvalidAddress(io::Error),
+    CreateSocket(io::Error),
+    Binding(io::Error),
+    SendingMagic(io::Error),
+    // Tap backend errors (Linux only).
+    #[cfg(target_os = "linux")]
     OpenNetTun(nix::Error),
+    #[cfg(target_os = "linux")]
     TunSetIff(io::Error),
+    #[cfg(target_os = "linux")]
     TunSetVnetHdrSz(io::Error),
+    #[cfg(target_os = "linux")]
     TunSetOffload(io::Error),
 }
 
@@ -21,7 +26,7 @@ pub enum ReadError {
     /// Nothing was written
     NothingRead,
     /// Another internal error occurred
-    Internal(nix::Error),
+    Internal(io::Error),
 }
 
 #[allow(dead_code)]
@@ -34,7 +39,7 @@ pub enum WriteError {
     /// Passt doesnt seem to be running (received EPIPE)
     ProcessNotRunning,
     /// Another internal error occurred
-    Internal(nix::Error),
+    Internal(io::Error),
 }
 
 pub trait NetBackend {
@@ -42,7 +47,7 @@ pub trait NetBackend {
     fn write_frame(&mut self, hdr_len: usize, buf: &mut [u8]) -> Result<(), WriteError>;
     fn has_unfinished_write(&self) -> bool;
     fn try_finish_write(&mut self, hdr_len: usize, buf: &[u8]) -> Result<(), WriteError>;
-    fn raw_socket_fd(&self) -> RawFd;
+    fn raw_socket_fd(&self) -> NetRawHandle;
 
     /// Delay in microseconds before retrying after NothingWritten.
     /// Returns 0 if no delay-based retry is needed (e.g. on Linux where
