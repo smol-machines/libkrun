@@ -99,7 +99,7 @@ impl NetBackend for Tap {
                 return Err(ReadError::NothingRead);
             }
             Err(e) => {
-                return Err(ReadError::Internal(e));
+                return Err(ReadError::Internal(e.into()));
             }
         };
         debug!("Read eth frame from tap: {frame_length} bytes");
@@ -108,7 +108,7 @@ impl NetBackend for Tap {
 
     /// Try to write a frame to the tap device.
     fn write_frame(&mut self, _hdr_len: usize, buf: &mut [u8]) -> Result<(), WriteError> {
-        let ret = write(&self.fd, buf).map_err(WriteError::Internal)?;
+        let ret = write(&self.fd, buf).map_err(|e| WriteError::Internal(e.into()))?;
         debug!("Written frame size={}, written={}", buf.len(), ret);
         Ok(())
     }
