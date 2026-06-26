@@ -17,20 +17,16 @@
 /// to temporary buffers, before passing it on to the vsock backend.
 use std::convert::TryInto;
 use std::ffi::CStr;
-use std::net::{Ipv4Addr, SocketAddrV4};
-#[cfg(target_os = "macos")]
-use std::net::{Ipv6Addr, SocketAddrV6};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::os::raw::c_char;
 use std::result;
 
-#[cfg(target_os = "linux")]
-use nix::sys::socket::{AddressFamily, sockaddr};
-use nix::sys::socket::{SockaddrLike, SockaddrStorage};
 use utils::byte_order;
 use vm_memory::{self, Address, GuestAddress, GuestMemory, GuestMemoryError};
 
 use super::super::DescriptorChain;
 use super::defs;
+use super::vsock_addr::VsockAddr;
 use super::{Result, VsockError};
 
 // The vsock packet header is defined by the C struct:
@@ -108,7 +104,7 @@ pub struct TsiProxyCreate {
 #[repr(C)]
 pub struct TsiConnectReq {
     pub peer_port: u32,
-    pub addr: SockaddrStorage,
+    pub addr: VsockAddr,
 }
 
 #[repr(C)]
@@ -128,16 +124,16 @@ pub struct TsiGetnameReq {
 pub struct TsiGetnameRsp {
     pub result: i32,
     pub addr_len: u32,
-    pub addr: SockaddrStorage,
+    pub addr: VsockAddr,
 }
 
 impl Default for TsiGetnameRsp {
     fn default() -> Self {
-        let addr: SockaddrStorage = SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0).into();
+        let addr: VsockAddr =
+            SocketAddr::from(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0)).into();
         TsiGetnameRsp {
             result: -1,
-            // It's fine to unwrap here sice we've just created the SocketAddrV4 above.
-            addr_len: addr.as_sockaddr_in().unwrap().len(),
+            addr_len: addr.linux_len(),
             addr,
         }
     }
@@ -147,7 +143,7 @@ impl Default for TsiGetnameRsp {
 #[derive(Debug)]
 pub struct TsiSendtoAddr {
     pub peer_port: u32,
-    pub addr: SockaddrStorage,
+    pub addr: VsockAddr,
 }
 
 #[repr(C)]
@@ -156,7 +152,7 @@ pub struct TsiListenReq {
     pub peer_port: u32,
     pub vm_port: u32,
     pub backlog: i32,
-    pub addr: SockaddrStorage,
+    pub addr: VsockAddr,
 }
 
 #[repr(C)]
@@ -563,87 +559,15 @@ impl VsockPacket {
         }
     }
 
-    #[cfg(target_os = "linux")]
-    fn parse_address(buf: &[u8], addr_len: u32) -> Option<SockaddrStorage> {
-        // `addr_len` is guest-controlled; `from_raw` reads that many bytes from
-        // the raw pointer, so reject any length that would run past the buffer
-        // (an OOB read of host memory otherwise).
-        let len = addr_len as usize;
-        if len == 0 || len > buf.len() {
-            warn!(
-                "parse_address: addr_len {addr_len} out of bounds for {}-byte buffer",
-                buf.len()
-            );
-            return None;
+    /// Parse a guest-supplied (Linux-layout) sockaddr into a host-neutral
+    /// [`VsockAddr`]. `buf`/`addr_len` are guest-controlled and bounds-checked
+    /// inside [`VsockAddr::parse_linux`].
+    fn parse_address(buf: &[u8], addr_len: u32) -> Option<VsockAddr> {
+        let addr = VsockAddr::parse_linux(buf, addr_len);
+        if addr.is_none() {
+            warn!("parse_address: invalid/unsupported sockaddr (addr_len={addr_len})");
         }
-        let sockaddr: SockaddrStorage = unsafe {
-            SockaddrStorage::from_raw(&buf[0] as *const _ as *const sockaddr, Some(addr_len))?
-        };
-
-        match sockaddr.family() {
-            Some(AddressFamily::Inet) => debug!("parse_address: AF_INET"),
-            Some(AddressFamily::Inet6) => debug!("parse_address: AF_INET6"),
-            Some(AddressFamily::Unix) => debug!("parse_address: AF_UNIX"),
-            _ => {
-                if let Some(family) = sockaddr.family() {
-                    warn!("parse_address: unsupported family {family:?}");
-                } else {
-                    warn!("parse_address: error parsing family");
-                }
-                return None;
-            }
-        }
-
-        Some(sockaddr)
-    }
-
-    #[cfg(target_os = "macos")]
-    fn parse_address(buf: &[u8], _addr_len: u32) -> Option<SockaddrStorage> {
-        // `buf` is guest-controlled and may be short; bounds-check before every
-        // fixed-offset read so a truncated address can't panic the VMM.
-        if buf.len() < 2 {
-            return None;
-        }
-        let family: u16 = byte_order::read_le_u16(&buf[0..2]);
-
-        match family {
-            defs::LINUX_AF_INET => {
-                debug!("parse_address: AF_INET");
-                if buf.len() < 8 {
-                    return None;
-                }
-                let in_port: u16 = byte_order::read_be_u16(&buf[2..4]);
-                let in_addr = Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7]);
-                Some(SocketAddrV4::new(in_addr, in_port).into())
-            }
-            defs::LINUX_AF_INET6 => {
-                debug!("parse_address: AF_INET6");
-                if buf.len() < 28 {
-                    return None;
-                }
-                let in_port: u16 = byte_order::read_be_u16(&buf[2..4]);
-                let flowinfo: u32 = byte_order::read_be_u32(&buf[4..8]);
-                let in6_addr = Ipv6Addr::new(
-                    byte_order::read_be_u16(&buf[8..10]),
-                    byte_order::read_be_u16(&buf[10..12]),
-                    byte_order::read_be_u16(&buf[12..14]),
-                    byte_order::read_be_u16(&buf[14..16]),
-                    byte_order::read_be_u16(&buf[16..18]),
-                    byte_order::read_be_u16(&buf[18..20]),
-                    byte_order::read_be_u16(&buf[20..22]),
-                    byte_order::read_be_u16(&buf[22..24]),
-                );
-                let scope_id: u32 = byte_order::read_be_u32(&buf[24..28]);
-                Some(SocketAddrV6::new(in6_addr, in_port, flowinfo, scope_id).into())
-            }
-            defs::LINUX_AF_UNIX => {
-                // On macOS, SockaddrStorage doesn't implement `from_raw` for
-                // Unix sockets, nor a way to cast an UnixPath to it.
-                error!("AF_UNIX sockets aren't yet supported on macOS");
-                None
-            }
-            _ => None,
-        }
+        addr
     }
 
     pub fn read_proxy_create(&self) -> Option<TsiProxyCreate> {
@@ -704,25 +628,12 @@ impl VsockPacket {
         {
             byte_order::write_le_u32(&mut buf[0..], rsp.result as u32);
             byte_order::write_le_u32(&mut buf[4..], rsp.addr_len);
-            let addr_ptr = rsp.addr.as_ptr();
-            let slice = unsafe {
-                std::slice::from_raw_parts(addr_ptr as *const u8, rsp.addr.len() as usize)
-            };
-            buf[8..(rsp.addr.len() + 8) as usize].copy_from_slice(slice);
-
-            // On macOS, convert BSD sockaddr (u8 sa_len + u8 sa_family) to
-            // Linux wire format (u16 sa_family). Also translate macOS AF_*
-            // values to their Linux equivalents (e.g. AF_INET6: 30 → 10).
-            #[cfg(target_os = "macos")]
-            {
-                let bsd_family = buf[9];
-                let linux_family: u16 = match bsd_family as i32 {
-                    libc::AF_INET => defs::LINUX_AF_INET,
-                    libc::AF_INET6 => defs::LINUX_AF_INET6,
-                    _ => 0, // AF_UNSPEC
-                };
-                byte_order::write_le_u16(&mut buf[8..], linux_family);
-            }
+            // `VsockAddr` always emits Linux wire layout regardless of host, so
+            // the bytes can be copied straight into the guest reply — no per-OS
+            // sockaddr patching needed.
+            let bytes = rsp.addr.to_linux_bytes();
+            let end = 8 + bytes.len().min(buf.len().saturating_sub(8));
+            buf[8..end].copy_from_slice(&bytes[..end - 8]);
         }
     }
 

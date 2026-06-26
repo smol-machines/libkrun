@@ -20,8 +20,8 @@ use super::timesync::TimesyncThread;
 use super::tsi_dgram::TsiDgramProxy;
 use super::tsi_stream::TsiStreamProxy;
 use super::unix::UnixProxy;
+use super::vsock_addr::VsockAddr;
 use crossbeam_channel::{Sender, unbounded};
-use nix::sys::socket::SockaddrStorage;
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vm_memory::GuestMemoryMmap;
 
@@ -163,7 +163,7 @@ impl VsockMuxer {
     /// Returns true if no policy is set (allow all), the IP matches a CIDR, or
     /// the IP was learned from an allowed DNS answer. Fail-closed on a poisoned
     /// policy lock.
-    fn is_ip_allowed(&self, addr: &SockaddrStorage) -> bool {
+    fn is_ip_allowed(&self, addr: &VsockAddr) -> bool {
         let Some(policy) = &self.egress_policy else {
             return true;
         };
@@ -175,7 +175,7 @@ impl VsockMuxer {
 
     /// Whether this destination is a DNS query to intercept: DNS filtering is
     /// active (a worker exists) and the destination port is 53.
-    fn is_dns_dest(&self, addr: &SockaddrStorage) -> bool {
+    fn is_dns_dest(&self, addr: &VsockAddr) -> bool {
         self.dns_sender.is_some() && sockaddr_port(addr) == Some(super::dns_filter::DNS_PORT)
     }
 
@@ -973,29 +973,23 @@ impl VsockMuxer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nix::sys::socket::{SockaddrIn, SockaddrIn6, SockaddrLike};
-    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 
-    /// Helper: create a SockaddrStorage from an IPv4 address.
-    fn sockaddr_v4(a: u8, b: u8, c: u8, d: u8, port: u16) -> SockaddrStorage {
-        let sa = SockaddrIn::new(a, b, c, d, port);
-        unsafe { SockaddrStorage::from_raw(sa.as_ptr(), Some(sa.len())).unwrap() }
+    /// Helper: create a VsockAddr from an IPv4 address.
+    fn sockaddr_v4(a: u8, b: u8, c: u8, d: u8, port: u16) -> VsockAddr {
+        VsockAddr::Inet(SocketAddrV4::new(Ipv4Addr::new(a, b, c, d), port).into())
     }
 
-    /// Helper: create a SockaddrStorage from an IPv6 address.
-    fn sockaddr_v6(addr: Ipv6Addr, port: u16) -> SockaddrStorage {
-        let std_addr = std::net::SocketAddrV6::new(addr, port, 0, 0);
-        let sa = SockaddrIn6::from(std_addr);
-        unsafe { SockaddrStorage::from_raw(sa.as_ptr(), Some(sa.len())).unwrap() }
+    /// Helper: create a VsockAddr from an IPv6 address.
+    fn sockaddr_v6(addr: Ipv6Addr, port: u16) -> VsockAddr {
+        VsockAddr::Inet(SocketAddrV6::new(addr, port, 0, 0).into())
     }
 
-    /// Test wrapper: extract the IP from a sockaddr and delegate to the shared
-    /// CIDR matcher (which now lives in `dns_filter` and takes an `IpAddr`).
-    fn ip_matches_cidrs(addr: &SockaddrStorage, cidrs: &[(IpAddr, u8)]) -> bool {
-        let ip = match (addr.as_sockaddr_in(), addr.as_sockaddr_in6()) {
-            (Some(sin), _) => IpAddr::V4(sin.ip()),
-            (_, Some(sin6)) => IpAddr::V6(sin6.ip()),
-            _ => return true,
+    /// Test wrapper: extract the IP from an address and delegate to the shared
+    /// CIDR matcher (which lives in `dns_filter` and takes an `IpAddr`).
+    fn ip_matches_cidrs(addr: &VsockAddr, cidrs: &[(IpAddr, u8)]) -> bool {
+        let Some(ip) = addr.inet().map(|a| a.ip()) else {
+            return true;
         };
         super::super::dns_filter::ip_matches_cidrs(ip, cidrs)
     }

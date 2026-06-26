@@ -1,21 +1,12 @@
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
-use std::num::Wrapping;
-use std::os::fd::OwnedFd;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::net::{Ipv4Addr, SocketAddrV4};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, RawFd};
 use std::sync::{Arc, Mutex};
 
-use nix::fcntl::{FcntlArg, OFlag, fcntl};
-#[cfg(target_os = "linux")]
-use nix::sys::socket::UnixAddr;
-use nix::sys::socket::{
-    AddressFamily, MsgFlags, SockFlag, SockType, SockaddrIn, SockaddrLike, SockaddrStorage, bind,
-    connect, getpeername, recv, send, sendto, socket,
-};
+use socket2::{Domain, Socket, Type};
 
 use super::super::Queue as VirtQueue;
-#[cfg(target_os = "macos")]
-use super::super::linux_errno::linux_errno_raw;
 use super::defs;
 use super::defs::uapi;
 use super::dns_filter::{DNS_PORT, DnsRequest, sockaddr_port};
@@ -24,7 +15,9 @@ use super::muxer_rxq::MuxerRxQ;
 use super::packet::{
     TsiAcceptReq, TsiConnectReq, TsiGetnameRsp, TsiListenReq, TsiSendtoAddr, VsockPacket,
 };
-use super::proxy::{Proxy, ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate, RecvPkt};
+use super::proxy::{Family, Proxy, ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate, RecvPkt};
+use super::sys;
+use super::vsock_addr::VsockAddr;
 use crossbeam_channel::Sender;
 use utils::epoll::EventSet;
 
@@ -35,11 +28,11 @@ pub struct TsiDgramProxy {
     cid: u64,
     local_port: u32,
     peer_port: u32,
-    fd: OwnedFd,
+    sock: Socket,
     pub status: ProxyStatus,
-    sendto_addr: Option<SockaddrStorage>,
+    sendto_addr: Option<VsockAddr>,
     listening: bool,
-    family: AddressFamily,
+    family: Family,
     mem: GuestMemoryMmap,
     queue: Arc<Mutex<VirtQueue>>,
     rxq: Arc<Mutex<MuxerRxQ>>,
@@ -54,6 +47,14 @@ pub struct TsiDgramProxy {
     connected_dns: bool,
 }
 
+use std::num::Wrapping;
+
+/// Raw socket handle used for epoll registration (Unix file descriptor).
+#[cfg(unix)]
+fn raw_handle(sock: &Socket) -> RawFd {
+    sock.as_raw_fd()
+}
+
 impl TsiDgramProxy {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -66,43 +67,17 @@ impl TsiDgramProxy {
         rxq: Arc<Mutex<MuxerRxQ>>,
         dns_sender: Option<Sender<DnsRequest>>,
     ) -> Result<Self, ProxyError> {
-        let family = match family {
-            defs::LINUX_AF_INET => AddressFamily::Inet,
-            defs::LINUX_AF_INET6 => AddressFamily::Inet6,
+        let (family, domain) = match family {
+            defs::LINUX_AF_INET => (Family::Inet, Domain::IPV4),
+            defs::LINUX_AF_INET6 => (Family::Inet6, Domain::IPV6),
             #[cfg(target_os = "linux")]
-            defs::LINUX_AF_UNIX => AddressFamily::Unix,
+            defs::LINUX_AF_UNIX => (Family::Unix, Domain::UNIX),
             _ => return Err(ProxyError::InvalidFamily),
         };
 
-        let fd = socket(family, SockType::Datagram, SockFlag::empty(), None)
-            .map_err(ProxyError::CreatingSocket)?;
-
-        // macOS forces us to do this here instead of just using SockFlag::SOCK_NONBLOCK above.
-        match fcntl(&fd, FcntlArg::F_GETFL) {
-            Ok(flags) => match OFlag::from_bits(flags) {
-                Some(flags) => {
-                    if let Err(e) = fcntl(&fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)) {
-                        warn!("error switching to non-blocking: id={id}, err={e}");
-                    }
-                }
-                None => error!("invalid fd flags id={id}"),
-            },
-            Err(e) => error!("couldn't obtain fd flags id={id}, err={e}"),
-        };
-
-        #[cfg(target_os = "macos")]
-        {
-            // nix doesn't provide an abstraction for SO_NOSIGPIPE, fall back to libc.
-            let option_value: libc::c_int = 1;
-            unsafe {
-                libc::setsockopt(
-                    fd.as_raw_fd(),
-                    libc::SOL_SOCKET,
-                    libc::SO_NOSIGPIPE,
-                    &option_value as *const _ as *const libc::c_void,
-                    std::mem::size_of_val(&option_value) as libc::socklen_t,
-                )
-            };
+        let sock = Socket::new(domain, Type::DGRAM, None).map_err(ProxyError::CreatingSocket)?;
+        if let Err(e) = sock.set_nonblocking(true) {
+            warn!("error switching to non-blocking: id={id}, err={e}");
         }
 
         Ok(TsiDgramProxy {
@@ -110,7 +85,7 @@ impl TsiDgramProxy {
             cid,
             local_port: 0,
             peer_port,
-            fd,
+            sock,
             status: ProxyStatus::Idle,
             sendto_addr: None,
             listening: false,
@@ -158,43 +133,10 @@ impl TsiDgramProxy {
             .set_fwd_cnt(self.tx_cnt.0);
     }
 
-    /*
-    fn peer_avail_credit(&self) -> usize {
-        (Wrapping(self.peer_buf_alloc) - (self.rx_cnt - self.peer_fwd_cnt)).0 as usize
-    }
-
-    fn send_credit_request(&self) {
-        // This response goes to the connection.
-        let rx = MuxerRx::CreditRequest {
-            local_port: self.local_port,
-            peer_port: self.peer_port,
-            fwd_cnt: self.tx_cnt.0,
-        };
-        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
-    }
-    */
-
     fn recv_to_pkt(&self, pkt: &mut VsockPacket) -> RecvPkt {
         if let Some(buf) = pkt.buf_mut() {
-            // Disable UDP credit accounting until is fixed in the kernel
-            //let peer_credit = self.peer_avail_credit();
-            //let max_len = std::cmp::min(buf.len(), peer_credit);
             let max_len = buf.len();
-
-            /*
-            debug!(
-                "recv_to_pkt: peer_avail_credit={}, buf.len={}, max_len={}",
-                self.peer_avail_credit(),
-                buf.len(),
-                max_len,
-            );
-
-            if max_len == 0 {
-                return RecvPkt::WaitForCredit;
-            }
-            */
-
-            match recv(self.fd.as_raw_fd(), &mut buf[..max_len], MsgFlags::empty()) {
+            match sys::recv_into(&self.sock, &mut buf[..max_len]) {
                 Ok(cnt) => {
                     debug!("recv cnt={cnt}");
                     if cnt > 0 {
@@ -259,6 +201,38 @@ impl TsiDgramProxy {
         debug!("recv_pkt: have_used={have_used}");
         (have_used, wait_credit)
     }
+
+    /// Bind the datagram socket to an unspecified local address so it can
+    /// receive replies. Returns the bind result.
+    fn bind_unspecified(&self) -> std::io::Result<()> {
+        match self.family {
+            Family::Inet => self
+                .sock
+                .bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into()),
+            Family::Inet6 => self.sock.bind(
+                &std::net::SocketAddrV6::new(std::net::Ipv6Addr::UNSPECIFIED, 0, 0, 0).into(),
+            ),
+            #[cfg(unix)]
+            Family::Unix => {
+                // Autobind an unnamed AF_UNIX datagram socket (zero-length path).
+                let mut sun: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+                sun.sun_family = libc::AF_UNIX as _;
+                let len = std::mem::size_of::<libc::sa_family_t>() as libc::socklen_t;
+                let rc = unsafe {
+                    libc::bind(
+                        self.sock.as_raw_fd(),
+                        &sun as *const _ as *const libc::sockaddr,
+                        len,
+                    )
+                };
+                if rc == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            }
+        }
+    }
 }
 
 impl Proxy for TsiDgramProxy {
@@ -288,7 +262,17 @@ impl Proxy for TsiDgramProxy {
             (0, false)
         } else {
             self.connected_dns = false;
-            match connect(self.fd.as_raw_fd(), &req.addr) {
+            let addr: std::io::Result<socket2::SockAddr> = match req.addr.inet() {
+                Some(inet) => Ok(inet.into()),
+                #[cfg(target_os = "linux")]
+                None => match req.addr.unix_path() {
+                    Some(p) => socket2::SockAddr::unix(p),
+                    None => Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+                },
+                #[cfg(not(target_os = "linux"))]
+                None => Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+            };
+            match addr.and_then(|a| self.sock.connect(&a)) {
                 Ok(()) => {
                     debug!("connect: Connected");
                     self.status = ProxyStatus::Connected;
@@ -296,11 +280,7 @@ impl Proxy for TsiDgramProxy {
                 }
                 Err(e) => {
                     debug!("Error connecting: {e}");
-                    #[cfg(target_os = "macos")]
-                    let errno = -linux_errno_raw(e as i32);
-                    #[cfg(target_os = "linux")]
-                    let errno = -(e as i32);
-                    (errno, false)
+                    (-sys::to_linux_errno(&e), false)
                 }
             }
         };
@@ -318,7 +298,7 @@ impl Proxy for TsiDgramProxy {
 
         let mut update = ProxyUpdate::default();
         if poll_host_socket && !self.listening {
-            update.polling = Some((self.id, self.fd.as_raw_fd(), EventSet::IN));
+            update.polling = Some((self.id, raw_handle(&self.sock), EventSet::IN));
         }
         update
     }
@@ -326,23 +306,23 @@ impl Proxy for TsiDgramProxy {
     fn getpeername(&mut self, pkt: &VsockPacket) {
         debug!("process_getpeername");
 
-        let (result, addr): (i32, SockaddrStorage) = match getpeername(self.fd.as_raw_fd()) {
-            Ok(name) => (0, name),
-            Err(e) => {
-                #[cfg(target_os = "macos")]
-                let errno = -linux_errno_raw(e as i32);
-                #[cfg(target_os = "linux")]
-                let errno = -(e as i32);
-                (
-                    errno,
-                    SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0).into(),
-                )
-            }
+        let (result, addr): (i32, VsockAddr) = match self.sock.peer_addr() {
+            Ok(sa) => match sa.as_socket() {
+                Some(socket_addr) => (0, VsockAddr::Inet(socket_addr)),
+                None => (
+                    -libc::EINVAL,
+                    VsockAddr::Inet(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into()),
+                ),
+            },
+            Err(e) => (
+                -sys::to_linux_errno(&e),
+                VsockAddr::Inet(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into()),
+            ),
         };
 
         let data = TsiGetnameRsp {
             result,
-            addr_len: addr.len(),
+            addr_len: addr.linux_len(),
             addr,
         };
 
@@ -368,17 +348,17 @@ impl Proxy for TsiDgramProxy {
         }
 
         let ret = if let Some(buf) = pkt.buf() {
-            #[cfg(target_os = "macos")]
-            let flags = MsgFlags::empty();
             #[cfg(target_os = "linux")]
-            let flags = MsgFlags::MSG_NOSIGNAL;
+            let send_res = self.sock.send_with_flags(buf, libc::MSG_NOSIGNAL);
+            #[cfg(not(target_os = "linux"))]
+            let send_res = self.sock.send(buf);
 
-            match send(self.fd.as_raw_fd(), buf, flags) {
+            match send_res {
                 Ok(sent) => {
                     self.tx_cnt += Wrapping(sent as u32);
                     sent as i32
                 }
-                Err(err) => -(err as i32),
+                Err(err) => -sys::to_linux_errno(&err),
             }
         } else {
             -libc::EINVAL
@@ -396,28 +376,10 @@ impl Proxy for TsiDgramProxy {
 
         self.sendto_addr = Some(req.addr);
         if !self.listening {
-            let bind_result = match self.family {
-                AddressFamily::Inet => bind(self.fd.as_raw_fd(), &SockaddrIn::new(0, 0, 0, 0, 0)),
-                AddressFamily::Inet6 => {
-                    let addr6: SockaddrStorage =
-                        SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0).into();
-                    bind(self.fd.as_raw_fd(), &addr6)
-                }
-                #[cfg(target_os = "linux")]
-                AddressFamily::Unix => {
-                    let addr = UnixAddr::new_unnamed();
-                    bind(self.fd.as_raw_fd(), &addr)
-                }
-                _ => {
-                    warn!("sendto_addr: unsupported address family: {:?}", self.family);
-                    return update;
-                }
-            };
-
-            match bind_result {
+            match self.bind_unspecified() {
                 Ok(_) => {
                     self.listening = true;
-                    update.polling = Some((self.id, self.fd.as_raw_fd(), EventSet::IN));
+                    update.polling = Some((self.id, raw_handle(&self.sock), EventSet::IN));
                 }
                 Err(e) => debug!("couldn't bind socket: {e}"),
             }
@@ -432,7 +394,7 @@ impl Proxy for TsiDgramProxy {
         self.peer_buf_alloc = pkt.buf_alloc();
         self.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
 
-        if let Some(addr) = self.sendto_addr {
+        if let Some(addr) = self.sendto_addr.clone() {
             if let Some(buf) = pkt.buf() {
                 // Unconnected DNS query (sendto a resolver:53): route to the
                 // worker instead of the host socket.
@@ -441,16 +403,24 @@ impl Proxy for TsiDgramProxy {
                     return;
                 }
 
-                #[cfg(target_os = "macos")]
-                let flags = MsgFlags::empty();
-                #[cfg(target_os = "linux")]
-                let flags = MsgFlags::MSG_NOSIGNAL;
+                let dst: Option<socket2::SockAddr> = match addr.inet() {
+                    Some(inet) => Some(inet.into()),
+                    #[cfg(target_os = "linux")]
+                    None => addr
+                        .unix_path()
+                        .and_then(|p| socket2::SockAddr::unix(p).ok()),
+                    #[cfg(not(target_os = "linux"))]
+                    None => None,
+                };
 
-                match sendto(self.fd.as_raw_fd(), buf, &addr, flags) {
-                    Ok(sent) => {
-                        self.tx_cnt += Wrapping(sent as u32);
-                    }
-                    Err(err) => debug!("error in sendto: {err}"),
+                match dst {
+                    Some(d) => match self.sock.send_to(buf, &d) {
+                        Ok(sent) => {
+                            self.tx_cnt += Wrapping(sent as u32);
+                        }
+                        Err(err) => debug!("error in sendto: {err}"),
+                    },
+                    None => debug!("sendto_data: unsupported destination address"),
                 }
             } else {
                 debug!("sendto_data pkt without buffer");
@@ -484,7 +454,7 @@ impl Proxy for TsiDgramProxy {
         self.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
 
         ProxyUpdate {
-            polling: Some((self.id, self.fd.as_raw_fd(), EventSet::IN)),
+            polling: Some((self.id, raw_handle(&self.sock), EventSet::IN)),
             ..Default::default()
         }
     }
@@ -534,7 +504,7 @@ impl Proxy for TsiDgramProxy {
 
             if self.status == ProxyStatus::WaitingCreditUpdate {
                 debug!("process_event: WaitingCreditUpdate");
-                update.polling = Some((self.id(), self.fd.as_raw_fd(), EventSet::empty()));
+                update.polling = Some((self.id(), raw_handle(&self.sock), EventSet::empty()));
             }
         }
 
@@ -546,8 +516,9 @@ impl Proxy for TsiDgramProxy {
     }
 }
 
+#[cfg(unix)]
 impl AsRawFd for TsiDgramProxy {
     fn as_raw_fd(&self) -> RawFd {
-        self.fd.as_raw_fd()
+        self.sock.as_raw_fd()
     }
 }

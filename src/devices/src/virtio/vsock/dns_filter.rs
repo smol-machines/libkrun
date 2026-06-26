@@ -26,8 +26,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
-use nix::sys::socket::SockaddrStorage;
 use vm_memory::GuestMemoryMmap;
+
+use super::vsock_addr::VsockAddr;
 
 use super::super::Queue as VirtQueue;
 use super::muxer::{MuxerRx, push_packet};
@@ -137,7 +138,7 @@ impl EgressPolicy {
     /// Egress allow check for a connect/sendto destination: a statically
     /// allowed CIDR, or an unexpired learned IP. Non-IP addresses are allowed
     /// (matches prior behavior for e.g. unix sockets).
-    pub(super) fn is_addr_allowed(&self, addr: &SockaddrStorage) -> bool {
+    pub(super) fn is_addr_allowed(&self, addr: &VsockAddr) -> bool {
         let Some(ip) = sockaddr_ip(addr) else {
             return true;
         };
@@ -292,20 +293,12 @@ fn handle_dns_query(policy: &Arc<RwLock<EgressPolicy>>, query: &[u8]) -> Vec<u8>
     build_error_response(query, DNS_RCODE_SERVFAIL)
 }
 
-pub(super) fn sockaddr_port(addr: &SockaddrStorage) -> Option<u16> {
-    match (addr.as_sockaddr_in(), addr.as_sockaddr_in6()) {
-        (Some(sin), _) => Some(sin.port()),
-        (_, Some(sin6)) => Some(sin6.port()),
-        _ => None,
-    }
+pub(super) fn sockaddr_port(addr: &VsockAddr) -> Option<u16> {
+    addr.inet().map(|a| a.port())
 }
 
-fn sockaddr_ip(addr: &SockaddrStorage) -> Option<IpAddr> {
-    match (addr.as_sockaddr_in(), addr.as_sockaddr_in6()) {
-        (Some(sin), _) => Some(IpAddr::V4(sin.ip())),
-        (_, Some(sin6)) => Some(IpAddr::V6(sin6.ip())),
-        _ => None,
-    }
+fn sockaddr_ip(addr: &VsockAddr) -> Option<IpAddr> {
+    addr.inet().map(|a| a.ip())
 }
 
 /// CIDR membership test. Public to the vsock module so the muxer can reuse it.
@@ -554,7 +547,7 @@ fn read_u32(buf: &[u8], offset: usize) -> Result<u32, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nix::sys::socket::{SockaddrIn, SockaddrLike};
+    use std::net::SocketAddrV4;
 
     fn query_for(name: &str) -> Vec<u8> {
         let mut query = vec![
@@ -585,9 +578,8 @@ mod tests {
         response
     }
 
-    fn sockaddr_v4(a: u8, b: u8, c: u8, d: u8, port: u16) -> SockaddrStorage {
-        let sa = SockaddrIn::new(a, b, c, d, port);
-        unsafe { SockaddrStorage::from_raw(sa.as_ptr(), Some(sa.len())).unwrap() }
+    fn sockaddr_v4(a: u8, b: u8, c: u8, d: u8, port: u16) -> VsockAddr {
+        VsockAddr::Inet(SocketAddrV4::new(Ipv4Addr::new(a, b, c, d), port).into())
     }
 
     fn host_policy(hosts: Vec<&str>) -> EgressPolicy {

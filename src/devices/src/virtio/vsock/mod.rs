@@ -15,6 +15,7 @@ mod muxer_thread;
 mod packet;
 mod proxy;
 mod reaper;
+mod sys;
 #[cfg(target_os = "macos")]
 mod timesync;
 mod tsi_dgram;
@@ -93,6 +94,8 @@ mod defs {
     pub const TSI_PROXY_RELEASE: u32 = 1031;
 
     // Linux definitions that we need for cross-platform compatibility.
+    // AF_UNIX over TSI is Linux-only; the constant is unused on macOS/Windows.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub const LINUX_AF_UNIX: u16 = 1;
     pub const LINUX_AF_INET: u16 = 2;
     pub const LINUX_AF_INET6: u16 = 10;

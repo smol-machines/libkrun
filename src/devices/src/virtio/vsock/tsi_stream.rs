@@ -1,28 +1,17 @@
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
 use std::fs;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::num::Wrapping;
-use std::os::fd::{FromRawFd, OwnedFd};
-use std::os::unix::fs::FileTypeExt;
-use std::os::unix::io::{AsRawFd, RawFd};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, RawFd};
+#[cfg(target_os = "linux")]
 use std::path::PathBuf;
-use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
-#[cfg(target_os = "linux")]
-use libc::EINVAL;
-#[cfg(target_os = "macos")]
-use libc::EINVAL;
-use nix::errno::Errno;
-use nix::fcntl::{FcntlArg, OFlag, fcntl};
-use nix::sys::socket::{
-    AddressFamily, Backlog, MsgFlags, Shutdown, SockFlag, SockType, SockaddrLike, SockaddrStorage,
-    accept, bind, connect, getpeername, listen, recv, send, setsockopt, shutdown, socket, sockopt,
-};
+use socket2::{Domain, Socket, Type};
 
 use super::super::Queue as VirtQueue;
-#[cfg(target_os = "macos")]
-use super::super::linux_errno::linux_errno_raw;
 use super::defs;
 use super::defs::uapi;
 use super::muxer::{MuxerRx, push_packet};
@@ -31,8 +20,11 @@ use super::packet::{
     TsiAcceptReq, TsiConnectReq, TsiGetnameRsp, TsiListenReq, TsiSendtoAddr, VsockPacket,
 };
 use super::proxy::{
-    ListenerDesc, NewProxyType, Proxy, ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate, RecvPkt,
+    Family, ListenerDesc, NewProxyType, Proxy, ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate,
+    RecvPkt,
 };
+use super::sys;
+use super::vsock_addr::VsockAddr;
 use utils::epoll::EventSet;
 
 use vm_memory::GuestMemoryMmap;
@@ -41,11 +33,11 @@ pub struct TsiStreamProxy {
     id: u64,
     cid: u64,
     parent_id: u64,
-    family: AddressFamily,
+    family: Family,
     local_port: u32,
     peer_port: u32,
     control_port: u32,
-    fd: OwnedFd,
+    sock: Socket,
     pub status: ProxyStatus,
     mem: GuestMemoryMmap,
     queue: Arc<Mutex<VirtQueue>>,
@@ -57,6 +49,7 @@ pub struct TsiStreamProxy {
     peer_fwd_cnt: Wrapping<u32>,
     push_cnt: Wrapping<u32>,
     pending_accepts: u64,
+    #[cfg(target_os = "linux")]
     unixsock_path: Option<PathBuf>,
     /// Guest listen port, set once this proxy becomes a listener (via
     /// `try_listen`/`relisten`). Captured into a [`ListenerDesc`] so a fork clone
@@ -64,6 +57,12 @@ pub struct TsiStreamProxy {
     listen_guest_port: u16,
     /// Listen backlog requested by the guest, for the same reason.
     listen_backlog: i32,
+}
+
+/// Raw socket handle used for epoll registration (Unix file descriptor).
+#[cfg(unix)]
+fn raw_handle(sock: &Socket) -> RawFd {
+    sock.as_raw_fd()
 }
 
 impl TsiStreamProxy {
@@ -79,90 +78,33 @@ impl TsiStreamProxy {
         queue: Arc<Mutex<VirtQueue>>,
         rxq: Arc<Mutex<MuxerRxQ>>,
     ) -> Result<Self, ProxyError> {
-        let family = match family {
-            defs::LINUX_AF_INET => AddressFamily::Inet,
-            defs::LINUX_AF_INET6 => AddressFamily::Inet6,
+        let (family, domain) = match family {
+            defs::LINUX_AF_INET => (Family::Inet, Domain::IPV4),
+            defs::LINUX_AF_INET6 => (Family::Inet6, Domain::IPV6),
             #[cfg(target_os = "linux")]
-            defs::LINUX_AF_UNIX => AddressFamily::Unix,
+            defs::LINUX_AF_UNIX => (Family::Unix, Domain::UNIX),
             _ => return Err(ProxyError::InvalidFamily),
         };
-        let fd = socket(family, SockType::Stream, SockFlag::empty(), None)
-            .map_err(ProxyError::CreatingSocket)?;
-
-        // macOS forces us to do this here instead of just using SockFlag::SOCK_NONBLOCK above.
-        match fcntl(&fd, FcntlArg::F_GETFL) {
-            Ok(flags) => match OFlag::from_bits(flags) {
-                Some(flags) => {
-                    if let Err(e) = fcntl(&fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)) {
-                        warn!("error switching to non-blocking: id={id}, err={e}");
-                    }
-                }
-                None => error!("invalid fd flags id={id}"),
-            },
-            Err(e) => error!("couldn't obtain fd flags id={id}, err={e}"),
-        };
-
-        if family == AddressFamily::Unix {
-            setsockopt(&fd, sockopt::ReuseAddr, &true).map_err(ProxyError::SettingReuseAddr)?;
-        } else {
-            setsockopt(&fd, sockopt::ReusePort, &true).map_err(ProxyError::SettingReusePort)?;
+        let sock = Socket::new(domain, Type::STREAM, None).map_err(ProxyError::CreatingSocket)?;
+        if let Err(e) = sock.set_nonblocking(true) {
+            warn!("error switching to non-blocking: id={id}, err={e}");
         }
 
-        #[cfg(target_os = "macos")]
-        {
-            // nix doesn't provide an abstraction for SO_NOSIGPIPE, fall back to libc.
-            let option_value: libc::c_int = 1;
-            unsafe {
-                libc::setsockopt(
-                    fd.as_raw_fd(),
-                    libc::SOL_SOCKET,
-                    libc::SO_NOSIGPIPE,
-                    &option_value as *const _ as *const libc::c_void,
-                    std::mem::size_of_val(&option_value) as libc::socklen_t,
-                )
-            };
-        }
+        // SO_REUSEADDR mirrors the previous behavior (Unix used REUSEADDR, INET
+        // used REUSEPORT; Windows has no REUSEPORT, so REUSEADDR is the portable
+        // choice for re-binding a listener).
+        let _ = sock.set_reuse_address(true);
 
-        // Enable TCP keepalive to prevent silent drops on idle connections.
-        // Without this, idle connections through NAT/firewalls or to servers
-        // with keepAliveTimeout can be silently dropped.
-        if family != AddressFamily::Unix {
-            let _ = setsockopt(&fd, sockopt::KeepAlive, &true);
-
-            #[cfg(target_os = "macos")]
-            unsafe {
-                let idle: libc::c_int = 60; // start probes after 60s idle
-                let interval: libc::c_int = 15; // 15s between probes
-                let count: libc::c_int = 4; // give up after 4 failures
-                libc::setsockopt(
-                    fd.as_raw_fd(),
-                    libc::IPPROTO_TCP,
-                    libc::TCP_KEEPALIVE,
-                    &idle as *const _ as *const libc::c_void,
-                    std::mem::size_of_val(&idle) as libc::socklen_t,
-                );
-                libc::setsockopt(
-                    fd.as_raw_fd(),
-                    libc::IPPROTO_TCP,
-                    0x101, // TCP_KEEPINTVL
-                    &interval as *const _ as *const libc::c_void,
-                    std::mem::size_of_val(&interval) as libc::socklen_t,
-                );
-                libc::setsockopt(
-                    fd.as_raw_fd(),
-                    libc::IPPROTO_TCP,
-                    0x102, // TCP_KEEPCNT
-                    &count as *const _ as *const libc::c_void,
-                    std::mem::size_of_val(&count) as libc::socklen_t,
-                );
-            }
-
-            #[cfg(target_os = "linux")]
-            {
-                let _ = setsockopt(&fd, sockopt::TcpKeepIdle, &60);
-                let _ = setsockopt(&fd, sockopt::TcpKeepInterval, &15);
-                let _ = setsockopt(&fd, sockopt::TcpKeepCount, &4);
-            }
+        // Enable TCP keepalive to prevent silent drops on idle INET connections.
+        #[cfg(target_os = "linux")]
+        let is_unix = family == Family::Unix;
+        #[cfg(not(target_os = "linux"))]
+        let is_unix = false;
+        if !is_unix {
+            let ka = socket2::TcpKeepalive::new()
+                .with_time(std::time::Duration::from_secs(60))
+                .with_interval(std::time::Duration::from_secs(15));
+            let _ = sock.set_tcp_keepalive(&ka);
         }
 
         Ok(TsiStreamProxy {
@@ -173,7 +115,7 @@ impl TsiStreamProxy {
             local_port,
             peer_port,
             control_port,
-            fd,
+            sock,
             status: ProxyStatus::Idle,
             mem,
             queue,
@@ -185,6 +127,7 @@ impl TsiStreamProxy {
             peer_fwd_cnt: Wrapping(0),
             push_cnt: Wrapping(0),
             pending_accepts: 0,
+            #[cfg(target_os = "linux")]
             unixsock_path: None,
             listen_guest_port: 0,
             listen_backlog: 0,
@@ -196,10 +139,10 @@ impl TsiStreamProxy {
         id: u64,
         cid: u64,
         parent_id: u64,
-        family: AddressFamily,
+        family: Family,
         local_port: u32,
         peer_port: u32,
-        fd: OwnedFd,
+        sock: Socket,
         mem: GuestMemoryMmap,
         queue: Arc<Mutex<VirtQueue>>,
         rxq: Arc<Mutex<MuxerRxQ>>,
@@ -213,7 +156,7 @@ impl TsiStreamProxy {
             local_port,
             peer_port,
             control_port: 0,
-            fd,
+            sock,
             status: ProxyStatus::ReverseInit,
             mem,
             queue,
@@ -225,6 +168,7 @@ impl TsiStreamProxy {
             peer_fwd_cnt: Wrapping(0),
             push_cnt: Wrapping(0),
             pending_accepts: 0,
+            #[cfg(target_os = "linux")]
             unixsock_path: None,
             listen_guest_port: 0,
             listen_backlog: 0,
@@ -251,96 +195,96 @@ impl TsiStreamProxy {
             return 0;
         }
 
-        let addr: SockaddrStorage = if let Some(port_map) = host_port_map {
-            if let Some(sin) = req.addr.as_sockaddr_in() {
-                debug!("sockaddr is ipv4");
-                if let Some(port) = port_map.get(&sin.port()) {
-                    SocketAddrV4::new(sin.ip(), *port).into()
+        // Resolve the bind address, applying the host port map for INET listeners.
+        let mapped: Option<SocketAddr> = match req.addr.inet() {
+            Some(inet) => {
+                if let Some(port_map) = host_port_map {
+                    match port_map.get(&inet.port()) {
+                        Some(host_port) => Some(match inet {
+                            SocketAddr::V4(a) => {
+                                SocketAddr::V4(SocketAddrV4::new(*a.ip(), *host_port))
+                            }
+                            SocketAddr::V6(a) => SocketAddr::V6(SocketAddrV6::new(
+                                *a.ip(),
+                                *host_port,
+                                a.flowinfo(),
+                                a.scope_id(),
+                            )),
+                        }),
+                        None => return -libc::EPERM,
+                    }
                 } else {
-                    return -libc::EPERM;
+                    Some(inet)
                 }
-            } else if let Some(sin6) = req.addr.as_sockaddr_in6() {
-                debug!("sockaddr is ipv6");
-                if let Some(port) = port_map.get(&sin6.port()) {
-                    SocketAddrV6::new(sin6.ip(), *port, sin6.flowinfo(), sin6.flowinfo()).into()
-                } else {
-                    return -libc::EPERM;
-                }
-            } else if req.addr.as_unix_addr().is_some() {
-                debug!("sockaddr is unix");
-                req.addr
-            } else {
-                return -libc::EINVAL;
             }
-        } else {
-            req.addr
+            None => None, // AF_UNIX (Linux) handled below
         };
 
         // Remember the guest listen port (the host_port_map key) so this listener
         // can be re-established on a fork clone (see ListenerDesc).
-        let guest_listen_port = req
-            .addr
-            .as_sockaddr_in()
-            .map(|s| s.port())
-            .or_else(|| req.addr.as_sockaddr_in6().map(|s| s.port()))
-            .unwrap_or(0);
+        let guest_listen_port = req.addr.inet().map(|s| s.port()).unwrap_or(0);
 
-        let unixsock_path = self.get_unixsock_path(&addr);
-        // If the userspace process in the guest has already created the socket,
-        // we need to unlink it to take ownership of the node in the filesystem.
-        if let Some(path) = &unixsock_path
-            && let Err(e) = fs::remove_file(path)
-        {
-            debug!("error removing socket: {e}");
-        }
+        let bind_res: std::io::Result<()> = match mapped {
+            Some(addr) => self.sock.bind(&addr.into()),
+            #[cfg(target_os = "linux")]
+            None => self.bind_unix(req),
+            #[cfg(not(target_os = "linux"))]
+            None => return -libc::EINVAL,
+        };
 
-        match bind(self.fd.as_raw_fd(), &addr) {
+        match bind_res {
             Ok(_) => {
                 debug!("tcp bind: id={}", self.id);
-
-                // For unix sockets we need to unlink the path on Drop, since
-                // it's possible the userspace application can't do it itself.
-                self.unixsock_path = unixsock_path;
-
-                // Clamp backlog to SOMAXCONN, mirroring Linux kernel's __sys_listen behavior.
-                // The nix crate's Backlog::new() rejects values above SOMAXCONN with EINVAL.
                 let clamped_backlog = req.backlog.clamp(0, libc::SOMAXCONN);
-                match Backlog::new(clamped_backlog) {
-                    Ok(backlog) => match listen(&self.fd, backlog) {
-                        Ok(_) => {
-                            debug!("proxy: id={}", self.id);
-                            self.listen_guest_port = guest_listen_port;
-                            self.listen_backlog = clamped_backlog;
-                            0
-                        }
-                        Err(e) => {
-                            warn!("proxy: id={} err={}", self.id, e);
-                            #[cfg(target_os = "macos")]
-                            let errno = -linux_errno_raw(e as i32);
-                            #[cfg(target_os = "linux")]
-                            let errno = -(e as i32);
-                            errno
-                        }
-                    },
+                match self.sock.listen(clamped_backlog) {
+                    Ok(_) => {
+                        debug!("proxy: id={}", self.id);
+                        self.listen_guest_port = guest_listen_port;
+                        self.listen_backlog = clamped_backlog;
+                        0
+                    }
                     Err(e) => {
-                        warn!("proxy: id={} err={}", self.id, e);
-                        #[cfg(target_os = "macos")]
-                        let errno = -linux_errno_raw(e as i32);
-                        #[cfg(target_os = "linux")]
-                        let errno = -(e as i32);
-                        errno
+                        warn!("proxy listen: id={} err={}", self.id, e);
+                        -sys::to_linux_errno(&e)
                     }
                 }
             }
             Err(e) => {
                 warn!("tcp bind: id={} err={}", self.id, e);
-                #[cfg(target_os = "macos")]
-                let errno = -linux_errno_raw(e as i32);
-                #[cfg(target_os = "linux")]
-                let errno = -(e as i32);
-                errno
+                -sys::to_linux_errno(&e)
             }
         }
+    }
+
+    /// Bind an AF_UNIX listener (Linux only). Unlinks any stale socket node first
+    /// so we can take ownership, and records the path for unlink-on-drop.
+    #[cfg(target_os = "linux")]
+    fn bind_unix(&mut self, req: &TsiListenReq) -> std::io::Result<()> {
+        let path = req.addr.unix_path();
+        if let Some(p) = &path
+            && let Err(e) = fs::remove_file(p)
+        {
+            debug!("error removing socket: {e}");
+        }
+        let addr = match &path {
+            Some(p) => socket2::SockAddr::unix(p)?,
+            None => {
+                return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+            }
+        };
+        self.sock.bind(&addr)?;
+        // Track for unlink on Drop if it is a real on-disk socket path.
+        if let Some(p) = path
+            && fs::metadata(&p)
+                .map(|m| {
+                    use std::os::unix::fs::FileTypeExt;
+                    m.file_type().is_socket()
+                })
+                .unwrap_or(false)
+        {
+            self.unixsock_path = Some(p);
+        }
+        Ok(())
     }
 
     fn peer_avail_credit(&self) -> usize {
@@ -363,11 +307,7 @@ impl TsiStreamProxy {
                 return RecvPkt::WaitForCredit;
             }
 
-            match recv(
-                self.fd.as_raw_fd(),
-                &mut buf[..max_len],
-                MsgFlags::MSG_DONTWAIT,
-            ) {
+            match sys::recv_into(&self.sock, &mut buf[..max_len]) {
                 Ok(cnt) => {
                     debug!("recv cnt={cnt}");
                     if cnt > 0 {
@@ -469,35 +409,16 @@ impl TsiStreamProxy {
 
     fn switch_to_connected(&mut self) {
         self.status = ProxyStatus::Connected;
-        match fcntl(&self.fd, FcntlArg::F_GETFL) {
-            Ok(flags) => match OFlag::from_bits(flags) {
-                Some(flags) => {
-                    if let Err(e) = fcntl(&self.fd, FcntlArg::F_SETFL(flags & !OFlag::O_NONBLOCK)) {
-                        warn!("error switching to blocking: id={}, err={}", self.id, e);
-                    }
-                }
-                None => error!("invalid fd flags id={}", self.id),
-            },
-            Err(e) => error!("couldn't obtain fd flags id={}, err={}", self.id, e),
-        };
-    }
-
-    fn get_addr_len(&self, addr: &SockaddrStorage) -> Option<u32> {
-        let addr_len = match self.family {
-            AddressFamily::Inet => addr.as_sockaddr_in()?.len(),
-            AddressFamily::Inet6 => addr.as_sockaddr_in6()?.len(),
-            AddressFamily::Unix => addr.as_unix_addr()?.len(),
-            _ => 0,
-        };
-
-        Some(addr_len)
+        if let Err(e) = self.sock.set_nonblocking(false) {
+            warn!("error switching to blocking: id={}, err={}", self.id, e);
+        }
     }
 
     /// Re-establish this freshly-constructed proxy as a host-side inbound
     /// listener for a fork clone, using the clone's own `host_port_map` (see
     /// [`ListenerDesc`]). Mirrors `try_listen`'s bind+listen but is driven by the
-    /// snapshot rather than a guest `TSI_LISTEN`, which a restored guest never
-    /// re-issues. Returns 0 on success, a negative errno otherwise.
+    /// snapshot rather than a guest `TSI_LISTEN`. Returns 0 on success, a
+    /// negative errno otherwise.
     pub fn relisten(
         &mut self,
         guest_port: u16,
@@ -508,23 +429,20 @@ impl TsiStreamProxy {
             Some(p) => *p,
             None => return -libc::EPERM,
         };
-        let addr: SockaddrStorage = match self.family {
-            AddressFamily::Inet => SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, host_port).into(),
-            AddressFamily::Inet6 => {
-                SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, host_port, 0, 0).into()
+        let addr: SocketAddr = match self.family {
+            Family::Inet => SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, host_port).into(),
+            Family::Inet6 => {
+                SocketAddrV6::new(std::net::Ipv6Addr::UNSPECIFIED, host_port, 0, 0).into()
             }
-            _ => return -libc::EINVAL,
+            #[cfg(unix)]
+            Family::Unix => return -libc::EINVAL,
         };
-        if let Err(e) = bind(self.fd.as_raw_fd(), &addr) {
+        if let Err(e) = self.sock.bind(&addr.into()) {
             warn!("relisten bind id={} err={e}", self.id);
             return -libc::EADDRINUSE;
         }
         let clamped = backlog.clamp(0, libc::SOMAXCONN);
-        let bl = match Backlog::new(clamped) {
-            Ok(b) => b,
-            Err(_) => return -libc::EINVAL,
-        };
-        if let Err(e) = listen(&self.fd, bl) {
+        if let Err(e) = self.sock.listen(clamped) {
             warn!("relisten listen id={} err={e}", self.id);
             return -libc::EINVAL;
         }
@@ -536,32 +454,6 @@ impl TsiStreamProxy {
             self.id, guest_port, host_port
         );
         0
-    }
-
-    fn get_unixsock_path(&self, addr: &SockaddrStorage) -> Option<PathBuf> {
-        if let Some(addr) = addr.as_unix_addr()
-            && let Some(path) = addr.path()
-        {
-            // SockaddrStorage doesn't clean up NULLs. This is fine when
-            // using addr with other nix methods, but we need to clean them
-            // up to be able to treat it as a path with other Rust crates.
-            let path_str = path.to_str()?.replace("\0", "");
-            debug!("unix socket path_str={path_str}");
-
-            match fs::metadata(&path_str) {
-                Ok(metadata) => {
-                    if metadata.file_type().is_socket() {
-                        debug!("unix socket path is socket");
-                        return PathBuf::from_str(&path_str).ok();
-                    } else {
-                        debug!("unix socket path is NOT a socket");
-                    }
-                }
-                Err(e) => debug!("metadata failed with {e}"),
-            }
-        }
-
-        None
     }
 }
 
@@ -579,9 +471,10 @@ impl Proxy for TsiStreamProxy {
             && self.listen_guest_port != 0
         {
             let family = match self.family {
-                AddressFamily::Inet => defs::LINUX_AF_INET,
-                AddressFamily::Inet6 => defs::LINUX_AF_INET6,
-                _ => return None,
+                Family::Inet => defs::LINUX_AF_INET,
+                Family::Inet6 => defs::LINUX_AF_INET6,
+                #[cfg(unix)]
+                Family::Unix => return None,
             };
             Some(ListenerDesc {
                 family,
@@ -598,36 +491,46 @@ impl Proxy for TsiStreamProxy {
     fn connect(&mut self, _pkt: &VsockPacket, req: TsiConnectReq) -> ProxyUpdate {
         let mut update = ProxyUpdate::default();
 
-        let result = match connect(self.fd.as_raw_fd(), &req.addr) {
-            Ok(()) => {
-                debug!("connect: Connected");
-                self.switch_to_connected();
-                0
-            }
-            Err(nix::errno::Errno::EINPROGRESS) => {
-                debug!("connect: Connecting");
-                self.status = ProxyStatus::Connecting;
-                0
-            }
-            Err(e) => {
-                debug!("TcpProxy: Error connecting: {e}");
-                #[cfg(target_os = "macos")]
-                let errno = -linux_errno_raw(Errno::last_raw());
-                #[cfg(target_os = "linux")]
-                let errno = -Errno::last_raw();
-                errno
-            }
+        let connect_addr: std::io::Result<socket2::SockAddr> = match req.addr.inet() {
+            Some(inet) => Ok(inet.into()),
+            #[cfg(target_os = "linux")]
+            None => match req.addr.unix_path() {
+                Some(p) => socket2::SockAddr::unix(p),
+                None => Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+            },
+            #[cfg(not(target_os = "linux"))]
+            None => Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+        };
+
+        let result = match connect_addr {
+            Ok(addr) => match self.sock.connect(&addr) {
+                Ok(()) => {
+                    debug!("connect: Connected");
+                    self.switch_to_connected();
+                    0
+                }
+                Err(e) if sys::connect_in_progress(&e) => {
+                    debug!("connect: Connecting");
+                    self.status = ProxyStatus::Connecting;
+                    0
+                }
+                Err(e) => {
+                    debug!("TcpProxy: Error connecting: {e}");
+                    -sys::to_linux_errno(&e)
+                }
+            },
+            Err(e) => -sys::to_linux_errno(&e),
         };
 
         if self.status == ProxyStatus::Connecting {
             update.polling = Some((
                 self.id,
-                self.fd.as_raw_fd(),
+                raw_handle(&self.sock),
                 EventSet::OUT | EventSet::EDGE_TRIGGERED,
             ));
         } else {
             if self.status == ProxyStatus::Connected {
-                update.polling = Some((self.id, self.fd.as_raw_fd(), EventSet::IN));
+                update.polling = Some((self.id, raw_handle(&self.sock), EventSet::IN));
             }
             self.push_connect_rsp(result);
         }
@@ -660,7 +563,7 @@ impl Proxy for TsiStreamProxy {
         // Now that the vsock transport is fully established, start listening
         // for events in the TCP socket again.
         Some(ProxyUpdate {
-            polling: Some((self.id, self.fd.as_raw_fd(), EventSet::IN)),
+            polling: Some((self.id, raw_handle(&self.sock), EventSet::IN)),
             ..Default::default()
         })
     }
@@ -668,31 +571,25 @@ impl Proxy for TsiStreamProxy {
     fn getpeername(&mut self, pkt: &VsockPacket) {
         debug!("getpeername: id={}", self.id);
 
-        let (result, addr_len, addr): (i32, u32, SockaddrStorage) =
-            match getpeername(self.fd.as_raw_fd()) {
-                Ok(addr) => {
-                    if let Some(addr_len) = self.get_addr_len(&addr) {
-                        (0, addr_len, addr)
-                    } else {
-                        #[cfg(target_os = "macos")]
-                        let errno = -linux_errno_raw(EINVAL);
-                        #[cfg(target_os = "linux")]
-                        let errno = -EINVAL;
-                        (errno, 0, addr)
-                    }
+        let (result, addr_len, addr): (i32, u32, VsockAddr) = match self.sock.peer_addr() {
+            Ok(sa) => match sa.as_socket() {
+                Some(socket_addr) => {
+                    let va = VsockAddr::Inet(socket_addr);
+                    let len = va.linux_len();
+                    (0, len, va)
                 }
-                Err(e) => {
-                    #[cfg(target_os = "macos")]
-                    let errno = -linux_errno_raw(e as i32);
-                    #[cfg(target_os = "linux")]
-                    let errno = -(e as i32);
-                    (
-                        errno,
-                        0,
-                        SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0).into(),
-                    )
-                }
-            };
+                None => (
+                    -libc::EINVAL,
+                    0,
+                    VsockAddr::Inet(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into()),
+                ),
+            },
+            Err(e) => (
+                -sys::to_linux_errno(&e),
+                0,
+                VsockAddr::Inet(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into()),
+            ),
+        };
 
         let data = TsiGetnameRsp {
             result,
@@ -732,12 +629,14 @@ impl Proxy for TsiStreamProxy {
         let mut update = ProxyUpdate::default();
 
         let ret = if let Some(buf) = pkt.buf() {
-            #[cfg(target_os = "macos")]
-            let flags = MsgFlags::empty();
+            // MSG_NOSIGNAL on Linux avoids SIGPIPE on a closed peer; macOS relies
+            // on the socket's SO_NOSIGPIPE / default, Windows has no SIGPIPE.
             #[cfg(target_os = "linux")]
-            let flags = MsgFlags::MSG_NOSIGNAL;
+            let send_res = self.sock.send_with_flags(buf, libc::MSG_NOSIGNAL);
+            #[cfg(not(target_os = "linux"))]
+            let send_res = self.sock.send(buf);
 
-            match send(self.fd.as_raw_fd(), buf, flags) {
+            match send_res {
                 Ok(sent) => {
                     if sent != buf.len() {
                         error!("couldn't set everything: buf={}, sent={}", buf.len(), sent);
@@ -745,13 +644,7 @@ impl Proxy for TsiStreamProxy {
                     self.tx_cnt += Wrapping(sent as u32);
                     sent as i32
                 }
-                Err(err) => {
-                    #[cfg(target_os = "macos")]
-                    let errno = -linux_errno_raw(err as i32);
-                    #[cfg(target_os = "linux")]
-                    let errno = -(err as i32);
-                    errno
-                }
+                Err(err) => -sys::to_linux_errno(&err),
             }
         } else {
             -libc::EINVAL
@@ -788,8 +681,8 @@ impl Proxy for TsiStreamProxy {
         host_port_map: &Option<HashMap<u16, u16>>,
     ) -> ProxyUpdate {
         debug!(
-            "listen: id={} addr={}, vm_port={} backlog={}",
-            self.id, req.addr, req.vm_port, req.backlog
+            "listen: id={} vm_port={} backlog={}",
+            self.id, req.vm_port, req.backlog
         );
         let mut update = ProxyUpdate::default();
 
@@ -806,7 +699,7 @@ impl Proxy for TsiStreamProxy {
         if result == 0 {
             self.peer_port = req.vm_port;
             self.status = ProxyStatus::Listening;
-            update.polling = Some((self.id, self.fd.as_raw_fd(), EventSet::IN));
+            update.polling = Some((self.id, raw_handle(&self.sock), EventSet::IN));
         }
 
         update
@@ -844,7 +737,7 @@ impl Proxy for TsiStreamProxy {
         self.status = ProxyStatus::Connected;
 
         ProxyUpdate {
-            polling: Some((self.id, self.fd.as_raw_fd(), EventSet::IN)),
+            polling: Some((self.id, raw_handle(&self.sock), EventSet::IN)),
             ..Default::default()
         }
     }
@@ -877,7 +770,7 @@ impl Proxy for TsiStreamProxy {
         self.switch_to_connected();
 
         ProxyUpdate {
-            polling: Some((self.id, self.fd.as_raw_fd(), EventSet::IN)),
+            polling: Some((self.id, raw_handle(&self.sock), EventSet::IN)),
             push_accept: Some((self.id, self.parent_id)),
             ..Default::default()
         }
@@ -914,14 +807,14 @@ impl Proxy for TsiStreamProxy {
         let send_off = pkt.flags() & uapi::VSOCK_FLAGS_SHUTDOWN_SEND != 0;
 
         let how = if recv_off && send_off {
-            Shutdown::Both
+            std::net::Shutdown::Both
         } else if recv_off {
-            Shutdown::Read
+            std::net::Shutdown::Read
         } else {
-            Shutdown::Write
+            std::net::Shutdown::Write
         };
 
-        if let Err(e) = shutdown(self.fd.as_raw_fd(), how) {
+        if let Err(e) = self.sock.shutdown(how) {
             warn!("error sending shutdown to socket: {e}");
         }
     }
@@ -950,34 +843,26 @@ impl Proxy for TsiStreamProxy {
             if self.status == ProxyStatus::Connecting {
                 self.push_connect_rsp(-libc::ECONNREFUSED);
                 self.status = ProxyStatus::Closed;
-                update.polling = Some((self.id, self.fd.as_raw_fd(), EventSet::empty()));
+                update.polling = Some((self.id, raw_handle(&self.sock), EventSet::empty()));
                 update.signal_queue = true;
                 update.remove_proxy = ProxyRemoval::Deferred;
                 return update;
             } else if self.status == ProxyStatus::Connected {
                 // Drain any remaining data before signaling closure.
-                // When the remote sends a response then closes (e.g. HTTP Connection: close),
-                // both IN and HANG_UP fire simultaneously. We must read the data first.
                 let (signal_queue, _) = self.recv_pkt();
                 update.signal_queue = signal_queue;
-                // Send RST to force-close the vsock connection. RST (not SHUTDOWN)
-                // is required because SHUTDOWN only marks peer_shutdown flags in the
-                // guest kernel — it does NOT change sk_state, so a subsequent guest
-                // write will block waiting for credit that will never arrive (the
-                // proxy is about to be removed). RST triggers do_close() in the
-                // guest kernel, which sets sk_state and wakes all blocked threads.
-                // Data already drained by recv_pkt() above is queued ahead of this
-                // RST in the RX ring, so the guest will process data first.
+                // Send RST to force-close the vsock connection (see git history
+                // for why RST and not SHUTDOWN).
                 self.push_reset();
                 self.status = ProxyStatus::Closed;
                 update.signal_queue = true;
-                update.polling = Some((self.id, self.fd.as_raw_fd(), EventSet::empty()));
+                update.polling = Some((self.id, raw_handle(&self.sock), EventSet::empty()));
                 update.remove_proxy = ProxyRemoval::Deferred;
                 return update;
             } else {
                 self.push_reset();
                 self.status = ProxyStatus::Closed;
-                update.polling = Some((self.id, self.fd.as_raw_fd(), EventSet::empty()));
+                update.polling = Some((self.id, raw_handle(&self.sock), EventSet::empty()));
                 update.signal_queue = true;
                 update.remove_proxy = if self.status == ProxyStatus::Listening {
                     ProxyRemoval::Immediate
@@ -1006,32 +891,27 @@ impl Proxy for TsiStreamProxy {
 
                 if self.status == ProxyStatus::PeerClosed {
                     debug!("process_event: peer closed, sending reset: id={}", self.id);
-                    // Send RST instead of SHUTDOWN — see HANG_UP handler comment.
                     self.push_reset();
                     self.status = ProxyStatus::Closed;
                     update.signal_queue = true;
-                    update.polling = Some((self.id(), self.fd.as_raw_fd(), EventSet::empty()));
+                    update.polling = Some((self.id(), raw_handle(&self.sock), EventSet::empty()));
                     update.remove_proxy = ProxyRemoval::Deferred;
                     return update;
                 } else if self.status == ProxyStatus::WaitingCreditUpdate {
                     debug!("process_event: WaitingCreditUpdate");
-                    update.polling = Some((self.id(), self.fd.as_raw_fd(), EventSet::empty()));
+                    update.polling = Some((self.id(), raw_handle(&self.sock), EventSet::empty()));
                 }
             } else if self.status == ProxyStatus::Listening
                 || self.status == ProxyStatus::WaitingOnAccept
             {
-                match accept(self.fd.as_raw_fd()) {
-                    Ok(accept_fd) => {
-                        // Safe because we've just obtained the FD from the `accept` call above.
-                        let new_fd = unsafe { OwnedFd::from_raw_fd(accept_fd) };
-                        // Use the original vsock ephemeral port (encoded in the high 32 bits of
-                        // self.id) rather than self.peer_port, which listen() overwrites with the
-                        // VM TCP port (e.g. 9222).  push_op_request() sends an OP_REQUEST to the
-                        // guest on this port; the guest TSI layer must have a vsock socket there,
-                        // not a plain TCP port.
+                match self.sock.accept() {
+                    Ok((new_sock, _addr)) => {
+                        // Use the original vsock ephemeral port (encoded in the
+                        // high 32 bits of self.id) rather than self.peer_port,
+                        // which listen() overwrites with the VM TCP port.
                         let vsock_peer_port = (self.id >> 32) as u32;
                         update.new_proxy =
-                            Some((vsock_peer_port, new_fd, self.family, NewProxyType::Tcp));
+                            Some((vsock_peer_port, new_sock, self.family, NewProxyType::Tcp));
                     }
                     Err(e) => warn!("error accepting connection: id={}, err={}", self.id, e),
                 };
@@ -1050,7 +930,7 @@ impl Proxy for TsiStreamProxy {
                 update.signal_queue = true;
                 // Stop listening for events in the TCP socket until we receive
                 // OP_REQUEST and the vsock transport is fully established.
-                update.polling = Some((self.id(), self.fd.as_raw_fd(), EventSet::empty()));
+                update.polling = Some((self.id(), raw_handle(&self.sock), EventSet::empty()));
             } else {
                 debug!("EventSet::OUT while not connecting");
             }
@@ -1060,12 +940,14 @@ impl Proxy for TsiStreamProxy {
     }
 }
 
+#[cfg(unix)]
 impl AsRawFd for TsiStreamProxy {
     fn as_raw_fd(&self) -> RawFd {
-        self.fd.as_raw_fd()
+        self.sock.as_raw_fd()
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Drop for TsiStreamProxy {
     fn drop(&mut self) {
         if let Some(path) = &self.unixsock_path {

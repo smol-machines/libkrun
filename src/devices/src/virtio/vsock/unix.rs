@@ -10,11 +10,14 @@ use nix::sys::socket::{
     connect, listen, recv, send, shutdown, socket,
 };
 use std::collections::HashMap;
+use std::io;
 use std::num::Wrapping;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+
+use socket2::Socket;
 
 use super::super::Queue as VirtQueue;
 #[cfg(target_os = "macos")]
@@ -22,10 +25,16 @@ use super::super::linux_errno::linux_errno_raw;
 use super::muxer::{MuxerRx, push_packet};
 use super::muxer_rxq::MuxerRxQ;
 use super::packet::{TsiAcceptReq, TsiConnectReq, TsiListenReq, TsiSendtoAddr, VsockPacket};
-use super::proxy::{NewProxyType, Proxy, ProxyError, ProxyStatus, ProxyUpdate};
+use super::proxy::{Family, NewProxyType, Proxy, ProxyError, ProxyStatus, ProxyUpdate};
 use utils::epoll::EventSet;
 
 use vm_memory::GuestMemoryMmap;
+
+/// Map a nix `Errno` from the AF_UNIX socket setup into the `io::Error`-carrying
+/// `ProxyError::CreatingSocket`.
+fn cs(e: Errno) -> ProxyError {
+    ProxyError::CreatingSocket(io::Error::from_raw_os_error(e as i32))
+}
 
 pub struct UnixProxy {
     id: u64,
@@ -60,7 +69,7 @@ fn proxy_fd_create(id: u64) -> Result<OwnedFd, ProxyError> {
         SockFlag::empty(),
         None,
     )
-    .map_err(ProxyError::CreatingSocket)?;
+    .map_err(cs)?;
 
     // macOS forces us to do this here instead of just using SockFlag::SOCK_NONBLOCK above.
     match fcntl(&fd, FcntlArg::F_GETFL) {
@@ -135,12 +144,15 @@ impl UnixProxy {
         cid: u64,
         local_port: u32,
         peer_port: u32,
-        fd: OwnedFd,
+        sock: Socket,
         mem: GuestMemoryMmap,
         queue: Arc<Mutex<VirtQueue>>,
         rxq: Arc<Mutex<MuxerRxQ>>,
     ) -> Self {
         debug!("new_reverse: id={id} local_port={local_port} peer_port={peer_port}");
+        // The muxer hands us a socket2 wrapper; the AF_UNIX proxy works on the
+        // raw OwnedFd via nix.
+        let fd = OwnedFd::from(sock);
         UnixProxy {
             id,
             cid,
@@ -681,25 +693,20 @@ impl UnixAcceptorProxy {
             SockFlag::empty(),
             None,
         )
-        .map_err(ProxyError::CreatingSocket)?;
+        .map_err(cs)?;
         info!(
             "[VSOCK_TIMING] UnixAcceptorProxy socket created in {:?}",
             start.elapsed()
         );
 
-        bind(
-            fd.as_raw_fd(),
-            &UnixAddr::new(path).map_err(ProxyError::CreatingSocket)?,
-        )
-        .map_err(ProxyError::CreatingSocket)?;
+        bind(fd.as_raw_fd(), &UnixAddr::new(path).map_err(cs)?).map_err(cs)?;
         info!(
             "[VSOCK_TIMING] UnixAcceptorProxy bound to {:?} in {:?}",
             path,
             start.elapsed()
         );
 
-        listen(&fd, Backlog::new(5).map_err(ProxyError::CreatingSocket)?)
-            .map_err(ProxyError::CreatingSocket)?;
+        listen(&fd, Backlog::new(5).map_err(cs)?).map_err(cs)?;
         info!(
             "[VSOCK_TIMING] UnixAcceptorProxy listening, total setup {:?}",
             start.elapsed()
@@ -780,8 +787,8 @@ impl Proxy for UnixAcceptorProxy {
                     let new_fd = unsafe { OwnedFd::from_raw_fd(accept_fd) };
                     update.new_proxy = Some((
                         self.peer_port,
-                        new_fd,
-                        AddressFamily::Unix,
+                        Socket::from(new_fd),
+                        Family::Unix,
                         NewProxyType::Unix,
                     ));
                 }

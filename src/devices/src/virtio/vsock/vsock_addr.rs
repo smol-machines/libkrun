@@ -4,21 +4,24 @@
 //! Cross-platform socket address for the TSI guest ABI.
 //!
 //! The guest always speaks the **Linux** sockaddr wire format (AF_INET = 2,
-//! AF_INET6 = 10; port and address in network byte order). The host, however,
-//! may lay sockaddrs out differently (macOS uses a `sa_len` byte and different
-//! AF_* values; Windows uses AF_INET6 = 23). The existing code carried a
-//! `nix::SockaddrStorage` and patched the bytes per-OS, but `nix` does not build
-//! on Windows at all.
+//! AF_INET6 = 10, AF_UNIX = 1; port and address in network byte order). The
+//! host, however, may lay sockaddrs out differently (macOS uses a `sa_len` byte
+//! and different AF_* values; Windows uses AF_INET6 = 23 and has no AF_UNIX).
+//! The old code carried a `nix::SockaddrStorage` and patched the bytes per-OS,
+//! but `nix` does not build on Windows at all.
 //!
-//! [`VsockAddr`] replaces `SockaddrStorage` in the vsock/TSI path: it parses the
-//! guest's Linux-layout bytes into a host-neutral [`std::net::SocketAddr`] and
-//! serializes back to Linux layout regardless of host, so the guest ABI stays
-//! identical on every platform and no per-OS patching is needed. The inner
-//! `SocketAddr` feeds `socket2` for the actual host socket calls.
+//! [`VsockAddr`] replaces `SockaddrStorage` in the vsock/TSI path. It parses the
+//! guest's Linux-layout bytes into a host-neutral value and serializes back to
+//! Linux layout regardless of host, so the guest ABI stays identical on every
+//! platform. INET addresses are represented as [`std::net::SocketAddr`] and feed
+//! `socket2` for the host socket calls; AF_UNIX is preserved as raw guest bytes
+//! on Linux only (macOS and Windows do not support AF_UNIX over TSI).
 //!
 //! See WINDOWS_NETWORKING_PORT.md (Phase 1).
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
 
 use super::defs;
 
@@ -28,17 +31,22 @@ const LINUX_SOCKADDR_IN_LEN: usize = 16;
 const LINUX_SOCKADDR_IN6_LEN: usize = 28;
 
 /// A socket address in the guest's (Linux) sockaddr ABI, stored host-neutrally.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct VsockAddr(SocketAddr);
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VsockAddr {
+    /// An IPv4 or IPv6 address (portable to every host).
+    Inet(SocketAddr),
+    /// A Linux AF_UNIX address, kept as the raw guest `sockaddr_un` bytes.
+    /// Linux-only: macOS and Windows do not proxy AF_UNIX over TSI.
+    #[cfg(target_os = "linux")]
+    Unix(Vec<u8>),
+}
 
-#[allow(dead_code)]
 impl VsockAddr {
     /// Parse the first `addr_len` bytes of a guest-supplied Linux sockaddr.
     ///
     /// `buf` and `addr_len` are guest-controlled, so every read is bounds-checked
     /// against both `addr_len` and the actual buffer length. Returns `None` for a
-    /// truncated buffer or an unsupported address family (AF_UNIX is handled
-    /// separately on the platforms that support it).
+    /// truncated buffer or an unsupported address family.
     pub fn parse_linux(buf: &[u8], addr_len: u32) -> Option<Self> {
         let len = addr_len as usize;
         if len < 2 || len > buf.len() {
@@ -52,7 +60,7 @@ impl VsockAddr {
                 }
                 let port = u16::from_be_bytes([buf[2], buf[3]]);
                 let ip = Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7]);
-                Some(VsockAddr(SocketAddrV4::new(ip, port).into()))
+                Some(VsockAddr::Inet(SocketAddrV4::new(ip, port).into()))
             }
             defs::LINUX_AF_INET6 => {
                 if buf.len() < LINUX_SOCKADDR_IN6_LEN {
@@ -63,27 +71,29 @@ impl VsockAddr {
                 let mut octets = [0u8; 16];
                 octets.copy_from_slice(&buf[8..24]);
                 let scope_id = u32::from_be_bytes([buf[24], buf[25], buf[26], buf[27]]);
-                Some(VsockAddr(
+                Some(VsockAddr::Inet(
                     SocketAddrV6::new(Ipv6Addr::from(octets), port, flowinfo, scope_id).into(),
                 ))
             }
+            #[cfg(target_os = "linux")]
+            defs::LINUX_AF_UNIX => Some(VsockAddr::Unix(buf[..len].to_vec())),
             _ => None,
         }
     }
 
-    /// Serialize to the guest's Linux sockaddr wire format (`sockaddr_in` for
-    /// IPv4, `sockaddr_in6` for IPv6). Always emits Linux layout regardless of
-    /// the host, so the value can be copied straight into a guest getname reply.
-    pub fn to_linux_bytes(self) -> Vec<u8> {
-        match self.0 {
-            SocketAddr::V4(a) => {
+    /// Serialize to the guest's Linux sockaddr wire format. INET addresses always
+    /// emit Linux layout regardless of host, so the value can be copied straight
+    /// into a guest getname reply; AF_UNIX echoes back the raw bytes.
+    pub fn to_linux_bytes(&self) -> Vec<u8> {
+        match self {
+            VsockAddr::Inet(SocketAddr::V4(a)) => {
                 let mut b = vec![0u8; LINUX_SOCKADDR_IN_LEN];
                 b[0..2].copy_from_slice(&defs::LINUX_AF_INET.to_le_bytes());
                 b[2..4].copy_from_slice(&a.port().to_be_bytes());
                 b[4..8].copy_from_slice(&a.ip().octets());
                 b
             }
-            SocketAddr::V6(a) => {
+            VsockAddr::Inet(SocketAddr::V6(a)) => {
                 let mut b = vec![0u8; LINUX_SOCKADDR_IN6_LEN];
                 b[0..2].copy_from_slice(&defs::LINUX_AF_INET6.to_le_bytes());
                 b[2..4].copy_from_slice(&a.port().to_be_bytes());
@@ -92,26 +102,78 @@ impl VsockAddr {
                 b[24..28].copy_from_slice(&a.scope_id().to_be_bytes());
                 b
             }
+            #[cfg(target_os = "linux")]
+            VsockAddr::Unix(raw) => raw.clone(),
         }
     }
 
     /// Length of the Linux sockaddr this address serializes to.
     pub fn linux_len(&self) -> u32 {
-        match self.0 {
-            SocketAddr::V4(_) => LINUX_SOCKADDR_IN_LEN as u32,
-            SocketAddr::V6(_) => LINUX_SOCKADDR_IN6_LEN as u32,
+        match self {
+            VsockAddr::Inet(SocketAddr::V4(_)) => LINUX_SOCKADDR_IN_LEN as u32,
+            VsockAddr::Inet(SocketAddr::V6(_)) => LINUX_SOCKADDR_IN6_LEN as u32,
+            #[cfg(target_os = "linux")]
+            VsockAddr::Unix(raw) => raw.len() as u32,
         }
     }
 
-    /// The host-neutral address, for handing to `socket2`/`std::net`.
-    pub fn socket_addr(&self) -> SocketAddr {
-        self.0
+    /// The INET address, for handing to `socket2`/`std::net`. `None` for AF_UNIX.
+    pub fn inet(&self) -> Option<SocketAddr> {
+        match self {
+            VsockAddr::Inet(a) => Some(*a),
+            #[cfg(target_os = "linux")]
+            VsockAddr::Unix(_) => None,
+        }
+    }
+
+    /// Filesystem path of an AF_UNIX address, if any (Linux only). The guest
+    /// `sockaddr_un` is `family:u16` followed by a NUL-terminated path.
+    #[cfg(target_os = "linux")]
+    pub fn unix_path(&self) -> Option<PathBuf> {
+        match self {
+            VsockAddr::Unix(raw) if raw.len() > 2 => {
+                let path = &raw[2..];
+                let end = path.iter().position(|&b| b == 0).unwrap_or(path.len());
+                let s = std::str::from_utf8(&path[..end]).ok()?;
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(PathBuf::from(s))
+                }
+            }
+            _ => None,
+        }
     }
 }
 
 impl From<SocketAddr> for VsockAddr {
     fn from(addr: SocketAddr) -> Self {
-        VsockAddr(addr)
+        VsockAddr::Inet(addr)
+    }
+}
+
+impl From<SocketAddrV4> for VsockAddr {
+    fn from(addr: SocketAddrV4) -> Self {
+        VsockAddr::Inet(SocketAddr::V4(addr))
+    }
+}
+
+impl From<SocketAddrV6> for VsockAddr {
+    fn from(addr: SocketAddrV6) -> Self {
+        VsockAddr::Inet(SocketAddr::V6(addr))
+    }
+}
+
+impl std::fmt::Display for VsockAddr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VsockAddr::Inet(a) => write!(f, "{a}"),
+            #[cfg(target_os = "linux")]
+            VsockAddr::Unix(_) => match self.unix_path() {
+                Some(p) => write!(f, "unix:{}", p.display()),
+                None => write!(f, "unix:<unnamed>"),
+            },
+        }
     }
 }
 
@@ -129,18 +191,17 @@ mod tests {
         ];
         let addr = VsockAddr::parse_linux(&buf, 16).unwrap();
         assert_eq!(
-            addr.socket_addr(),
+            addr.inet().unwrap(),
             "127.0.0.1:8080".parse::<SocketAddr>().unwrap()
         );
         assert_eq!(addr.linux_len(), 16);
-        // Serialized bytes match the meaningful prefix of the input.
         assert_eq!(&addr.to_linux_bytes()[..8], &buf[..8]);
     }
 
     #[test]
     fn ipv6_round_trip() {
         let ip: Ipv6Addr = "2001:db8::1".parse().unwrap();
-        let original = VsockAddr(SocketAddrV6::new(ip, 443, 0, 7).into());
+        let original = VsockAddr::Inet(SocketAddrV6::new(ip, 443, 0, 7).into());
         let bytes = original.to_linux_bytes();
         assert_eq!(bytes.len(), 28);
         assert_eq!(
@@ -151,7 +212,7 @@ mod tests {
 
         let parsed = VsockAddr::parse_linux(&bytes, 28).unwrap();
         assert_eq!(parsed, original);
-        match parsed.socket_addr() {
+        match parsed.inet().unwrap() {
             SocketAddr::V6(a) => {
                 assert_eq!(*a.ip(), ip);
                 assert_eq!(a.port(), 443);
@@ -163,25 +224,31 @@ mod tests {
 
     #[test]
     fn rejects_short_and_unknown() {
-        // addr_len past the buffer.
         assert!(VsockAddr::parse_linux(&[2, 0, 0, 0], 16).is_none());
-        // Too few bytes for the claimed family.
         assert!(VsockAddr::parse_linux(&[2, 0, 0], 3).is_none());
-        // Unknown family.
         let mut buf = [0u8; 16];
         buf[0] = 99;
         assert!(VsockAddr::parse_linux(&buf, 16).is_none());
-        // Zero length.
         assert!(VsockAddr::parse_linux(&buf, 0).is_none());
     }
 
     #[test]
     fn ipv4_port_and_addr_byte_order() {
-        let addr = VsockAddr(SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 2), 53).into());
+        let addr = VsockAddr::Inet(SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 2), 53).into());
         let b = addr.to_linux_bytes();
-        // Family little-endian, port big-endian, address in order.
         assert_eq!(&b[0..2], &[2, 0]);
         assert_eq!(&b[2..4], &53u16.to_be_bytes());
         assert_eq!(&b[4..8], &[10, 0, 2, 2]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unix_path_round_trip() {
+        let mut buf = vec![1u8, 0]; // AF_UNIX (LE)
+        buf.extend_from_slice(b"/tmp/sock\0");
+        let addr = VsockAddr::parse_linux(&buf, buf.len() as u32).unwrap();
+        assert_eq!(addr.unix_path().unwrap(), PathBuf::from("/tmp/sock"));
+        assert_eq!(addr.inet(), None);
+        assert_eq!(addr.to_linux_bytes(), buf);
     }
 }
