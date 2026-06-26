@@ -40,10 +40,53 @@ use super::{AsRawFd, RawFd};
 use windows_sys::Win32::Foundation::{
     CloseHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT as WAIT_TIMEOUT_CODE,
 };
+use windows_sys::Win32::Networking::WinSock::{
+    FD_ACCEPT, FD_CLOSE, FD_CONNECT, FD_READ, FD_WRITE, SOCKET, WSACloseEvent, WSACreateEvent,
+    WSAEVENT, WSAEnumNetworkEvents, WSAEventSelect, WSANETWORKEVENTS,
+};
+use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_PIPE, GetFileType};
 use windows_sys::Win32::System::IO::{
     CreateIoCompletionPort, GetQueuedCompletionStatusEx, OVERLAPPED_ENTRY,
 };
 use windows_sys::Win32::System::Threading::INFINITE;
+
+/// Heuristic: a Winsock SOCKET reports as `FILE_TYPE_PIPE`, whereas the Windows
+/// Event objects backing `EventFd` report `FILE_TYPE_UNKNOWN`. We only ever
+/// register those two kinds of handle, so this cleanly distinguishes them.
+fn is_socket(h: HANDLE) -> bool {
+    unsafe { GetFileType(h) == FILE_TYPE_PIPE }
+}
+
+/// Translate an [`EventSet`] interest mask into the Winsock `WSAEventSelect`
+/// network-event mask. `FD_CLOSE` is always selected so peer closes surface.
+fn wsa_mask(events: EventSet) -> i32 {
+    let mut mask = FD_CLOSE;
+    if events.contains(EventSet::IN) {
+        mask |= FD_READ | FD_ACCEPT;
+    }
+    if events.contains(EventSet::OUT) {
+        mask |= FD_WRITE | FD_CONNECT;
+    }
+    mask as i32
+}
+
+/// Translate the network events reported by `WSAEnumNetworkEvents` into an
+/// [`EventSet`]. `FD_CLOSE` maps to `IN | HANG_UP` so the reader drains any
+/// buffered data before the connection is torn down.
+fn wsa_events_to_set(network_events: i32) -> EventSet {
+    let ne = network_events as u32;
+    let mut set = EventSet::empty();
+    if ne & (FD_READ | FD_ACCEPT) != 0 {
+        set |= EventSet::IN;
+    }
+    if ne & (FD_WRITE | FD_CONNECT) != 0 {
+        set |= EventSet::OUT;
+    }
+    if ne & FD_CLOSE != 0 {
+        set |= EventSet::IN | EventSet::HANG_UP;
+    }
+    set
+}
 
 // Generic access mask requesting all permissions the caller is allowed.
 // https://learn.microsoft.com/en-us/windows/win32/secauthz/access-mask
@@ -127,7 +170,16 @@ impl EpollEvent {
 /// This lets [`Epoll::wait`] access `Watch` fields through raw
 /// pointers and atomics with no locking.
 struct Watch {
+    /// User-facing key passed to [`Epoll::ctl`] (an EventFd handle or a SOCKET).
     fd: HANDLE,
+    /// Waitable handle associated with the WCP. For an EventFd this is `fd`
+    /// itself; for a socket it is the `WSAEventSelect` event (`wsa_event`).
+    target: HANDLE,
+    /// The SOCKET, when this watch tracks a Winsock socket; else null.
+    socket: HANDLE,
+    /// The `WSACreateEvent` handle for a socket watch; else null. Equals
+    /// `target` when set; tracked separately for cleanup.
+    wsa_event: HANDLE,
     wcp: HANDLE,
     events: AtomicU32,
     data: AtomicU64,
@@ -165,6 +217,10 @@ impl Drop for CompletionPort {
                 let w = Box::from_raw(ptr);
                 let _ = NtCancelWaitCompletionPacket(w.wcp, 1);
                 CloseHandle(w.wcp);
+                if !w.socket.is_null() {
+                    WSAEventSelect(w.socket as SOCKET, 0, 0);
+                    WSACloseEvent(w.wsa_event as WSAEVENT);
+                }
             }
         }
         for (_, ptr) in self.zombies.get_mut().unwrap().drain(..) {
@@ -273,24 +329,58 @@ impl Epoll {
                     ));
                 }
 
+                // For a Winsock socket, bridge an auto-signaling event into the
+                // WCP path: WSAEventSelect signals `wsa_event` on the requested
+                // network events, and that event is what the WCP waits on.
+                let (target, socket, wsa_event) = if is_socket(fd) {
+                    // WSACreateEvent returns a `WSAEVENT` (isize); 0 is the
+                    // failure sentinel. It is a real waitable Event handle, so we
+                    // store it as a HANDLE for the WCP association.
+                    let ev = unsafe { WSACreateEvent() };
+                    if ev == 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    let interest = EventSet::from_bits_truncate(event.events());
+                    if unsafe { WSAEventSelect(fd as SOCKET, ev, wsa_mask(interest)) } != 0 {
+                        unsafe {
+                            WSACloseEvent(ev);
+                        }
+                        return Err(io::Error::last_os_error());
+                    }
+                    (ev as HANDLE, fd, ev as HANDLE)
+                } else {
+                    (fd, ptr::null_mut(), ptr::null_mut())
+                };
+
                 let mut wcp: HANDLE = ptr::null_mut();
                 let status =
                     unsafe { NtCreateWaitCompletionPacket(&mut wcp, MAXIMUM_ALLOWED, ptr::null()) };
                 if !nt_success(status) {
+                    if !wsa_event.is_null() {
+                        unsafe {
+                            WSACloseEvent(wsa_event as WSAEVENT);
+                        }
+                    }
                     return Err(nt_status_err(status));
                 }
 
                 let watch_ptr = Box::into_raw(Box::new(Watch {
                     fd,
+                    target,
+                    socket,
+                    wsa_event,
                     wcp,
                     events: AtomicU32::new(event.events()),
                     data: AtomicU64::new(event.data()),
                     is_active: AtomicBool::new(true),
                 }));
 
-                if let Err(e) = associate_wcp(wcp, self.iocp.handle, fd, watch_ptr as *mut _) {
+                if let Err(e) = associate_wcp(wcp, self.iocp.handle, target, watch_ptr as *mut _) {
                     unsafe {
                         CloseHandle(wcp);
+                        if !wsa_event.is_null() {
+                            WSACloseEvent(wsa_event as WSAEVENT);
+                        }
                         let _ = Box::from_raw(watch_ptr);
                     }
                     return Err(e);
@@ -307,10 +397,27 @@ impl Epoll {
                 watch.events.store(event.events(), Ordering::Release);
                 watch.data.store(event.data(), Ordering::Release);
 
+                // Re-arm the socket's network-event selection with the new mask.
+                if !watch.socket.is_null() {
+                    let interest = EventSet::from_bits_truncate(event.events());
+                    unsafe {
+                        WSAEventSelect(
+                            watch.socket as SOCKET,
+                            watch.wsa_event as WSAEVENT,
+                            wsa_mask(interest),
+                        );
+                    }
+                }
+
                 unsafe {
                     let _ = NtCancelWaitCompletionPacket(watch.wcp, 1);
                 }
-                associate_wcp(watch.wcp, self.iocp.handle, fd, watch_ptr as *mut _)?;
+                associate_wcp(
+                    watch.wcp,
+                    self.iocp.handle,
+                    watch.target,
+                    watch_ptr as *mut _,
+                )?;
             }
             ControlOperation::Delete => {
                 let watch_ptr = watches.remove(&fd).ok_or_else(|| {
@@ -322,6 +429,11 @@ impl Epoll {
                 unsafe {
                     let _ = NtCancelWaitCompletionPacket(watch.wcp, 1);
                     CloseHandle(watch.wcp);
+                    if !watch.socket.is_null() {
+                        // Cancel network-event selection and free the WSA event.
+                        WSAEventSelect(watch.socket as SOCKET, 0, 0);
+                        WSACloseEvent(watch.wsa_event as WSAEVENT);
+                    }
                 }
 
                 // Add the Watch to the zombies list with the current time
@@ -415,8 +527,29 @@ impl Epoll {
             let current_events = watch.events.load(Ordering::Acquire);
             let event_set = EventSet::from_bits_truncate(current_events);
 
+            // For a socket, the actual readiness comes from the network-event
+            // record (which also resets `wsa_event` so the next event re-signals);
+            // for an EventFd we report the registered interest mask as before.
+            let ready = if !watch.socket.is_null() {
+                let mut nev: WSANETWORKEVENTS = unsafe { std::mem::zeroed() };
+                let rc = unsafe {
+                    WSAEnumNetworkEvents(
+                        watch.socket as SOCKET,
+                        watch.wsa_event as WSAEVENT,
+                        &mut nev,
+                    )
+                };
+                if rc != 0 {
+                    EventSet::empty()
+                } else {
+                    wsa_events_to_set(nev.lNetworkEvents)
+                }
+            } else {
+                event_set & (EventSet::IN | EventSet::OUT)
+            };
+
             events[result_count] = EpollEvent {
-                events: (event_set & (EventSet::IN | EventSet::OUT)).bits(),
+                events: ready.bits(),
                 u64: watch.data.load(Ordering::Acquire),
             };
             result_count += 1;
@@ -449,7 +582,7 @@ impl Epoll {
                 //
                 // We should try to remove the GC mechanism but for now
                 // this is acceptable.
-                let _ = associate_wcp(watch.wcp, iocp_handle, watch.fd, watch_ptr as *mut _);
+                let _ = associate_wcp(watch.wcp, iocp_handle, watch.target, watch_ptr as *mut _);
             }
         }
 
