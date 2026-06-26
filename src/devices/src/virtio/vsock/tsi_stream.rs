@@ -3,8 +3,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::num::Wrapping;
-#[cfg(unix)]
-use std::os::fd::{AsRawFd, RawFd};
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -20,8 +18,8 @@ use super::packet::{
     TsiAcceptReq, TsiConnectReq, TsiGetnameRsp, TsiListenReq, TsiSendtoAddr, VsockPacket,
 };
 use super::proxy::{
-    Family, ListenerDesc, NewProxyType, Proxy, ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate,
-    RecvPkt,
+    Family, ListenerDesc, NewProxyType, Proxy, ProxyError, ProxyRawHandle, ProxyRemoval,
+    ProxyStatus, ProxyUpdate, RecvPkt, raw_handle,
 };
 use super::sys;
 use super::vsock_addr::VsockAddr;
@@ -57,12 +55,6 @@ pub struct TsiStreamProxy {
     listen_guest_port: u16,
     /// Listen backlog requested by the guest, for the same reason.
     listen_backlog: i32,
-}
-
-/// Raw socket handle used for epoll registration (Unix file descriptor).
-#[cfg(unix)]
-fn raw_handle(sock: &Socket) -> RawFd {
-    sock.as_raw_fd()
 }
 
 impl TsiStreamProxy {
@@ -458,6 +450,10 @@ impl TsiStreamProxy {
 }
 
 impl Proxy for TsiStreamProxy {
+    fn poll_handle(&self) -> ProxyRawHandle {
+        raw_handle(&self.sock)
+    }
+
     fn id(&self) -> u64 {
         self.id
     }
@@ -937,13 +933,6 @@ impl Proxy for TsiStreamProxy {
         }
 
         update
-    }
-}
-
-#[cfg(unix)]
-impl AsRawFd for TsiStreamProxy {
-    fn as_raw_fd(&self) -> RawFd {
-        self.sock.as_raw_fd()
     }
 }
 

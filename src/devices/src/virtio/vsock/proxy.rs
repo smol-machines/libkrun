@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io;
 #[cfg(unix)]
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::RawFd;
 
 use socket2::Socket;
 
@@ -11,10 +11,26 @@ use super::packet::{TsiAcceptReq, TsiConnectReq, TsiListenReq, TsiSendtoAddr, Vs
 use serde::{Deserialize, Serialize};
 use utils::epoll::EventSet;
 
-/// Raw socket handle used for epoll registration. Unix file descriptor today;
-/// the Windows socket variant lands with the epoll-shim socket support.
+/// Raw handle a proxy hands to the epoll layer for readiness registration. On
+/// Unix this is the socket's file descriptor; on Windows it is the Winsock
+/// SOCKET cast to the epoll shim's `HANDLE`-shaped `RawFd` (the shim detects
+/// sockets and bridges them via `WSAEventSelect`).
 #[cfg(unix)]
 pub type ProxyRawHandle = RawFd;
+#[cfg(windows)]
+pub type ProxyRawHandle = utils::windows::RawFd;
+
+/// Compute the [`ProxyRawHandle`] for a socket2 socket, cross-platform.
+#[cfg(unix)]
+pub fn raw_handle(sock: &Socket) -> ProxyRawHandle {
+    use std::os::unix::io::AsRawFd;
+    sock.as_raw_fd()
+}
+#[cfg(windows)]
+pub fn raw_handle(sock: &Socket) -> ProxyRawHandle {
+    use std::os::windows::io::AsRawSocket;
+    sock.as_raw_socket() as ProxyRawHandle
+}
 
 /// Address family of a TSI proxy, replacing the Unix-only `nix::AddressFamily`.
 /// AF_UNIX is Linux-only (macOS/Windows do not proxy AF_UNIX over TSI).
@@ -91,6 +107,7 @@ pub enum ProxyRemoval {
 pub enum NewProxyType {
     #[default]
     Tcp,
+    #[cfg(unix)]
     Unix,
 }
 
@@ -110,7 +127,10 @@ impl fmt::Display for ProxyError {
     }
 }
 
-pub trait Proxy: Send + AsRawFd {
+pub trait Proxy: Send {
+    /// Raw handle the muxer registers with the epoll layer for this proxy's host
+    /// socket. Cross-platform replacement for the former `AsRawFd` supertrait.
+    fn poll_handle(&self) -> ProxyRawHandle;
     fn id(&self) -> u64;
     #[allow(dead_code)]
     fn status(&self) -> ProxyStatus;

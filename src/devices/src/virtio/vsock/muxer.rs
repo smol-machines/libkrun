@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -379,7 +379,7 @@ impl VsockMuxer {
                 Ok(mut proxy) => {
                     let rc = proxy.relisten(d.guest_port, d.backlog, &self.host_port_map);
                     if rc == 0 {
-                        let fd = proxy.as_raw_fd();
+                        let fd = proxy.poll_handle();
                         self.proxy_map
                             .write()
                             .unwrap()

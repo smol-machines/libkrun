@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddrV4};
-#[cfg(unix)]
-use std::os::fd::{AsRawFd, RawFd};
+use std::num::Wrapping;
 use std::sync::{Arc, Mutex};
 
 use socket2::{Domain, Socket, Type};
@@ -15,7 +14,10 @@ use super::muxer_rxq::MuxerRxQ;
 use super::packet::{
     TsiAcceptReq, TsiConnectReq, TsiGetnameRsp, TsiListenReq, TsiSendtoAddr, VsockPacket,
 };
-use super::proxy::{Family, Proxy, ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate, RecvPkt};
+use super::proxy::{
+    Family, Proxy, ProxyError, ProxyRawHandle, ProxyRemoval, ProxyStatus, ProxyUpdate, RecvPkt,
+    raw_handle,
+};
 use super::sys;
 use super::vsock_addr::VsockAddr;
 use crossbeam_channel::Sender;
@@ -45,14 +47,6 @@ pub struct TsiDgramProxy {
     /// Set when this socket was `connect()`ed to a resolver (port 53) and is
     /// being intercepted — sends on it are routed to the DNS worker.
     connected_dns: bool,
-}
-
-use std::num::Wrapping;
-
-/// Raw socket handle used for epoll registration (Unix file descriptor).
-#[cfg(unix)]
-fn raw_handle(sock: &Socket) -> RawFd {
-    sock.as_raw_fd()
 }
 
 impl TsiDgramProxy {
@@ -220,7 +214,7 @@ impl TsiDgramProxy {
                 let len = std::mem::size_of::<libc::sa_family_t>() as libc::socklen_t;
                 let rc = unsafe {
                     libc::bind(
-                        self.sock.as_raw_fd(),
+                        raw_handle(&self.sock),
                         &sun as *const _ as *const libc::sockaddr,
                         len,
                     )
@@ -236,6 +230,10 @@ impl TsiDgramProxy {
 }
 
 impl Proxy for TsiDgramProxy {
+    fn poll_handle(&self) -> ProxyRawHandle {
+        raw_handle(&self.sock)
+    }
+
     fn id(&self) -> u64 {
         self.id
     }
@@ -513,12 +511,5 @@ impl Proxy for TsiDgramProxy {
         }
 
         update
-    }
-}
-
-#[cfg(unix)]
-impl AsRawFd for TsiDgramProxy {
-    fn as_raw_fd(&self) -> RawFd {
-        self.sock.as_raw_fd()
     }
 }

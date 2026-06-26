@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::io;
 use std::num::Wrapping;
 use std::os::fd::{FromRawFd, OwnedFd};
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -25,7 +25,9 @@ use super::super::linux_errno::linux_errno_raw;
 use super::muxer::{MuxerRx, push_packet};
 use super::muxer_rxq::MuxerRxQ;
 use super::packet::{TsiAcceptReq, TsiConnectReq, TsiListenReq, TsiSendtoAddr, VsockPacket};
-use super::proxy::{Family, NewProxyType, Proxy, ProxyError, ProxyStatus, ProxyUpdate};
+use super::proxy::{
+    Family, NewProxyType, Proxy, ProxyError, ProxyRawHandle, ProxyStatus, ProxyUpdate,
+};
 use utils::epoll::EventSet;
 
 use vm_memory::GuestMemoryMmap;
@@ -332,6 +334,10 @@ impl UnixProxy {
 }
 
 impl Proxy for UnixProxy {
+    fn poll_handle(&self) -> ProxyRawHandle {
+        self.fd.as_raw_fd()
+    }
+
     fn id(&self) -> u64 {
         self.id
     }
@@ -667,12 +673,6 @@ impl Proxy for UnixProxy {
     }
 }
 
-impl AsRawFd for UnixProxy {
-    fn as_raw_fd(&self) -> RawFd {
-        self.fd.as_raw_fd()
-    }
-}
-
 pub struct UnixAcceptorProxy {
     id: u64,
     fd: OwnedFd,
@@ -717,6 +717,10 @@ impl UnixAcceptorProxy {
 }
 
 impl Proxy for UnixAcceptorProxy {
+    fn poll_handle(&self) -> ProxyRawHandle {
+        self.fd.as_raw_fd()
+    }
+
     fn id(&self) -> u64 {
         self.id
     }
@@ -797,11 +801,5 @@ impl Proxy for UnixAcceptorProxy {
             update.signal_queue = true;
         }
         update
-    }
-}
-
-impl AsRawFd for UnixAcceptorProxy {
-    fn as_raw_fd(&self) -> RawFd {
-        self.fd.as_raw_fd()
     }
 }

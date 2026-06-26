@@ -192,7 +192,7 @@ impl MuxerThread {
                 .unwrap()
                 .insert(id, Mutex::new(Box::new(proxy)));
             if let Some(proxy) = self.proxy_map.read().unwrap().get(&id) {
-                self.update_polling(id, proxy.lock().unwrap().as_raw_fd(), EventSet::IN);
+                self.update_polling(id, proxy.lock().unwrap().poll_handle(), EventSet::IN);
             };
             info!("[VSOCK_TIMING] port {} registered with epoll", port);
         }
