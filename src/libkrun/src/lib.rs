@@ -33,7 +33,7 @@ use std::io::{Read, Write};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
-use std::os::fd::{BorrowedFd, FromRawFd, RawFd};
+use std::os::fd::{BorrowedFd, FromRawFd};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 #[cfg(windows)]
@@ -53,8 +53,6 @@ use vmm::resources::{
     DefaultVirtioConsoleConfig, PortConfig, SerialConsoleConfig, VirtioConsoleConfigMode,
     VmResources,
 };
-// TSI/vsock is Unix-only.
-#[cfg(not(target_os = "windows"))]
 use vmm::resources::{TsiFlags, VsockConfig};
 #[cfg(feature = "blk")]
 use vmm::vmm_config::block::{BlockDeviceConfig, BlockRootConfig};
@@ -71,7 +69,6 @@ use vmm::vmm_config::kernel_cmdline::{DEFAULT_KERNEL_CMDLINE, KernelCmdlineConfi
 use vmm::vmm_config::machine_config::VmConfig;
 #[cfg(feature = "net")]
 use vmm::vmm_config::net::NetworkInterfaceConfig;
-#[cfg(not(target_os = "windows"))]
 use vmm::vmm_config::vsock::VsockDeviceConfig;
 
 #[cfg(feature = "aws-nitro")]
@@ -180,8 +177,6 @@ struct ContextConfig {
     tsi_port_map: Option<HashMap<u16, u16>>,
     egress_cidrs: Option<Vec<(std::net::IpAddr, u8)>>,
     control_socket_path: Option<PathBuf>,
-    // TSI/vsock is Unix-only.
-    #[cfg(not(target_os = "windows"))]
     vsock_config: VsockConfig,
     #[cfg(feature = "blk")]
     block_cfgs: Vec<BlockDeviceConfig>,
@@ -399,7 +394,7 @@ impl TryFrom<ContextConfig> for NitroEnclave {
                     let device = device.lock().unwrap();
 
                     let fd = match device.cfg_backend {
-                        VirtioNetBackend::UnixstreamFd(fd) => RawFd::from(fd),
+                        VirtioNetBackend::UnixstreamFd(fd) => std::os::fd::RawFd::from(fd),
                         _ => return Err(libc::EINVAL),
                     };
 
@@ -1471,7 +1466,6 @@ pub unsafe extern "C" fn krun_set_port_map(ctx_id: u32, c_port_map: *const *cons
         match CTX_MAP.lock().unwrap().entry(ctx_id) {
             Entry::Occupied(mut ctx_cfg) => {
                 let cfg = ctx_cfg.get_mut();
-                #[cfg(not(target_os = "windows"))]
                 if cfg.vsock_config == VsockConfig::Disabled {
                     return -libc::ENODEV;
                 }
@@ -1642,7 +1636,6 @@ pub unsafe extern "C" fn krun_set_egress_policy(
     match map.entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
             let cfg = ctx_cfg.get_mut();
-            #[cfg(not(target_os = "windows"))]
             if cfg.vsock_config == VsockConfig::Disabled {
                 return -libc::ENODEV;
             }
@@ -1883,7 +1876,6 @@ pub unsafe extern "C" fn krun_add_vsock_port2(
         match CTX_MAP.lock().unwrap().entry(ctx_id) {
             Entry::Occupied(mut ctx_cfg) => {
                 let cfg = ctx_cfg.get_mut();
-                #[cfg(not(target_os = "windows"))]
                 if cfg.vsock_config == VsockConfig::Disabled {
                     return -libc::ENODEV;
                 }
@@ -3127,7 +3119,6 @@ pub unsafe extern "C" fn krun_get_default_init(
     -libc::ENOTSUP
 }
 
-#[cfg(not(target_os = "windows"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn krun_add_vsock(ctx_id: u32, tsi_features: u32) -> i32 {
     let tsi_flags = match TsiFlags::from_bits(tsi_features) {
@@ -3135,8 +3126,10 @@ pub extern "C" fn krun_add_vsock(ctx_id: u32, tsi_features: u32) -> i32 {
         None => return -libc::EINVAL,
     };
 
-    if cfg!(target_os = "macos") && tsi_flags.contains(TsiFlags::HIJACK_UNIX) {
-        error!("TSI hijacking of UNIX sockets is not yet supported on macOS");
+    // AF_UNIX hijacking needs host AF_UNIX sockets, which exist only on Unix
+    // (and aren't yet wired on macOS).
+    if !cfg!(target_os = "linux") && tsi_flags.contains(TsiFlags::HIJACK_UNIX) {
+        error!("TSI hijacking of UNIX sockets is only supported on Linux");
         return -libc::EINVAL;
     }
 
@@ -3152,13 +3145,6 @@ pub extern "C" fn krun_add_vsock(ctx_id: u32, tsi_features: u32) -> i32 {
     }
 
     KRUN_SUCCESS
-}
-
-// TSI/vsock networking is built on Unix sockets; not yet supported on Windows.
-#[cfg(target_os = "windows")]
-#[unsafe(no_mangle)]
-pub extern "C" fn krun_add_vsock(_ctx_id: u32, _tsi_features: u32) -> i32 {
-    -libc::ENOTSUP
 }
 
 #[cfg(unix)]
@@ -3582,7 +3568,6 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     let egress_hosts = ctx_cfg.egress_hosts.take();
     let egress_resolvers = ctx_cfg.egress_resolvers.take();
 
-    #[cfg(not(target_os = "windows"))]
     match &ctx_cfg.vsock_config {
         VsockConfig::Disabled => (),
         VsockConfig::Explicit { tsi_flags } => {
@@ -3599,8 +3584,6 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
             ctx_cfg.vmr.set_vsock_device(vsock_device_config).unwrap();
         }
     }
-    #[cfg(target_os = "windows")]
-    let _ = (egress_cidrs, egress_hosts, egress_resolvers);
 
     if let Some(virgl_flags) = ctx_cfg.gpu_virgl_flags {
         ctx_cfg.vmr.set_gpu_virgl_flags(virgl_flags);
