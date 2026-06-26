@@ -139,3 +139,26 @@ matching Linux's default — verified working over both IPv4 and IPv6.
 Remaining genuinely-unsupported (not bugs): **AF_UNIX host-IPC over TSI** is
 Unix-only — Windows has no AF_UNIX, so `krun_add_vsock_port` (the UDS bridge)
 is a no-op there; INET TCP/UDP and port-forward are unaffected.
+
+## Production QA (2026-06-26)
+
+All run on the Windows 10 1909 WHP thinkpad:
+
+- **Functional battery: 15/15** — process/exec, virtiofs (incl. 1 MB file),
+  virtio-blk, shell, DNS, outbound TCP, 8-way concurrent soak.
+- **Load/integrity: 5/5** — 1 MB HTTP download over TSI; 8 MB random round-trips
+  through `/dev/vda` and the virtiofs root with **matching md5** (no corruption);
+  20 sequential DNS lookups; concurrent 1 MB download + 8 MB disk write.
+- **Stability: 5/5** — five consecutive VM lifecycles, each 15/15, no flakiness,
+  leaks, or hangs.
+- **Error paths: 5/5** — missing-exec → 127, bad cd, TSI connect to a closed
+  port and an NXDOMAIN both fail cleanly (no hang), and TSI keeps working after.
+- **Inbound port-forward** — single and repeated (3/3 sequential HTTP fetches
+  from the host to a guest `nc` server), over both IPv4 and IPv6.
+
+Two real bugs were found and fixed during QA:
+1. IPv6 listeners were v6-only on Windows (inbound unreachable over IPv4) →
+   `set_only_v6(false)` to match Linux's dual-stack default.
+2. A failed nonblocking connect signalled `FD_CONNECT` with an error that the
+   epoll bridge mapped to OUT, so a guest connect() to a closed port hung →
+   surface it as HANG_UP so the proxy reports the failure.
