@@ -1176,6 +1176,13 @@ pub fn build_microvm(
         }
     }
 
+    // WHP's emulated LAPIC timer delivers no interrupts to the guest, so steer
+    // the guest onto its i8253 (PIT) clockevent — which we emulate (see the
+    // `Pit` device) — instead of the dead LAPIC timer. Without this the guest
+    // calibrates and selects the LAPIC timer and then never ticks.
+    #[cfg(target_os = "windows")]
+    vmm.kernel_cmdline.insert_str("nolapic_timer")?;
+
     #[cfg(feature = "net")]
     attach_net_devices(&mut vmm, &vm_resources.net, intc.clone())?;
     #[cfg(feature = "net")]
@@ -2201,6 +2208,24 @@ fn attach_legacy_devices(
         .register_devices()
         .map_err(Error::LegacyIOBus)
         .map_err(StartMicrovmError::Internal)?;
+
+    // WHP has no PIT, and its emulated LAPIC timer delivers no interrupts to the
+    // guest, so without this the guest has no working clockevent and timers /
+    // `nanosleep` hang. Emulate the i8254 channel-0 timer (IRQ 0): it asserts
+    // IRQ 0 through the IOAPIC at the cadence the guest programs via ports
+    // 0x40/0x43, giving the guest's i8253 clockevent a tick. Paired with
+    // `nolapic_timer` on the kernel cmdline so the guest picks the PIT over the
+    // dead LAPIC timer.
+    #[cfg(target_os = "windows")]
+    if let Some(intc) = intc.clone() {
+        pio_device_manager
+            .io_bus
+            .insert(Arc::new(Mutex::new(devices::legacy::Pit::new(intc))), 0x40, 0x4)
+            .map_err(|e| {
+                Error::LegacyIOBus(device_manager::legacy::Error::BusError(e))
+            })
+            .map_err(StartMicrovmError::Internal)?;
+    }
 
     // On WHP the IOAPIC is always a software device reached over MMIO: WHP
     // emulates the LAPIC but not the IOAPIC, so the guest must be able to

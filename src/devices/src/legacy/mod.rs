@@ -13,6 +13,8 @@ mod gicv3;
 mod hvfgicv3;
 #[cfg(target_arch = "x86_64")]
 mod i8042;
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+mod pit;
 #[cfg(target_arch = "x86_64")]
 mod ioapic;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -59,6 +61,8 @@ pub use self::gpio::Gpio;
 pub use self::hvfgicv3::HvfGicV3;
 #[cfg(target_arch = "x86_64")]
 pub use self::i8042::{Error as I8042DeviceError, I8042Device};
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+pub use self::pit::Pit;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub use self::ioapic_kvm::IoApic;
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
