@@ -20,17 +20,6 @@ through the Windows socket2/Winsock TSI backend. All four phases done.
   Cross-compiles for `x86_64-pc-windows-gnu`.
 - ✅ **Phase 3 (1/2) — cross-platform proxy handle** (`3fe9fa4`): `Proxy::poll_handle()`
   + `ProxyRawHandle` replace the Unix-only `AsRawFd` supertrait.
-- ⏳ **Phase 3 (2/2) — remaining build wiring.** Next concrete steps:
-  1. `vsock/mod.rs`: gate `mod unix;` behind `#[cfg(unix)]`.
-  2. `muxer.rs` / `muxer_thread.rs`: gate the AF_UNIX bits for Windows — the
-     `UnixProxy` import + construction, `unix_ipc_port_map`, and
-     `create_lisening_ipc_sockets`; change `update_polling`'s `RawFd` param to
-     `ProxyRawHandle`.
-  3. `devices/src/virtio/mod.rs`: drop the `#[cfg(not(target_os = "windows"))]`
-     gates on `pub mod vsock` / `pub use vsock::*`.
-  4. `libkrun/src/lib.rs` + `vmm`: drop the `#[cfg(not(windows))]` gates on the
-     vsock device, `krun_add_vsock`, `krun_add_vsock_port*`, and `krun_set_port_map`.
-  5. Cross-compile `krun.dll` with vsock; fix residual Windows-only errors.
 - ✅ **Phase 3 (2/2) — build wiring** (`f35422a`, `ea21344`, `a318e3d`, `95d55ac`):
   AF_UNIX gated to Unix throughout (muxer/muxer_thread/libkrun); `update_polling`
   takes `ProxyRawHandle`; EventFd epoll registration uses the platform `AsRawFd`;
@@ -43,10 +32,9 @@ through the Windows socket2/Winsock TSI backend. All four phases done.
   (see status above). The vsock event-handler WouldBlock log noise was silenced
   to match the other devices.
 
-The port is functional. Possible follow-ups (not blocking): inbound
-port-forward (`accept()` reverse proxies) and AF_UNIX host IPC on Windows are
-still Unix-only; the WSAEventSelect level-vs-edge semantics could use a
-soak test under heavy concurrent connections.
+The port is functional. Inbound port-forward and the concurrency soak are now
+validated (see the validation battery below). AF_UNIX host IPC on Windows
+remains intentionally unsupported (Windows has no AF_UNIX).
 
 
 Goal: bring the libkrun guest networking path (TSI — Transparent Socket Implementation,
