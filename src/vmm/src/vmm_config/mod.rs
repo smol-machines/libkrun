@@ -28,8 +28,7 @@ pub mod kernel_bundle;
 pub mod machine_config;
 
 /// Wrapper for configuring the vsock devices attached to the microVM.
-/// TSI/vsock is built on Unix domain sockets, so it is Unix-only for now.
-#[cfg(not(target_os = "windows"))]
+/// Host sockets are cross-platform (socket2); AF_UNIX host-IPC is Unix-only.
 pub mod vsock;
 
 /// Wrapper for configuring the network devices attached to the microVM.

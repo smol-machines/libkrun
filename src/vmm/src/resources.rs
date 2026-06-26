@@ -30,7 +30,6 @@ use crate::vmm_config::kernel_cmdline::{KernelCmdlineConfig, KernelCmdlineConfig
 use crate::vmm_config::machine_config::{VmConfig, VmConfigError};
 #[cfg(feature = "net")]
 use crate::vmm_config::net::{NetBuilder, NetworkInterfaceConfig, NetworkInterfaceError};
-#[cfg(not(target_os = "windows"))]
 use crate::vmm_config::vsock::*;
 use crate::vstate::VcpuConfig;
 #[cfg(feature = "gpu")]
@@ -42,8 +41,7 @@ use krun_display::DisplayBackend;
 
 type Result<E> = std::result::Result<(), E>;
 
-// Re-export TsiFlags from devices crate (TSI/vsock is Unix-only).
-#[cfg(not(target_os = "windows"))]
+// Re-export TsiFlags from the devices crate.
 pub use devices::virtio::TsiFlags;
 
 #[cfg(feature = "vhost-user")]
@@ -78,7 +76,6 @@ pub enum Error {
     /// microVM vCpus or memory configuration error.
     VmConfig(VmConfigError),
     /// Vsock device configuration error.
-    #[cfg(not(target_os = "windows"))]
     VsockDevice(VsockConfigError),
 }
 
@@ -164,8 +161,7 @@ pub enum PortConfig {
     },
 }
 
-/// Configuration for the vsock device (TSI/vsock is Unix-only).
-#[cfg(not(target_os = "windows"))]
+/// Configuration for the vsock device.
 #[derive(Debug, Default, Clone, Eq, PartialEq)]
 pub enum VsockConfig {
     /// No vsock device
@@ -198,8 +194,7 @@ pub struct VmResources {
     /// The fs device.
     #[cfg(not(feature = "tee"))]
     pub fs: Vec<FsDeviceConfig>,
-    /// The vsock device (TSI/vsock is Unix-only).
-    #[cfg(not(target_os = "windows"))]
+    /// The vsock device.
     pub vsock: VsockBuilder,
     /// The virtio-blk device.
     #[cfg(feature = "blk")]
@@ -391,8 +386,7 @@ impl VmResources {
         self.block.insert(config)
     }
 
-    /// Sets a vsock device to be attached when the VM starts (Unix-only).
-    #[cfg(not(target_os = "windows"))]
+    /// Sets a vsock device to be attached when the VM starts.
     pub fn set_vsock_device(&mut self, config: VsockDeviceConfig) -> Result<VsockConfigError> {
         self.vsock.insert(config)
     }

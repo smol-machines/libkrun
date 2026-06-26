@@ -36,7 +36,6 @@ use super::{Error, Vmm};
 #[cfg(target_arch = "x86_64")]
 use crate::device_manager::legacy::PortIODeviceManager;
 use crate::device_manager::mmio::MMIODeviceManager;
-#[cfg(not(target_os = "windows"))]
 use crate::resources::TsiFlags;
 use crate::resources::{
     DefaultVirtioConsoleConfig, PortConfig, VirtioConsoleConfigMode, VmResources,
@@ -64,7 +63,6 @@ use devices::legacy::{GicV3, HvfGicV3};
 use devices::legacy::{IrqChip, IrqChipDevice};
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 use devices::legacy::{KvmGicV2, KvmGicV3};
-#[cfg(not(target_os = "windows"))]
 use devices::virtio::Vsock;
 use devices::virtio::{MmioTransport, PortDescription, VirtioDevice, port_io};
 
@@ -1167,8 +1165,6 @@ pub fn build_microvm(
     #[cfg(feature = "blk")]
     attach_block_devices(&mut vmm, &vm_resources.block, intc.clone())?;
 
-    // TSI/vsock is Unix-only.
-    #[cfg(not(target_os = "windows"))]
     if let Some(vsock) = vm_resources.vsock.get() {
         attach_unixsock_vsock_device(&mut vmm, vsock, event_manager, intc.clone())?;
         let tsi_flags = vm_resources.vsock.tsi_flags();
@@ -2950,7 +2946,6 @@ fn attach_net_devices(
     Ok(())
 }
 
-#[cfg(not(target_os = "windows"))]
 fn attach_unixsock_vsock_device(
     vmm: &mut Vmm,
     unix_vsock: &Arc<Mutex<Vsock>>,
