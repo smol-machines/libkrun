@@ -39,6 +39,22 @@ use windows_sys::Win32::System::Hypervisor::{
     WHV_EMULATOR_IO_ACCESS_INFO, WHV_EMULATOR_MEMORY_ACCESS_INFO, WHV_TRANSLATE_GVA_FLAGS,
     WHV_TRANSLATE_GVA_RESULT, WHV_TRANSLATE_GVA_RESULT_CODE, WHvTranslateGva,
 };
+// Register names + state APIs used for checkpoint/restore (snapshot & fork).
+use windows_sys::Win32::System::Hypervisor::{
+    WHvGetVirtualProcessorInterruptControllerState, WHvGetVirtualProcessorXsaveState,
+    WHvSetVirtualProcessorInterruptControllerState, WHvSetVirtualProcessorXsaveState,
+    WHvX64RegisterApicBase, WHvX64RegisterCr0, WHvX64RegisterCr2, WHvX64RegisterCr3,
+    WHvX64RegisterCr4, WHvX64RegisterCr8, WHvX64RegisterCs, WHvX64RegisterCstar,
+    WHvX64RegisterDr0, WHvX64RegisterDr1, WHvX64RegisterDr2, WHvX64RegisterDr3, WHvX64RegisterDr6,
+    WHvX64RegisterDr7, WHvX64RegisterDs, WHvX64RegisterEfer, WHvX64RegisterEs, WHvX64RegisterFs,
+    WHvX64RegisterGdtr, WHvX64RegisterGs, WHvX64RegisterIdtr, WHvX64RegisterKernelGsBase,
+    WHvX64RegisterLdtr, WHvX64RegisterLstar, WHvX64RegisterPat, WHvX64RegisterR8, WHvX64RegisterR9,
+    WHvX64RegisterR10, WHvX64RegisterR11, WHvX64RegisterR12, WHvX64RegisterR13, WHvX64RegisterR14,
+    WHvX64RegisterR15, WHvX64RegisterRbp, WHvX64RegisterRdi, WHvX64RegisterRsi, WHvX64RegisterSfmask,
+    WHvX64RegisterSs, WHvX64RegisterStar, WHvX64RegisterSysenterCs, WHvX64RegisterSysenterEip,
+    WHvX64RegisterSysenterEsp, WHvX64RegisterTr, WHvX64RegisterTsc, WHvX64RegisterTscAux,
+    WHvX64RegisterXCr0,
+};
 use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows_sys::core::HRESULT;
 
@@ -1300,6 +1316,300 @@ impl WhpVcpu {
             WHvRunVpExitReasonUnsupportedFeature => VcpuExitReason::UnsupportedFeature,
             _ => VcpuExitReason::Unknown(ctx.ExitReason as u32),
         }
+    }
+}
+
+/// Ordered register set captured and restored for checkpoint/fork. The saved
+/// blob records each register's name alongside its value, so restore writes back
+/// exactly what was captured (and a host that lacks a newer register simply omits
+/// it). The LAPIC is intentionally excluded here — it is captured separately via
+/// the interrupt-controller state blob — and the x87/SSE/AVX register file is
+/// covered by the XSAVE blob rather than the individual `Fp*`/`Xmm*` registers.
+const CHECKPOINT_REGS: &[WHV_REGISTER_NAME] = &[
+    // General-purpose registers.
+    WHvX64RegisterRax,
+    WHvX64RegisterRcx,
+    WHvX64RegisterRdx,
+    WHvX64RegisterRbx,
+    WHvX64RegisterRsp,
+    WHvX64RegisterRbp,
+    WHvX64RegisterRsi,
+    WHvX64RegisterRdi,
+    WHvX64RegisterR8,
+    WHvX64RegisterR9,
+    WHvX64RegisterR10,
+    WHvX64RegisterR11,
+    WHvX64RegisterR12,
+    WHvX64RegisterR13,
+    WHvX64RegisterR14,
+    WHvX64RegisterR15,
+    WHvX64RegisterRip,
+    WHvX64RegisterRflags,
+    // Segment registers (selector + cached descriptor).
+    WHvX64RegisterEs,
+    WHvX64RegisterCs,
+    WHvX64RegisterSs,
+    WHvX64RegisterDs,
+    WHvX64RegisterFs,
+    WHvX64RegisterGs,
+    WHvX64RegisterLdtr,
+    WHvX64RegisterTr,
+    // Descriptor tables.
+    WHvX64RegisterIdtr,
+    WHvX64RegisterGdtr,
+    // Control registers.
+    WHvX64RegisterCr0,
+    WHvX64RegisterCr2,
+    WHvX64RegisterCr3,
+    WHvX64RegisterCr4,
+    WHvX64RegisterCr8,
+    WHvX64RegisterXCr0,
+    // Debug registers.
+    WHvX64RegisterDr0,
+    WHvX64RegisterDr1,
+    WHvX64RegisterDr2,
+    WHvX64RegisterDr3,
+    WHvX64RegisterDr6,
+    WHvX64RegisterDr7,
+    // MSRs exposed through the register namespace.
+    WHvX64RegisterEfer,
+    WHvX64RegisterKernelGsBase,
+    WHvX64RegisterApicBase,
+    WHvX64RegisterPat,
+    WHvX64RegisterSysenterCs,
+    WHvX64RegisterSysenterEip,
+    WHvX64RegisterSysenterEsp,
+    WHvX64RegisterStar,
+    WHvX64RegisterLstar,
+    WHvX64RegisterCstar,
+    WHvX64RegisterSfmask,
+    WHvX64RegisterTsc,
+    WHvX64RegisterTscAux,
+];
+
+/// Full architectural state of a WHP virtual processor, captured for
+/// checkpoint/restore (snapshot and fork). Holds the saved register
+/// name/value pairs plus the opaque LAPIC and XSAVE blobs. Serializes to a
+/// flat byte buffer via [`WhpVcpuState::to_bytes`] / [`WhpVcpuState::from_bytes`].
+#[derive(Clone, Default)]
+pub struct WhpVcpuState {
+    reg_names: Vec<WHV_REGISTER_NAME>,
+    reg_values: Vec<[u8; 16]>,
+    lapic: Vec<u8>,
+    xsave: Vec<u8>,
+}
+
+impl WhpVcpuState {
+    /// Serializes the captured state to a flat, self-describing byte buffer:
+    /// `[n_regs u32]( [name i32][value 16B] )* [lapic_len u32][lapic] [xsave_len u32][xsave]`.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + self.reg_names.len() * 20 + self.lapic.len() + 16);
+        out.extend_from_slice(&(self.reg_names.len() as u32).to_le_bytes());
+        for (name, value) in self.reg_names.iter().zip(self.reg_values.iter()) {
+            out.extend_from_slice(&name.to_le_bytes());
+            out.extend_from_slice(value);
+        }
+        out.extend_from_slice(&(self.lapic.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.lapic);
+        out.extend_from_slice(&(self.xsave.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.xsave);
+        out
+    }
+
+    /// Reconstructs the state from a buffer produced by [`Self::to_bytes`].
+    pub fn from_bytes(bytes: &[u8]) -> Result<WhpVcpuState, String> {
+        let mut cur = bytes;
+        fn take<'a>(cur: &mut &'a [u8], n: usize) -> Result<&'a [u8], String> {
+            if cur.len() < n {
+                return Err("WhpVcpuState: truncated buffer".to_string());
+            }
+            let (head, tail) = cur.split_at(n);
+            *cur = tail;
+            Ok(head)
+        }
+        fn take_u32(cur: &mut &[u8]) -> Result<u32, String> {
+            Ok(u32::from_le_bytes(take(cur, 4)?.try_into().unwrap()))
+        }
+
+        let n_regs = take_u32(&mut cur)? as usize;
+        let mut reg_names = Vec::with_capacity(n_regs);
+        let mut reg_values = Vec::with_capacity(n_regs);
+        for _ in 0..n_regs {
+            let name = i32::from_le_bytes(take(&mut cur, 4)?.try_into().unwrap());
+            let value: [u8; 16] = take(&mut cur, 16)?.try_into().unwrap();
+            reg_names.push(name as WHV_REGISTER_NAME);
+            reg_values.push(value);
+        }
+        let lapic_len = take_u32(&mut cur)? as usize;
+        let lapic = take(&mut cur, lapic_len)?.to_vec();
+        let xsave_len = take_u32(&mut cur)? as usize;
+        let xsave = take(&mut cur, xsave_len)?.to_vec();
+        Ok(WhpVcpuState {
+            reg_names,
+            reg_values,
+            lapic,
+            xsave,
+        })
+    }
+}
+
+/// Converts a raw 16-byte register value to a `WHV_REGISTER_VALUE`.
+fn bytes_to_reg_value(bytes: &[u8; 16]) -> WHV_REGISTER_VALUE {
+    // SAFETY: `WHV_REGISTER_VALUE` is a 16-byte POD union (`Reg128` is its widest
+    // member); any 16-byte pattern is a valid bit-image of it.
+    unsafe { *(bytes.as_ptr() as *const WHV_REGISTER_VALUE) }
+}
+
+/// Converts a `WHV_REGISTER_VALUE` to its raw 16-byte image.
+fn reg_value_to_bytes(value: &WHV_REGISTER_VALUE) -> [u8; 16] {
+    // SAFETY: `WHV_REGISTER_VALUE` is 16 bytes; reading it as bytes is always valid.
+    unsafe { *(value as *const WHV_REGISTER_VALUE as *const [u8; 16]) }
+}
+
+impl WhpVcpu {
+    /// Captures the full architectural state of this virtual processor for
+    /// checkpoint/restore. The vCPU must be quiescent (paused at a VM exit).
+    ///
+    /// Registers are read in one batch when the host accepts the whole list;
+    /// otherwise it falls back to reading each register individually and keeping
+    /// only the ones the host knows (older Windows lacks some newer register
+    /// names). The LAPIC and XSAVE areas are best-effort: a host that does not
+    /// expose them yields an empty blob, which restore then skips.
+    pub fn save_state(&self) -> Result<WhpVcpuState, Error> {
+        let part = self.vm.partition_handle();
+        let n = CHECKPOINT_REGS.len();
+
+        let mut reg_names: Vec<WHV_REGISTER_NAME>;
+        let mut reg_values: Vec<[u8; 16]>;
+
+        let mut batch: Vec<WHV_REGISTER_VALUE> = vec![unsafe { mem::zeroed() }; n];
+        let hr = unsafe {
+            WHvGetVirtualProcessorRegisters(
+                part,
+                self.index,
+                CHECKPOINT_REGS.as_ptr(),
+                n as u32,
+                batch.as_mut_ptr(),
+            )
+        };
+        if hr == S_OK {
+            reg_names = CHECKPOINT_REGS.to_vec();
+            reg_values = batch.iter().map(reg_value_to_bytes).collect();
+        } else {
+            // Per-register fallback: keep only registers the host recognizes.
+            reg_names = Vec::with_capacity(n);
+            reg_values = Vec::with_capacity(n);
+            for &name in CHECKPOINT_REGS {
+                let mut value: WHV_REGISTER_VALUE = unsafe { mem::zeroed() };
+                let hr = unsafe {
+                    WHvGetVirtualProcessorRegisters(part, self.index, &name, 1, &mut value)
+                };
+                if hr == S_OK {
+                    reg_names.push(name);
+                    reg_values.push(reg_value_to_bytes(&value));
+                }
+            }
+            if reg_names.is_empty() {
+                return Err(Error::GetRegisters(hr));
+            }
+        }
+
+        let lapic = self.get_state_blob(|buf, len, written| unsafe {
+            WHvGetVirtualProcessorInterruptControllerState(
+                part,
+                self.index,
+                buf as *mut c_void,
+                len,
+                written,
+            )
+        });
+        let xsave = self.get_state_blob(|buf, len, written| unsafe {
+            WHvGetVirtualProcessorXsaveState(part, self.index, buf as *mut c_void, len, written)
+        });
+
+        Ok(WhpVcpuState {
+            reg_names,
+            reg_values,
+            lapic,
+            xsave,
+        })
+    }
+
+    /// Restores architectural state previously captured by [`Self::save_state`].
+    /// The vCPU must be quiescent. Registers are written first (batch with a
+    /// per-register fallback), then the XSAVE area, then the LAPIC state so the
+    /// interrupt-controller view wins over CR8/APIC-base.
+    pub fn restore_state(&self, state: &WhpVcpuState) -> Result<(), Error> {
+        let part = self.vm.partition_handle();
+        let values: Vec<WHV_REGISTER_VALUE> =
+            state.reg_values.iter().map(bytes_to_reg_value).collect();
+
+        let hr = unsafe {
+            WHvSetVirtualProcessorRegisters(
+                part,
+                self.index,
+                state.reg_names.as_ptr(),
+                state.reg_names.len() as u32,
+                values.as_ptr(),
+            )
+        };
+        if hr != S_OK {
+            // Per-register fallback: set each individually, skipping any the host
+            // rejects, so one unknown register does not abort the whole restore.
+            for (name, value) in state.reg_names.iter().zip(values.iter()) {
+                let _ = unsafe {
+                    WHvSetVirtualProcessorRegisters(part, self.index, name, 1, value)
+                };
+            }
+        }
+
+        if !state.xsave.is_empty() {
+            let hr = unsafe {
+                WHvSetVirtualProcessorXsaveState(
+                    part,
+                    self.index,
+                    state.xsave.as_ptr() as *const c_void,
+                    state.xsave.len() as u32,
+                )
+            };
+            if hr != S_OK {
+                error!("WHvSetVirtualProcessorXsaveState failed: HRESULT 0x{hr:08x}");
+            }
+        }
+
+        if !state.lapic.is_empty() {
+            let hr = unsafe {
+                WHvSetVirtualProcessorInterruptControllerState(
+                    part,
+                    self.index,
+                    state.lapic.as_ptr() as *const c_void,
+                    state.lapic.len() as u32,
+                )
+            };
+            if hr != S_OK {
+                error!(
+                    "WHvSetVirtualProcessorInterruptControllerState failed: HRESULT 0x{hr:08x}"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Reads a variable-length WHP state blob (LAPIC or XSAVE) into a right-sized
+    /// `Vec`. Returns an empty vec if the host does not support the query.
+    fn get_state_blob(
+        &self,
+        get: impl Fn(*mut u8, u32, *mut u32) -> HRESULT,
+    ) -> Vec<u8> {
+        let mut buf = vec![0u8; 4096];
+        let mut written: u32 = 0;
+        let hr = get(buf.as_mut_ptr(), buf.len() as u32, &mut written);
+        if hr != S_OK {
+            return Vec::new();
+        }
+        buf.truncate(written as usize);
+        buf
     }
 }
 
