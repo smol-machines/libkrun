@@ -25,7 +25,7 @@ fn emit_snapshot_cfgs() {
     if linux_x86 || macos_arm || windows_x86 {
         println!("cargo:rustc-cfg=snapshot_supported");
     }
-    if linux_x86 || macos_arm {
+    if linux_x86 || macos_arm || windows_x86 {
         println!("cargo:rustc-cfg=fork_supported");
     }
 }

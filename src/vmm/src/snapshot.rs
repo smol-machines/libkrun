@@ -390,6 +390,95 @@ pub fn open_cow_memory_from_paths(descs: &[MemfdRegionDesc]) -> io::Result<Guest
     GuestMemoryMmap::from_regions(regions).map_err(|e| io_err(format!("from_regions: {e:?}")))
 }
 
+/// Windows variant of [`memfd_region_descs`]: records each region's backing-file
+/// path (recovered via `GetFinalPathNameByHandleW` on the open handle) so a clone
+/// can open it. Windows has no `/proc/<pid>/fd`, so cross-process sharing goes
+/// through the file path (the macOS model); the owner must stay alive (frozen)
+/// and the file must remain on disk for the clone's lifetime. Anonymous regions
+/// get an empty path.
+#[cfg(target_os = "windows")]
+pub fn memfd_region_descs(mem: &GuestMemoryMmap) -> Vec<MemfdRegionDesc> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_NAME_NORMALIZED, GetFinalPathNameByHandleW};
+
+    mem.iter()
+        .map(|region| {
+            let (path, offset) = match region.file_offset() {
+                Some(fo) => {
+                    let handle = fo.file().as_raw_handle();
+                    let mut buf = vec![0u16; 32768];
+                    // SAFETY: `handle` is an open file handle; `buf` is a valid,
+                    // sized wide-char buffer.
+                    let len = unsafe {
+                        GetFinalPathNameByHandleW(
+                            handle as *mut core::ffi::c_void,
+                            buf.as_mut_ptr(),
+                            buf.len() as u32,
+                            FILE_NAME_NORMALIZED,
+                        )
+                    };
+                    let path = if len > 0 && (len as usize) < buf.len() {
+                        String::from_utf16_lossy(&buf[..len as usize])
+                    } else {
+                        String::new()
+                    };
+                    (path, fo.start())
+                }
+                None => (String::new(), 0),
+            };
+            MemfdRegionDesc {
+                gpa: region.start_addr().raw_value(),
+                len: region.len(),
+                fd: if path.is_empty() { -1 } else { 0 },
+                offset,
+                path,
+            }
+        })
+        .collect()
+}
+
+/// Windows variant of [`open_cow_memory_from_paths`]: builds the clone's guest
+/// memory by **eager copy** — fresh anonymous regions into which the golden's
+/// backing-file bytes are read. Windows guest RAM cannot yet be wrapped as a
+/// copy-on-write view of the golden's section (vm-memory's Windows backend
+/// exposes no `build_raw`/`FILE_MAP_COPY`), so each clone takes an independent
+/// full copy instead of sharing clean pages. Correct but not dense; true CoW is
+/// a follow-up that requires a vm-memory patch. The owner must be frozen and its
+/// backing files present while this runs. Anonymous regions stay zeroed.
+#[cfg(target_os = "windows")]
+pub fn open_cow_memory_from_paths(descs: &[MemfdRegionDesc]) -> io::Result<GuestMemoryMmap> {
+    use std::io::{Seek, SeekFrom};
+
+    let io_err = |m: String| io::Error::other(m);
+    let ranges: Vec<(GuestAddress, usize)> = descs
+        .iter()
+        .map(|d| (GuestAddress(d.gpa), d.len as usize))
+        .collect();
+    let mem = GuestMemoryMmap::from_ranges(&ranges)
+        .map_err(|e| io_err(format!("from_ranges: {e:?}")))?;
+
+    for d in descs {
+        if d.path.is_empty() {
+            continue; // anonymous region: leave zeroed
+        }
+        let size = d.len as usize;
+        let mut file = std::fs::File::open(&d.path)
+            .map_err(|e| io_err(format!("open {}: {e}", d.path)))?;
+        file.seek(SeekFrom::Start(d.offset))
+            .map_err(|e| io_err(format!("seek {}: {e}", d.path)))?;
+        // Copy the region's bytes into the clone's freshly-mapped guest RAM.
+        let host = mem
+            .get_host_address(GuestAddress(d.gpa))
+            .map_err(|e| io_err(format!("host addr for gpa {:#x}: {e:?}", d.gpa)))?;
+        // SAFETY: `host` points at `size` bytes of this clone's own guest RAM
+        // (just mapped above); we own it exclusively here.
+        let slice = unsafe { std::slice::from_raw_parts_mut(host, size) };
+        file.read_exact(slice)
+            .map_err(|e| io_err(format!("read {} into guest RAM: {e}", d.path)))?;
+    }
+    Ok(mem)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

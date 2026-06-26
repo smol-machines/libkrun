@@ -27,15 +27,12 @@ use std::ffi::CString;
 use std::ffi::{CStr, c_void};
 use std::fs::File;
 use std::io::IsTerminal;
-// Read/Write are only used by the (Unix-only) control-socket handler.
-#[cfg(not(target_os = "windows"))]
-use std::io::{Read, Write};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::fd::{BorrowedFd, FromRawFd};
 #[cfg(unix)]
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixListener;
 #[cfg(windows)]
 use std::os::windows::io::BorrowedHandle;
 use std::path::PathBuf;
@@ -646,7 +643,7 @@ fn build_restore_ctx(
     #[cfg(target_os = "linux")]
     let guest_memory = vmm::snapshot::open_cow_memory_from_pid(_owner_pid, &descs)
         .map_err(|e| format!("cow-map guest memory: {e}"))?;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     let guest_memory = vmm::snapshot::open_cow_memory_from_paths(&descs)
         .map_err(|e| format!("cow-map guest memory: {e}"))?;
     Ok(vmm::builder::RestoreCtx {
@@ -655,8 +652,10 @@ fn build_restore_ctx(
     })
 }
 
-#[cfg(not(target_os = "windows"))]
-fn handle_control_stream(mut stream: UnixStream, vmm: &Arc<Mutex<vmm::Vmm>>) {
+fn handle_control_stream<S: std::io::Read + std::io::Write>(
+    mut stream: S,
+    vmm: &Arc<Mutex<vmm::Vmm>>,
+) {
     let mut buf = [0_u8; 128];
     let response = match stream.read(&mut buf) {
         Ok(0) => "ERR EINVAL empty command\n".to_string(),
@@ -715,6 +714,35 @@ fn handle_control_stream(mut stream: UnixStream, vmm: &Arc<Mutex<vmm::Vmm>>) {
 fn start_control_socket(path: PathBuf, vmm: Arc<Mutex<vmm::Vmm>>) -> std::io::Result<()> {
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
+
+    std::thread::Builder::new()
+        .name("krun control".into())
+        .spawn(move || {
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(stream) => handle_control_stream(stream, &vmm),
+                    Err(e) => {
+                        error!("control socket accept failed: {e}");
+                        break;
+                    }
+                }
+            }
+        })?;
+
+    Ok(())
+}
+
+/// Windows has no `AF_UNIX` in `std`, so the control channel is a TCP listener
+/// bound to loopback. The OS-assigned port is written (as decimal text) to
+/// `path`, which a client reads to discover where to connect — keeping the
+/// `krun_set_control_socket(path)` C API identical across platforms.
+#[cfg(target_os = "windows")]
+fn start_control_socket(path: PathBuf, vmm: Arc<Mutex<vmm::Vmm>>) -> std::io::Result<()> {
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind(("127.0.0.1", 0))?;
+    let port = listener.local_addr()?.port();
+    std::fs::write(&path, port.to_string())?;
 
     std::thread::Builder::new()
         .name("krun control".into())
@@ -3629,7 +3657,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     };
     lk_timing!("build_microvm done");
 
-    #[cfg(unix)]
+    #[cfg(any(unix, target_os = "windows"))]
     if let Some(control_socket_path) = ctx_cfg.control_socket_path.take()
         && let Err(e) = start_control_socket(control_socket_path, _vmm.clone())
     {

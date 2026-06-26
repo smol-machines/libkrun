@@ -1756,7 +1756,7 @@ pub struct PayloadConfig {
 /// has no `memfd`, but a file mmap'd `MAP_PRIVATE` gives the same cross-process
 /// CoW — validated against HVF). Gated on the per-VM `SMOLVM_FORKABLE` opt-in.
 fn memfd_backed_ram_enabled() -> bool {
-    (cfg!(target_os = "linux") || cfg!(target_os = "macos"))
+    (cfg!(target_os = "linux") || cfg!(target_os = "macos") || cfg!(target_os = "windows"))
         && std::env::var_os("SMOLVM_FORKABLE").is_some_and(|v| v == "1")
 }
 
@@ -1808,9 +1808,35 @@ pub(crate) fn create_guest_ram_memfd(size: usize) -> std::result::Result<File, S
     Ok(file)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+/// Windows has no `memfd`; back the guest-RAM region with a regular temp file
+/// (the macOS model). vm-memory maps it `FILE_MAP_ALL_ACCESS` to serve the
+/// golden's RAM, and a clone re-opens the same path to read its image. The path
+/// is recovered at fork time via `GetFinalPathNameByHandleW`. The file is opened
+/// with share-read/write/delete (Rust's default) so a clone can open it
+/// concurrently; it is cleaned up when the forkable golden is torn down.
+#[cfg(target_os = "windows")]
+pub(crate) fn create_guest_ram_memfd(size: usize) -> std::result::Result<File, String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    // Unique per (process, call) without needing a RNG: pid + monotonic counter.
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = dir.join(format!("smolvm-guest-ram-{pid}-{n}.bin"));
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|e| format!("create guest-RAM file {}: {e}", path.display()))?;
+    file.set_len(size as u64)
+        .map_err(|e| format!("sizing guest-RAM file to {size}: {e}"))?;
+    Ok(file)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn create_guest_ram_memfd(_size: usize) -> std::result::Result<File, String> {
-    Err("forkable guest RAM is Linux/macOS-only".to_string())
+    Err("forkable guest RAM is Linux/macOS/Windows-only".to_string())
 }
 
 /// Build the `(GuestAddress, size, Option<FileOffset>)` list for
