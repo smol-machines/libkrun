@@ -227,7 +227,7 @@ impl TsiStreamProxy {
         match bind_res {
             Ok(_) => {
                 debug!("tcp bind: id={}", self.id);
-                let clamped_backlog = req.backlog.clamp(0, libc::SOMAXCONN);
+                let clamped_backlog = req.backlog.clamp(0, sys::SOMAXCONN);
                 match self.sock.listen(clamped_backlog) {
                     Ok(_) => {
                         debug!("proxy: id={}", self.id);
@@ -433,7 +433,7 @@ impl TsiStreamProxy {
             warn!("relisten bind id={} err={e}", self.id);
             return -libc::EADDRINUSE;
         }
-        let clamped = backlog.clamp(0, libc::SOMAXCONN);
+        let clamped = backlog.clamp(0, sys::SOMAXCONN);
         if let Err(e) = self.sock.listen(clamped) {
             warn!("relisten listen id={} err={e}", self.id);
             return -libc::EINVAL;
@@ -710,7 +710,7 @@ impl Proxy for TsiStreamProxy {
             self.pending_accepts -= 1;
             self.push_accept_rsp(0);
             update.signal_queue = true;
-        } else if (req.flags & libc::O_NONBLOCK as u32) != 0 {
+        } else if (req.flags & defs::LINUX_O_NONBLOCK) != 0 {
             self.push_accept_rsp(-libc::EWOULDBLOCK);
             update.signal_queue = true;
         } else {

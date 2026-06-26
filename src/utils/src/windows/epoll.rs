@@ -171,6 +171,8 @@ impl EpollEvent {
 /// pointers and atomics with no locking.
 struct Watch {
     /// User-facing key passed to [`Epoll::ctl`] (an EventFd handle or a SOCKET).
+    /// Retained for diagnostics/identity; readiness uses `target`/`socket`.
+    #[allow(dead_code)]
     fd: HANDLE,
     /// Waitable handle associated with the WCP. For an EventFd this is `fd`
     /// itself; for a socket it is the `WSAEventSelect` event (`wsa_event`).
@@ -288,6 +290,12 @@ impl Clone for Epoll {
         }
     }
 }
+
+// The `entries` scratch buffer holds `OVERLAPPED_ENTRY` values (with raw
+// `*mut OVERLAPPED` pointers) only transiently inside `wait`; it is cleared
+// between calls and never shared. The `iocp` is `Send + Sync`. Moving an
+// `Epoll` to another thread (e.g. the vsock muxer thread) is therefore sound.
+unsafe impl Send for Epoll {}
 
 impl Epoll {
     /// Create a new polling instance backed by a fresh I/O Completion Port.

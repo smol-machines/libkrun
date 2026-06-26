@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
-use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -12,13 +11,17 @@ use super::defs::uapi;
 use super::dns_filter::{DnsRequest, DnsWorker, EgressPolicy, sockaddr_port};
 use super::muxer_rxq::{MuxerRxQ, rx_to_pkt};
 use super::muxer_thread::MuxerThread;
-use super::packet::{TsiConnectReq, TsiGetnameRsp, VsockPacket};
+#[cfg(unix)]
+use super::packet::TsiConnectReq;
+use super::packet::{TsiGetnameRsp, VsockPacket};
+use super::proxy::ProxyRawHandle;
 use super::proxy::{ListenerDesc, Proxy, ProxyRemoval, ProxyUpdate};
 use super::reaper::ReaperThread;
 #[cfg(target_os = "macos")]
 use super::timesync::TimesyncThread;
 use super::tsi_dgram::TsiDgramProxy;
 use super::tsi_stream::TsiStreamProxy;
+#[cfg(unix)]
 use super::unix::UnixProxy;
 use super::vsock_addr::VsockAddr;
 use crossbeam_channel::{Sender, unbounded};
@@ -401,7 +404,7 @@ impl VsockMuxer {
         }
     }
 
-    pub fn update_polling(&self, id: u64, fd: RawFd, evset: EventSet) {
+    pub fn update_polling(&self, id: u64, fd: ProxyRawHandle, evset: EventSet) {
         debug!("update_polling id={id} fd={fd:?} evset={evset:?}");
         let _ = self
             .epoll
@@ -466,13 +469,13 @@ impl VsockMuxer {
                 defs::SOCK_STREAM => {
                     debug!("proxy create stream");
                     let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
-                    if req.family as i32 == libc::AF_UNIX
+                    if req.family == defs::LINUX_AF_UNIX
                         && !self.tsi_flags.contains(TsiFlags::HIJACK_UNIX)
                     {
                         warn!("rejecting stream unix proxy because HIJACK_UNIX is disabled");
                         return;
                     }
-                    if (req.family as i32 == libc::AF_INET || req.family as i32 == libc::AF_INET6)
+                    if (req.family == defs::LINUX_AF_INET || req.family == defs::LINUX_AF_INET6)
                         && !self.tsi_flags.contains(TsiFlags::HIJACK_INET)
                     {
                         warn!("rejecting stream inet proxy because HIJACK_INET is disabled");
@@ -501,13 +504,13 @@ impl VsockMuxer {
                 defs::SOCK_DGRAM => {
                     debug!("proxy create dgram");
                     let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
-                    if req.family as i32 == libc::AF_UNIX
+                    if req.family == defs::LINUX_AF_UNIX
                         && !self.tsi_flags.contains(TsiFlags::HIJACK_UNIX)
                     {
                         warn!("rejecting dgram unix proxy because HIJACK_UNIX is disabled");
                         return;
                     }
-                    if (req.family as i32 == libc::AF_INET || req.family as i32 == libc::AF_INET6)
+                    if (req.family == defs::LINUX_AF_INET || req.family == defs::LINUX_AF_INET6)
                         && !self.tsi_flags.contains(TsiFlags::HIJACK_INET)
                     {
                         warn!("rejecting dgram inet proxy because HIJACK_INET is disabled");
@@ -753,47 +756,54 @@ impl VsockMuxer {
             pkt.src_port(),
             pkt.dst_port()
         );
+        // `mut` is only needed for the Unix AF_UNIX-IPC branch below.
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut proxy_map = self.proxy_map.write().unwrap();
 
         if let Some(proxy) = proxy_map.get(&id) {
             if let Some(update) = proxy.lock().unwrap().confirm_connect(pkt) {
                 self.process_proxy_update(id, update);
             }
-        } else if let Some(ipc_map) = &mut self.unix_ipc_port_map
-            && let Some((path, listen)) = ipc_map.get(&pkt.dst_port())
-        {
-            let mem = self.mem.as_ref().unwrap();
-            let queue = self.queue.as_ref().unwrap();
-            if *listen {
-                warn!("Attempting to connect a socket that is listening, sending rst");
-                let rx = MuxerRx::Reset {
-                    local_port: pkt.dst_port(),
-                    peer_port: pkt.src_port(),
-                };
-                push_packet(self.cid, rx, &self.rxq, queue, mem);
-                return;
-            }
-            let rxq = self.rxq.clone();
+        } else {
+            // AF_UNIX host-IPC connect target (Unix-only; the map is always
+            // empty on Windows, which has no AF_UNIX over TSI).
+            #[cfg(unix)]
+            if let Some(ipc_map) = &mut self.unix_ipc_port_map
+                && let Some((path, listen)) = ipc_map.get(&pkt.dst_port())
+            {
+                let mem = self.mem.as_ref().unwrap();
+                let queue = self.queue.as_ref().unwrap();
+                if *listen {
+                    warn!("Attempting to connect a socket that is listening, sending rst");
+                    let rx = MuxerRx::Reset {
+                        local_port: pkt.dst_port(),
+                        peer_port: pkt.src_port(),
+                    };
+                    push_packet(self.cid, rx, &self.rxq, queue, mem);
+                    return;
+                }
+                let rxq = self.rxq.clone();
 
-            let mut unix = UnixProxy::new(
-                id,
-                self.cid,
-                pkt.dst_port(),
-                pkt.src_port(),
-                mem.clone(),
-                queue.clone(),
-                rxq,
-                path.to_path_buf(),
-            )
-            .unwrap();
-            let tsi = TsiConnectReq {
-                peer_port: 0,
-                addr: SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0).into(),
-            };
-            let update = unix.connect(pkt, tsi);
-            unix.confirm_connect(pkt);
-            proxy_map.insert(id, Mutex::new(Box::new(unix)));
-            self.process_proxy_update(id, update);
+                let mut unix = UnixProxy::new(
+                    id,
+                    self.cid,
+                    pkt.dst_port(),
+                    pkt.src_port(),
+                    mem.clone(),
+                    queue.clone(),
+                    rxq,
+                    path.to_path_buf(),
+                )
+                .unwrap();
+                let tsi = TsiConnectReq {
+                    peer_port: 0,
+                    addr: SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0).into(),
+                };
+                let update = unix.connect(pkt, tsi);
+                unix.confirm_connect(pkt);
+                proxy_map.insert(id, Mutex::new(Box::new(unix)));
+                self.process_proxy_update(id, update);
+            }
         }
     }
 

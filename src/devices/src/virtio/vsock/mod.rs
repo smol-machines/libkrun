@@ -101,6 +101,8 @@ mod defs {
     pub const LINUX_AF_UNIX: u16 = 1;
     pub const LINUX_AF_INET: u16 = 2;
     pub const LINUX_AF_INET6: u16 = 10;
+    /// Linux `O_NONBLOCK`, as seen in the guest's TSI accept flags.
+    pub const LINUX_O_NONBLOCK: u32 = 0o4000;
 
     pub mod uapi {
 

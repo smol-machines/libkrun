@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -7,11 +6,13 @@ use std::thread;
 use super::super::Queue as VirtQueue;
 use super::muxer::{MuxerRx, ProxyMap, push_packet};
 use super::muxer_rxq::MuxerRxQ;
-use super::proxy::{NewProxyType, Proxy, ProxyRemoval, ProxyUpdate};
+use super::proxy::{NewProxyType, Proxy, ProxyRawHandle, ProxyRemoval, ProxyUpdate};
 use super::tsi_stream::TsiStreamProxy;
 
 use crate::virtio::InterruptTransport;
+#[cfg(unix)]
 use crate::virtio::vsock::defs;
+#[cfg(unix)]
 use crate::virtio::vsock::unix::{UnixAcceptorProxy, UnixProxy};
 use crossbeam_channel::Sender;
 use rand::{Rng, rng, rngs::ThreadRng};
@@ -27,6 +28,9 @@ pub struct MuxerThread {
     queue: Arc<Mutex<VirtQueue>>,
     interrupt: InterruptTransport,
     reaper_sender: Sender<u64>,
+    /// AF_UNIX host-IPC listeners; consumed only by `create_lisening_ipc_sockets`
+    /// (Unix-only). Always empty on Windows.
+    #[cfg_attr(not(unix), allow(dead_code))]
     unix_ipc_port_map: HashMap<u32, (PathBuf, bool)>,
 }
 
@@ -68,7 +72,7 @@ impl MuxerThread {
         push_packet(self.cid, credit_rx, &self.rxq, &self.queue, &self.mem);
     }
 
-    pub fn update_polling(&self, id: u64, fd: RawFd, evset: EventSet) {
+    pub fn update_polling(&self, id: u64, fd: ProxyRawHandle, evset: EventSet) {
         debug!("update_polling id={id} fd={fd:?} evset={evset:?}");
         let _ = self
             .epoll
@@ -126,6 +130,7 @@ impl MuxerThread {
                     self.queue.clone(),
                     self.rxq.clone(),
                 )),
+                #[cfg(unix)]
                 NewProxyType::Unix => Box::new(UnixProxy::new_reverse(
                     new_id,
                     self.cid,
@@ -154,6 +159,9 @@ impl MuxerThread {
         }
     }
 
+    /// Set up AF_UNIX host-IPC listeners from `unix_ipc_port_map`. Unix-only;
+    /// Windows has no AF_UNIX so there is nothing to do.
+    #[cfg(unix)]
     fn create_lisening_ipc_sockets(&self) {
         let start = std::time::Instant::now();
         info!(
@@ -208,6 +216,7 @@ impl MuxerThread {
         info!("[VSOCK_TIMING] MuxerThread work() started");
 
         let mut thread_rng = rng();
+        #[cfg(unix)]
         self.create_lisening_ipc_sockets();
 
         info!(
@@ -234,7 +243,7 @@ impl MuxerThread {
                     event_count += ev_cnt as u64;
 
                     for ev in &epoll_events[0..ev_cnt] {
-                        debug!("Event: ev.data={} ev.fd={}", ev.data(), ev.fd());
+                        debug!("Event: ev.data={} ev.fd={:?}", ev.data(), ev.fd());
                         let evset = EventSet::from_bits(ev.events).unwrap();
                         let id = ev.data();
 
