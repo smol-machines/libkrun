@@ -1,6 +1,13 @@
 # Windows TSI/vsock Networking Port — Implementation Plan
 
-Status: **phases 1–2 done, phase 3 in progress** (2026-06-25)
+Status: **COMPLETE — hardware-validated** (2026-06-26)
+
+Guest networking works on the Windows Hypervisor Platform. Validated on the
+Windows 10 1909 WHP thinkpad: the guest's outbound **TCP** (a `nc` HTTP GET to
+`1.1.1.1:80` returned `HTTP/1.1 301 ... Server: cloudflare`, and a `wget` to
+`:443` completed a full TLS handshake receiving the server certificate) and
+**UDP/DNS** (`nslookup example.com 1.1.1.1` resolved to real A records) both go
+through the Windows socket2/Winsock TSI backend. All four phases done.
 
 ## Progress log
 
@@ -24,7 +31,22 @@ Status: **phases 1–2 done, phase 3 in progress** (2026-06-25)
   4. `libkrun/src/lib.rs` + `vmm`: drop the `#[cfg(not(windows))]` gates on the
      vsock device, `krun_add_vsock`, `krun_add_vsock_port*`, and `krun_set_port_map`.
   5. Cross-compile `krun.dll` with vsock; fix residual Windows-only errors.
-- ⏳ **Phase 4 — hardware bring-up** on the WHP thinkpad: outbound TCP, DNS, UDP.
+- ✅ **Phase 3 (2/2) — build wiring** (`f35422a`, `ea21344`, `a318e3d`, `95d55ac`):
+  AF_UNIX gated to Unix throughout (muxer/muxer_thread/libkrun); `update_polling`
+  takes `ProxyRawHandle`; EventFd epoll registration uses the platform `AsRawFd`;
+  `libc::AF_*`/`SOMAXCONN`/`O_NONBLOCK` replaced with the guest's Linux constants;
+  the IOCP `Epoll` marked `Send`; and the `cfg(not(windows))` gates dropped on
+  `pub mod vsock`, the vmm vsock device/config/builder, and the libkrun
+  `krun_add_vsock`/`krun_set_port_map`/`krun_add_vsock_port` C API. `krun.dll`
+  builds for `x86_64-pc-windows-gnu` with TSI.
+- ✅ **Phase 4 — hardware bring-up**: outbound TCP + UDP/DNS validated on WHP
+  (see status above). The vsock event-handler WouldBlock log noise was silenced
+  to match the other devices.
+
+The port is functional. Possible follow-ups (not blocking): inbound
+port-forward (`accept()` reverse proxies) and AF_UNIX host IPC on Windows are
+still Unix-only; the WSAEventSelect level-vs-edge semantics could use a
+soak test under heavy concurrent connections.
 
 
 Goal: bring the libkrun guest networking path (TSI — Transparent Socket Implementation,

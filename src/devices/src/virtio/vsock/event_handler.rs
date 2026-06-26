@@ -36,7 +36,11 @@ impl Vsock {
 
         let mut raise_irq = false;
         if let Err(e) = self.queue_events[RXQ_INDEX].read() {
-            error!("Failed to get vsock rx queue event: {e:?}");
+            // A drained eventfd reports WouldBlock on a spurious level-triggered
+            // wakeup (common with the Windows epoll shim) — expected, not an error.
+            if e.kind() != std::io::ErrorKind::WouldBlock {
+                error!("Failed to get vsock rx queue event: {e:?}");
+            }
         } else {
             raise_irq |= self.process_stream_rx();
         }
@@ -67,7 +71,9 @@ impl Vsock {
 
         let mut raise_irq = false;
         if let Err(e) = self.queue_events[TXQ_INDEX].read() {
-            error!("Failed to get vsock tx queue event: {e:?}");
+            if e.kind() != std::io::ErrorKind::WouldBlock {
+                error!("Failed to get vsock tx queue event: {e:?}");
+            }
         } else {
             raise_irq |= self.process_stream_tx();
             // The backend may have queued up responses to the packets we sent during
