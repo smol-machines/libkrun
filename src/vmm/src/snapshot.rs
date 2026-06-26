@@ -400,9 +400,20 @@ pub fn open_cow_memory_from_paths(descs: &[MemfdRegionDesc]) -> io::Result<Guest
 pub fn memfd_region_descs(mem: &GuestMemoryMmap) -> Vec<MemfdRegionDesc> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{FILE_NAME_NORMALIZED, GetFinalPathNameByHandleW};
+    use windows_sys::Win32::System::Memory::FlushViewOfFile;
 
     mem.iter()
         .map(|region| {
+            // Flush the golden's mapped guest-RAM writes to the backing file so a
+            // clone's freshly-created copy-on-write section reads coherent data
+            // (a new file-mapping section is not guaranteed to observe another
+            // section's not-yet-flushed dirty pages).
+            if region.file_offset().is_some()
+                && let Ok(host) = mem.get_host_address(region.start_addr())
+            {
+                // SAFETY: `host` is this region's live mapped view of `len` bytes.
+                unsafe { FlushViewOfFile(host as *const core::ffi::c_void, region.len() as usize) };
+            }
             let (path, offset) = match region.file_offset() {
                 Some(fo) => {
                     let handle = fo.file().as_raw_handle();
@@ -438,45 +449,82 @@ pub fn memfd_region_descs(mem: &GuestMemoryMmap) -> Vec<MemfdRegionDesc> {
 }
 
 /// Windows variant of [`open_cow_memory_from_paths`]: builds the clone's guest
-/// memory by **eager copy** — fresh anonymous regions into which the golden's
-/// backing-file bytes are read. Windows guest RAM cannot yet be wrapped as a
-/// copy-on-write view of the golden's section (vm-memory's Windows backend
-/// exposes no `build_raw`/`FILE_MAP_COPY`), so each clone takes an independent
-/// full copy instead of sharing clean pages. Correct but not dense; true CoW is
-/// a follow-up that requires a vm-memory patch. The owner must be frozen and its
-/// backing files present while this runs. Anonymous regions stay zeroed.
+/// memory as **copy-on-write views** of the frozen golden VM's guest-RAM files.
+/// For each region we open the golden's backing file and `MapViewOfFile`-map a
+/// `FILE_MAP_COPY` view: clean pages are shared with the golden (dense,
+/// size-independent), and the clone's writes copy on demand — the Windows
+/// equivalent of the Linux/macOS `mmap(MAP_PRIVATE)` CoW path. The owner must be
+/// frozen and its backing files present for the clone's lifetime. Anonymous
+/// regions (empty path) get a fresh zeroed mapping.
 #[cfg(target_os = "windows")]
 pub fn open_cow_memory_from_paths(descs: &[MemfdRegionDesc]) -> io::Result<GuestMemoryMmap> {
-    use std::io::{Seek, SeekFrom};
+    use std::os::windows::io::AsRawHandle;
+    use vm_memory::GuestRegionMmap;
+    use vm_memory::mmap::MmapRegion;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Memory::{
+        CreateFileMappingW, FILE_MAP_COPY, MapViewOfFile, PAGE_WRITECOPY,
+    };
 
     let io_err = |m: String| io::Error::other(m);
-    let ranges: Vec<(GuestAddress, usize)> = descs
-        .iter()
-        .map(|d| (GuestAddress(d.gpa), d.len as usize))
-        .collect();
-    let mem = GuestMemoryMmap::from_ranges(&ranges)
-        .map_err(|e| io_err(format!("from_ranges: {e:?}")))?;
+    let mut regions: Vec<GuestRegionMmap> = Vec::with_capacity(descs.len());
 
     for d in descs {
-        if d.path.is_empty() {
-            continue; // anonymous region: leave zeroed
-        }
         let size = d.len as usize;
-        let mut file = std::fs::File::open(&d.path)
-            .map_err(|e| io_err(format!("open {}: {e}", d.path)))?;
-        file.seek(SeekFrom::Start(d.offset))
-            .map_err(|e| io_err(format!("seek {}: {e}", d.path)))?;
-        // Copy the region's bytes into the clone's freshly-mapped guest RAM.
-        let host = mem
-            .get_host_address(GuestAddress(d.gpa))
-            .map_err(|e| io_err(format!("host addr for gpa {:#x}: {e:?}", d.gpa)))?;
-        // SAFETY: `host` points at `size` bytes of this clone's own guest RAM
-        // (just mapped above); we own it exclusively here.
-        let slice = unsafe { std::slice::from_raw_parts_mut(host, size) };
-        file.read_exact(slice)
-            .map_err(|e| io_err(format!("read {} into guest RAM: {e}", d.path)))?;
+        let region = if !d.path.is_empty() {
+            let file = std::fs::File::open(&d.path)
+                .map_err(|e| io_err(format!("open {}: {e}", d.path)))?;
+            // A copy-on-write section over the golden's RAM file. PAGE_WRITECOPY
+            // (with a read-only file handle) backs FILE_MAP_COPY; CoW writes go to
+            // the pagefile, never the shared file.
+            // SAFETY: `file` is a valid open handle; a 0 max size maps the whole
+            // file (each region has its own file).
+            let mapping = unsafe {
+                CreateFileMappingW(
+                    file.as_raw_handle() as *mut core::ffi::c_void,
+                    std::ptr::null(),
+                    PAGE_WRITECOPY,
+                    0,
+                    0,
+                    std::ptr::null(),
+                )
+            };
+            if mapping.is_null() {
+                return Err(io::Error::other(format!(
+                    "CreateFileMapping {}: {}",
+                    d.path,
+                    io::Error::last_os_error()
+                )));
+            }
+            let off = d.offset;
+            // SAFETY: `mapping` is valid; mapping `size` bytes at `off` of it.
+            let view = unsafe {
+                MapViewOfFile(mapping, FILE_MAP_COPY, (off >> 32) as u32, off as u32, size)
+            };
+            // The view holds its own reference to the section, so the handle can
+            // be closed now.
+            unsafe { CloseHandle(mapping) };
+            if view.Value.is_null() {
+                return Err(io::Error::other(format!(
+                    "MapViewOfFile {}: {}",
+                    d.path,
+                    io::Error::last_os_error()
+                )));
+            }
+            // SAFETY: `view` is a live FILE_MAP_COPY mapping of `size` bytes;
+            // ownership transfers to the MmapRegion (its Drop unmaps it).
+            unsafe { MmapRegion::build_raw(view.Value as *mut u8, size, 0, 0) }
+                .map_err(|e| io_err(format!("build_raw: {e:?}")))?
+        } else {
+            // Anonymous region (device SHM/GPU): fresh zeroed mapping.
+            MmapRegion::new(size).map_err(|e| io_err(format!("anon mmap: {e:?}")))?
+        };
+        let guest_region = GuestRegionMmap::new(region, GuestAddress(d.gpa))
+            .ok_or_else(|| io_err("guest region address overflow".to_string()))?;
+        regions.push(guest_region);
     }
-    Ok(mem)
+
+    GuestMemoryMmap::from_regions(regions).map_err(|e| io_err(format!("from_regions: {e:?}")))
 }
 
 #[cfg(test)]
