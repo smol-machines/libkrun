@@ -16,7 +16,7 @@ use super::packet::{TsiGetnameRsp, VsockPacket};
 use super::proxy::ProxyRawHandle;
 use super::proxy::{ListenerDesc, Proxy, ProxyRemoval, ProxyUpdate};
 use super::reaper::ReaperThread;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use super::timesync::TimesyncThread;
 use super::tsi_dgram::TsiDgramProxy;
 use super::tsi_stream::TsiStreamProxy;
@@ -193,7 +193,12 @@ impl VsockMuxer {
         self.mem = Some(mem.clone());
         self.interrupt = Some(interrupt.clone());
 
-        #[cfg(target_os = "macos")]
+        // The guest wall-clock is synced from the host over a vsock DGRAM here on
+        // hypervisors without a paravirt clock the guest can read directly:
+        // macOS/HVF and Windows/WHP. (On Linux/KVM the guest uses kvmclock, so
+        // this is unnecessary.) Without it the WHP guest boots at ~1999 and all
+        // TLS cert validation fails ("certificate not yet valid").
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
             info!("[VSOCK_TIMING] starting TimesyncThread");
             let timesync =

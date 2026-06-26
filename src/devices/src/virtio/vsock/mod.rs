@@ -16,7 +16,7 @@ mod packet;
 mod proxy;
 mod reaper;
 mod sys;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 mod timesync;
 mod tsi_dgram;
 mod tsi_stream;
