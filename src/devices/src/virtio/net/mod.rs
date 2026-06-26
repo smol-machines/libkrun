@@ -13,8 +13,11 @@ pub static QUEUE_CONFIG: [QueueConfig; NUM_QUEUES] = [QueueConfig::new(QUEUE_SIZ
 
 mod backend;
 pub mod device;
+mod sys;
 #[cfg(target_os = "linux")]
 mod tap;
+// AF_UNIX datagram sockets exist only on Unix (Windows AF_UNIX is stream-only).
+#[cfg(unix)]
 mod unixgram;
 mod unixstream;
 mod worker;

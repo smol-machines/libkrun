@@ -23,6 +23,7 @@ use super::worker::NetWorker;
 
 use std::cmp;
 use std::io::Write;
+#[cfg(unix)]
 use std::os::fd::RawFd;
 use std::path::PathBuf;
 use virtio_bindings::virtio_net::VIRTIO_NET_F_MAC;
@@ -66,9 +67,14 @@ unsafe impl ByteValued for VirtioNetConfig {}
 
 #[derive(Clone)]
 pub enum VirtioNetBackend {
+    // Passing a raw fd over the C API is Unix-only.
+    #[cfg(unix)]
     UnixstreamFd(RawFd),
     UnixstreamPath(PathBuf),
+    // AF_UNIX datagram is Unix-only (Windows AF_UNIX is stream-only).
+    #[cfg(unix)]
     UnixgramFd(RawFd),
+    #[cfg(unix)]
     UnixgramPath(PathBuf, bool),
     #[cfg(target_os = "linux")]
     Tap(String),

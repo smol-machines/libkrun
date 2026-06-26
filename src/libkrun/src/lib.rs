@@ -1196,11 +1196,12 @@ pub unsafe extern "C" fn krun_add_disk3(
  * Send the VFKIT magic after establishing the connection,
  * as required by gvproxy in vfkit mode.
  */
-#[cfg(feature = "net")]
+// VFKIT magic / NET_FLAG_ALL are consumed only by the Unix unixgram backend.
+#[cfg(all(feature = "net", unix))]
 const NET_FLAG_VFKIT: u32 = 1 << 0;
 #[cfg(feature = "net")]
 const NET_FLAG_DHCP_CLIENT: u32 = 1 << 1;
-#[cfg(feature = "net")]
+#[cfg(all(feature = "net", unix))]
 const NET_FLAG_ALL: u32 = NET_FLAG_VFKIT | NET_FLAG_DHCP_CLIENT;
 
 /* Taken from uapi/linux/virtio_net.h */
@@ -1258,10 +1259,13 @@ pub unsafe extern "C" fn krun_add_net_unixstream(
         if fd < 0 && path.is_none() {
             return -libc::EINVAL;
         }
-        let backend = if let Some(path) = path {
-            VirtioNetBackend::UnixstreamPath(path)
-        } else {
-            VirtioNetBackend::UnixstreamFd(fd)
+        // Passing a raw fd is Unix-only; on Windows use the path form.
+        let backend = match (path, fd) {
+            (Some(path), _) => VirtioNetBackend::UnixstreamPath(path),
+            #[cfg(unix)]
+            (None, fd) => VirtioNetBackend::UnixstreamFd(fd),
+            #[cfg(not(unix))]
+            (None, _) => return -libc::EINVAL,
         };
 
         let mac: [u8; 6] = match slice::from_raw_parts(c_mac, 6).try_into() {
@@ -1292,9 +1296,25 @@ pub unsafe extern "C" fn krun_add_net_unixstream(
     }
 }
 
+// AF_UNIX datagram sockets are Unix-only (Windows AF_UNIX is stream-only); use
+// krun_add_net_unixstream on Windows.
 #[allow(clippy::missing_safety_doc)]
 #[unsafe(no_mangle)]
-#[cfg(feature = "net")]
+#[cfg(all(feature = "net", windows))]
+pub unsafe extern "C" fn krun_add_net_unixgram(
+    _ctx_id: u32,
+    _c_path: *const c_char,
+    _fd: c_int,
+    _c_mac: *const u8,
+    _features: u32,
+    _flags: u32,
+) -> i32 {
+    -libc::ENOTSUP
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
+#[cfg(all(feature = "net", unix))]
 pub unsafe extern "C" fn krun_add_net_unixgram(
     ctx_id: u32,
     c_path: *const c_char,

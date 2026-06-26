@@ -1,15 +1,10 @@
-use nix::sys::socket::{
-    AddressFamily, MsgFlags, SockFlag, SockType, UnixAddr, connect, getsockopt, recv, send,
-    setsockopt, socket, sockopt,
-};
-use std::{
-    os::fd::{AsRawFd, OwnedFd, RawFd},
-    path::PathBuf,
-};
+use std::io;
+use std::path::PathBuf;
 
-use crate::virtio::net::backend::ConnectError;
+use socket2::Socket;
 
-use super::backend::{NetBackend, ReadError, WriteError};
+use super::backend::{ConnectError, NetBackend, ReadError, WriteError};
+use super::sys::{self, NetRawHandle};
 use super::write_virtio_net_hdr;
 
 /// Each frame the network proxy is prepended by a 4 byte "header".
@@ -17,7 +12,7 @@ use super::write_virtio_net_hdr;
 const FRAME_HEADER_LEN: usize = 4;
 
 pub struct Unixstream {
-    fd: OwnedFd,
+    sock: Socket,
     // 0 when a frame length has not been read
     expecting_frame_length: u32,
     // 0 if last write is fully complete, otherwise the length that was written
@@ -25,20 +20,20 @@ pub struct Unixstream {
 }
 
 impl Unixstream {
-    /// Create the backend with a pre-established connection to the userspace network proxy.
-    pub fn new(fd: OwnedFd) -> Self {
-        if let Err(e) = setsockopt(&fd, sockopt::SndBuf, &(16 * 1024 * 1024)) {
+    /// Create the backend from an already-connected socket to the userspace
+    /// network proxy. The socket is switched to nonblocking mode.
+    pub fn new(sock: Socket) -> Self {
+        let _ = sock.set_nonblocking(true);
+        if let Err(e) = sock.set_send_buffer_size(16 * 1024 * 1024) {
             log::warn!("Failed to increase SO_SNDBUF (performance may be decreased): {e}");
         }
-
         log::debug!(
-            "network proxy socket (fd {fd:?}) buffer sizes: SndBuf={:?} RcvBuf={:?}",
-            getsockopt(&fd, sockopt::SndBuf),
-            getsockopt(&fd, sockopt::RcvBuf)
+            "network proxy socket buffer sizes: SndBuf={:?} RcvBuf={:?}",
+            sock.send_buffer_size(),
+            sock.recv_buffer_size()
         );
-
         Self {
-            fd,
+            sock,
             expecting_frame_length: 0,
             last_partial_write_length: 0,
         }
@@ -46,69 +41,35 @@ impl Unixstream {
 
     /// Create the backend opening a connection to the userspace network proxy.
     pub fn open(path: PathBuf) -> Result<Self, ConnectError> {
-        let fd = socket(
-            AddressFamily::Unix,
-            SockType::Stream,
-            SockFlag::empty(),
-            None,
-        )
-        .map_err(ConnectError::CreateSocket)?;
-        let peer_addr = UnixAddr::new(&path).map_err(ConnectError::InvalidAddress)?;
-        connect(fd.as_raw_fd(), &peer_addr).map_err(ConnectError::Binding)?;
-
-        if let Err(e) = setsockopt(&fd, sockopt::SndBuf, &(16 * 1024 * 1024)) {
-            log::warn!("Failed to increase SO_SNDBUF (performance may be decreased): {e}");
-        }
-
-        log::debug!(
-            "network socket (fd {fd:?}) buffer sizes: SndBuf={:?} RcvBuf={:?}",
-            getsockopt(&fd, sockopt::SndBuf),
-            getsockopt(&fd, sockopt::RcvBuf)
-        );
-
-        Ok(Self {
-            fd,
-            expecting_frame_length: 0,
-            last_partial_write_length: 0,
-        })
+        let sock = sys::connect_unix_stream(&path).map_err(ConnectError::Binding)?;
+        Ok(Self::new(sock))
     }
 
-    /// Try to read until filling the whole slice.
+    /// Try to read until filling the whole slice. The socket is nonblocking; the
+    /// first read (`block_until_has_data == false`) reports `NothingRead` when no
+    /// data is available, and the remainder is filled by retrying on WouldBlock
+    /// (the worker only calls in once the socket is readable, so this completes
+    /// promptly).
     fn read_loop(&self, buf: &mut [u8], block_until_has_data: bool) -> Result<(), ReadError> {
         let mut bytes_read = 0;
-        #[cfg(target_os = "linux")]
-        let flags = MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_NOSIGNAL;
-        #[cfg(target_os = "macos")]
-        let flags = MsgFlags::MSG_DONTWAIT;
 
         if !block_until_has_data {
-            match recv(self.fd.as_raw_fd(), buf, flags) {
+            match sys::recv(&self.sock, buf) {
+                Ok(0) => return Err(ReadError::Internal(io::ErrorKind::UnexpectedEof.into())),
                 Ok(size) => bytes_read += size,
-                #[allow(unreachable_patterns)]
-                Err(nix::Error::EAGAIN | nix::Error::EWOULDBLOCK) => {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     return Err(ReadError::NothingRead);
                 }
                 Err(e) => return Err(ReadError::Internal(e)),
             }
         }
 
-        #[cfg(target_os = "linux")]
-        let flags = MsgFlags::MSG_WAITALL | MsgFlags::MSG_NOSIGNAL;
-        #[cfg(target_os = "macos")]
-        let flags = MsgFlags::MSG_WAITALL;
-
         while bytes_read < buf.len() {
-            match recv(self.fd.as_raw_fd(), &mut buf[bytes_read..], flags) {
-                #[allow(unreachable_patterns)]
-                Err(nix::Error::EAGAIN | nix::Error::EWOULDBLOCK) => {
-                    log::warn!("read_loop: unexpected EAGAIN/EWOULDBLOCK on blocking socket");
-                    continue;
-                }
+            match sys::recv(&self.sock, &mut buf[bytes_read..]) {
+                Ok(0) => return Err(ReadError::Internal(io::ErrorKind::UnexpectedEof.into())),
+                Ok(size) => bytes_read += size,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
                 Err(e) => return Err(ReadError::Internal(e)),
-                Ok(size) => {
-                    bytes_read += size;
-                    //log::trace!("proxy recv {}/{}", bytes_read, buf.len());
-                }
             }
         }
 
@@ -118,28 +79,23 @@ impl Unixstream {
     fn write_loop(&mut self, buf: &[u8]) -> Result<(), WriteError> {
         let mut bytes_send = 0;
 
-        #[cfg(target_os = "linux")]
-        let flags = MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_NOSIGNAL;
-        #[cfg(target_os = "macos")]
-        let flags = MsgFlags::MSG_DONTWAIT;
-
         while bytes_send < buf.len() {
-            match send(self.fd.as_raw_fd(), &buf[bytes_send..], flags) {
+            match sys::send(&self.sock, &buf[bytes_send..]) {
                 Ok(size) => bytes_send += size,
-                #[allow(unreachable_patterns)]
-                Err(nix::Error::EAGAIN | nix::Error::EWOULDBLOCK) => {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     if bytes_send == 0 {
                         return Err(WriteError::NothingWritten);
                     } else {
                         log::trace!(
                             "Wrote {bytes_send} bytes, but socket blocked, will need try_finish_write() to finish"
                         );
-
                         self.last_partial_write_length += bytes_send;
                         return Err(WriteError::PartialWrite);
                     }
                 }
-                Err(nix::Error::EPIPE) => return Err(WriteError::ProcessNotRunning),
+                Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
+                    return Err(WriteError::ProcessNotRunning);
+                }
                 Err(e) => return Err(WriteError::Internal(e)),
             }
         }
@@ -216,7 +172,7 @@ impl NetBackend for Unixstream {
         Ok(())
     }
 
-    fn raw_socket_fd(&self) -> RawFd {
-        self.fd.as_raw_fd()
+    fn raw_socket_fd(&self) -> NetRawHandle {
+        sys::raw_handle(&self.sock)
     }
 }
