@@ -20,6 +20,8 @@ mod sys;
 mod timesync;
 mod tsi_dgram;
 mod tsi_stream;
+// AF_UNIX host-IPC proxy; Unix-only (Windows has no AF_UNIX over TSI).
+#[cfg(unix)]
 mod unix;
 mod vsock_addr;
 
