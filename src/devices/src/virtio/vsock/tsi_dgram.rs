@@ -73,6 +73,10 @@ impl TsiDgramProxy {
         if let Err(e) = sock.set_nonblocking(true) {
             warn!("error switching to non-blocking: id={id}, err={e}");
         }
+        // Match Linux's dual-stack default for IPv6 wildcard binds (no-op on IPv4).
+        if family == Family::Inet6 {
+            let _ = sock.set_only_v6(false);
+        }
 
         Ok(TsiDgramProxy {
             id,

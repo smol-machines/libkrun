@@ -132,3 +132,22 @@ nonblocking-connect (`WSAEWOULDBLOCK` vs `EINPROGRESS`) edge cases.
 - **epoll Delete/GC race** already documented in the shim applies to sockets too; reuse the
   zombie-list pattern.
 - Do not regress the Unix path: every phase must keep `cargo test` green on Linux/macOS.
+
+## Validation battery (2026-06-26)
+
+A 15-test PASS/FAIL battery driven by a single launcher (virtiofs + virtio-blk +
+vsock) passed **15/15** on the WHP thinkpad: process/exec (echo, pipe, exit
+codes, nested exec), virtiofs (write/read/append/delete/mkdir/1 MB file),
+virtio-blk (`/dev/vda` write+read), shell (loop, conditional), and networking
+(DNS over UDP, outbound TCP, and an **8-way concurrent-connection soak** that
+exercises the `WSAEventSelect` path under load).
+
+**Inbound port-forward** (host→guest via `krun_set_port_map` + the `accept()`
+reverse proxy) is validated: a host TCP client reached a guest listener through
+the mapped port and received its response. A dual-stack fix (`set_only_v6(false)`
+on IPv6 sockets) was added so an IPv6 wildcard listener also accepts IPv4,
+matching Linux's default — verified working over both IPv4 and IPv6.
+
+Remaining genuinely-unsupported (not bugs): **AF_UNIX host-IPC over TSI** is
+Unix-only — Windows has no AF_UNIX, so `krun_add_vsock_port` (the UDS bridge)
+is a no-op there; INET TCP/UDP and port-forward are unaffected.
