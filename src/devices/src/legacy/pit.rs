@@ -13,10 +13,12 @@
 //! of the dead LAPIC timer), this gives the guest a working tick.
 //!
 //! Only channel 0 is modeled; channels 1 (legacy DRAM refresh) and 2 (PC
-//! speaker) are not used by the Linux clockevent. Read-back of the live count is
+//! speaker) are not used by the Linux clockevent. Counter-latch / read-back is
 //! not implemented (the clockevent reprograms the counter each tick in one-shot
-//! mode and never depends on a precise read), so reads return 0.
+//! mode and never depends on a precise read), so reads return 0 and latch
+//! commands are ignored.
 
+use std::io;
 use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -52,20 +54,20 @@ pub struct Pit {
 
 impl Pit {
     /// Creates the PIT and spawns its background interrupt thread, which asserts
-    /// IRQ 0 through `intc` at the programmed cadence.
-    pub fn new(intc: IrqChip) -> Self {
+    /// IRQ 0 through `intc` at the programmed cadence. Fails only if the timer
+    /// thread cannot be spawned.
+    pub fn new(intc: IrqChip) -> io::Result<Self> {
         let (tx, rx) = channel::<Arm>();
         thread::Builder::new()
             .name("pit-timer".into())
-            .spawn(move || timer_loop(rx, intc))
-            .expect("failed to spawn PIT timer thread");
-        Pit {
+            .spawn(move || timer_loop(rx, intc))?;
+        Ok(Pit {
             tx,
             access_lohi: true,
             expect_hi: false,
             reload_lo: 0,
             mode: 2,
-        }
+        })
     }
 
     fn arm(&self, reload: u16) {
@@ -92,6 +94,13 @@ impl BusDevice for Pit {
                     return;
                 }
                 let access = (val >> 4) & 0b11;
+                // access == 0 is a counter-latch command (latch the current count
+                // for read-back); it does not change the access mode. We don't
+                // implement read-back, so ignore it rather than corrupting the
+                // lobyte/hibyte state machine.
+                if access == 0 {
+                    return;
+                }
                 self.mode = (val >> 1) & 0b111;
                 self.access_lohi = access == 0b11;
                 self.expect_hi = false;
@@ -121,20 +130,22 @@ impl BusDevice for Pit {
     }
 }
 
-/// Background thread: assert IRQ 0 at the cadence the guest programs. A re-arm
-/// (new `Arm` on the channel) preempts the current wait so the next deadline
-/// takes effect immediately.
+/// Background thread: assert IRQ 0 at the cadence the guest programs. While the
+/// timer is unarmed it blocks on the channel (so it wakes immediately on the
+/// next arm, or exits promptly once the device is dropped); while armed it waits
+/// until the deadline, preempted by a re-arm.
 fn timer_loop(rx: std::sync::mpsc::Receiver<Arm>, intc: IrqChip) {
     let mut deadline: Option<Instant> = None;
     let mut period = Duration::from_millis(10);
     let mut periodic = false;
 
     loop {
-        let wait = match deadline {
-            Some(d) => d.saturating_duration_since(Instant::now()),
-            None => Duration::from_secs(3600),
+        let next = match deadline {
+            // Unarmed: block until armed or the device is dropped.
+            None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
+            Some(d) => rx.recv_timeout(d.saturating_duration_since(Instant::now())),
         };
-        match rx.recv_timeout(wait) {
+        match next {
             Ok(arm) => {
                 period = arm.period;
                 periodic = arm.periodic;
@@ -142,7 +153,12 @@ fn timer_loop(rx: std::sync::mpsc::Receiver<Arm>, intc: IrqChip) {
             }
             Err(RecvTimeoutError::Timeout) => {
                 if deadline.is_some_and(|d| Instant::now() >= d) {
-                    let _ = intc.lock().unwrap().set_irq(Some(PIT_IRQ), None);
+                    // Recover from a poisoned irqchip lock rather than killing the
+                    // guest clock — a transient poison must not permanently wedge
+                    // timers.
+                    let chip = intc.lock().unwrap_or_else(|e| e.into_inner());
+                    let _ = chip.set_irq(Some(PIT_IRQ), None);
+                    drop(chip);
                     // Re-arm from "now" rather than the old deadline so a slow
                     // host can't accumulate a backlog of catch-up ticks.
                     deadline = periodic.then(|| Instant::now() + period);

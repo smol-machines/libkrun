@@ -2218,12 +2218,13 @@ fn attach_legacy_devices(
     // dead LAPIC timer.
     #[cfg(target_os = "windows")]
     if let Some(intc) = intc.clone() {
+        let pit = devices::legacy::Pit::new(intc)
+            .map_err(|e| Error::LegacyIOBus(device_manager::legacy::Error::EventFd(e)))
+            .map_err(StartMicrovmError::Internal)?;
         pio_device_manager
             .io_bus
-            .insert(Arc::new(Mutex::new(devices::legacy::Pit::new(intc))), 0x40, 0x4)
-            .map_err(|e| {
-                Error::LegacyIOBus(device_manager::legacy::Error::BusError(e))
-            })
+            .insert(Arc::new(Mutex::new(pit)), 0x40, 0x4)
+            .map_err(|e| Error::LegacyIOBus(device_manager::legacy::Error::BusError(e)))
             .map_err(StartMicrovmError::Internal)?;
     }
 

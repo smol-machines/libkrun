@@ -18,7 +18,9 @@ use crate::volatile_memory::{self, compute_offset, VolatileMemory, VolatileSlice
 
 #[allow(non_snake_case)]
 #[link(name = "kernel32")]
-extern "stdcall" {
+// `"system"` selects the platform default (stdcall on x86, C on x86_64); the
+// upstream `"stdcall"` warns / is a future hard error on x86_64.
+extern "system" {
     pub fn VirtualAlloc(
         lpAddress: *mut c_void,
         dwSize: size_t,

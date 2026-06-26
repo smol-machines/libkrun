@@ -1432,8 +1432,11 @@ impl WhpVcpuState {
         }
 
         let n_regs = take_u32(&mut cur)? as usize;
-        let mut reg_names = Vec::with_capacity(n_regs);
-        let mut reg_values = Vec::with_capacity(n_regs);
+        // Clamp the pre-allocation to the known register count: the per-iteration
+        // `take` below bounds the actual reads, but a corrupt/oversized count must
+        // not trigger a multi-GB up-front allocation.
+        let mut reg_names = Vec::with_capacity(n_regs.min(CHECKPOINT_REGS.len()));
+        let mut reg_values = Vec::with_capacity(n_regs.min(CHECKPOINT_REGS.len()));
         for _ in 0..n_regs {
             let name = i32::from_le_bytes(take(&mut cur, 4)?.try_into().unwrap());
             let value: [u8; 16] = take(&mut cur, 16)?.try_into().unwrap();
@@ -1554,12 +1557,31 @@ impl WhpVcpu {
             )
         };
         if hr != S_OK {
-            // Per-register fallback: set each individually, skipping any the host
-            // rejects, so one unknown register does not abort the whole restore.
+            // Per-register fallback: set each individually so one register the
+            // host doesn't recognize doesn't abort the whole restore. Tolerate a
+            // rejected non-core register (log it), but a rejected core register
+            // (RIP/RSP/RFLAGS/CR0/CR3/CR4/EFER) means the clone would resume into
+            // a fault, so surface that as an error.
+            const CORE: &[WHV_REGISTER_NAME] = &[
+                WHvX64RegisterRip,
+                WHvX64RegisterRsp,
+                WHvX64RegisterRflags,
+                WHvX64RegisterCr0,
+                WHvX64RegisterCr3,
+                WHvX64RegisterCr4,
+                WHvX64RegisterEfer,
+            ];
             for (name, value) in state.reg_names.iter().zip(values.iter()) {
-                let _ = unsafe {
+                let hr = unsafe {
                     WHvSetVirtualProcessorRegisters(part, self.index, name, 1, value)
                 };
+                if hr != S_OK {
+                    if CORE.contains(name) {
+                        error!("restoring core vCPU register {name} failed: HRESULT 0x{hr:08x}");
+                        return Err(Error::SetRegisters(hr));
+                    }
+                    debug!("restoring vCPU register {name} failed (ignored): HRESULT 0x{hr:08x}");
+                }
             }
         }
 

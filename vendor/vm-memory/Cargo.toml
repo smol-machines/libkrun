@@ -21,7 +21,6 @@ autoexamples = false
 autotests = false
 autobenches = false
 description = "Safe abstractions for accessing the VM physical memory"
-readme = "README.md"
 keywords = ["memory"]
 categories = ["memory-management"]
 license = "Apache-2.0 OR BSD-3-Clause"
@@ -59,10 +58,6 @@ xen = [
 name = "vm_memory"
 path = "src/lib.rs"
 
-[[bench]]
-name = "main"
-path = "benches/main.rs"
-harness = false
 
 [dependencies.arc-swap]
 version = "1.0.0"

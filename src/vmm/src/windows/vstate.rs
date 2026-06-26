@@ -478,7 +478,11 @@ impl Vcpu {
         // restored register state and sent Resume, so the guest never executes
         // with cold (boot) registers.
         if self.start_paused && !self.run_paused_loop() {
-            let _ = self.response_sender.send(VcpuResponse::Exited(0));
+            // run_paused_loop returns false on a restore error or a channel close
+            // (VM teardown). Report a non-zero code so a failed clone restore is
+            // not mistaken for a clean exit (the orchestrator also observes the
+            // missing RestoredState ack).
+            let _ = self.response_sender.send(VcpuResponse::Exited(1));
             return;
         }
         loop {

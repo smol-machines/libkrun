@@ -12,8 +12,10 @@ fn main() {
 ///   device state in process — Linux x86_64 (KVM), macOS aarch64 (HVF), and
 ///   Windows x86_64 (WHP).
 /// - `fork_supported`: the platform additionally has cross-process CoW guest
-///   RAM for golden→clone forking — Linux x86_64 and macOS aarch64. Windows is
-///   not yet enabled here (the WHP CoW memory path is still in progress).
+///   RAM for golden→clone forking — Linux x86_64 (memfd), macOS aarch64 (backing
+///   file), and Windows x86_64 (FILE_MAP_COPY view of a backing file). Currently
+///   the same set as `snapshot_supported`; kept distinct so a future platform
+///   that can snapshot but not fork can diverge.
 fn emit_snapshot_cfgs() {
     println!("cargo:rustc-check-cfg=cfg(snapshot_supported)");
     println!("cargo:rustc-check-cfg=cfg(fork_supported)");
