@@ -1070,6 +1070,7 @@ pub fn build_microvm(
         exit_observers: Vec::new(),
         exit_code: exit_code.clone(),
         vm,
+        intc: intc.clone(),
         mmio_device_manager,
         #[cfg(target_arch = "x86_64")]
         pio_device_manager,

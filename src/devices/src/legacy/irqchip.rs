@@ -35,6 +35,14 @@ impl IrqChipDevice {
     ) -> Result<(), DeviceError> {
         self.inner.set_irq(irq_line, interrupt_evt)
     }
+
+    pub fn save_irqchip_state(&self) -> Vec<u64> {
+        self.inner.save_irqchip_state()
+    }
+
+    pub fn restore_irqchip_state(&self, state: &[u64]) {
+        self.inner.restore_irqchip_state(state)
+    }
 }
 
 impl BusDevice for IrqChipDevice {
@@ -121,6 +129,16 @@ pub trait IrqChipT: BusDevice {
         irq_line: Option<u32>,
         interrupt_evt: Option<&EventFd>,
     ) -> Result<(), DeviceError>;
+    /// Capture host-serializable interrupt-controller state for VM
+    /// checkpoint/fork (the software IOAPIC's redirection table). Default empty
+    /// for backends with no host-side state (e.g. an in-kernel KVM IRQ chip,
+    /// whose state rides the VM-level checkpoint instead).
+    fn save_irqchip_state(&self) -> Vec<u64> {
+        Vec::new()
+    }
+    /// Restore the state captured by [`Self::save_irqchip_state`] onto a fork
+    /// clone. Default no-op.
+    fn restore_irqchip_state(&self, _state: &[u64]) {}
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -132,6 +150,10 @@ pub trait IrqChipT: BusDevice + GICDevice {
         irq_line: Option<u32>,
         interrupt_evt: Option<&EventFd>,
     ) -> Result<(), DeviceError>;
+    fn save_irqchip_state(&self) -> Vec<u64> {
+        Vec::new()
+    }
+    fn restore_irqchip_state(&self, _state: &[u64]) {}
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -143,6 +165,10 @@ pub trait IrqChipT: BusDevice + AIADevice {
         irq_line: Option<u32>,
         interrupt_evt: Option<&EventFd>,
     ) -> Result<(), DeviceError>;
+    fn save_irqchip_state(&self) -> Vec<u64> {
+        Vec::new()
+    }
+    fn restore_irqchip_state(&self, _state: &[u64]) {}
 }
 
 #[cfg(any(test, feature = "test_utils"))]

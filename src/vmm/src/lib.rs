@@ -227,6 +227,10 @@ pub struct VmCheckpoint {
     pub vcpu_states: Vec<vstate::VcpuState>,
     /// Virtio device runtime state (queues, negotiated features, etc.).
     pub devices: devices::virtio::persist::VmDevicesState,
+    /// Software-IOAPIC redirection table (host-side IRQ routing the guest
+    /// programmed). Empty for backends whose IRQ-chip state rides `vm_state`
+    /// (e.g. in-kernel KVM). A missing section deserializes to empty.
+    pub ioapic_redtbl: Vec<u64>,
 }
 
 #[cfg(snapshot_supported)]
@@ -247,6 +251,11 @@ impl VmCheckpoint {
             put(&mut out, &v.serialize());
         }
         put(&mut out, &self.devices.to_bytes().unwrap_or_default());
+        let mut redtbl = Vec::with_capacity(self.ioapic_redtbl.len() * 8);
+        for e in &self.ioapic_redtbl {
+            redtbl.extend_from_slice(&e.to_le_bytes());
+        }
+        put(&mut out, &redtbl);
         out
     }
 
@@ -277,10 +286,19 @@ impl VmCheckpoint {
             vcpu_states.push(vstate::VcpuState::deserialize(take(bytes, &mut pos)?)?);
         }
         let devices = devices::virtio::persist::VmDevicesState::from_bytes(take(bytes, &mut pos)?)?;
+        // The IOAPIC section is optional: snapshots predating it simply end here.
+        let ioapic_redtbl = match take(bytes, &mut pos) {
+            Ok(s) => s
+                .chunks_exact(8)
+                .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+                .collect(),
+            Err(_) => Vec::new(),
+        };
         Ok(VmCheckpoint {
             vm_state,
             vcpu_states,
             devices,
+            ioapic_redtbl,
         })
     }
 }
@@ -298,6 +316,10 @@ pub struct Vmm {
     paused_at: Option<Instant>,
     exit_evt: EventFd,
     vm: Vm,
+    /// Interrupt controller, kept so checkpoint/fork can capture and restore the
+    /// software IOAPIC's redirection table (the in-kernel KVM chip rides the
+    /// VM-level checkpoint instead, so its `save_irqchip_state` is empty).
+    intc: IrqChip,
     exit_observers: Vec<Arc<Mutex<dyn VmmExitObserver>>>,
     exit_code: Arc<AtomicI32>,
 
@@ -395,10 +417,30 @@ impl Vmm {
         self.vm
             .restore_state(&checkpoint.vm_state)
             .map_err(Error::Vm)?;
+        // Restore the software IOAPIC's redirection table BEFORE re-activating
+        // devices: a clone boots with a reset (all-masked) IOAPIC, so without
+        // this the IRQ routing the guest programmed is lost and device
+        // interrupts (e.g. vsock) never reach the guest. No-op for backends
+        // whose IRQ-chip state rides `vm_state` (in-kernel KVM).
+        self.intc
+            .lock()
+            .expect("poisoned intc lock")
+            .restore_irqchip_state(&checkpoint.ioapic_redtbl);
         self.restore_activate_devices(&checkpoint.devices)
             .map_err(Error::Snapshot)?;
         self.restore_vcpu_states(checkpoint.vcpu_states)?;
         Ok(())
+    }
+
+    /// Capture the interrupt controller's host-serializable state (the software
+    /// IOAPIC redirection table) for a checkpoint. Empty when the backend has no
+    /// host-side IRQ-chip state (in-kernel KVM).
+    #[cfg(snapshot_supported)]
+    fn save_ioapic_state(&self) -> Vec<u64> {
+        self.intc
+            .lock()
+            .expect("poisoned intc lock")
+            .save_irqchip_state()
     }
 
     /// Drain + reclaim worker-owned virtqueues (block/net) so their indices can
@@ -626,11 +668,13 @@ impl Vmm {
             .map_err(|e| Error::Snapshot(format!("guest-memory dump: {e}")))?;
         // Re-arm workers so the original VM can resume from this checkpoint.
         self.rearm_devices();
+        let ioapic_redtbl = self.save_ioapic_state();
         Ok((
             VmCheckpoint {
                 vm_state,
                 vcpu_states,
                 devices,
+                ioapic_redtbl,
             },
             mem_descs,
         ))
@@ -693,11 +737,13 @@ impl Vmm {
         let mem_clone = snapshot::cow_clone_guest_memory(&self.guest_memory)
             .map_err(|e| Error::Snapshot(format!("cow-clone guest memory: {e}")))?;
         self.rearm_devices();
+        let ioapic_redtbl = self.save_ioapic_state();
         Ok((
             VmCheckpoint {
                 vm_state,
                 vcpu_states,
                 devices,
+                ioapic_redtbl,
             },
             mem_clone,
         ))
@@ -749,6 +795,7 @@ impl Vmm {
         let vm_state = self.vm.save_state().map_err(Error::Vm)?;
         let devices = self.snapshot_devices();
         let descs = snapshot::memfd_region_descs(&self.guest_memory);
+        let ioapic_redtbl = self.save_ioapic_state();
         // Intentionally NOT re-armed/resumed: the golden stays frozen as the
         // shared CoW base for its clones.
         Ok((
@@ -756,6 +803,7 @@ impl Vmm {
                 vm_state,
                 vcpu_states,
                 devices,
+                ioapic_redtbl,
             },
             descs,
         ))

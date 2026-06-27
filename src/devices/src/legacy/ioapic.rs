@@ -130,6 +130,20 @@ impl<B: IoApicBackend> IrqChipT for Ioapic<B> {
         let IoapicInner { regs, backend } = &mut *inner;
         backend.set_irq(irq_line, interrupt_evt, regs)
     }
+
+    /// Capture the redirection table so a fork clone re-establishes the IRQ
+    /// routing the guest programmed. Without this a software-IOAPIC clone boots
+    /// with every pin masked and device IRQs (e.g. vsock) never reach the guest.
+    fn save_irqchip_state(&self) -> Vec<u64> {
+        self.inner.lock().unwrap().regs.ioredtbl.to_vec()
+    }
+
+    fn restore_irqchip_state(&self, state: &[u64]) {
+        let mut inner = self.inner.lock().unwrap();
+        for (dst, src) in inner.regs.ioredtbl.iter_mut().zip(state.iter()) {
+            *dst = *src;
+        }
+    }
 }
 
 impl<B: IoApicBackend> BusDevice for Ioapic<B> {
