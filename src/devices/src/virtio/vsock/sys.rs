@@ -29,13 +29,30 @@ pub const SOMAXCONN: i32 = 0x7fff_ffff;
 /// initialized `&mut [u8]` as uninitialized memory is sound (we never read the
 /// "uninit" view, only write through it), and the returned count bounds what the
 /// caller reads back.
+///
+/// On Unix the recv is forced non-blocking with `MSG_DONTWAIT`. The host-IPC
+/// `UnixProxy` keeps its connected socket in *blocking* mode (so partial-write
+/// `send`s drain fully), but its recv is driven by edge-readiness from the
+/// muxer's epoll loop and must never block that single thread on a spurious or
+/// already-drained `IN` wakeup — which a blocking `recv()` would do, hanging the
+/// whole muxer. This restores the pre-socket2 `nix` behavior, which always
+/// passed `MSG_DONTWAIT` regardless of the socket's blocking mode. Windows has
+/// no `MSG_DONTWAIT`; there the socket's own non-blocking state governs recv,
+/// matching the established (verified) Windows path.
 pub fn recv_into(sock: &Socket, buf: &mut [u8]) -> io::Result<usize> {
     // SAFETY: `[u8]` and `[MaybeUninit<u8>]` have identical layout; we only hand
     // the slice to the kernel to write into and use the returned length.
     let uninit = unsafe {
         std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut MaybeUninit<u8>, buf.len())
     };
-    sock.recv(uninit)
+    #[cfg(unix)]
+    {
+        sock.recv_with_flags(uninit, libc::MSG_DONTWAIT)
+    }
+    #[cfg(windows)]
+    {
+        sock.recv(uninit)
+    }
 }
 
 /// True if a nonblocking `connect` error means "connection in progress" rather
