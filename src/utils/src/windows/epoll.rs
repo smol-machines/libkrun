@@ -574,10 +574,18 @@ impl Epoll {
             };
             result_count += 1;
 
-            if !event_set.contains(EventSet::EDGE_TRIGGERED) {
-                // Level-triggered: re-associate the WCP so the next signal
-                // on this handle produces another completion packet.
-                //
+            // Re-associate the WCP so the next signal on this handle produces
+            // another completion packet. Level-triggered watches always re-arm.
+            // Edge-triggered watches are one-shot for an EventFd, but a SOCKET
+            // watch must still re-arm even when edge-triggered: its edge
+            // semantics already come from `WSAEventSelect`/`WSAEnumNetworkEvents`
+            // (which reports only *new* events since the last enum), and the WCP
+            // is consumed when it fires — so without re-arming, a socket would
+            // deliver exactly one event for its whole lifetime. This stalled
+            // virtio-net on WHP: the backend AF_UNIX socket got its initial
+            // writable (OUT) event and then never another readable (IN) one, so
+            // libkrun never read the host gateway's replies back to the guest.
+            if !event_set.contains(EventSet::EDGE_TRIGGERED) || !watch.socket.is_null() {
                 // KNOWN RACE: there is a race between this call and
                 // `CloseHandle(watch.wcp)` in `Epoll::ctl(Delete)`.  Another
                 // thread may delete the watch (marking it inactive and closing
