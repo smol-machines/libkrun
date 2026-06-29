@@ -10,6 +10,17 @@ fn main() {
     match target_os.as_str() {
         "linux" => {
             println!("cargo:rustc-cdylib-link-arg=-Wl,-soname,libkrun.so.{major}");
+            // Force lazy binding, overriding the build host's hardened `-z now`
+            // default. libkrun carries undefined `virgl_renderer_*` references that
+            // live in libvirglrenderer, dlopen'd ONLY on a GPU request and absent
+            // from GPU-less hosts (deliberately not in DT_NEEDED). Under `-z now`
+            // (DF_1_NOW / full RELRO) the loader resolves every undefined symbol
+            // eagerly at dlopen() time, overriding the caller's RTLD_LAZY — so on a
+            // GPU-less host `dlopen(libkrun)` fails with `undefined symbol:
+            // virgl_renderer_poll` and every microVM boot dies. `-z lazy` defers
+            // those symbols until called (never, with no GPU). `-z relro` (partial
+            // RELRO) is kept; only eager PLT binding is dropped.
+            println!("cargo:rustc-cdylib-link-arg=-Wl,-z,lazy");
         }
         "macos" => {
             println!(
