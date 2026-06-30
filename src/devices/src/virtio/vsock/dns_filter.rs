@@ -185,6 +185,94 @@ impl EgressPolicy {
     }
 }
 
+/// How much of the platform hard-floor applies, chosen once per VM from the
+/// deployment context. This mirrors the virtio-net gateway's floor
+/// (`smolvm-network::egress`) so a TSI (default `--net`) guest gets the same
+/// protection as a virtio-net one: even with NO egress allow-list, a guest must
+/// never reach cloud-metadata, and under fleet mode also the host/control
+/// internal subnets.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum FloorMode {
+    /// Trusted single-tenant/local override (`SMOLVM_EGRESS_ALLOW_PRIVATE=1`):
+    /// floor nothing — the guest reaches exactly what the host can.
+    Off,
+    /// Local default: deny ONLY the cloud-metadata link-local range
+    /// (`169.254.0.0/16`, incl. `169.254.169.254`). The guest keeps reaching the
+    /// host's LAN/loopback, so local dev behavior is unchanged.
+    MetadataOnly,
+    /// Multi-tenant/fleet (`SMOLVM_PUBLISH_ADDR` set): the full floor — metadata,
+    /// host/control internal subnets, loopback, link/unique-local, and the
+    /// gateway CGNAT range — so a guest can't steal host credentials, pivot to
+    /// the control plane / worker API, or reach co-resident tenants.
+    Strict,
+}
+
+/// Resolve the floor from the deployment context. Read once at muxer creation
+/// (never per-packet): explicit local override wins, else fleet ⇒ strict, else
+/// the metadata-only local default.
+pub(super) fn floor_mode() -> FloorMode {
+    let allow_private = std::env::var("SMOLVM_EGRESS_ALLOW_PRIVATE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if allow_private {
+        FloorMode::Off
+    } else if std::env::var_os("SMOLVM_PUBLISH_ADDR").is_some() {
+        FloorMode::Strict
+    } else {
+        FloorMode::MetadataOnly
+    }
+}
+
+/// The cloud-metadata link-local range (`169.254.0.0/16` / `fe80::/10`) — the one
+/// destination floored in every mode except `Off`, including via an IPv4-mapped
+/// IPv6 address so it can't be smuggled past.
+fn is_link_local(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            (v6.segments()[0] & 0xffc0) == 0xfe80
+                || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_link_local())
+        }
+    }
+}
+
+/// The full multi-tenant IPv4 floor (metadata + internal + loopback + CGNAT).
+fn is_reserved_v4(v4: Ipv4Addr) -> bool {
+    v4.is_loopback()        // 127.0.0.0/8
+        || v4.is_link_local() // 169.254.0.0/16 — incl. 169.254.169.254 (cloud metadata)
+        || v4.is_private()    // 10/8, 172.16/12, 192.168/16 — host/control internal subnet
+        || v4.is_unspecified()
+        || v4.is_broadcast()
+        // 100.64.0.0/10 (CGNAT) — the gateway's own guest/gateway addresses live here.
+        || matches!(v4.octets(), [100, b, ..] if (64..=127).contains(&b))
+}
+
+/// Whether `ip` is floored under `mode` — the single hard-floor predicate. Also
+/// defeats DNS-rebinding (a learned IP in a floored range is still denied).
+fn is_floored(ip: IpAddr, mode: FloorMode) -> bool {
+    match mode {
+        FloorMode::Off => false,
+        FloorMode::MetadataOnly => is_link_local(ip),
+        FloorMode::Strict => match ip {
+            IpAddr::V4(v4) => is_reserved_v4(v4),
+            IpAddr::V6(v6) => {
+                v6.is_loopback()
+                    || v6.is_unspecified()
+                    || (v6.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
+                    || (v6.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 unique-local
+                    || v6.to_ipv4_mapped().is_some_and(is_reserved_v4)
+            }
+        },
+    }
+}
+
+/// The hard-floor check for a connect/sendto destination, applied BEFORE any
+/// allow-list (and even when there is no policy at all). Non-IP destinations
+/// (e.g. unix sockets) are never floored.
+pub(super) fn is_addr_floored(addr: &VsockAddr, mode: FloorMode) -> bool {
+    sockaddr_ip(addr).is_some_and(|ip| is_floored(ip, mode))
+}
+
 /// Work item handed from the muxer thread to the DNS worker thread. Carries an
 /// owned copy of the query and the vsock addressing needed to deliver the
 /// response — no shared handles, so passing it is cheap and lock-free.
@@ -740,5 +828,53 @@ mod tests {
     fn sockaddr_port_extracts_port() {
         assert_eq!(sockaddr_port(&sockaddr_v4(1, 1, 1, 1, 53)), Some(53));
         assert_eq!(sockaddr_port(&sockaddr_v4(1, 1, 1, 1, 853)), Some(853));
+    }
+
+    #[test]
+    fn metadata_floor_blocks_link_local_only() {
+        let meta = FloorMode::MetadataOnly;
+        // Cloud-metadata is denied even with no allow-list.
+        assert!(is_addr_floored(&sockaddr_v4(169, 254, 169, 254, 80), meta));
+        assert!(is_addr_floored(&sockaddr_v4(169, 254, 0, 1, 80), meta));
+        // Host LAN / loopback / public stay reachable in the local default.
+        assert!(!is_addr_floored(&sockaddr_v4(127, 0, 0, 1, 80), meta));
+        assert!(!is_addr_floored(&sockaddr_v4(192, 168, 1, 1, 80), meta));
+        assert!(!is_addr_floored(&sockaddr_v4(10, 0, 0, 5, 80), meta));
+        assert!(!is_addr_floored(&sockaddr_v4(1, 1, 1, 1, 443), meta));
+    }
+
+    #[test]
+    fn strict_floor_blocks_metadata_internal_and_loopback() {
+        let strict = FloorMode::Strict;
+        // Metadata + every internal/loopback/CGNAT range is denied under fleet mode.
+        assert!(is_addr_floored(
+            &sockaddr_v4(169, 254, 169, 254, 80),
+            strict
+        ));
+        assert!(is_addr_floored(&sockaddr_v4(127, 0, 0, 1, 80), strict));
+        assert!(is_addr_floored(&sockaddr_v4(10, 0, 0, 5, 80), strict));
+        assert!(is_addr_floored(&sockaddr_v4(172, 16, 0, 1, 80), strict));
+        assert!(is_addr_floored(&sockaddr_v4(192, 168, 1, 1, 80), strict));
+        assert!(is_addr_floored(&sockaddr_v4(100, 64, 0, 1, 80), strict)); // CGNAT gateway
+        // A genuine public destination is still reachable.
+        assert!(!is_addr_floored(&sockaddr_v4(1, 1, 1, 1, 443), strict));
+        assert!(!is_addr_floored(&sockaddr_v4(140, 82, 121, 4, 443), strict)); // github
+    }
+
+    #[test]
+    fn off_floor_allows_everything() {
+        let off = FloorMode::Off;
+        assert!(!is_addr_floored(&sockaddr_v4(169, 254, 169, 254, 80), off));
+        assert!(!is_addr_floored(&sockaddr_v4(10, 0, 0, 5, 80), off));
+        assert!(!is_addr_floored(&sockaddr_v4(127, 0, 0, 1, 80), off));
+    }
+
+    #[test]
+    fn ipv4_mapped_metadata_cannot_smuggle_past_floor() {
+        // ::ffff:169.254.169.254 must be floored just like the bare v4 form.
+        let mapped = Ipv4Addr::new(169, 254, 169, 254).to_ipv6_mapped();
+        let addr = VsockAddr::Inet(std::net::SocketAddrV6::new(mapped, 80, 0, 0).into());
+        assert!(is_addr_floored(&addr, FloorMode::MetadataOnly));
+        assert!(is_addr_floored(&addr, FloorMode::Strict));
     }
 }

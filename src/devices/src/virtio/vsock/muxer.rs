@@ -8,7 +8,9 @@ use super::TsiFlags;
 use super::VsockError;
 use super::defs;
 use super::defs::uapi;
-use super::dns_filter::{DnsRequest, DnsWorker, EgressPolicy, sockaddr_port};
+use super::dns_filter::{
+    DnsRequest, DnsWorker, EgressPolicy, FloorMode, floor_mode, is_addr_floored, sockaddr_port,
+};
 use super::muxer_rxq::{MuxerRxQ, rx_to_pkt};
 use super::muxer_thread::MuxerThread;
 use super::packet::TsiConnectReq;
@@ -119,8 +121,12 @@ pub struct VsockMuxer {
     unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
     tsi_flags: TsiFlags,
     /// Optional egress policy (CIDRs + DNS allow-hosts + learned IPs).
-    /// None = no policy (allow all).
+    /// None = no allow-list (allow all EXCEPT the platform hard-floor below).
     egress_policy: Option<Arc<RwLock<EgressPolicy>>>,
+    /// Platform hard-floor scope, resolved once from the deployment context. This
+    /// is applied to EVERY connect/sendto, including the no-policy default case,
+    /// so a guest can never reach cloud-metadata even with no allow-list set.
+    floor: FloorMode,
     /// Sender to the DNS worker thread; Some only when DNS filtering is active.
     dns_sender: Option<Sender<DnsRequest>>,
 }
@@ -156,15 +162,21 @@ impl VsockMuxer {
             unix_ipc_port_map,
             tsi_flags,
             egress_policy,
+            floor: floor_mode(),
             dns_sender: None,
         }
     }
 
-    /// Check if the given socket address is allowed by the egress policy.
-    /// Returns true if no policy is set (allow all), the IP matches a CIDR, or
-    /// the IP was learned from an allowed DNS answer. Fail-closed on a poisoned
-    /// policy lock.
+    /// Check if the given socket address is allowed for egress. The platform
+    /// hard-floor is enforced FIRST and unconditionally — even with no allow-list
+    /// — so a guest can never reach cloud-metadata (and, under fleet mode, the
+    /// host/control internal subnets). Past the floor: true if no allow-list is
+    /// set (allow all), the IP matches a CIDR, or the IP was learned from an
+    /// allowed DNS answer. Fail-closed on a poisoned policy lock.
     fn is_ip_allowed(&self, addr: &VsockAddr) -> bool {
+        if is_addr_floored(addr, self.floor) {
+            return false;
+        }
         let Some(policy) = &self.egress_policy else {
             return true;
         };
