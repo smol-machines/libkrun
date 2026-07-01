@@ -1039,10 +1039,16 @@ impl VirtioGpu {
                     _ => panic!("unexpected prot mode for mapping"),
                 };
 
-                if offset + resource.size > shm_region.size as u64 {
-                    error!("mapping DOES NOT FIT");
+                // A blob that does not fit the shm region must be rejected, not
+                // just logged: falling through to mmap MAP_FIXED with an
+                // out-of-range offset writes outside the region (matches the
+                // virgl_resource_map2 variant below).
+                let end = offset.checked_add(resource.size).ok_or(ErrUnspec)?;
+                if end > shm_region.size as u64 {
+                    error!("resource map doesn't fit in shm region");
+                    return Err(ErrUnspec);
                 }
-                let addr = shm_region.host_addr + offset;
+                let addr = shm_region.host_addr.checked_add(offset).ok_or(ErrUnspec)?;
                 debug!(
                     "mapping: host_addr={:x}, addr={:x}, size={}",
                     shm_region.host_addr, addr, resource.size
@@ -1094,11 +1100,12 @@ impl VirtioGpu {
             _ => panic!("unexpected prot mode for mapping"),
         };
 
-        if offset + resource.size > shm_region.size as u64 {
+        let end = offset.checked_add(resource.size).ok_or(ErrUnspec)?;
+        if end > shm_region.size as u64 {
             error!("resource map doesn't fit in shm region");
             return Err(ErrUnspec);
         }
-        let addr = shm_region.host_addr + offset;
+        let addr = shm_region.host_addr.checked_add(offset).ok_or(ErrUnspec)?;
 
         if let Ok(export) = self.rutabaga.export_blob(resource_id) {
             // SHM and DMABUF are both regular host fds whose pages can be exposed
@@ -1166,12 +1173,13 @@ impl VirtioGpu {
 
         if let Ok(export) = self.rutabaga.export_blob(resource_id) {
             if export.handle_type == RUTABAGA_MEM_HANDLE_TYPE_APPLE {
-                if offset + resource.size > shm_region.size as u64 {
+                let end = offset.checked_add(resource.size).ok_or(ErrUnspec)?;
+                if end > shm_region.size as u64 {
                     error!("mapping DOES NOT FIT");
                     return Err(ErrUnspec);
                 }
 
-                let guest_addr = shm_region.guest_addr + offset;
+                let guest_addr = shm_region.guest_addr.checked_add(offset).ok_or(ErrUnspec)?;
                 debug!(
                     "mapping: map_ptr={:x}, guest_addr={:x}, size={}",
                     map_ptr, guest_addr, resource.size
@@ -1217,7 +1225,10 @@ impl VirtioGpu {
 
         let shmem_offset = resource.shmem_offset.ok_or(ErrUnspec)?;
 
-        let addr = shm_region.host_addr + shmem_offset;
+        let addr = shm_region
+            .host_addr
+            .checked_add(shmem_offset)
+            .ok_or(ErrUnspec)?;
 
         let ret = unsafe {
             libc::mmap(
@@ -1229,8 +1240,12 @@ impl VirtioGpu {
                 0_i64,
             )
         };
+        // A failed re-map must not abort the whole VMM: surface it as an error
+        // to the guest instead of panicking (a guest could otherwise crash the
+        // host process by driving unmap into a failing mmap).
         if ret == libc::MAP_FAILED {
-            panic!("UNMAP failed");
+            error!("resource_unmap_blob: failed to unmap blob region");
+            return Err(ErrUnspec);
         }
 
         resource.shmem_offset = None;
