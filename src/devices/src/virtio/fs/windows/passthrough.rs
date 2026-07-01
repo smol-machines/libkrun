@@ -2605,8 +2605,9 @@ impl FileSystem for PassthroughFs {
             return Err(io::Error::from_raw_os_error(libc::EINVAL));
         }
 
-        if (moffset + len) > shm_size {
-            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        let end = moffset.checked_add(len).ok_or_else(einval)?;
+        if end > shm_size {
+            return Err(einval());
         }
 
         let is_write = (flags & (fuse::SetupmappingFlags::WRITE.bits() as u64)) != 0;
@@ -2621,7 +2622,7 @@ impl FileSystem for PassthroughFs {
             FILE_MAP_READ
         };
 
-        let addr = host_shm_base + moffset;
+        let addr = host_shm_base.checked_add(moffset).ok_or_else(einval)?;
         debug!("setupmapping: ino {inode:?} addr={addr:x} len={len}");
 
         let file = self

@@ -2555,11 +2555,13 @@ impl FileSystem for PassthroughFs {
             libc::PROT_READ
         };
 
-        if (moffset + len) > shm_size {
-            return Err(linux_error(io::Error::from_raw_os_error(libc::EINVAL)));
+        let einval = || linux_error(io::Error::from_raw_os_error(libc::EINVAL));
+        let end = moffset.checked_add(len).ok_or_else(einval)?;
+        if end > shm_size {
+            return Err(einval());
         }
 
-        let guest_addr = guest_shm_base + moffset;
+        let guest_addr = guest_shm_base.checked_add(moffset).ok_or_else(einval)?;
 
         debug!("setupmapping: ino {inode:?} guest_addr={guest_addr:x} len={len}");
 
@@ -2620,10 +2622,12 @@ impl FileSystem for PassthroughFs {
         }
 
         for req in requests {
-            let guest_addr = guest_shm_base + req.moffset;
-            if (req.moffset + req.len) > shm_size {
-                return Err(linux_error(io::Error::from_raw_os_error(libc::EINVAL)));
+            let einval = || linux_error(io::Error::from_raw_os_error(libc::EINVAL));
+            let end = req.moffset.checked_add(req.len).ok_or_else(einval)?;
+            if end > shm_size {
+                return Err(einval());
             }
+            let guest_addr = guest_shm_base.checked_add(req.moffset).ok_or_else(einval)?;
             let host_addr = match self.map_windows.lock().unwrap().remove(&guest_addr) {
                 Some(a) => a,
                 None => return Err(linux_error(io::Error::from_raw_os_error(libc::EINVAL))),

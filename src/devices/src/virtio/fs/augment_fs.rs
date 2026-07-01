@@ -658,11 +658,14 @@ impl<T: FileSystem<Inode = Inode, Handle = Handle>> FileSystem for AugmentFs<T> 
                 let data = vnode.data().ok_or_else(linux_errno::eisdir)?;
                 #[cfg(target_os = "linux")]
                 {
-                    if (moffset + len) > shm_size {
+                    let end = moffset.checked_add(len).ok_or_else(linux_errno::einval)?;
+                    if end > shm_size {
                         return Err(linux_errno::einval());
                     }
 
-                    let addr = host_shm_base + moffset;
+                    let addr = host_shm_base
+                        .checked_add(moffset)
+                        .ok_or_else(linux_errno::einval)?;
                     let ret = unsafe {
                         libc::mmap(
                             addr as *mut libc::c_void,

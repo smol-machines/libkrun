@@ -2210,11 +2210,16 @@ impl FileSystem for PassthroughFs {
             libc::PROT_READ
         };
 
-        if (moffset + len) > shm_size {
+        // Guard against a malicious guest supplying a moffset/len that wraps
+        // u64: an unchecked `moffset + len` or `host_shm_base + moffset` could
+        // pass the bounds check and then mmap MAP_FIXED outside the shared
+        // window, corrupting host memory. Reject any request that overflows.
+        let end = moffset.checked_add(len).ok_or_else(einval)?;
+        if end > shm_size {
             return Err(einval());
         }
 
-        let addr = host_shm_base + moffset;
+        let addr = host_shm_base.checked_add(moffset).ok_or_else(einval)?;
 
         debug!("setupmapping: ino {inode:?} addr={addr:x} len={len}");
 
@@ -2246,10 +2251,13 @@ impl FileSystem for PassthroughFs {
         shm_size: u64,
     ) -> io::Result<()> {
         for req in requests {
-            let addr = host_shm_base + req.moffset;
-            if (req.moffset + req.len) > shm_size {
+            // Reject wrapping offsets before computing the mmap target (see
+            // setupmapping): a wrapped addr would MAP_FIXED outside the window.
+            let end = req.moffset.checked_add(req.len).ok_or_else(einval)?;
+            if end > shm_size {
                 return Err(einval());
             }
+            let addr = host_shm_base.checked_add(req.moffset).ok_or_else(einval)?;
             debug!("removemapping: addr={:x} len={:?}", addr, req.len);
             let ret = unsafe {
                 libc::mmap(
