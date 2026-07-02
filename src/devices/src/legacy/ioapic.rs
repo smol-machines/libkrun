@@ -72,6 +72,39 @@ impl IoApicRegs {
             self.ioredtbl[index] &= !IOAPIC_LVT_REMOTE_IRR;
         }
     }
+
+    /// Serialize for a VM checkpoint: fixed little-endian layout of every
+    /// guest-visible register. A userspace IOAPIC's redirection table lives only
+    /// in this process, so unlike an in-kernel chip it must ride the checkpoint
+    /// explicitly or a restored clone boots with all pins masked (device IRQs —
+    /// e.g. vsock — are then never delivered).
+    fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(3 + 4 + IOAPIC_NUM_PINS * 8);
+        out.push(self.id);
+        out.push(self.ioregsel);
+        out.push(self.version);
+        out.extend_from_slice(&self.irr.to_le_bytes());
+        for entry in &self.ioredtbl {
+            out.extend_from_slice(&entry.to_le_bytes());
+        }
+        out
+    }
+
+    /// Apply state captured by [`Self::serialize`]. Returns false (leaving the
+    /// regs untouched) on a size mismatch.
+    fn deserialize_into(&mut self, bytes: &[u8]) -> bool {
+        if bytes.len() != 3 + 4 + IOAPIC_NUM_PINS * 8 {
+            return false;
+        }
+        self.id = bytes[0];
+        self.ioregsel = bytes[1];
+        self.version = bytes[2];
+        self.irr = u32::from_le_bytes(bytes[3..7].try_into().unwrap());
+        for (i, chunk) in bytes[7..].chunks_exact(8).enumerate() {
+            self.ioredtbl[i] = u64::from_le_bytes(chunk.try_into().unwrap());
+        }
+        true
+    }
 }
 
 // Implemented per hypervisor to handle interrupt injection and routing.
@@ -129,6 +162,17 @@ impl<B: IoApicBackend> IrqChipT for Ioapic<B> {
         let mut inner = self.inner.lock().unwrap();
         let IoapicInner { regs, backend } = &mut *inner;
         backend.set_irq(irq_line, interrupt_evt, regs)
+    }
+
+    fn save_state(&self) -> Option<Vec<u8>> {
+        Some(self.inner.lock().unwrap().regs.serialize())
+    }
+
+    fn restore_state(&self, bytes: &[u8]) {
+        let mut inner = self.inner.lock().unwrap();
+        if !inner.regs.deserialize_into(bytes) {
+            error!("ioapic: checkpoint state has unexpected size; leaving reset state");
+        }
     }
 }
 

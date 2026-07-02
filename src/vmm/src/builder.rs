@@ -1073,6 +1073,8 @@ pub fn build_microvm(
         mmio_device_manager,
         #[cfg(target_arch = "x86_64")]
         pio_device_manager,
+        #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+        intc: intc.clone(),
     };
 
     // Set raw mode for FDs that are connected to legacy serial devices.
