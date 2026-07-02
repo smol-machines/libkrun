@@ -75,7 +75,16 @@ jobs:
           sudo make install
       
       - name: Install libkrunfw
-        run: TAG=`curl -sL https://api.github.com/repos/containers/libkrunfw/releases/latest |jq -r .tag_name` && curl -L -o /tmp/libkrunfw-x86_64.tgz https://github.com/containers/libkrunfw/releases/download/$TAG/libkrunfw-x86_64.tgz && mkdir tmp && tar xf /tmp/libkrunfw-x86_64.tgz -C tmp && sudo mv tmp/lib64/* /lib/x86_64-linux-gnu
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Authenticate the API call so it is not throttled by GitHub's 60/hr
+          # anonymous rate limit, which resolves TAG to null and makes the asset
+          # download 404 with a 9-byte "Not Found" that tar then chokes on.
+          TAG=$(curl -sfL -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/containers/libkrunfw/releases/latest | jq -r .tag_name)
+          [ -n "$TAG" ] && [ "$TAG" != "null" ] || { echo "failed to resolve libkrunfw release tag"; exit 1; }
+          curl -fL --retry 3 -o /tmp/libkrunfw-x86_64.tgz "https://github.com/containers/libkrunfw/releases/download/$TAG/libkrunfw-x86_64.tgz"
+          mkdir tmp && tar xf /tmp/libkrunfw-x86_64.tgz -C tmp && sudo mv tmp/lib64/* /lib/x86_64-linux-gnu
       
       - name: Integration tests
         run: KRUN_ENOMEM_WORKAROUND=1 KRUN_TEST_BASE_DIR=/tmp/libkrun-tests make test NET=1 BLK=1 IPERF_DURATION=3 TEST_FLAGS="--keep-all --github-summary"
@@ -157,7 +166,16 @@ jobs:
           sudo make install
       
       - name: Install libkrunfw
-        run: TAG=`curl -sL https://api.github.com/repos/containers/libkrunfw/releases/latest |jq -r .tag_name` && curl -L -o /tmp/libkrunfw-aarch64.tgz https://github.com/containers/libkrunfw/releases/download/$TAG/libkrunfw-aarch64.tgz && mkdir tmp && tar xf /tmp/libkrunfw-aarch64.tgz -C tmp && sudo mv tmp/lib64/* /lib/aarch64-linux-gnu
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Authenticate the API call so it is not throttled by GitHub's 60/hr
+          # anonymous rate limit, which resolves TAG to null and makes the asset
+          # download 404 with a 9-byte "Not Found" that tar then chokes on.
+          TAG=$(curl -sfL -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/containers/libkrunfw/releases/latest | jq -r .tag_name)
+          [ -n "$TAG" ] && [ "$TAG" != "null" ] || { echo "failed to resolve libkrunfw release tag"; exit 1; }
+          curl -fL --retry 3 -o /tmp/libkrunfw-aarch64.tgz "https://github.com/containers/libkrunfw/releases/download/$TAG/libkrunfw-aarch64.tgz"
+          mkdir tmp && tar xf /tmp/libkrunfw-aarch64.tgz -C tmp && sudo mv tmp/lib64/* /lib/aarch64-linux-gnu
 
       - name: Clean up tests directory
         run: rm -fr /tmp/libkrun-tests
