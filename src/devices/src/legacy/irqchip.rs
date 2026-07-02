@@ -35,6 +35,19 @@ impl IrqChipDevice {
     ) -> Result<(), DeviceError> {
         self.inner.set_irq(irq_line, interrupt_evt)
     }
+
+    /// Checkpoint the chip's userspace register state, if it has any (see
+    /// [`IrqChipT::save_state`]).
+    #[cfg(target_arch = "x86_64")]
+    pub fn save_state(&self) -> Option<Vec<u8>> {
+        self.inner.save_state()
+    }
+
+    /// Restore state captured by [`Self::save_state`].
+    #[cfg(target_arch = "x86_64")]
+    pub fn restore_state(&self, bytes: &[u8]) {
+        self.inner.restore_state(bytes)
+    }
 }
 
 impl BusDevice for IrqChipDevice {
@@ -121,6 +134,17 @@ pub trait IrqChipT: BusDevice {
         irq_line: Option<u32>,
         interrupt_evt: Option<&EventFd>,
     ) -> Result<(), DeviceError>;
+
+    /// Capture interrupt-controller state for a VM checkpoint. Only chips whose
+    /// registers live in userspace (e.g. the WHP software IOAPIC) return state;
+    /// in-kernel chips are captured through the hypervisor's `VmState` instead
+    /// and keep the `None` default.
+    fn save_state(&self) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// Apply state captured by [`Self::save_state`]. Default: no-op.
+    fn restore_state(&self, _bytes: &[u8]) {}
 }
 
 #[cfg(target_arch = "aarch64")]

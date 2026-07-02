@@ -227,6 +227,12 @@ pub struct VmCheckpoint {
     pub vcpu_states: Vec<vstate::VcpuState>,
     /// Virtio device runtime state (queues, negotiated features, etc.).
     pub devices: devices::virtio::persist::VmDevicesState,
+    /// Userspace interrupt-controller registers. `None` on hypervisors whose
+    /// IRQ chip is in-kernel and already inside `vm_state` (KVM) or captured
+    /// separately (HVF GIC distributor). On WHP the IOAPIC is a software device
+    /// in this process; without this section a restored clone boots with an
+    /// all-masked redirection table and device IRQs (e.g. vsock) never arrive.
+    pub ioapic: Option<Vec<u8>>,
 }
 
 #[cfg(snapshot_supported)]
@@ -247,6 +253,8 @@ impl VmCheckpoint {
             put(&mut out, &v.serialize());
         }
         put(&mut out, &self.devices.to_bytes().unwrap_or_default());
+        // Userspace IRQ-chip section; empty means "none" (in-kernel chip).
+        put(&mut out, self.ioapic.as_deref().unwrap_or(&[]));
         out
     }
 
@@ -277,10 +285,19 @@ impl VmCheckpoint {
             vcpu_states.push(vstate::VcpuState::deserialize(take(bytes, &mut pos)?)?);
         }
         let devices = devices::virtio::persist::VmDevicesState::from_bytes(take(bytes, &mut pos)?)?;
+        // Userspace IRQ-chip section: empty (or absent, for blobs written before
+        // the section existed) means the chip is in-kernel and rides vm_state.
+        let ioapic = if pos < bytes.len() {
+            let b = take(bytes, &mut pos)?;
+            (!b.is_empty()).then(|| b.to_vec())
+        } else {
+            None
+        };
         Ok(VmCheckpoint {
             vm_state,
             vcpu_states,
             devices,
+            ioapic,
         })
     }
 }
@@ -305,6 +322,10 @@ pub struct Vmm {
     mmio_device_manager: MMIODeviceManager,
     #[cfg(target_arch = "x86_64")]
     pio_device_manager: PortIODeviceManager,
+    /// The interrupt controller, held for checkpoint/restore of userspace IRQ
+    /// chips (the WHP software IOAPIC — see [`VmCheckpoint::ioapic`]).
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    intc: devices::legacy::IrqChip,
 }
 
 impl Vmm {
@@ -395,6 +416,14 @@ impl Vmm {
         self.vm
             .restore_state(&checkpoint.vm_state)
             .map_err(Error::Vm)?;
+        // Restore the userspace IRQ chip (WHP software IOAPIC) before devices
+        // re-activate: a fresh chip has every redirection entry masked, so an
+        // IRQ raised earlier than this would be dropped and the clone's vsock
+        // never delivers.
+        #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+        if let Some(bytes) = &checkpoint.ioapic {
+            self.intc.lock().unwrap().restore_state(bytes);
+        }
         self.restore_activate_devices(&checkpoint.devices)
             .map_err(Error::Snapshot)?;
         self.restore_vcpu_states(checkpoint.vcpu_states)?;
@@ -626,11 +655,16 @@ impl Vmm {
             .map_err(|e| Error::Snapshot(format!("guest-memory dump: {e}")))?;
         // Re-arm workers so the original VM can resume from this checkpoint.
         self.rearm_devices();
+        #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+        let ioapic = self.intc.lock().unwrap().save_state();
+        #[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
+        let ioapic = None;
         Ok((
             VmCheckpoint {
                 vm_state,
                 vcpu_states,
                 devices,
+                ioapic,
             },
             mem_descs,
         ))
@@ -664,6 +698,12 @@ impl Vmm {
         self.vm
             .restore_state(&checkpoint.vm_state)
             .map_err(Error::Vm)?;
+        // See apply_restore: the WHP software IOAPIC must be restored before
+        // devices signal or their IRQs hit an all-masked redirection table.
+        #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+        if let Some(bytes) = &checkpoint.ioapic {
+            self.intc.lock().unwrap().restore_state(bytes);
+        }
         self.restore_devices(&checkpoint.devices)
             .map_err(Error::Snapshot)?;
         self.restore_vcpu_states(checkpoint.vcpu_states)?;
@@ -698,6 +738,8 @@ impl Vmm {
                 vm_state,
                 vcpu_states,
                 devices,
+                // Linux-only path; KVM's IOAPIC is in-kernel and rides vm_state.
+                ioapic: None,
             },
             mem_clone,
         ))
@@ -751,11 +793,16 @@ impl Vmm {
         let descs = snapshot::memfd_region_descs(&self.guest_memory);
         // Intentionally NOT re-armed/resumed: the golden stays frozen as the
         // shared CoW base for its clones.
+        #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+        let ioapic = self.intc.lock().unwrap().save_state();
+        #[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
+        let ioapic = None;
         Ok((
             VmCheckpoint {
                 vm_state,
                 vcpu_states,
                 devices,
+                ioapic,
             },
             descs,
         ))
