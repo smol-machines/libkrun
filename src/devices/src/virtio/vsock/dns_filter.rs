@@ -207,10 +207,33 @@ pub(super) enum FloorMode {
     Strict,
 }
 
+/// Parse an explicit `SMOLVM_EGRESS_FLOOR` value into a mode. Returns `None`
+/// for an absent/unrecognized value so the caller falls back to the inferred
+/// default. Pure (no env) so it is unit-testable.
+fn parse_floor_override(v: &str) -> Option<FloorMode> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "strict" => Some(FloorMode::Strict),
+        "metadata" | "metadata-only" | "metadataonly" => Some(FloorMode::MetadataOnly),
+        "off" | "none" => Some(FloorMode::Off),
+        _ => None,
+    }
+}
+
 /// Resolve the floor from the deployment context. Read once at muxer creation
-/// (never per-packet): explicit local override wins, else fleet ⇒ strict, else
-/// the metadata-only local default.
+/// (never per-packet): explicit `SMOLVM_EGRESS_FLOOR` override wins, else the
+/// `ALLOW_PRIVATE` opt-out, else fleet ⇒ strict, else the metadata-only default.
 pub(super) fn floor_mode() -> FloorMode {
+    // Explicit override wins (highest precedence). A multi-tenant node sets
+    // `SMOLVM_EGRESS_FLOOR=strict` so the TSI floor is fail-closed and never
+    // silently degrades to metadata-only (loopback/RFC1918 reachable) if
+    // `SMOLVM_PUBLISH_ADDR` is missing from the environment — a dropped env var
+    // must NOT expose the host loopback control door / co-tenants to a guest.
+    if let Some(mode) = std::env::var("SMOLVM_EGRESS_FLOOR")
+        .ok()
+        .and_then(|v| parse_floor_override(&v))
+    {
+        return mode;
+    }
     let allow_private = std::env::var("SMOLVM_EGRESS_ALLOW_PRIVATE")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
@@ -636,6 +659,20 @@ fn read_u32(buf: &[u8], offset: usize) -> Result<u32, ()> {
 mod tests {
     use super::*;
     use std::net::SocketAddrV4;
+
+    #[test]
+    fn floor_override_parsing() {
+        assert_eq!(parse_floor_override("strict"), Some(FloorMode::Strict));
+        assert_eq!(parse_floor_override("  STRICT "), Some(FloorMode::Strict));
+        assert_eq!(
+            parse_floor_override("metadata"),
+            Some(FloorMode::MetadataOnly)
+        );
+        assert_eq!(parse_floor_override("off"), Some(FloorMode::Off));
+        assert_eq!(parse_floor_override("none"), Some(FloorMode::Off));
+        assert_eq!(parse_floor_override(""), None);
+        assert_eq!(parse_floor_override("bogus"), None);
+    }
 
     fn query_for(name: &str) -> Vec<u8> {
         let mut query = vec![
