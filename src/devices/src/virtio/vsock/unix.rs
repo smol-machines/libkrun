@@ -477,7 +477,7 @@ impl Proxy for UnixProxy {
         todo!();
     }
 
-    fn shutdown(&mut self, pkt: &VsockPacket) {
+    fn shutdown(&mut self, pkt: &VsockPacket) -> ProxyUpdate {
         let recv_off = pkt.flags() & uapi::VSOCK_FLAGS_SHUTDOWN_RCV != 0;
         let send_off = pkt.flags() & uapi::VSOCK_FLAGS_SHUTDOWN_SEND != 0;
 
@@ -492,6 +492,7 @@ impl Proxy for UnixProxy {
         if let Err(e) = self.sock.shutdown(how) {
             warn!("error sending shutdown to socket: {e}");
         }
+        ProxyUpdate::default()
     }
 
     fn release(&mut self) -> ProxyUpdate {

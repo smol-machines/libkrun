@@ -805,7 +805,24 @@ impl Proxy for TsiStreamProxy {
         push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
     }
 
-    fn shutdown(&mut self, pkt: &VsockPacket) {
+    fn shutdown(&mut self, pkt: &VsockPacket) -> ProxyUpdate {
+        // Linux semantics for shutting down a LISTENING socket: any blocked
+        // accept() fails with EINVAL. Without waking it, the guest acceptor —
+        // and every syscall serialized behind the in-kernel socket lock it
+        // holds (including this shutdown's caller) — hangs forever.
+        if self.status == ProxyStatus::WaitingOnAccept {
+            self.status = ProxyStatus::Listening;
+            self.push_accept_rsp(-libc::EINVAL);
+            return ProxyUpdate {
+                signal_queue: true,
+                ..Default::default()
+            };
+        }
+        if self.status == ProxyStatus::Listening {
+            // Host-side TcpListener has no shutdown; nothing else to do.
+            return ProxyUpdate::default();
+        }
+
         let recv_off = pkt.flags() & uapi::VSOCK_FLAGS_SHUTDOWN_RCV != 0;
         let send_off = pkt.flags() & uapi::VSOCK_FLAGS_SHUTDOWN_SEND != 0;
 
@@ -820,6 +837,7 @@ impl Proxy for TsiStreamProxy {
         if let Err(e) = self.sock.shutdown(how) {
             warn!("error sending shutdown to socket: {e}");
         }
+        ProxyUpdate::default()
     }
 
     fn release(&mut self) -> ProxyUpdate {
