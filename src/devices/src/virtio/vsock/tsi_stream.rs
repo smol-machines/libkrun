@@ -55,6 +55,11 @@ pub struct TsiStreamProxy {
     listen_guest_port: u16,
     /// Listen backlog requested by the guest, for the same reason.
     listen_backlog: i32,
+    /// Set once the remote peer half-closed its send side (our recv hit EOF) and
+    /// we forwarded a partial SHUTDOWN to the guest. Guards against re-sending
+    /// the shutdown and marks that remote→guest is done while guest→remote still
+    /// flows.
+    local_read_shutdown: bool,
 }
 
 impl TsiStreamProxy {
@@ -130,6 +135,7 @@ impl TsiStreamProxy {
             unixsock_path: None,
             listen_guest_port: 0,
             listen_backlog: 0,
+            local_read_shutdown: false,
         })
     }
 
@@ -171,6 +177,7 @@ impl TsiStreamProxy {
             unixsock_path: None,
             listen_guest_port: 0,
             listen_backlog: 0,
+            local_read_shutdown: false,
         }
     }
 
@@ -402,6 +409,26 @@ impl TsiStreamProxy {
         let rx = MuxerRx::Reset {
             local_port: self.local_port,
             peer_port: self.peer_port,
+        };
+        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+    }
+
+    /// Forward a partial SHUTDOWN toward the guest. Used when the remote peer
+    /// half-closes (our recv hits EOF) so the guest sees an orderly end-of-data
+    /// on its receive half while the proxy keeps forwarding guest→remote — a full
+    /// RST here would drop any output the guest is still sending after a remote
+    /// server closes only its write side.
+    fn push_shutdown(&self, flags: u32) {
+        debug!(
+            "push_shutdown: id: {}, peer_port: {}, local_port: {}, flags: {}",
+            self.id, self.peer_port, self.local_port, flags
+        );
+
+        let rx = MuxerRx::Shutdown {
+            local_port: self.local_port,
+            peer_port: self.peer_port,
+            flags,
+            fwd_cnt: self.tx_cnt.0,
         };
         push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
     }
@@ -911,12 +938,25 @@ impl Proxy for TsiStreamProxy {
                 }
 
                 if self.status == ProxyStatus::PeerClosed {
-                    debug!("process_event: peer closed, sending reset: id={}", self.id);
-                    self.push_reset();
-                    self.status = ProxyStatus::Closed;
+                    // The remote peer half-closed its send side (our recv hit
+                    // EOF). Forward a partial SHUTDOWN so the guest sees an
+                    // orderly end-of-data on its receive half, but keep the proxy
+                    // alive so guest→remote output still flows — a full RST here
+                    // silently drops output the guest is still sending after a
+                    // remote server that closes only its write side. Stop polling
+                    // the fd (the EOF is level-triggered and would spin); the
+                    // proxy is reaped when the guest closes its half.
+                    debug!(
+                        "process_event: peer half-closed, forwarding shutdown: id={}",
+                        self.id
+                    );
+                    if !self.local_read_shutdown {
+                        self.push_shutdown(uapi::VSOCK_FLAGS_SHUTDOWN_SEND);
+                        self.local_read_shutdown = true;
+                    }
+                    self.status = ProxyStatus::Connected;
                     update.signal_queue = true;
                     update.polling = Some((self.id(), raw_handle(&self.sock), EventSet::empty()));
-                    update.remove_proxy = ProxyRemoval::Deferred;
                     return update;
                 } else if self.status == ProxyStatus::WaitingCreditUpdate {
                     debug!("process_event: WaitingCreditUpdate");
