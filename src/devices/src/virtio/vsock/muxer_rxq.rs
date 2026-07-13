@@ -115,6 +115,27 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
                 .set_buf_alloc(0)
                 .set_fwd_cnt(0);
         }
+        MuxerRx::Shutdown {
+            local_port,
+            peer_port,
+            flags,
+            fwd_cnt,
+        } => {
+            // Carry the real buf_alloc/fwd_cnt (not 0): the guest updates its
+            // view of our receive window from every packet header, so a zeroed
+            // credit here would stall a guest that still wants to send output
+            // back after the half-close.
+            pkt.set_op(uapi::VSOCK_OP_SHUTDOWN)
+                .set_src_cid(uapi::VSOCK_HOST_CID)
+                .set_dst_cid(cid)
+                .set_src_port(local_port)
+                .set_dst_port(peer_port)
+                .set_len(0)
+                .set_type(uapi::VSOCK_TYPE_STREAM)
+                .set_flags(flags)
+                .set_buf_alloc(defs::CONN_TX_BUF_SIZE as u32)
+                .set_fwd_cnt(fwd_cnt);
+        }
         MuxerRx::ConnResponse {
             local_port,
             peer_port,
