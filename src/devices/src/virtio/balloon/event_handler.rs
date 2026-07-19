@@ -15,7 +15,7 @@ impl Balloon {
     }
 
     pub(crate) fn handle_ifq_event(&mut self, event: &EpollEvent) {
-        error!("balloon: unsupported inflate queue event");
+        debug!("balloon: inflate queue event");
 
         let event_set = event.event_set();
         if event_set != EventSet::IN {
@@ -25,11 +25,13 @@ impl Balloon {
 
         if let Err(e) = self.queue_event(IFQ_INDEX).read() {
             error!("Failed to read balloon inflate queue event: {e:?}");
+        } else if self.process_ifq() {
+            self.device_state.signal_used_queue();
         }
     }
 
     pub(crate) fn handle_dfq_event(&mut self, event: &EpollEvent) {
-        error!("balloon: unsupported deflate queue event");
+        debug!("balloon: deflate queue event");
 
         let event_set = event.event_set();
         if event_set != EventSet::IN {
@@ -38,7 +40,9 @@ impl Balloon {
         }
 
         if let Err(e) = self.queue_event(DFQ_INDEX).read() {
-            error!("Failed to read balloon inflate queue event: {e:?}");
+            error!("Failed to read balloon deflate queue event: {e:?}");
+        } else if self.process_dfq() {
+            self.device_state.signal_used_queue();
         }
     }
 

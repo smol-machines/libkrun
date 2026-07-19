@@ -320,6 +320,9 @@ pub struct Vmm {
 
     // Guest VM devices.
     mmio_device_manager: MMIODeviceManager,
+    /// Balloon device handle for runtime target control (idle-squeeze).
+    #[cfg(not(feature = "tee"))]
+    balloon: Option<Arc<Mutex<devices::virtio::Balloon>>>,
     #[cfg(target_arch = "x86_64")]
     pio_device_manager: PortIODeviceManager,
     /// The interrupt controller, held for checkpoint/restore of userspace IRQ
@@ -329,6 +332,32 @@ pub struct Vmm {
 }
 
 impl Vmm {
+    #[cfg(not(feature = "tee"))]
+    pub(crate) fn set_balloon(&mut self, balloon: Arc<Mutex<devices::virtio::Balloon>>) {
+        self.balloon = Some(balloon);
+    }
+
+    /// Ask the guest to inflate/deflate its balloon to `mib` MiB (0 fully
+    /// deflates). Returns `(target_pages, actual_pages)` after applying.
+    #[cfg(not(feature = "tee"))]
+    pub fn balloon_set_target_mib(
+        &mut self,
+        mib: u32,
+    ) -> std::result::Result<(u32, u32), &'static str> {
+        let balloon = self.balloon.as_ref().ok_or("no balloon device")?;
+        let mut b = balloon.lock().unwrap();
+        b.set_target_pages(mib.saturating_mul(256));
+        Ok(b.pages())
+    }
+
+    /// Current balloon `(target_pages, actual_pages)`.
+    #[cfg(not(feature = "tee"))]
+    pub fn balloon_pages(&self) -> std::result::Result<(u32, u32), &'static str> {
+        let balloon = self.balloon.as_ref().ok_or("no balloon device")?;
+        let b = balloon.lock().unwrap();
+        Ok(b.pages())
+    }
+
     /// The guest RAM regions as `(guest_physical_start, host_virtual_addr, len)`
     /// triples.
     ///

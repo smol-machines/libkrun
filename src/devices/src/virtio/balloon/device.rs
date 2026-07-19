@@ -5,7 +5,7 @@ use std::convert::TryInto;
 use std::io::Write;
 
 use utils::eventfd::EventFd;
-use vm_memory::{ByteValued, GuestMemory, GuestMemoryMmap};
+use vm_memory::{Address, ByteValued, Bytes, GuestMemory, GuestMemoryMmap};
 
 use super::super::{
     ActivateError, ActivateResult, BalloonError, DeviceQueue, DeviceState, QueueConfig,
@@ -75,6 +75,23 @@ impl Balloon {
         defs::BALLOON_DEV_ID
     }
 
+    /// Host-side target: ask the guest to inflate the balloon to `pages`
+    /// 4 KiB pages (0 fully deflates). Takes effect via a config-change
+    /// interrupt; the guest driver in/deflates toward the target and updates
+    /// `actual` in config space as it goes.
+    pub fn set_target_pages(&mut self, pages: u32) {
+        self.config.num_pages = pages;
+        if let DeviceState::Activated(_, ref interrupt) = self.device_state {
+            interrupt.signal_config_change();
+        }
+    }
+
+    /// (target, actual) balloon size in 4 KiB pages, as last written by the
+    /// host and guest respectively.
+    pub fn pages(&self) -> (u32, u32) {
+        (self.config.num_pages, self.config.actual)
+    }
+
     pub fn process_frq(&mut self) -> bool {
         debug!("balloon: process_frq()");
         let mem = match self.device_state {
@@ -136,6 +153,119 @@ impl Balloon {
 
         have_used
     }
+
+    /// Inflate queue: the guest surrenders pages as arrays of little-endian
+    /// u32 PFNs (4 KiB units). Coalesce consecutive PFNs into runs and release
+    /// each run exactly like a free-page report — the guest will not touch
+    /// these pages until it deflates them, and deflated pages come back
+    /// zero-filled (refault path / fresh anonymous pages), which the driver
+    /// tolerates because we do not negotiate MUST_TELL_HOST semantics beyond
+    /// the queue itself.
+    pub fn process_ifq(&mut self) -> bool {
+        debug!("balloon: process_ifq()");
+        let mem = match self.device_state {
+            DeviceState::Activated(ref mem, _) => mem,
+            DeviceState::Inactive => unreachable!(),
+        };
+        let queues = self
+            .queues
+            .as_mut()
+            .expect("queues should exist when activated");
+        let mut have_used = false;
+
+        while let Some(head) = queues[IFQ_INDEX].queue.pop(mem) {
+            let index = head.index;
+            for desc in head.into_iter() {
+                let count = desc.len as usize / 4;
+                let mut run_start: u64 = 0;
+                let mut run_len: u64 = 0;
+                for i in 0..count {
+                    let pfn: u32 = match mem.read_obj(desc.addr.unchecked_add(i as u64 * 4)) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            error!("balloon: bad inflate pfn buffer: {e:?}");
+                            break;
+                        }
+                    };
+                    let gpa = u64::from(pfn) << 12;
+                    if run_len > 0 && gpa == run_start + run_len {
+                        run_len += 4096;
+                    } else {
+                        if run_len > 0 {
+                            release_guest_range(mem, run_start, run_len);
+                        }
+                        run_start = gpa;
+                        run_len = 4096;
+                    }
+                }
+                if run_len > 0 {
+                    release_guest_range(mem, run_start, run_len);
+                }
+            }
+            have_used = true;
+            if let Err(e) = queues[IFQ_INDEX].queue.add_used(mem, index, 0) {
+                error!("failed to add used elements to the inflate queue: {e:?}");
+            }
+        }
+        have_used
+    }
+
+    /// Deflate queue: the guest reclaims pages from the balloon. Nothing to
+    /// release — the pages materialize on access (refault remap on macOS,
+    /// fresh anonymous pages on Linux) — so just ack the descriptors.
+    pub fn process_dfq(&mut self) -> bool {
+        debug!("balloon: process_dfq()");
+        let mem = match self.device_state {
+            DeviceState::Activated(ref mem, _) => mem,
+            DeviceState::Inactive => unreachable!(),
+        };
+        let queues = self
+            .queues
+            .as_mut()
+            .expect("queues should exist when activated");
+        let mut have_used = false;
+
+        while let Some(head) = queues[DFQ_INDEX].queue.pop(mem) {
+            let index = head.index;
+            have_used = true;
+            if let Err(e) = queues[DFQ_INDEX].queue.add_used(mem, index, 0) {
+                error!("failed to add used elements to the deflate queue: {e:?}");
+            }
+        }
+        have_used
+    }
+}
+
+/// Release a guest range surrendered by the balloon (free-page report or
+/// inflate): unmap+purge on macOS when reclaim is enabled, otherwise the
+/// per-OS madvise/discard fallback. Sub-host-page runs are silently skipped
+/// by the reclaim path's inward alignment.
+fn release_guest_range(mem: &GuestMemoryMmap, gpa: u64, len: u64) {
+    use vm_memory::GuestAddress;
+    let host_addr = match mem.get_host_address(GuestAddress(gpa)) {
+        Ok(p) => p,
+        Err(e) => {
+            error!("balloon: inflate range outside guest memory: 0x{gpa:x}+{len}: {e:?}");
+            return;
+        }
+    };
+    #[cfg(target_os = "macos")]
+    if hvf::balloon_reclaim_enabled() {
+        hvf::balloon_reclaim_range(gpa, host_addr as u64, len);
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    let advice = libc::MADV_DONTNEED;
+    #[cfg(target_os = "macos")]
+    let advice = libc::MADV_FREE_REUSABLE;
+    #[cfg(unix)]
+    unsafe {
+        libc::madvise(host_addr as *mut libc::c_void, len as usize, advice)
+    };
+    #[cfg(target_os = "windows")]
+    unsafe {
+        DiscardVirtualMemory(host_addr as *mut core::ffi::c_void, len as usize)
+    };
 }
 
 impl VirtioDevice for Balloon {
@@ -178,6 +308,12 @@ impl VirtioDevice for Balloon {
     }
 
     fn write_config(&mut self, offset: u64, data: &[u8]) {
+        // The guest driver reports the balloon's current size by writing
+        // `actual` (offset 4, 4 bytes LE). Everything else is host-owned.
+        if offset == 4 && data.len() == 4 {
+            self.config.actual = u32::from_le_bytes(data.try_into().unwrap());
+            return;
+        }
         warn!(
             "balloon: guest driver attempted to write device config (offset={:x}, len={:x})",
             offset,

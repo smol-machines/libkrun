@@ -1071,6 +1071,8 @@ pub fn build_microvm(
         exit_code: exit_code.clone(),
         vm,
         mmio_device_manager,
+        #[cfg(not(feature = "tee"))]
+        balloon: None,
         #[cfg(target_arch = "x86_64")]
         pio_device_manager,
         #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
@@ -3038,6 +3040,8 @@ fn attach_balloon_device(
         .map_err(RegisterEvent)?;
 
     let id = String::from(balloon.lock().unwrap().id());
+
+    vmm.set_balloon(balloon.clone());
 
     // The device mutex mustn't be locked here otherwise it will deadlock.
     attach_mmio_device(vmm, id, intc.clone(), balloon).map_err(RegisterBalloonDevice)?;

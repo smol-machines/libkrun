@@ -692,6 +692,29 @@ fn handle_control_stream<S: std::io::Read + std::io::Write>(
                     let state = vmm.lock().unwrap().run_state();
                     format!("OK {state}\n")
                 }
+                // BALLOON <mib>: ask the guest to inflate its balloon to <mib>
+                // MiB (0 deflates fully); the freed pages are reclaimed by the
+                // host as the guest surrenders them. BALLOON with no argument
+                // reports "target actual" in MiB (actual is guest-reported and
+                // lags while in/deflation is in progress).
+                #[cfg(not(feature = "tee"))]
+                "BALLOON" => {
+                    let mut vmm = vmm.lock().unwrap();
+                    if _arg.is_empty() {
+                        match vmm.balloon_pages() {
+                            Ok((t, a)) => format!("OK target={} actual={}\n", t / 256, a / 256),
+                            Err(e) => format!("ERR ENODEV {e}\n"),
+                        }
+                    } else {
+                        match _arg.parse::<u32>() {
+                            Ok(mib) => match vmm.balloon_set_target_mib(mib) {
+                                Ok(_) => format!("OK balloon target {mib} MiB\n"),
+                                Err(e) => format!("ERR ENODEV {e}\n"),
+                            },
+                            Err(_) => "ERR EINVAL balloon target must be MiB\n".to_string(),
+                        }
+                    }
+                }
                 // CHECKPOINT <id>: capture VM/vCPU/device state + guest memory
                 // into an in-process stash keyed by <id>. The VM is left paused;
                 // send RESUME to keep the original running, or RESTORE <id>
