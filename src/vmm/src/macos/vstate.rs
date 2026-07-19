@@ -429,11 +429,6 @@ impl Vcpu {
 
         match hvf_vcpu.run(self.vcpu_list.clone()) {
             Ok(exit) => match exit {
-                VcpuExit::BalloonRefault => {
-                    // Reclaimed RAM was remapped; re-enter the guest to retry
-                    // the faulting instruction.
-                    Ok(VcpuEmulation::Handled)
-                }
                 VcpuExit::Breakpoint => {
                     debug!("vCPU {vcpuid} breakpoint");
                     Ok(VcpuEmulation::Interrupted)

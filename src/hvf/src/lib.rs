@@ -833,10 +833,6 @@ impl HvfVm {
 
 #[derive(Debug)]
 pub enum VcpuExit<'a> {
-    /// A data abort landed in a balloon-reclaimed RAM range; the range has
-    /// been remapped and the faulting instruction must be retried (PC is not
-    /// advanced).
-    BalloonRefault,
     Breakpoint,
     Canceled,
     CpuOn(u64, u64, u64),
@@ -1238,161 +1234,167 @@ impl HvfVcpu<'_> {
             vcpu_set_pending_irq(self.vcpuid, InterruptType::Irq, true)?;
         }
 
-        let ret = unsafe { hv_vcpu_run(self.vcpuid) };
-        if ret != HV_SUCCESS {
-            return Err(Error::VcpuRun);
-        }
-
-        match self.vcpu_exit.reason {
-            HV_EXIT_REASON_EXCEPTION => { /* This is the main one, handle below. */ }
-            HV_EXIT_REASON_VTIMER_ACTIVATED => {
-                self.vtimer_masked = true;
-                return Ok(VcpuExit::VtimerActivated);
+        // Loop only for balloon refaults: a data abort in a reclaimed RAM
+        // range remaps the range and retries the instruction without leaving
+        // the vCPU thread (PC untouched). Every other exit returns.
+        loop {
+            let ret = unsafe { hv_vcpu_run(self.vcpuid) };
+            if ret != HV_SUCCESS {
+                return Err(Error::VcpuRun);
             }
-            HV_EXIT_REASON_CANCELED => return Ok(VcpuExit::Canceled),
-            _ => {
-                let pc = self.read_reg(hv_reg_t_HV_REG_PC)?;
-                panic!(
-                    "unexpected exit reason: vcpuid={} 0x{:x} at pc=0x{:x}",
-                    self.id(),
-                    self.vcpu_exit.reason,
-                    pc
-                );
-            }
-        }
 
-        self.hvf_sync_vtimer(vcpu_list.clone());
-
-        let syndrome = self.vcpu_exit.exception.syndrome;
-        let ec = (syndrome >> 26) & 0x3f;
-        match ec {
-            EC_AA64_BKPT => {
-                debug!("vcpu[{}]: BRK exit", self.vcpuid);
-                Ok(VcpuExit::Breakpoint)
-            }
-            EC_DATAABORT => {
-                let isv: bool = (syndrome & (1 << 24)) != 0;
-                let iswrite: bool = ((syndrome >> 6) & 1) != 0;
-                let s1ptw: bool = ((syndrome >> 7) & 1) != 0;
-                let sas: u32 = ((syndrome >> 22) & 3) as u32;
-                let len: usize = (1 << sas) as usize;
-                let srt: u32 = ((syndrome >> 16) & 0x1f) as u32;
-                let cm: u32 = ((syndrome >> 8) & 0x1) as u32;
-
-                debug!(
-                    "EC_DATAABORT {} {} {} {} {} {} {} {}",
-                    syndrome, isv as u8, iswrite as u8, s1ptw as u8, sas, len, srt, cm
-                );
-
-                let pa = self.vcpu_exit.exception.physical_address;
-
-                // A fault inside a balloon-reclaimed RAM range is not MMIO:
-                // remap it and retry the instruction (PC not advanced). This
-                // must precede MMIO classification — RAM addresses are never
-                // valid MMIO and misdispatching them would corrupt the guest.
-                if balloon_reclaim_enabled() && balloon_remap_if_reclaimed(pa) {
-                    return Ok(VcpuExit::BalloonRefault);
+            match self.vcpu_exit.reason {
+                HV_EXIT_REASON_EXCEPTION => { /* This is the main one, handle below. */ }
+                HV_EXIT_REASON_VTIMER_ACTIVATED => {
+                    self.vtimer_masked = true;
+                    return Ok(VcpuExit::VtimerActivated);
                 }
-
-                self.pending_advance_pc = true;
-
-                if iswrite {
-                    let val = if srt < 31 {
-                        self.read_reg(hv_reg_t_HV_REG_X0 + srt)?
-                    } else {
-                        0
-                    };
-
-                    match len {
-                        1 => self.mmio_buf[0..1].copy_from_slice(&(val as u8).to_le_bytes()),
-                        4 => self.mmio_buf[0..4].copy_from_slice(&(val as u32).to_le_bytes()),
-                        8 => self.mmio_buf[0..8].copy_from_slice(&val.to_le_bytes()),
-                        _ => panic!("unsupported mmio len={len}"),
-                    };
-
-                    Ok(VcpuExit::MmioWrite(pa, &self.mmio_buf[0..len]))
-                } else {
-                    self.pending_mmio_read = Some(MmioRead { addr: pa, srt, len });
-                    Ok(VcpuExit::MmioRead(pa, &mut self.mmio_buf[0..len]))
+                HV_EXIT_REASON_CANCELED => return Ok(VcpuExit::Canceled),
+                _ => {
+                    let pc = self.read_reg(hv_reg_t_HV_REG_PC)?;
+                    panic!(
+                        "unexpected exit reason: vcpuid={} 0x{:x} at pc=0x{:x}",
+                        self.id(),
+                        self.vcpu_exit.reason,
+                        pc
+                    );
                 }
             }
-            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-            EC_SYSTEMREGISTERTRAP => {
-                let isread: bool = (syndrome & 1) != 0;
-                let rt: u32 = ((syndrome >> 5) & 0x1f) as u32;
-                let reg: u32 = syndrome as u32 & SYSREG_MASK;
-                debug!(
-                    "EC_SYSTEMREGISTERTRAP isread={}, syndrome={}, rt={}, reg={}, reg_name={}",
-                    isread as u32,
-                    syndrome,
-                    rt,
-                    reg,
-                    sys_reg_name(reg).unwrap_or("unknown sysreg")
-                );
 
-                self.pending_advance_pc = true;
+            self.hvf_sync_vtimer(vcpu_list.clone());
 
-                if isread {
-                    assert!(rt < 32);
+            let syndrome = self.vcpu_exit.exception.syndrome;
+            let ec = (syndrome >> 26) & 0x3f;
+            return match ec {
+                EC_AA64_BKPT => {
+                    debug!("vcpu[{}]: BRK exit", self.vcpuid);
+                    Ok(VcpuExit::Breakpoint)
+                }
+                EC_DATAABORT => {
+                    let isv: bool = (syndrome & (1 << 24)) != 0;
+                    let iswrite: bool = ((syndrome >> 6) & 1) != 0;
+                    let s1ptw: bool = ((syndrome >> 7) & 1) != 0;
+                    let sas: u32 = ((syndrome >> 22) & 3) as u32;
+                    let len: usize = (1 << sas) as usize;
+                    let srt: u32 = ((syndrome >> 16) & 0x1f) as u32;
+                    let cm: u32 = ((syndrome >> 8) & 0x1) as u32;
 
-                    // See https://developer.arm.com/documentation/dui0801/l/Overview-of-AArch64-state/Registers-in-AArch64-state
-                    if rt == 31 {
-                        return Ok(VcpuExit::SystemRegister);
+                    debug!(
+                        "EC_DATAABORT {} {} {} {} {} {} {} {}",
+                        syndrome, isv as u8, iswrite as u8, s1ptw as u8, sas, len, srt, cm
+                    );
+
+                    let pa = self.vcpu_exit.exception.physical_address;
+
+                    // A fault inside a balloon-reclaimed RAM range is not MMIO:
+                    // remap it and retry the instruction (PC not advanced). This
+                    // must precede MMIO classification — RAM addresses are never
+                    // valid MMIO and misdispatching them would corrupt the guest.
+                    if balloon_reclaim_enabled() && balloon_remap_if_reclaimed(pa) {
+                        continue;
                     }
 
-                    match vcpu_list.handle_sysreg_read(self.vcpuid, reg) {
-                        Some(val) => {
-                            self.write_reg(rt, val)?;
-                            Ok(VcpuExit::SystemRegister)
+                    self.pending_advance_pc = true;
+
+                    if iswrite {
+                        let val = if srt < 31 {
+                            self.read_reg(hv_reg_t_HV_REG_X0 + srt)?
+                        } else {
+                            0
+                        };
+
+                        match len {
+                            1 => self.mmio_buf[0..1].copy_from_slice(&(val as u8).to_le_bytes()),
+                            4 => self.mmio_buf[0..4].copy_from_slice(&(val as u32).to_le_bytes()),
+                            8 => self.mmio_buf[0..8].copy_from_slice(&val.to_le_bytes()),
+                            _ => panic!("unsupported mmio len={len}"),
+                        };
+
+                        Ok(VcpuExit::MmioWrite(pa, &self.mmio_buf[0..len]))
+                    } else {
+                        self.pending_mmio_read = Some(MmioRead { addr: pa, srt, len });
+                        Ok(VcpuExit::MmioRead(pa, &mut self.mmio_buf[0..len]))
+                    }
+                }
+                #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+                EC_SYSTEMREGISTERTRAP => {
+                    let isread: bool = (syndrome & 1) != 0;
+                    let rt: u32 = ((syndrome >> 5) & 0x1f) as u32;
+                    let reg: u32 = syndrome as u32 & SYSREG_MASK;
+                    debug!(
+                        "EC_SYSTEMREGISTERTRAP isread={}, syndrome={}, rt={}, reg={}, reg_name={}",
+                        isread as u32,
+                        syndrome,
+                        rt,
+                        reg,
+                        sys_reg_name(reg).unwrap_or("unknown sysreg")
+                    );
+
+                    self.pending_advance_pc = true;
+
+                    if isread {
+                        assert!(rt < 32);
+
+                        // See https://developer.arm.com/documentation/dui0801/l/Overview-of-AArch64-state/Registers-in-AArch64-state
+                        if rt == 31 {
+                            return Ok(VcpuExit::SystemRegister);
                         }
-                        None => panic!(
-                            "UNKNOWN rt={}, reg={} name={}",
-                            rt,
-                            reg,
-                            sys_reg_name(reg).unwrap_or("unknown sysreg")
-                        ),
-                    }
-                } else {
-                    assert!(rt < 32);
 
-                    // See https://developer.arm.com/documentation/dui0801/l/Overview-of-AArch64-state/Registers-in-AArch64-state
-                    let val = if rt == 31 { 0u64 } else { self.read_reg(rt)? };
-
-                    if vcpu_list.handle_sysreg_write(self.vcpuid, reg, val) {
-                        Ok(VcpuExit::SystemRegister)
+                        match vcpu_list.handle_sysreg_read(self.vcpuid, reg) {
+                            Some(val) => {
+                                self.write_reg(rt, val)?;
+                                Ok(VcpuExit::SystemRegister)
+                            }
+                            None => panic!(
+                                "UNKNOWN rt={}, reg={} name={}",
+                                rt,
+                                reg,
+                                sys_reg_name(reg).unwrap_or("unknown sysreg")
+                            ),
+                        }
                     } else {
-                        panic!(
-                            "unexpected write: {} name={}",
-                            reg,
-                            sys_reg_name(reg).unwrap_or("unknown sysreg")
-                        );
+                        assert!(rt < 32);
+
+                        // See https://developer.arm.com/documentation/dui0801/l/Overview-of-AArch64-state/Registers-in-AArch64-state
+                        let val = if rt == 31 { 0u64 } else { self.read_reg(rt)? };
+
+                        if vcpu_list.handle_sysreg_write(self.vcpuid, reg, val) {
+                            Ok(VcpuExit::SystemRegister)
+                        } else {
+                            panic!(
+                                "unexpected write: {} name={}",
+                                reg,
+                                sys_reg_name(reg).unwrap_or("unknown sysreg")
+                            );
+                        }
                     }
                 }
-            }
-            EC_WFX_TRAP => {
-                let ctl = self.read_sys_reg(hv_sys_reg_t_HV_SYS_REG_CNTV_CTL_EL0)?;
+                EC_WFX_TRAP => {
+                    let ctl = self.read_sys_reg(hv_sys_reg_t_HV_SYS_REG_CNTV_CTL_EL0)?;
 
-                self.pending_advance_pc = true;
-                if ((ctl & 1) == 0) || (ctl & 2) != 0 {
-                    return Ok(VcpuExit::WaitForEvent);
+                    self.pending_advance_pc = true;
+                    if ((ctl & 1) == 0) || (ctl & 2) != 0 {
+                        return Ok(VcpuExit::WaitForEvent);
+                    }
+
+                    // Also CNTV_CVAL & CNTV_CVAL_EL0
+                    let cval = self.read_sys_reg(hv_sys_reg_t_HV_SYS_REG_CNTV_CVAL_EL0)?;
+                    let now = unsafe { mach_absolute_time() };
+                    if now > cval {
+                        return Ok(VcpuExit::WaitForEventExpired);
+                    }
+
+                    let timeout =
+                        Duration::from_nanos((cval - now) * (1_000_000_000 / self.cntfrq));
+                    Ok(VcpuExit::WaitForEventTimeout(timeout))
                 }
-
-                // Also CNTV_CVAL & CNTV_CVAL_EL0
-                let cval = self.read_sys_reg(hv_sys_reg_t_HV_SYS_REG_CNTV_CVAL_EL0)?;
-                let now = unsafe { mach_absolute_time() };
-                if now > cval {
-                    return Ok(VcpuExit::WaitForEventExpired);
+                EC_AA64_HVC => self.handle_psci_request(),
+                EC_AA64_SMC => {
+                    self.pending_advance_pc = true;
+                    self.handle_psci_request()
                 }
-
-                let timeout = Duration::from_nanos((cval - now) * (1_000_000_000 / self.cntfrq));
-                Ok(VcpuExit::WaitForEventTimeout(timeout))
-            }
-            EC_AA64_HVC => self.handle_psci_request(),
-            EC_AA64_SMC => {
-                self.pending_advance_pc = true;
-                self.handle_psci_request()
-            }
-            _ => panic!("unexpected exception: 0x{ec:x}"),
+                _ => panic!("unexpected exception: 0x{ec:x}"),
+            };
         }
     }
 }
