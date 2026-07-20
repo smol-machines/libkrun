@@ -92,6 +92,11 @@ pub struct FuseServerState {
     pub next_handle: u64,
     pub writeback: bool,
     pub announce_submounts: bool,
+    /// Active DAX window mappings, replayed into a clone's window after the
+    /// inode map is rebuilt. Defaults to empty for snapshots taken before this
+    /// field existed.
+    #[serde(default)]
+    pub dax_maps: Vec<FuseDaxMapSnap>,
 }
 
 /// One FUSE inode: the guest's nodeid mapped to an absolute host path (recovered
@@ -110,6 +115,26 @@ pub struct FuseHandleSnap {
     pub handle: u64,
     pub nodeid: u64,
     pub flags: i32,
+}
+
+/// One active DAX window mapping (a SETUPMAPPING the guest has not removed):
+/// recorded so a fork clone can replay the host-side `mmap(MAP_SHARED|MAP_FIXED)`
+/// into its window. The window itself is an anonymous guest-memory region that a
+/// cross-process clone rebuilds as fresh zero pages, while the restored guest
+/// kernel still holds DAX page-table entries into it — without replay the guest
+/// reads zeros where file pages were.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FuseDaxMapSnap {
+    /// Byte offset of the mapping inside the DAX window.
+    pub moffset: u64,
+    /// FUSE nodeid of the mapped file (resolved via the restored inode map).
+    pub nodeid: u64,
+    /// Byte offset of the mapping inside the file.
+    pub foffset: u64,
+    /// Mapping length in bytes.
+    pub len: u64,
+    /// FUSE SETUPMAPPING flags (read/write) the guest requested.
+    pub flags: u64,
 }
 
 impl Fs {

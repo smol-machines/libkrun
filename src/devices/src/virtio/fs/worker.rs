@@ -107,6 +107,12 @@ impl FsWorker {
                 let inner = PassthroughFsRo::new(cfg, inode_alloc.clone())?;
                 if let Some(state) = restore_fuse.as_ref() {
                     inner.inner().restore(state)?;
+                    #[cfg(target_os = "linux")]
+                    if let Some(shm) = shm_region.as_ref() {
+                        inner
+                            .inner()
+                            .replay_dax_maps(shm.host_addr, shm.size as u64);
+                    }
                 }
                 FsServer::ReadOnly(Server::new(AugmentFs::new(
                     inner,
@@ -118,6 +124,10 @@ impl FsWorker {
                 let inner = PassthroughFs::new(cfg, inode_alloc.clone())?;
                 if let Some(state) = restore_fuse.as_ref() {
                     inner.restore(state)?;
+                    #[cfg(target_os = "linux")]
+                    if let Some(shm) = shm_region.as_ref() {
+                        inner.replay_dax_maps(shm.host_addr, shm.size as u64);
+                    }
                 }
                 FsServer::ReadWrite(Server::new(AugmentFs::new(
                     inner,

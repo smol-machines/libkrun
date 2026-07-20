@@ -27,7 +27,7 @@ use super::super::filesystem::{
 use super::super::fuse;
 use super::super::inode_alloc::InodeAllocator;
 use super::super::multikey::MultikeyBTreeMap;
-use super::super::{FuseHandleSnap, FuseInodeSnap, FuseServerState};
+use super::super::{FuseDaxMapSnap, FuseHandleSnap, FuseInodeSnap, FuseServerState};
 
 const CURRENT_DIR_CSTR: &[u8] = b".\0";
 const PARENT_DIR_CSTR: &[u8] = b"..\0";
@@ -400,6 +400,11 @@ pub struct PassthroughFs {
     my_gid: Option<libc::gid_t>,
     cap_fowner: bool,
 
+    // Active DAX window mappings, keyed by window offset. Serialized in the
+    // fork snapshot so a clone can replay them into its window (the window is
+    // anonymous memory and does not survive a cross-process fork).
+    dax_maps: RwLock<BTreeMap<u64, FuseDaxMapSnap>>,
+
     cfg: Config,
 }
 
@@ -469,6 +474,7 @@ impl PassthroughFs {
             my_uid,
             my_gid,
             cap_fowner,
+            dax_maps: RwLock::new(BTreeMap::new()),
             cfg,
         };
 
@@ -575,6 +581,7 @@ impl PassthroughFs {
             next_handle: self.next_handle.load(Ordering::Relaxed),
             writeback: self.writeback.load(Ordering::Relaxed),
             announce_submounts: self.announce_submounts.load(Ordering::Relaxed),
+            dax_maps: self.dax_maps.read().unwrap().values().copied().collect(),
         }
     }
 
@@ -666,7 +673,49 @@ impl PassthroughFs {
                 ),
             }
         }
+
+        {
+            let mut maps = self.dax_maps.write().unwrap();
+            maps.clear();
+            for m in &state.dax_maps {
+                maps.insert(m.moffset, *m);
+            }
+        }
         Ok(())
+    }
+
+    /// Replay the restored DAX window mappings into this (clone) process's
+    /// window: re-establish each `mmap(MAP_SHARED|MAP_FIXED)` the golden had, so
+    /// the guest kernel's existing DAX page-table entries resolve to file pages
+    /// instead of the window's fresh zero pages. Must run after [`Self::restore`]
+    /// (the mappings resolve nodeids through the rebuilt inode map) and before
+    /// the guest resumes. A mapping whose file has vanished is skipped with a
+    /// warning — that chunk reads as zeros, as it would without replay.
+    pub fn replay_dax_maps(&self, host_shm_base: u64, shm_size: u64) {
+        let maps: Vec<FuseDaxMapSnap> = self.dax_maps.read().unwrap().values().copied().collect();
+        for m in maps {
+            if let Err(e) = FileSystem::setupmapping(
+                self,
+                Context {
+                    uid: 0,
+                    gid: 0,
+                    pid: 0,
+                },
+                m.nodeid,
+                0,
+                m.foffset,
+                m.len,
+                m.flags,
+                m.moffset,
+                host_shm_base,
+                shm_size,
+            ) {
+                warn!(
+                    "fs restore: replay dax map moffset={:#x} len={:#x} nodeid={} failed: {e}",
+                    m.moffset, m.len, m.nodeid
+                );
+            }
+        }
     }
 
     fn open_inode(&self, inode: Inode, mut flags: i32) -> io::Result<File> {
@@ -2240,6 +2289,21 @@ impl FileSystem for PassthroughFs {
             return Err(io::Error::last_os_error());
         }
 
+        {
+            let mut maps = self.dax_maps.write().unwrap();
+            maps.retain(|_, m| m.moffset + m.len <= moffset || m.moffset >= end);
+            maps.insert(
+                moffset,
+                FuseDaxMapSnap {
+                    moffset,
+                    nodeid: inode,
+                    foffset,
+                    len,
+                    flags,
+                },
+            );
+        }
+
         Ok(())
     }
 
@@ -2272,6 +2336,10 @@ impl FileSystem for PassthroughFs {
             if std::ptr::eq(ret, libc::MAP_FAILED) {
                 return Err(io::Error::last_os_error());
             }
+            self.dax_maps
+                .write()
+                .unwrap()
+                .retain(|_, m| m.moffset + m.len <= req.moffset || m.moffset >= end);
         }
 
         Ok(())
