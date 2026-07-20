@@ -49,6 +49,15 @@ pub struct VirtioBalloonConfig {
 // Safe because it only has data and has no implicit padding.
 unsafe impl ByteValued for VirtioBalloonConfig {}
 
+/// Runtime state captured for checkpoint/fork (see `save_state`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BalloonState {
+    pub acked_features: u64,
+    pub num_pages: u32,
+    pub actual: u32,
+    pub queues: Vec<Option<crate::virtio::queue::QueueState>>,
+}
+
 pub struct Balloon {
     pub(crate) queues: Option<Vec<DeviceQueue>>,
     pub(crate) avail_features: u64,
@@ -73,6 +82,32 @@ impl Balloon {
 
     pub fn id(&self) -> &str {
         defs::BALLOON_DEV_ID
+    }
+
+    /// Capture runtime state for checkpoint/fork. vCPUs must be paused, so
+    /// the queues are at a clean boundary.
+    pub fn save_state(&self) -> BalloonState {
+        BalloonState {
+            acked_features: self.acked_features,
+            num_pages: self.config.num_pages,
+            actual: self.config.actual,
+            queues: match self.queues.as_ref() {
+                Some(qs) => qs.iter().map(|q| Some(q.queue.save_state())).collect(),
+                None => vec![None; defs::NUM_QUEUES],
+            },
+        }
+    }
+
+    /// Restore negotiated features + config onto a freshly-built,
+    /// not-yet-activated Balloon; the queues are re-applied when the device is
+    /// re-activated (`restore_and_activate`). Without this the restored guest
+    /// keeps submitting free-page reports to a device that was never
+    /// activated in the clone, so nothing is ever reclaimed.
+    pub fn restore_state(&mut self, state: &BalloonState) -> Result<(), String> {
+        self.acked_features = state.acked_features;
+        self.config.num_pages = state.num_pages;
+        self.config.actual = state.actual;
+        Ok(())
     }
 
     /// Host-side target: ask the guest to inflate the balloon to `pages`

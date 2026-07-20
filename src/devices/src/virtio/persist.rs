@@ -11,6 +11,8 @@
 //! unaware of snapshots, and devices without a Persist impl yet (balloon, rng,
 //! fs, gpu, snd, input) are simply skipped.
 
+#[cfg(not(feature = "tee"))]
+use crate::virtio::{Balloon, BalloonState};
 #[cfg(feature = "blk")]
 use crate::virtio::{Block, block::BlockState};
 use crate::virtio::{Console, ConsoleState, VirtioDevice};
@@ -37,6 +39,10 @@ pub enum DeviceSnapshot {
     Block(BlockState),
     #[cfg(feature = "net")]
     Net(NetState),
+    /// Appended after the original variants: existing serialized checkpoints
+    /// predate it and must keep decoding.
+    #[cfg(not(feature = "tee"))]
+    Balloon(BalloonState),
 }
 
 impl DeviceSnapshot {
@@ -52,6 +58,8 @@ impl DeviceSnapshot {
             DeviceSnapshot::Fs(_) => TYPE_FS,
             #[cfg(not(feature = "tee"))]
             DeviceSnapshot::Rng(_) => TYPE_RNG,
+            #[cfg(not(feature = "tee"))]
+            DeviceSnapshot::Balloon(_) => TYPE_BALLOON,
             #[cfg(feature = "blk")]
             DeviceSnapshot::Block(_) => TYPE_BLOCK,
             #[cfg(feature = "net")]
@@ -69,6 +77,8 @@ impl DeviceSnapshot {
             DeviceSnapshot::Fs(s) => s.acked_features,
             #[cfg(not(feature = "tee"))]
             DeviceSnapshot::Rng(s) => s.acked_features,
+            #[cfg(not(feature = "tee"))]
+            DeviceSnapshot::Balloon(s) => s.acked_features,
             #[cfg(feature = "blk")]
             DeviceSnapshot::Block(s) => s.acked_features,
             #[cfg(feature = "net")]
@@ -87,6 +97,8 @@ impl DeviceSnapshot {
             DeviceSnapshot::Fs(s) => s.queues.clone(),
             #[cfg(not(feature = "tee"))]
             DeviceSnapshot::Rng(s) => vec![s.queue.clone()],
+            #[cfg(not(feature = "tee"))]
+            DeviceSnapshot::Balloon(s) => s.queues.clone(),
             #[cfg(feature = "blk")]
             DeviceSnapshot::Block(s) => vec![s.queue.clone()],
             #[cfg(feature = "net")]
@@ -135,6 +147,10 @@ pub fn snapshot_device(dev: &dyn VirtioDevice) -> Option<DeviceSnapshot> {
     if let Some(d) = any.downcast_ref::<Rng>() {
         return Some(DeviceSnapshot::Rng(d.save_state()));
     }
+    #[cfg(not(feature = "tee"))]
+    if let Some(d) = any.downcast_ref::<Balloon>() {
+        return Some(DeviceSnapshot::Balloon(d.save_state()));
+    }
     #[cfg(feature = "blk")]
     if let Some(d) = any.downcast_ref::<Block>() {
         return Some(DeviceSnapshot::Block(d.save_state()));
@@ -169,6 +185,11 @@ pub fn restore_device(dev: &mut dyn VirtioDevice, snap: &DeviceSnapshot) -> Resu
         DeviceSnapshot::Rng(s) => any
             .downcast_mut::<Rng>()
             .ok_or_else(|| "snapshot/device mismatch: expected Rng".to_string())?
+            .restore_state(s),
+        #[cfg(not(feature = "tee"))]
+        DeviceSnapshot::Balloon(s) => any
+            .downcast_mut::<Balloon>()
+            .ok_or_else(|| "snapshot/device mismatch: expected Balloon".to_string())?
             .restore_state(s),
         #[cfg(feature = "blk")]
         DeviceSnapshot::Block(s) => any
