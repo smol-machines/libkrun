@@ -105,6 +105,8 @@ pub enum Error {
     HypercallExitEnable(kvm_ioctls::Error),
     /// Cannot configure the IRQ.
     Irq(kvm_ioctls::Error),
+    /// Cannot open /dev/kvm (KVM unavailable, or inaccessible to this process).
+    KvmOpen(kvm_ioctls::Error),
     /// The host kernel reports an invalid KVM API version.
     KvmApiVersion(i32),
     /// Cannot initialize the KVM context due to missing capabilities.
@@ -285,6 +287,12 @@ impl Display for Error {
             HTNotInitialized => write!(f, "Hyperthreading flag is not initialized"),
             #[cfg(feature = "tee")]
             HypercallExitEnable(e) => write!(f, "Unable to enable KVM hypercall exits: {e}"),
+            KvmOpen(e) => write!(
+                f,
+                "Cannot open /dev/kvm: {e} (KVM unavailable, or inaccessible to \
+                 this process — check the kvm module is loaded and /dev/kvm's \
+                 group/permissions grant access)"
+            ),
             KvmApiVersion(v) => {
                 write!(f, "The host kernel reports an invalid KVM API version: {v}")
             }
@@ -455,7 +463,11 @@ pub struct KvmContext {
 
 impl KvmContext {
     pub fn new() -> Result<Self> {
-        let kvm = Kvm::new().expect("Error creating the Kvm object");
+        // Propagate rather than `.expect()`: a /dev/kvm open failure is recoverable
+        // (KVM absent, or no access after a privilege drop), and unwinding it here
+        // aborts the VMM — which, under seccomp, dies silently instead of surfacing
+        // the error `KvmContext::new` is typed to return.
+        let kvm = Kvm::new().map_err(Error::KvmOpen)?;
 
         // Check that KVM has the correct version.
         if kvm.get_api_version() != KVM_API_VERSION as i32 {
