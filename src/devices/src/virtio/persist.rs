@@ -18,6 +18,8 @@ use crate::virtio::{Block, block::BlockState};
 use crate::virtio::{Console, ConsoleState, VirtioDevice};
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use crate::virtio::{Fs, FsState};
+#[cfg(feature = "gpu")]
+use crate::virtio::{Gpu, gpu::GpuState};
 #[cfg(feature = "net")]
 use crate::virtio::{Net, net::NetState};
 #[cfg(not(feature = "tee"))]
@@ -43,6 +45,8 @@ pub enum DeviceSnapshot {
     /// predate it and must keep decoding.
     #[cfg(not(feature = "tee"))]
     Balloon(BalloonState),
+    #[cfg(feature = "gpu")]
+    Gpu(GpuState),
 }
 
 impl DeviceSnapshot {
@@ -64,6 +68,8 @@ impl DeviceSnapshot {
             DeviceSnapshot::Block(_) => TYPE_BLOCK,
             #[cfg(feature = "net")]
             DeviceSnapshot::Net(_) => TYPE_NET,
+            #[cfg(feature = "gpu")]
+            DeviceSnapshot::Gpu(_) => TYPE_GPU,
         }
     }
 
@@ -83,6 +89,8 @@ impl DeviceSnapshot {
             DeviceSnapshot::Block(s) => s.acked_features,
             #[cfg(feature = "net")]
             DeviceSnapshot::Net(s) => s.acked_features,
+            #[cfg(feature = "gpu")]
+            DeviceSnapshot::Gpu(s) => s.acked_features,
         }
     }
 
@@ -103,6 +111,8 @@ impl DeviceSnapshot {
             DeviceSnapshot::Block(s) => vec![s.queue.clone()],
             #[cfg(feature = "net")]
             DeviceSnapshot::Net(s) => vec![s.queue_rx.clone(), s.queue_tx.clone()],
+            #[cfg(feature = "gpu")]
+            DeviceSnapshot::Gpu(s) => s.queues.clone(),
         }
     }
 }
@@ -159,6 +169,10 @@ pub fn snapshot_device(dev: &dyn VirtioDevice) -> Option<DeviceSnapshot> {
     if let Some(d) = any.downcast_ref::<Net>() {
         return Some(DeviceSnapshot::Net(d.save_state()));
     }
+    #[cfg(feature = "gpu")]
+    if let Some(d) = any.downcast_ref::<Gpu>() {
+        return Some(DeviceSnapshot::Gpu(d.save_state()));
+    }
     None
 }
 
@@ -200,6 +214,11 @@ pub fn restore_device(dev: &mut dyn VirtioDevice, snap: &DeviceSnapshot) -> Resu
         DeviceSnapshot::Net(s) => any
             .downcast_mut::<Net>()
             .ok_or_else(|| "snapshot/device mismatch: expected Net".to_string())?
+            .restore_state(s),
+        #[cfg(feature = "gpu")]
+        DeviceSnapshot::Gpu(s) => any
+            .downcast_mut::<Gpu>()
+            .ok_or_else(|| "snapshot/device mismatch: expected Gpu".to_string())?
             .restore_state(s),
     }
 }
@@ -259,6 +278,46 @@ mod tests {
         assert_eq!(
             state, restored,
             "device state must round-trip through bytes"
+        );
+    }
+
+    // A GPU device carries only transport state (features + queue rings) into a
+    // fork — never its rutabaga GPU state — so the clone re-activates the device
+    // fresh. This checks the snapshot reports that transport state and survives
+    // the serialization used for cross-process fork.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_snapshot_reports_transport_state_and_roundtrips() {
+        use crate::virtio::TYPE_GPU;
+
+        let qs = QueueState {
+            size: 256,
+            ready: true,
+            desc_table: 0x1000,
+            avail_ring: 0x2000,
+            used_ring: 0x3000,
+            next_avail: 5,
+            next_used: 5,
+            event_idx_enabled: false,
+            num_added: 0,
+        };
+        let snap = DeviceSnapshot::Gpu(GpuState {
+            acked_features: 0xF00D,
+            queues: vec![Some(qs.clone()), None],
+        });
+
+        assert_eq!(snap.device_type(), TYPE_GPU);
+        assert_eq!(snap.acked_features(), 0xF00D);
+        assert_eq!(snap.queue_states(), vec![Some(qs), None]);
+
+        let state = VmDevicesState {
+            devices: vec![snap],
+        };
+        let restored =
+            VmDevicesState::from_bytes(&state.to_bytes().expect("serialize")).expect("deserialize");
+        assert_eq!(
+            state, restored,
+            "gpu snapshot must round-trip through bytes"
         );
     }
 }

@@ -1,12 +1,13 @@
 use std::io::Write;
+use std::sync::{Arc, Mutex};
 
 #[cfg(target_os = "macos")]
 use crossbeam_channel::Sender;
 use vm_memory::{ByteValued, GuestMemoryMmap};
 
 use super::super::{
-    ActivateError, ActivateResult, DeviceQueue, DeviceState, QueueConfig, VirtioDevice,
-    VirtioShmRegion, fs::ExportTable,
+    ActivateError, ActivateResult, DeviceQueue, DeviceState, Queue as VirtQueue, QueueConfig,
+    VirtioDevice, VirtioShmRegion, fs::ExportTable, queue::QueueState,
 };
 use super::defs;
 use super::defs::uapi;
@@ -30,6 +31,21 @@ const QUEUE_SIZE: u16 = 256;
 static QUEUE_CONFIG: [QueueConfig; defs::NUM_QUEUES] =
     [QueueConfig::new(QUEUE_SIZE); defs::NUM_QUEUES];
 
+/// Snapshot of the GPU device's transport-level state for checkpoint/fork.
+///
+/// Deliberately excludes rutabaga/virgl GPU state (contexts, resources, the
+/// render-server connection) — that is live host GPU state which is not
+/// serializable (rutabaga only snapshots 2D). A fork clone re-activates the GPU
+/// device fresh, spawning its own render-server and rutabaga; this snapshot
+/// carries only what the transport needs to re-attach the guest's queues:
+/// negotiated features + per-queue ring state.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GpuState {
+    pub acked_features: u64,
+    /// Control queue then cursor queue (index order), each `None` if never set up.
+    pub queues: Vec<Option<QueueState>>,
+}
+
 pub struct Gpu {
     pub(crate) avail_features: u64,
     pub(crate) acked_features: u64,
@@ -41,6 +57,12 @@ pub struct Gpu {
     export_table: Option<ExportTable>,
     displays: Box<[DisplayInfo]>,
     display_backend: DisplayBackend<'static>,
+    /// Control queue, shared with the worker (an `Arc` clone). Read at snapshot
+    /// time to capture ring state; the golden is paused so the worker is idle.
+    control_queue: Option<Arc<Mutex<VirtQueue>>>,
+    /// Cursor queue ring state, captured at activate (the cursor queue is not
+    /// driven by the worker, so its state is stable after negotiation).
+    cursor_queue_state: Option<QueueState>,
 }
 
 impl Gpu {
@@ -61,7 +83,31 @@ impl Gpu {
             export_table: None,
             displays,
             display_backend,
+            control_queue: None,
+            cursor_queue_state: None,
         })
+    }
+
+    /// Capture the device's transport state for checkpoint/fork. GPU state is
+    /// intentionally NOT captured (see [`GpuState`]) — the clone re-activates
+    /// fresh.
+    pub fn save_state(&self) -> GpuState {
+        let control = self
+            .control_queue
+            .as_ref()
+            .map(|q| q.lock().expect("gpu control queue poisoned").save_state());
+        GpuState {
+            acked_features: self.acked_features,
+            queues: vec![control, self.cursor_queue_state.clone()],
+        }
+    }
+
+    /// Restore transport state onto a freshly-built device before re-activation.
+    /// Only the negotiated features are applied here; the queues are rebuilt from
+    /// the saved ring state by the transport's `restore_and_activate`.
+    pub fn restore_state(&mut self, state: &GpuState) -> Result<(), String> {
+        self.acked_features = state.acked_features;
+        Ok(())
     }
 
     pub fn id(&self) -> &str {
@@ -193,7 +239,7 @@ impl VirtioDevice for Gpu {
         interrupt: InterruptTransport,
         queues: Vec<DeviceQueue>,
     ) -> ActivateResult {
-        let [control_q, _cursor_q]: [_; defs::NUM_QUEUES] = queues.try_into().map_err(|_| {
+        let [control_q, cursor_q]: [_; defs::NUM_QUEUES] = queues.try_into().map_err(|_| {
             error!(
                 "Cannot perform activate. Expected {} queue(s)",
                 defs::NUM_QUEUES
@@ -206,9 +252,21 @@ impl VirtioDevice for Gpu {
             None => panic!("virtio_gpu: missing SHM region"),
         };
 
+        // Capture the cursor queue's ring state (the worker never drives it, so
+        // it is stable) for snapshot, then share the control queue with the
+        // worker via an `Arc` so it too can be read at snapshot time (for fork).
+        self.cursor_queue_state = Some(cursor_q.queue.save_state());
+        let DeviceQueue {
+            queue: control_queue,
+            event: control_event,
+        } = control_q;
+        let control_queue = Arc::new(Mutex::new(control_queue));
+        self.control_queue = Some(control_queue.clone());
+
         // cursor queue not used by worker
         let worker = Worker::new(
-            control_q,
+            control_queue,
+            control_event,
             mem.clone(),
             interrupt.clone(),
             shm_region,

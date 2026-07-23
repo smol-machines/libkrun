@@ -21,7 +21,7 @@ use utils::worker_message::WorkerMessage;
 use vm_memory::{GuestAddress, GuestMemoryMmap};
 
 use super::super::descriptor_utils::{Reader, Writer};
-use super::super::{DeviceQueue, GpuError, Queue as VirtQueue};
+use super::super::{GpuError, Queue as VirtQueue};
 use super::protocol::{
     GpuCommand, GpuResponse, VirtioGpuResult, virtio_gpu_ctrl_hdr, virtio_gpu_mem_entry,
 };
@@ -68,7 +68,8 @@ pub struct Worker {
 impl Worker {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        control_q: DeviceQueue,
+        control_queue: Arc<Mutex<VirtQueue>>,
+        control_event: Arc<EventFd>,
         mem: GuestMemoryMmap,
         interrupt: InterruptTransport,
         shm_region: VirtioShmRegion,
@@ -79,7 +80,7 @@ impl Worker {
         display_backend: DisplayBackend<'static>,
     ) -> Self {
         // Clone the eventfd so we have our own file description, then set it to blocking mode.
-        let control_evt = control_q.event.try_clone().unwrap();
+        let control_evt = control_event.try_clone().unwrap();
         // SAFETY: control_evt is valid for the duration of the fcntl calls.
         let fd = unsafe { BorrowedFd::borrow_raw(control_evt.as_raw_fd()) };
         let flags =
@@ -88,7 +89,7 @@ impl Worker {
 
         Self {
             control_evt,
-            control_queue: Arc::new(Mutex::new(control_q.queue)),
+            control_queue,
             mem,
             interrupt,
             shm_region,
