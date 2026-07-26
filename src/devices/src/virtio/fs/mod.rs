@@ -77,6 +77,8 @@ pub enum FsError {
     /// A C string parameter is invalid.
     InvalidCString(FromBytesWithNulError),
     InvalidCString2(FromVecWithNulError),
+    /// A directory-entry name from the guest is not a single path component.
+    InvalidFilename,
     /// The `len` field of the header is too small.
     InvalidHeaderLength,
     /// The `size` field of the `SetxattrIn` message does not match the length

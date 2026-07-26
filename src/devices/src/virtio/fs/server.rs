@@ -200,7 +200,7 @@ impl<F: FileSystem + Sync> Server<F> {
 
         r.read_exact(&mut buf).map_err(Error::DecodeMessage)?;
 
-        let name = bytes_to_cstr(buf.as_ref())?;
+        let name = bytes_to_filename(buf.as_ref())?;
 
         match self
             .fs
@@ -320,7 +320,7 @@ impl<F: FileSystem + Sync> Server<F> {
             Context::from(in_header),
             bytes_to_cstr(linkname)?,
             in_header.nodeid.into(),
-            bytes_to_cstr(name)?,
+            bytes_to_filename(name)?,
             extensions,
         ) {
             Ok(entry) => {
@@ -354,7 +354,7 @@ impl<F: FileSystem + Sync> Server<F> {
         match self.fs.mknod(
             Context::from(in_header),
             in_header.nodeid.into(),
-            bytes_to_cstr(name)?,
+            bytes_to_filename(name)?,
             mode,
             rdev,
             umask,
@@ -389,7 +389,7 @@ impl<F: FileSystem + Sync> Server<F> {
         match self.fs.mkdir(
             Context::from(in_header),
             in_header.nodeid.into(),
-            bytes_to_cstr(name)?,
+            bytes_to_filename(name)?,
             mode,
             umask,
             extensions,
@@ -414,7 +414,7 @@ impl<F: FileSystem + Sync> Server<F> {
         match self.fs.unlink(
             Context::from(in_header),
             in_header.nodeid.into(),
-            bytes_to_cstr(&name)?,
+            bytes_to_filename(&name)?,
         ) {
             Ok(()) => reply_ok(None::<u8>, None, in_header.unique, w),
             Err(e) => reply_error(e, in_header.unique, w),
@@ -432,7 +432,7 @@ impl<F: FileSystem + Sync> Server<F> {
         match self.fs.rmdir(
             Context::from(in_header),
             in_header.nodeid.into(),
-            bytes_to_cstr(&name)?,
+            bytes_to_filename(&name)?,
         ) {
             Ok(()) => reply_ok(None::<u8>, None, in_header.unique, w),
             Err(e) => reply_error(e, in_header.unique, w),
@@ -468,9 +468,9 @@ impl<F: FileSystem + Sync> Server<F> {
         match self.fs.rename(
             Context::from(in_header),
             in_header.nodeid.into(),
-            bytes_to_cstr(oldname)?,
+            bytes_to_filename(oldname)?,
             newdir.into(),
-            bytes_to_cstr(newname)?,
+            bytes_to_filename(newname)?,
             flags,
         ) {
             Ok(()) => reply_ok(None::<u8>, None, in_header.unique, w),
@@ -508,7 +508,7 @@ impl<F: FileSystem + Sync> Server<F> {
             Context::from(in_header),
             oldnodeid.into(),
             in_header.nodeid.into(),
-            bytes_to_cstr(&name)?,
+            bytes_to_filename(&name)?,
         ) {
             Ok(entry) => {
                 let out = EntryOut::from(entry);
@@ -1144,7 +1144,7 @@ impl<F: FileSystem + Sync> Server<F> {
         match self.fs.create(
             Context::from(in_header),
             in_header.nodeid.into(),
-            bytes_to_cstr(name)?,
+            bytes_to_filename(name)?,
             mode,
             kill_priv,
             flags,
@@ -1505,6 +1505,25 @@ fn bytes_to_cstr(buf: &[u8]) -> Result<&CStr> {
     CStr::from_bytes_with_nul(buf).map_err(Error::InvalidCString)
 }
 
+/// Convert a guest-supplied buffer to a directory-entry name, rejecting
+/// anything that is not a single path component.
+///
+/// Backends resolve these names with `openat(parent_fd, name, ..)`, and the
+/// kernel IGNORES `parent_fd` when `name` is absolute — so an unchecked `/etc`
+/// resolves from the host root rather than the shared directory, and `..` walks
+/// above it. `O_NOFOLLOW` does not cover this: it only rejects a symlink as the
+/// final component. A well-behaved guest kernel never sends these, so rejecting
+/// them costs nothing and keeps every backend (passthrough, read-only, augment)
+/// confined to the directory the parent inode names.
+fn bytes_to_filename(buf: &[u8]) -> Result<&CStr> {
+    let name = bytes_to_cstr(buf)?;
+    let bytes = name.to_bytes();
+    if bytes.is_empty() || bytes == b"." || bytes == b".." || bytes.contains(&b'/') {
+        return Err(Error::InvalidFilename);
+    }
+    Ok(name)
+}
+
 fn add_dirent(
     cursor: &mut Writer,
     max: u32,
@@ -1673,4 +1692,41 @@ fn get_extensions(options: FsOptions, skip: usize, request_bytes: &[u8]) -> Resu
     }
 
     Ok(extensions)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filenames_that_escape_the_parent_directory_are_rejected() {
+        // `openat(parent_fd, name, ..)` ignores `parent_fd` for an absolute
+        // name and walks up for `..`, so neither may reach a backend.
+        for bad in [
+            &b"\0"[..],
+            b"/\0",
+            b"..\0",
+            b".\0",
+            b"/etc/passwd\0",
+            b"../../etc/shadow\0",
+            b"sub/dir\0",
+        ] {
+            assert!(
+                bytes_to_filename(bad).is_err(),
+                "accepted escaping name: {:?}",
+                bad
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_filenames_are_accepted() {
+        for ok in [&b"file\0"[..], b"a.txt\0", b"..hidden\0", b"...\0"] {
+            assert!(
+                bytes_to_filename(ok).is_ok(),
+                "rejected valid name: {:?}",
+                ok
+            );
+        }
+    }
 }
