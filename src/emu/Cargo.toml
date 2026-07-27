@@ -1,0 +1,10 @@
+[package]
+name = "krun-emu"
+version = "0.1.0-2.0.0-dev"
+authors = ["The libkrun Authors"]
+edition = "2024"
+description = "Emulated riscv64 CPU core for libkrun"
+license = "Apache-2.0"
+repository = "https://github.com/containers/libkrun"
+
+[dependencies]

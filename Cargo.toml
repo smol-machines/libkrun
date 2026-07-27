@@ -12,6 +12,7 @@ members = [
     "src/polly",
     "src/kernel",
     "src/arch",
+    "src/emu",
     "src/hvf",
     "src/devices",
     "src/vmm",
