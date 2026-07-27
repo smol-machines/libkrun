@@ -1787,18 +1787,75 @@ pub(crate) fn create_guest_ram_memfd(size: usize) -> std::result::Result<File, S
     Ok(file)
 }
 
+/// Directory backing the macOS guest-RAM temp files (`$TMPDIR`, else `/tmp`).
+#[cfg(target_os = "macos")]
+fn guest_ram_dir() -> String {
+    std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string())
+}
+
+/// Reap guest-RAM backing files left by forkable goldens whose process is gone.
+///
+/// macOS has no `memfd` and no `DELETE_ON_CLOSE`, and a forkable golden is
+/// typically killed externally (no clean-shutdown hook), so its RAM file can't
+/// be unlinked on exit. The file name embeds the creating pid; before each
+/// forkable launch we remove any file whose pid is no longer alive
+/// (`kill(pid, 0)` → `ESRCH`), which bounds disk use instead of leaking the
+/// multi-hundred-MB RAM images across launches. A file owned by a LIVE process
+/// is left untouched — a running golden is still serving clones by that path.
+#[cfg(target_os = "macos")]
+fn reap_orphaned_guest_ram() {
+    reap_orphaned_guest_ram_in(&guest_ram_dir());
+}
+
+#[cfg(target_os = "macos")]
+fn reap_orphaned_guest_ram_in(dir: &str) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid_str) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix("smolvm-guest-ram-"))
+            .and_then(|rest| rest.split('-').next())
+        else {
+            continue;
+        };
+        // Legacy (pre-pid) names carry no parseable pid; leave them for manual
+        // cleanup since liveness can't be determined from the name alone.
+        let Ok(pid) = pid_str.parse::<libc::pid_t>() else {
+            continue;
+        };
+        // Safety: signal 0 only probes for the process's existence, sends nothing.
+        let dead = unsafe { libc::kill(pid, 0) } != 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        if dead {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// macOS has no `memfd`; back the guest-RAM region with a regular temp file
 /// instead. mmap'd `MAP_SHARED` it serves the golden's RAM, and a clone re-opens
 /// the same path and maps it `MAP_PRIVATE` for copy-on-write (validated: HVF
 /// honors the host CoW on guest writes). The path is recovered at fork time via
-/// `fcntl(F_GETPATH)`. The file is NOT unlinked (clones re-open it by path);
-/// it is cleaned up when the forkable golden is torn down.
+/// `fcntl(F_GETPATH)`, so the file is NOT unlinked while the golden lives.
+/// Cleanup is by liveness instead: the name embeds the creating pid and dead-pid
+/// files are reaped on the next forkable launch (see `reap_orphaned_guest_ram`).
 #[cfg(target_os = "macos")]
 pub(crate) fn create_guest_ram_memfd(size: usize) -> std::result::Result<File, String> {
     use std::os::fd::FromRawFd;
-    let dir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
-    let mut template =
-        format!("{}/smolvm-guest-ram-XXXXXX", dir.trim_end_matches('/')).into_bytes();
+    use std::sync::Once;
+    // Reap leftovers from dead goldens once per process, before creating ours.
+    static REAP: Once = Once::new();
+    REAP.call_once(reap_orphaned_guest_ram);
+    let dir = guest_ram_dir();
+    let pid = std::process::id();
+    let mut template = format!(
+        "{}/smolvm-guest-ram-{pid}-XXXXXX",
+        dir.trim_end_matches('/')
+    )
+    .into_bytes();
     template.push(0);
     // Safety: `template` is a NUL-terminated, writable buffer; mkstemp fills in
     // the XXXXXX and returns an owned fd to the freshly-created file.
@@ -3200,6 +3257,39 @@ fn attach_input_devices(
 pub mod tests {
     use super::*;
     use crate::vmm_config::kernel_bundle::KernelBundle;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn reaps_dead_pid_guest_ram_keeps_live_and_legacy() {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("grr-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+
+        // A pid we know is dead: spawn a child and reap it.
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = child.id();
+        child.wait().unwrap();
+
+        let live = dir.join(format!("smolvm-guest-ram-{}-AAAAAA", std::process::id()));
+        let dead = dir.join(format!("smolvm-guest-ram-{dead_pid}-BBBBBB"));
+        let legacy = dir.join("smolvm-guest-ram-CCCCCC"); // pre-pid name, no pid
+        let other = dir.join("unrelated.bin");
+        for f in [&live, &dead, &legacy, &other] {
+            fs::write(f, b"x").unwrap();
+        }
+
+        reap_orphaned_guest_ram_in(dir.to_str().unwrap());
+
+        assert!(live.exists(), "a live golden's RAM file must be kept");
+        assert!(!dead.exists(), "a dead pid's RAM file must be reaped");
+        assert!(
+            legacy.exists(),
+            "legacy (no-pid) files are left for manual cleanup"
+        );
+        assert!(other.exists(), "unrelated files are untouched");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[allow(unused)]
     fn default_guest_memory(
