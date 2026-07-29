@@ -1153,7 +1153,7 @@ impl Vcpu {
         // still surfaced instead of leaving a vCPU in an infinite retry loop.
         let kernel_enomem_retries = if env::var_os("KRUN_ENOMEM_RETRY").is_some() {
             debug!("Enabling bounded KVM_RUN ENOMEM retries");
-            3
+            20
         } else {
             0
         };
