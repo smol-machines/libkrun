@@ -1008,6 +1008,8 @@ pub struct Vcpu {
     kernel_enomem_workaround: bool,
     #[cfg(target_arch = "x86_64")]
     kernel_first_run_delay: bool,
+    #[cfg(target_arch = "x86_64")]
+    kernel_enomem_retries: u8,
 
     #[cfg(target_arch = "aarch64")]
     mpidr: u64,
@@ -1146,6 +1148,15 @@ impl Vcpu {
         } else {
             false
         };
+        // KVM_RUN should not return ENOMEM, but affected host kernels can do so
+        // transiently. Bound the workaround so a real persistent failure is
+        // still surfaced instead of leaving a vCPU in an infinite retry loop.
+        let kernel_enomem_retries = if env::var_os("KRUN_ENOMEM_RETRY").is_some() {
+            debug!("Enabling bounded KVM_RUN ENOMEM retries");
+            3
+        } else {
+            0
+        };
 
         // Initially the cpuid per vCPU is the one supported by this VM.
         Ok(Vcpu {
@@ -1158,6 +1169,7 @@ impl Vcpu {
             msr_list,
             kernel_enomem_workaround,
             kernel_first_run_delay,
+            kernel_enomem_retries,
             event_receiver,
             event_sender: Some(event_sender),
             response_receiver: Some(response_receiver),
@@ -1652,6 +1664,16 @@ impl Vcpu {
                         self.fd.set_kvm_immediate_exit(0);
                         // Notify that this KVM_RUN was interrupted.
                         Ok(VcpuEmulation::Interrupted)
+                    }
+                    #[cfg(target_arch = "x86_64")]
+                    libc::ENOMEM if self.kernel_enomem_retries > 0 => {
+                        self.kernel_enomem_retries -= 1;
+                        debug!(
+                            "Retrying KVM_RUN after ENOMEM ({} retries remain)",
+                            self.kernel_enomem_retries
+                        );
+                        thread::sleep(Duration::from_millis(5));
+                        Ok(VcpuEmulation::Handled)
                     }
                     _ => {
                         error!("Failure during vcpu run: {e}");
