@@ -1006,6 +1006,8 @@ pub struct Vcpu {
     msr_list: MsrList,
     #[cfg(target_arch = "x86_64")]
     kernel_enomem_workaround: bool,
+    #[cfg(target_arch = "x86_64")]
+    kernel_first_run_delay: bool,
 
     #[cfg(target_arch = "aarch64")]
     mpidr: u64,
@@ -1138,6 +1140,12 @@ impl Vcpu {
         } else {
             false
         };
+        let kernel_first_run_delay = if env::var_os("KRUN_FIRST_RUN_DELAY").is_some() {
+            debug!("Delaying the first KVM_RUN");
+            true
+        } else {
+            false
+        };
 
         // Initially the cpuid per vCPU is the one supported by this VM.
         Ok(Vcpu {
@@ -1149,6 +1157,7 @@ impl Vcpu {
             cpuid,
             msr_list,
             kernel_enomem_workaround,
+            kernel_first_run_delay,
             event_receiver,
             event_sender: Some(event_sender),
             response_receiver: Some(response_receiver),
@@ -1499,14 +1508,21 @@ impl Vcpu {
     ///
     /// Returns error or enum specifying whether emulation was handled or interrupted.
     fn run_emulation(&mut self) -> Result<VcpuEmulation> {
-        // This is a workaround for a kernel bug in the Linux
-        // kernel (6.12 and 6.13).
-        // https://github.com/containers/libkrun/issues/314#issuecomment-2818154193
+        // Work around a kernel bug that can return ENOMEM when the first
+        // KVM_RUN follows vCPU creation too closely. Delaying only the first
+        // entry avoids taxing every subsequent guest exit.
+        // https://github.com/containers/libkrun/issues/314
         #[cfg(target_arch = "x86_64")]
-        {
-            if self.kernel_enomem_workaround {
-                thread::sleep(Duration::from_millis(5));
-            }
+        if self.kernel_first_run_delay {
+            self.kernel_first_run_delay = false;
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        // Preserve the legacy opt-in workaround for callers that need a delay
+        // before every KVM entry.
+        #[cfg(target_arch = "x86_64")]
+        if self.kernel_enomem_workaround {
+            thread::sleep(Duration::from_millis(5));
         }
 
         match self.fd.run() {
