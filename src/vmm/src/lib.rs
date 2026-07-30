@@ -313,6 +313,7 @@ pub struct Vmm {
     vcpus_handles: Vec<VcpuHandle>,
     run_state: VmmRunState,
     paused_at: Option<Instant>,
+    devices_quiesced: bool,
     exit_evt: EventFd,
     vm: Vm,
     exit_observers: Vec<Arc<Mutex<dyn VmmExitObserver>>>,
@@ -482,13 +483,19 @@ impl Vmm {
 
     /// Drain + reclaim worker-owned virtqueues (block/net) so their indices can
     /// be captured/restored at a clean boundary. vCPUs must be paused first.
-    pub fn quiesce_devices(&self) {
-        self.mmio_device_manager.quiesce_devices();
+    pub fn quiesce_devices(&mut self) {
+        if !self.devices_quiesced {
+            self.mmio_device_manager.quiesce_devices();
+            self.devices_quiesced = true;
+        }
     }
 
     /// Re-arm device workers quiesced by [`Self::quiesce_devices`].
-    pub fn rearm_devices(&self) {
-        self.mmio_device_manager.rearm_devices();
+    pub fn rearm_devices(&mut self) {
+        if self.devices_quiesced {
+            self.mmio_device_manager.rearm_devices();
+            self.devices_quiesced = false;
+        }
     }
 
     /// Starts the microVM vcpus (running).
@@ -888,6 +895,11 @@ impl Vmm {
         match self.run_state {
             VmmRunState::Running => Ok(()),
             VmmRunState::Paused | VmmRunState::Pausing => {
+                // A fork checkpoint drains and stops virtio workers while the
+                // golden is frozen. A failed fork may resume that golden, so
+                // restore device service before its vCPUs can issue more I/O.
+                // Ordinary PAUSE/RESUME leaves this as a no-op.
+                self.rearm_devices();
                 self.run_state = VmmRunState::Resuming;
                 let paused_duration = self
                     .paused_at

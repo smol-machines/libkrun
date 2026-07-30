@@ -1066,6 +1066,7 @@ pub fn build_microvm(
         vcpus_handles: Vec::new(),
         run_state: super::VmmRunState::Paused,
         paused_at: None,
+        devices_quiesced: false,
         exit_evt,
         exit_observers: Vec::new(),
         exit_code: exit_code.clone(),
