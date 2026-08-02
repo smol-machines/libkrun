@@ -16,7 +16,7 @@ use super::muxer_thread::MuxerThread;
 use super::packet::TsiConnectReq;
 use super::packet::{TsiGetnameRsp, VsockPacket};
 use super::proxy::ProxyRawHandle;
-use super::proxy::{ListenerDesc, Proxy, ProxyRemoval, ProxyUpdate};
+use super::proxy::{ListenerDesc, Proxy, ProxyRemoval, ProxyStatus, ProxyUpdate};
 use super::reaper::ReaperThread;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use super::timesync::TimesyncThread;
@@ -818,6 +818,26 @@ impl VsockMuxer {
                     addr: SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0).into(),
                 };
                 let update = unix.connect(pkt, tsi);
+                if unix.status() == ProxyStatus::Idle {
+                    // connect() hit a hard, immediate failure (e.g. EAGAIN when
+                    // the target's accept backlog is momentarily full) rather
+                    // than succeeding or going Connecting. Tell the guest's
+                    // real connect() it failed instead of unconditionally
+                    // confirming a connection that never happened -- otherwise
+                    // the guest believes it's connected, writes into a proxy
+                    // whose backing socket was never connected, and hangs
+                    // forever waiting for a response that can't arrive.
+                    warn!(
+                        "host-IPC connect to {:?} failed, sending rst: id={:#x}",
+                        path, id
+                    );
+                    let rx = MuxerRx::Reset {
+                        local_port: pkt.dst_port(),
+                        peer_port: pkt.src_port(),
+                    };
+                    push_packet(self.cid, rx, &self.rxq, queue, mem);
+                    return;
+                }
                 unix.confirm_connect(pkt);
                 proxy_map.insert(id, Mutex::new(Box::new(unix)));
                 self.process_proxy_update(id, update);
