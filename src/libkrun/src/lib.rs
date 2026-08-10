@@ -613,24 +613,33 @@ fn rollback_failed_fork(
     checkpoint: vmm::VmCheckpoint,
     failure: String,
 ) -> String {
-    let mut rollback_errors = Vec::new();
+    let recovery_checkpoint = checkpoint.serialize();
+    if let Err(error) = vmm.lock().unwrap().rollback_fork_checkpoint(checkpoint) {
+        let recovery = match std::fs::write(dir.join("checkpoint.bin"), recovery_checkpoint) {
+            Ok(()) => format!("checkpoint preserved at {}", dir.display()),
+            Err(write_error) => format!(
+                "checkpoint preservation at {} failed: {write_error}",
+                dir.display()
+            ),
+        };
+        return format!("ERR EIO {failure}; rollback failed: {error}; {recovery}\n");
+    }
+
+    let mut cleanup_errors = Vec::new();
     for name in ["checkpoint.bin", "manifest.bin"] {
         if let Err(error) = std::fs::remove_file(dir.join(name))
             && error.kind() != std::io::ErrorKind::NotFound
         {
-            rollback_errors.push(format!("remove {name}: {error}"));
+            cleanup_errors.push(format!("remove {name}: {error}"));
         }
     }
-    if let Err(error) = vmm.lock().unwrap().rollback_fork_checkpoint(checkpoint) {
-        rollback_errors.push(format!("restore VM: {error}"));
-    }
 
-    if rollback_errors.is_empty() {
+    if cleanup_errors.is_empty() {
         format!("ERR EIO {failure}\n")
     } else {
         format!(
-            "ERR EIO {failure}; rollback failed: {}\n",
-            rollback_errors.join(", ")
+            "ERR EIO {failure}; rollback succeeded but cleanup failed: {}\n",
+            cleanup_errors.join(", ")
         )
     }
 }
