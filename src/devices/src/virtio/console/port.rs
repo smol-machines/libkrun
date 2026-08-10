@@ -66,6 +66,8 @@ enum PortState {
         stop: Arc<AtomicBool>,
         rx_thread: Option<JoinHandle<Queue>>,
         tx_thread: Option<JoinHandle<Queue>>,
+        idle_rx: Option<Queue>,
+        idle_tx: Option<Queue>,
     },
 }
 
@@ -148,32 +150,43 @@ impl Port {
             .expect("Failed to create EventFd for interrupt_evt");
         let stop = Arc::new(AtomicBool::new(false));
 
-        let rx_thread = input.map(|input| {
-            let mem = mem.clone();
-            let interrupt = interrupt.clone();
-            let port_id = self.port_id;
-            let stopfd = stopfd.try_clone().unwrap();
-            let stop = stop.clone();
-            thread::Builder::new()
-                .name("console port".into())
-                .spawn(move || {
-                    process_rx(
-                        mem, rx_queue, interrupt, input, control, port_id, stopfd, stop,
-                    )
-                })
-                .unwrap()
-        });
+        let (rx_thread, idle_rx) = match input {
+            Some(input) => {
+                let mem = mem.clone();
+                let interrupt = interrupt.clone();
+                let port_id = self.port_id;
+                let stopfd = stopfd.try_clone().unwrap();
+                let stop = stop.clone();
+                let thread = thread::Builder::new()
+                    .name("console port".into())
+                    .spawn(move || {
+                        process_rx(
+                            mem, rx_queue, interrupt, input, control, port_id, stopfd, stop,
+                        )
+                    })
+                    .unwrap();
+                (Some(thread), None)
+            }
+            None => (None, Some(rx_queue)),
+        };
 
-        let tx_thread = output.map(|output| {
-            let stop = stop.clone();
-            thread::spawn(move || process_tx(mem, tx_queue, interrupt, output, stop))
-        });
+        let (tx_thread, idle_tx) = match output {
+            Some(output) => {
+                let stop = stop.clone();
+                let thread =
+                    thread::spawn(move || process_tx(mem, tx_queue, interrupt, output, stop));
+                (Some(thread), None)
+            }
+            None => (None, Some(tx_queue)),
+        };
 
         self.state = PortState::Active {
             stopfd,
             stop,
             rx_thread,
             tx_thread,
+            idle_rx,
+            idle_tx,
         }
     }
 
@@ -191,8 +204,12 @@ impl Port {
             stop,
             tx_thread,
             rx_thread,
+            idle_rx,
+            idle_tx,
         } = &mut self.state
         {
+            reclaimed.rx = idle_rx.take();
+            reclaimed.tx = idle_tx.take();
             stop.store(true, Ordering::Release);
             if let Some(tx_thread) = mem::take(tx_thread) {
                 tx_thread.thread().unpark();
@@ -223,5 +240,36 @@ impl Port {
     /// True if this port currently has running worker threads.
     pub(crate) fn is_active(&self) -> bool {
         matches!(self.state, PortState::Active { .. })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inactive_directions_retain_their_queues_for_snapshot_rearm() {
+        let mut port = Port::new(
+            0,
+            PortDescription {
+                name: "test".into(),
+                input: None,
+                output: None,
+                terminal: None,
+            },
+        );
+        port.state = PortState::Active {
+            stopfd: utils::eventfd::EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
+            stop: Arc::new(AtomicBool::new(false)),
+            rx_thread: None,
+            tx_thread: None,
+            idle_rx: Some(Queue::new(16)),
+            idle_tx: Some(Queue::new(16)),
+        };
+
+        let reclaimed = port.shutdown_and_reclaim();
+        assert!(reclaimed.rx.is_some());
+        assert!(reclaimed.tx.is_some());
+        assert!(!port.is_active());
     }
 }

@@ -607,6 +607,35 @@ fn read_fork_manifest(
 }
 
 #[cfg(fork_supported)]
+fn rollback_failed_fork(
+    vmm: &Arc<Mutex<vmm::Vmm>>,
+    dir: &std::path::Path,
+    checkpoint: vmm::VmCheckpoint,
+    failure: String,
+) -> String {
+    let mut rollback_errors = Vec::new();
+    for name in ["checkpoint.bin", "manifest.bin"] {
+        if let Err(error) = std::fs::remove_file(dir.join(name))
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            rollback_errors.push(format!("remove {name}: {error}"));
+        }
+    }
+    if let Err(error) = vmm.lock().unwrap().rollback_fork_checkpoint(checkpoint) {
+        rollback_errors.push(format!("restore VM: {error}"));
+    }
+
+    if rollback_errors.is_empty() {
+        format!("ERR EIO {failure}\n")
+    } else {
+        format!(
+            "ERR EIO {failure}; rollback failed: {}\n",
+            rollback_errors.join(", ")
+        )
+    }
+}
+
+#[cfg(fork_supported)]
 fn handle_fork(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
     if dir.is_empty() {
         return "ERR EINVAL fork snapshot dir required\n".to_string();
@@ -618,23 +647,48 @@ fn handle_fork(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
     // Capture + freeze (the VM stays paused as the CoW base).
     let (checkpoint, descs) = match vmm.lock().unwrap().checkpoint_for_fork() {
         Ok(v) => v,
+        Err(vmm::Error::ForkRequiresMemfd) => {
+            return "ERR EINVAL no memfd-backed RAM (start the golden VM with SMOLVM_FORKABLE=1)\n"
+                .to_string();
+        }
         Err(e) => return format!("ERR EIO fork checkpoint failed: {e}\n"),
     };
-    if descs.iter().all(|d| d.fd < 0) {
-        return "ERR EINVAL no memfd-backed RAM (start the golden VM with SMOLVM_FORKABLE=1)\n"
-            .to_string();
-    }
     if let Err(e) = std::fs::write(dir.join("checkpoint.bin"), checkpoint.serialize()) {
-        return format!("ERR EIO write checkpoint: {e}\n");
+        return rollback_failed_fork(vmm, dir, checkpoint, format!("write checkpoint: {e}"));
     }
     let pid = std::process::id() as i32;
     if let Err(e) = write_fork_manifest(&dir.join("manifest.bin"), pid, &descs) {
-        return format!("ERR EIO write manifest: {e}\n");
+        return rollback_failed_fork(vmm, dir, checkpoint, format!("write manifest: {e}"));
     }
     format!(
         "OK forked (frozen base, pid {pid}, {} regions)\n",
         descs.len()
     )
+}
+
+#[cfg(fork_supported)]
+fn handle_rollback_fork(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
+    if dir.is_empty() {
+        return "ERR EINVAL fork snapshot dir required\n".to_string();
+    }
+    let checkpoint_path = std::path::Path::new(dir).join("checkpoint.bin");
+    let bytes = match std::fs::read(&checkpoint_path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return format!(
+                "ERR EIO read rollback checkpoint {}: {error}\n",
+                checkpoint_path.display()
+            );
+        }
+    };
+    let checkpoint = match vmm::VmCheckpoint::deserialize(&bytes) {
+        Ok(checkpoint) => checkpoint,
+        Err(error) => return format!("ERR EINVAL decode rollback checkpoint: {error}\n"),
+    };
+    match vmm.lock().unwrap().rollback_fork_checkpoint(checkpoint) {
+        Ok(()) => "OK running\n".to_string(),
+        Err(error) => format!("ERR EIO rollback fork: {error}\n"),
+    }
 }
 
 /// Build a [`vmm::builder::RestoreCtx`] from a fork snapshot directory: parse the
@@ -661,15 +715,34 @@ fn build_restore_ctx(
     })
 }
 
+const MAX_CONTROL_COMMAND_BYTES: usize = 4096;
+
+fn read_control_command<R: std::io::Read>(reader: &mut R) -> std::io::Result<Vec<u8>> {
+    let mut command = Vec::with_capacity(256);
+    let mut byte = [0_u8; 1];
+    loop {
+        match reader.read(&mut byte)? {
+            0 => return Ok(command),
+            _ if byte[0] == b'\n' => return Ok(command),
+            _ if command.len() == MAX_CONTROL_COMMAND_BYTES => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "control command exceeds 4096 bytes",
+                ));
+            }
+            _ => command.push(byte[0]),
+        }
+    }
+}
+
 fn handle_control_stream<S: std::io::Read + std::io::Write>(
     mut stream: S,
     vmm: &Arc<Mutex<vmm::Vmm>>,
 ) {
-    let mut buf = [0_u8; 128];
-    let response = match stream.read(&mut buf) {
-        Ok(0) => "ERR EINVAL empty command\n".to_string(),
-        Ok(n) => {
-            let cmd = String::from_utf8_lossy(&buf[..n]);
+    let response = match read_control_command(&mut stream) {
+        Ok(buf) if buf.is_empty() => "ERR EINVAL empty command\n".to_string(),
+        Ok(buf) => {
+            let cmd = String::from_utf8_lossy(&buf);
             let cmd = cmd.trim();
             // Split into a verb (case-insensitive) and an optional argument
             // (e.g. a checkpoint id), preserving the argument's case.
@@ -733,6 +806,8 @@ fn handle_control_stream<S: std::io::Read + std::io::Write>(
                 // (SMOLVM_FORKABLE=1).
                 #[cfg(fork_supported)]
                 "FORK" => handle_fork(vmm, _arg),
+                #[cfg(fork_supported)]
+                "ROLLBACK_FORK" => handle_rollback_fork(vmm, _arg),
                 _ => "ERR EINVAL unknown command\n".to_string(),
             }
         }
@@ -740,6 +815,22 @@ fn handle_control_stream<S: std::io::Read + std::io::Write>(
     };
 
     let _ = stream.write_all(response.as_bytes());
+}
+
+#[cfg(test)]
+mod control_command_tests {
+    use super::*;
+
+    #[test]
+    fn control_commands_are_complete_and_bounded() {
+        let command = format!("ROLLBACK_FORK /{}\nignored", "x".repeat(512));
+        let parsed = read_control_command(&mut command.as_bytes()).unwrap();
+        assert_eq!(parsed, command.as_bytes()[..command.find('\n').unwrap()]);
+
+        let oversized = vec![b'x'; MAX_CONTROL_COMMAND_BYTES + 1];
+        let error = read_control_command(&mut oversized.as_slice()).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -3803,7 +3894,7 @@ mod test_disable_implicit_init {
 
     #[test]
     fn test_disable_implicit_init() {
-        let ctx = unsafe { krun_create_ctx() } as u32;
+        let ctx = krun_create_ctx() as u32;
         unsafe {
             krun_disable_implicit_init(ctx);
             krun_add_virtiofs3(ctx, c"/dev/root".as_ptr(), c"/tmp".as_ptr(), 0, false);

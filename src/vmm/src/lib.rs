@@ -140,6 +140,9 @@ pub enum Error {
     VcpuSnapshot(String),
     /// VM checkpoint/restore (memory, device, or VM state) failed.
     Snapshot(String),
+    /// Fork snapshots require guest RAM backed by shareable file descriptors.
+    #[cfg(fork_supported)]
+    ForkRequiresMemfd,
     /// Cannot spawn a new Vcpu thread.
     VcpuSpawn(std::io::Error),
     /// Vm error.
@@ -179,6 +182,8 @@ impl Display for Error {
             VcpuResume => write!(f, "vCPUs resume failed."),
             VcpuSnapshot(e) => write!(f, "vCPU snapshot/restore failed: {e}"),
             Snapshot(e) => write!(f, "VM snapshot/restore failed: {e}"),
+            #[cfg(fork_supported)]
+            ForkRequiresMemfd => write!(f, "fork requires memfd-backed guest RAM"),
             VcpuSpawn(e) => write!(f, "Cannot spawn Vcpu thread: {e}"),
             Vm(e) => write!(f, "Vm error: {e}"),
             VmmObserverInit(e) => write!(
@@ -330,6 +335,11 @@ pub struct Vmm {
     /// chips (the WHP software IOAPIC — see [`VmCheckpoint::ioapic`]).
     #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
     intc: devices::legacy::IrqChip,
+}
+
+#[cfg(fork_supported)]
+fn has_memfd_backed_memory(descs: &[snapshot::MemfdRegionDesc]) -> bool {
+    descs.iter().any(|desc| desc.fd >= 0)
 }
 
 impl Vmm {
@@ -842,27 +852,87 @@ impl Vmm {
     pub fn checkpoint_for_fork(
         &mut self,
     ) -> Result<(VmCheckpoint, Vec<snapshot::MemfdRegionDesc>)> {
+        // Validate the immutable prerequisite before pausing vCPUs or draining
+        // device workers. A failed FORK must not alter the running VM.
+        let descs = snapshot::memfd_region_descs(&self.guest_memory);
+        if !has_memfd_backed_memory(&descs) {
+            return Err(Error::ForkRequiresMemfd);
+        }
+
         self.pause()?;
         self.quiesce_devices();
-        let vcpu_states = self.save_vcpu_states()?;
-        let vm_state = self.vm.save_state().map_err(Error::Vm)?;
-        let devices = self.snapshot_devices();
-        let descs = snapshot::memfd_region_descs(&self.guest_memory);
-        // Intentionally NOT re-armed/resumed: the golden stays frozen as the
-        // shared CoW base for its clones.
-        #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
-        let ioapic = self.intc.lock().unwrap().save_state();
-        #[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
-        let ioapic = None;
-        Ok((
-            VmCheckpoint {
+        let checkpoint = (|| {
+            let vcpu_states = self.save_vcpu_states()?;
+            let vm_state = self.vm.save_state().map_err(Error::Vm)?;
+            let devices = self.snapshot_devices();
+            #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+            let ioapic = self.intc.lock().unwrap().save_state();
+            #[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
+            let ioapic = None;
+            Ok(VmCheckpoint {
                 vm_state,
                 vcpu_states,
                 devices,
                 ioapic,
+            })
+        })();
+
+        match checkpoint {
+            // Intentionally leave a successful checkpoint frozen as the stable
+            // shared CoW base for its clones.
+            Ok(checkpoint) => Ok((checkpoint, descs)),
+            Err(checkpoint_error) => match self.resume() {
+                Ok(()) => Err(checkpoint_error),
+                Err(resume_error) => Err(Error::Snapshot(format!(
+                    "fork checkpoint failed ({checkpoint_error}); rollback failed ({resume_error})"
+                ))),
             },
-            descs,
-        ))
+        }
+    }
+
+    /// Reapply a successful fork checkpoint and resume the original VM.
+    ///
+    /// Fork capture intentionally leaves device workers stopped and vCPUs
+    /// paused. A failure after capture must restore the captured VM, vCPU, and
+    /// device state before resuming; a plain resume can leave guest I/O wedged.
+    #[cfg(fork_supported)]
+    pub fn rollback_fork_checkpoint(&mut self, checkpoint: VmCheckpoint) -> Result<()> {
+        if self.run_state != VmmRunState::Paused {
+            return Err(Error::Snapshot(
+                "fork rollback requires a paused VM".to_string(),
+            ));
+        }
+
+        let VmCheckpoint {
+            vm_state,
+            vcpu_states,
+            devices,
+            ioapic,
+        } = checkpoint;
+        let restore = (|| {
+            self.vm.restore_state(&vm_state).map_err(Error::Vm)?;
+            #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+            if let Some(bytes) = &ioapic {
+                self.intc.lock().unwrap().restore_state(bytes);
+            }
+            #[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
+            let _ = ioapic;
+            self.restore_devices(&devices).map_err(Error::Snapshot)?;
+            self.restore_vcpu_states(vcpu_states)
+        })();
+
+        // Attempt both halves even if state restoration fails, so recoverable
+        // errors do not silently strand stopped workers and paused vCPUs.
+        self.rearm_devices();
+        let resume = self.resume();
+        match (restore, resume) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(restore_error), Ok(())) => Err(restore_error),
+            (Ok(()), Err(resume_error)) => Err(resume_error),
+            (Err(restore_error), Err(resume_error)) => Err(Error::Snapshot(format!(
+                "fork rollback restore failed ({restore_error}); resume failed ({resume_error})"
+            ))),
+        }
     }
 
     /// Pause the microVM.
@@ -1065,6 +1135,28 @@ impl Vmm {
     #[cfg(target_os = "macos")]
     pub fn remove_mapping(&self, reply_sender: Sender<bool>, guest_addr: u64, len: u64) {
         self.vm.remove_mapping(reply_sender, guest_addr, len);
+    }
+}
+
+#[cfg(all(test, fork_supported))]
+mod fork_tests {
+    use super::*;
+
+    fn region(fd: i32) -> snapshot::MemfdRegionDesc {
+        snapshot::MemfdRegionDesc {
+            gpa: 0,
+            len: 4096,
+            fd,
+            offset: 0,
+            path: String::new(),
+        }
+    }
+
+    #[test]
+    fn fork_requires_at_least_one_shareable_ram_region() {
+        assert!(!has_memfd_backed_memory(&[]));
+        assert!(!has_memfd_backed_memory(&[region(-1), region(-1)]));
+        assert!(has_memfd_backed_memory(&[region(-1), region(7)]));
     }
 }
 
