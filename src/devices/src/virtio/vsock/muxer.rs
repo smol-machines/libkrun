@@ -910,6 +910,25 @@ impl VsockMuxer {
         if let Some(update) = update {
             self.process_proxy_update(id, update);
         }
+
+        // Drain any data already buffered on the host socket now that the
+        // guest has credit again. Waiting for the poller is not enough on
+        // Windows: `WSAEventSelect`'s `FD_READ` only re-signals after a
+        // `recv` call, and a proxy that hit WaitForCredit returned without
+        // recv'ing — so buffered bytes would never produce another readiness
+        // event, the stream would stall, and the remote peer's idle timeout
+        // would reset the connection (a guest download dying "unexpected
+        // EOF"). On Unix the extra recv attempt just reports WouldBlock when
+        // nothing is buffered.
+        let drain = self
+            .proxy_map
+            .read()
+            .unwrap()
+            .get(&id)
+            .map(|proxy| proxy.lock().unwrap().process_event(EventSet::IN));
+        if let Some(update) = drain {
+            self.process_proxy_update(id, update);
+        }
     }
 
     fn process_stream_rw(&self, pkt: &VsockPacket) {

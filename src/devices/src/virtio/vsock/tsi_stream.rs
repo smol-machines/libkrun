@@ -659,18 +659,14 @@ impl Proxy for TsiStreamProxy {
         let mut update = ProxyUpdate::default();
 
         let ret = if let Some(buf) = pkt.buf() {
-            // MSG_NOSIGNAL on Linux avoids SIGPIPE on a closed peer; macOS relies
-            // on the socket's SO_NOSIGPIPE / default, Windows has no SIGPIPE.
-            #[cfg(target_os = "linux")]
-            let send_res = self.sock.send_with_flags(buf, libc::MSG_NOSIGNAL);
-            #[cfg(not(target_os = "linux"))]
-            let send_res = self.sock.send(buf);
-
-            match send_res {
+            // `send_all` delivers the whole buffer or fails — a vsock stream
+            // has no way to signal a partial write, so anything short of full
+            // delivery silently corrupts the byte stream. On Windows the
+            // socket is permanently nonblocking (see `sys::send_all`), so the
+            // plain `send` this used could drop the tail of any buffer larger
+            // than the socket's free space.
+            match sys::send_all(&self.sock, buf) {
                 Ok(sent) => {
-                    if sent != buf.len() {
-                        error!("couldn't set everything: buf={}, sent={}", buf.len(), sent);
-                    }
                     self.tx_cnt += Wrapping(sent as u32);
                     sent as i32
                 }
