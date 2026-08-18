@@ -2689,11 +2689,58 @@ impl FileSystem for PassthroughFs {
                 std::fs::remove_dir_all(&self.cfg.root_dir)?;
                 Ok(Vec::new())
             }
+            // A regular file is never a terminal, so reject the terminal ioctl
+            // family with ENOTTY. Without this the catch-all below reports
+            // success, and glibc's `isatty()` — which probes with a terminal
+            // ioctl and reads success as "is a tty" (TCGETS before glibc 2.42,
+            // TCGETS2 since) — treats every virtiofs-mounted file as a terminal,
+            // so e.g. `python3 script.py` on a mount drops into interactive mode.
+            _ if is_terminal_ioctl(cmd) => Err(io::Error::from_raw_os_error(libc::ENOTTY)),
             // For FS_IOC_GETFLAGS (used by overlayfs copy-up): return zero flags
             // instead of an error. macOS doesn't support Linux file attributes, so
             // report "no flags set" which lets overlayfs proceed normally.
             // Returning EOPNOTSUPP/ENOTSUPP causes overlayfs copy-up to fail.
             _ => Ok(vec![0u8; std::mem::size_of::<u32>()]),
         }
+    }
+}
+
+/// Whether a Linux ioctl request belongs to the terminal (`'T'`) family —
+/// `TCGETS`, `TCGETS2`, `TIOCGWINSZ`, and the rest of the termios/tty ioctls.
+///
+/// The request is a Linux `_IOC(...)` value forwarded verbatim by the guest
+/// virtiofs client; its "type" byte sits at bits 8..=15. A regular file is
+/// never a terminal, so the passthrough backend answers these with `ENOTTY`
+/// rather than a bogus success — otherwise `isatty()` in the guest reports a
+/// mounted file as a tty.
+fn is_terminal_ioctl(cmd: u32) -> bool {
+    const IOC_TYPE_SHIFT: u32 = 8;
+    const IOC_TYPE_MASK: u32 = 0xff;
+    (cmd >> IOC_TYPE_SHIFT) & IOC_TYPE_MASK == b'T' as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_terminal_ioctl;
+
+    #[test]
+    fn terminal_ioctls_are_recognized() {
+        // The termios/tty family that `isatty()` probes with.
+        const TCGETS: u32 = 0x5401; // glibc < 2.42, musl
+        const TCGETS2: u32 = 0x802c_542b; // glibc >= 2.42
+        const TIOCGWINSZ: u32 = 0x5413;
+        assert!(is_terminal_ioctl(TCGETS));
+        assert!(is_terminal_ioctl(TCGETS2));
+        assert!(is_terminal_ioctl(TIOCGWINSZ));
+    }
+
+    #[test]
+    fn non_terminal_ioctls_are_not_misclassified() {
+        // FS_IOC_GETFLAGS (type 'f') is used by overlayfs copy-up and must
+        // still reach the catch-all, not be rejected as a terminal ioctl.
+        const FS_IOC_GETFLAGS: u32 = 0x8008_6601;
+        const FS_IOC_SETFLAGS: u32 = 0x4008_6602;
+        assert!(!is_terminal_ioctl(FS_IOC_GETFLAGS));
+        assert!(!is_terminal_ioctl(FS_IOC_SETFLAGS));
     }
 }
