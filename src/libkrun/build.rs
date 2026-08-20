@@ -44,12 +44,13 @@ fn emit_snapshot_cfgs() {
     let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let linux_x86 = os == "linux" && arch == "x86_64";
+    let linux_arm = os == "linux" && arch == "aarch64";
     let macos_arm = os == "macos" && arch == "aarch64";
     let windows_x86 = os == "windows" && arch == "x86_64";
-    if linux_x86 || macos_arm || windows_x86 {
+    if linux_x86 || linux_arm || macos_arm || windows_x86 {
         println!("cargo:rustc-cfg=snapshot_supported");
     }
-    if linux_x86 || macos_arm || windows_x86 {
+    if linux_x86 || linux_arm || macos_arm || windows_x86 {
         println!("cargo:rustc-cfg=fork_supported");
     }
 }

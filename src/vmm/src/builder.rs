@@ -978,7 +978,16 @@ pub fn build_microvm(
             // try first to instantiate a GICv3, and fall back to a GICv2 if it fails.
             let vcpu_count = vm_resources.vm_config().vcpu_count.unwrap() as u64;
             let gic = match KvmGicV3::new(vm.fd(), vcpu_count) {
-                Ok(gicv3) => IrqChipDevice::new(Box::new(gicv3)),
+                Ok(gicv3) => {
+                    // Register the vGICv3 with the VM so checkpoint/restore
+                    // (fork) can transfer its state; per-CPU registers are
+                    // addressed by each vCPU's MPIDR.
+                    vm.register_vgic(
+                        gicv3.device_fd(),
+                        vcpus.iter().map(|v| v.get_mpidr()).collect(),
+                    );
+                    IrqChipDevice::new(Box::new(gicv3))
+                }
                 Err(_) => {
                     warn!("KVM GICv3 creation failed, falling back to KVM GICv2");
                     IrqChipDevice::new(Box::new(KvmGicV2::new(vm.fd(), vcpu_count)))

@@ -17,7 +17,7 @@ const KVM_VGIC_V3_BASE_SIZE: u64 = 0x0001_0000;
 const ARCH_GIC_V3_MAINT_IRQ: u32 = 9;
 
 pub struct KvmGicV3 {
-    _device_fd: DeviceFd,
+    device_fd: DeviceFd,
 
     /// GIC device properties, to be used for setting up the fdt entry
     properties: [u64; 4],
@@ -76,10 +76,16 @@ impl KvmGicV3 {
         device_fd.set_device_attr(&attr)?;
 
         Ok(Self {
-            _device_fd: device_fd,
+            device_fd,
             properties: [dist_addr, dist_size, redists_addr, redists_size],
             vcpu_count,
         })
+    }
+
+    /// The vGIC device fd, used by the snapshot path to capture/restore the
+    /// in-kernel GIC state via `KVM_{GET,SET}_DEVICE_ATTR`.
+    pub fn device_fd(&self) -> &DeviceFd {
+        &self.device_fd
     }
 }
 

@@ -14,9 +14,12 @@ use std::fmt::{Display, Formatter};
 use std::io;
 use std::ops::Range;
 
-// Only needed by the x86_64 kvmclock ioctl below (aarch64 uses a local import).
-#[cfg(target_arch = "x86_64")]
+// x86_64: the kvmclock ioctl below; aarch64: duplicating the vGIC device fd
+// for the snapshot path.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use std::os::fd::AsRawFd;
+#[cfg(target_arch = "aarch64")]
+use std::os::fd::FromRawFd;
 use std::os::unix::io::RawFd;
 
 #[cfg(target_arch = "x86_64")]
@@ -62,6 +65,8 @@ use kvm_bindings::{
     KVM_MEM_GUEST_MEMFD, KVM_MEMORY_ATTRIBUTE_PRIVATE, kvm_create_guest_memfd,
     kvm_memory_attributes, kvm_userspace_memory_region2,
 };
+#[cfg(target_arch = "aarch64")]
+use kvm_bindings::{KVM_REG_SIZE_MASK, KVM_REG_SIZE_SHIFT, RegList, kvm_mp_state};
 use kvm_ioctls::{Cap::*, *};
 use utils::eventfd::EventFd;
 use utils::signal::{Killable, register_signal_handler, sigrtmin};
@@ -179,9 +184,21 @@ pub enum Error {
     #[cfg(target_arch = "x86_64")]
     /// Failed to get KVM vcpu lapic.
     VcpuGetLapic(kvm_ioctls::Error),
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     /// Failed to get KVM vcpu mp state.
     VcpuGetMpState(kvm_ioctls::Error),
+    #[cfg(target_arch = "aarch64")]
+    /// Failed to enumerate the KVM vcpu register list.
+    VcpuGetRegList(kvm_ioctls::Error),
+    #[cfg(target_arch = "aarch64")]
+    /// Failed to get a KVM vcpu register (reg id, error).
+    VcpuGetOneReg(u64, kvm_ioctls::Error),
+    #[cfg(target_arch = "aarch64")]
+    /// Failed to set a KVM vcpu register (reg id, error).
+    VcpuSetOneReg(u64, kvm_ioctls::Error),
+    #[cfg(target_arch = "aarch64")]
+    /// Failed to capture or restore the in-kernel vGIC state.
+    VmGicState(String),
     #[cfg(target_arch = "x86_64")]
     /// Failed to get KVM vcpu msrs.
     VcpuGetMsrs(kvm_ioctls::Error),
@@ -211,7 +228,7 @@ pub enum Error {
     #[cfg(target_arch = "x86_64")]
     /// Failed to set KVM vcpu lapic.
     VcpuSetLapic(kvm_ioctls::Error),
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     /// Failed to set KVM vcpu mp state.
     VcpuSetMpState(kvm_ioctls::Error),
     #[cfg(target_arch = "x86_64")]
@@ -377,8 +394,16 @@ impl Display for Error {
             VcpuGetDebugRegs(e) => write!(f, "Failed to get KVM vcpu debug regs: {e}"),
             #[cfg(target_arch = "x86_64")]
             VcpuGetLapic(e) => write!(f, "Failed to get KVM vcpu lapic: {e}"),
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             VcpuGetMpState(e) => write!(f, "Failed to get KVM vcpu mp state: {e}"),
+            #[cfg(target_arch = "aarch64")]
+            VcpuGetRegList(e) => write!(f, "Failed to get KVM vcpu register list: {e}"),
+            #[cfg(target_arch = "aarch64")]
+            VcpuGetOneReg(id, e) => write!(f, "Failed to get KVM vcpu register {id:#x}: {e}"),
+            #[cfg(target_arch = "aarch64")]
+            VcpuSetOneReg(id, e) => write!(f, "Failed to set KVM vcpu register {id:#x}: {e}"),
+            #[cfg(target_arch = "aarch64")]
+            VmGicState(e) => write!(f, "vGIC state transfer failed: {e}"),
             #[cfg(target_arch = "x86_64")]
             VcpuGetMsrs(e) => write!(f, "Failed to get KVM vcpu msrs: {e}"),
             #[cfg(target_arch = "x86_64")]
@@ -397,7 +422,7 @@ impl Display for Error {
             VcpuSetDebugRegs(e) => write!(f, "Failed to set KVM vcpu debug regs: {e}"),
             #[cfg(target_arch = "x86_64")]
             VcpuSetLapic(e) => write!(f, "Failed to set KVM vcpu lapic: {e}"),
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             VcpuSetMpState(e) => write!(f, "Failed to set KVM vcpu mp state: {e}"),
             #[cfg(target_arch = "x86_64")]
             VcpuSetMsrs(e) => write!(f, "Failed to set KVM vcpu msrs: {e}"),
@@ -529,6 +554,22 @@ pub struct Vm {
     pub tee_config: Tee,
 
     pub guest_memfds: Vec<(Range<u64>, RawFd)>,
+
+    /// Handle onto the in-kernel vGICv3 for checkpoint/restore (registered by
+    /// the builder after the GIC device and vCPUs exist). `None` on GICv2
+    /// hosts, where snapshots degrade to a warning (fork clones would not
+    /// receive device IRQs).
+    #[cfg(target_arch = "aarch64")]
+    vgic: Option<VgicSnapshotHandle>,
+}
+
+/// The pieces needed to capture/restore the in-kernel vGICv3 state: a dup of
+/// the GIC `DeviceFd` (attribute ioctls) plus each vCPU's MPIDR (redistributor
+/// and CPU-interface state is addressed by CPU affinity).
+#[cfg(target_arch = "aarch64")]
+pub struct VgicSnapshotHandle {
+    fd: DeviceFd,
+    mpidrs: Vec<u64>,
 }
 
 impl Vm {
@@ -554,7 +595,30 @@ impl Vm {
             #[cfg(target_arch = "x86_64")]
             supported_msrs,
             guest_memfds: Vec::new(),
+            #[cfg(target_arch = "aarch64")]
+            vgic: None,
         })
+    }
+
+    /// Register the in-kernel vGICv3 for checkpoint/restore. Called by the
+    /// builder once the GIC device and the (configured) vCPUs exist; without
+    /// it, `save_state` captures an empty GIC and warns.
+    #[cfg(target_arch = "aarch64")]
+    pub fn register_vgic(&mut self, gic_fd: &DeviceFd, mpidrs: Vec<u64>) {
+        // Dup so the handle stays valid independent of the device object's
+        // lifetime inside the IRQ-chip container.
+        let fd = unsafe { libc::dup(gic_fd.as_raw_fd()) };
+        if fd < 0 {
+            warn!(
+                "could not dup the vGIC device fd ({}); snapshots will not carry GIC state",
+                io::Error::last_os_error()
+            );
+            return;
+        }
+        self.vgic = Some(VgicSnapshotHandle {
+            fd: unsafe { DeviceFd::from_raw_fd(fd) },
+            mpidrs,
+        });
     }
 
     #[cfg(feature = "amd-sev")]
@@ -960,6 +1024,44 @@ impl Vm {
             .map_err(Error::VmSetIrqChip)?;
         Ok(())
     }
+
+    /// Saves the VM-level KVM state. On aarch64 that is the in-kernel vGICv3
+    /// (KVM's arm equivalent of the x86 irqchip/PIT/clock capture): the
+    /// distributor, per-CPU redistributor, and CPU-interface registers, read
+    /// through the GIC device fd. Requires the vCPUs to be paused. Empty (with
+    /// a warning) when no vGICv3 was registered — an in-place pause/resume
+    /// does not need it, but a fork clone restored from such a checkpoint
+    /// would never receive device IRQs.
+    #[cfg(target_arch = "aarch64")]
+    pub fn save_state(&self) -> Result<VmState> {
+        match &self.vgic {
+            Some(handle) => vgic::save(handle).map_err(Error::VmGicState),
+            None => {
+                warn!(
+                    "no vGICv3 registered for snapshot; checkpoint carries no GIC state \
+                     (a restored clone may not receive device IRQs)"
+                );
+                Ok(VmState::default())
+            }
+        }
+    }
+
+    /// Restores VM-level state: replay the captured vGICv3 registers onto the
+    /// clone's freshly-initialized GIC (`GICD_CTLR` written last so delivery
+    /// only enables once the rest of the state is in place). No-op if empty.
+    #[cfg(target_arch = "aarch64")]
+    pub fn restore_state(&self, state: &VmState) -> Result<()> {
+        if state.dist_regs.is_empty() && state.redist_regs.is_empty() && state.icc_regs.is_empty() {
+            return Ok(());
+        }
+        match &self.vgic {
+            Some(handle) => vgic::restore(handle, state).map_err(Error::VmGicState),
+            None => {
+                warn!("checkpoint carries GIC state but no vGICv3 is registered; skipping");
+                Ok(())
+            }
+        }
+    }
 }
 
 #[allow(unused)]
@@ -971,6 +1073,322 @@ pub struct VmState {
     pic_master: kvm_irqchip,
     pic_slave: kvm_irqchip,
     ioapic: kvm_irqchip,
+}
+
+/// VM-level state for an aarch64 checkpoint: the in-kernel vGICv3 registers.
+/// Distributor entries are keyed by register byte offset; redistributor and
+/// CPU-interface entries are keyed by the full KVM device-attribute id
+/// (CPU affinity in bits 63:32, register offset/id in bits 31:0), so restore
+/// is a direct replay.
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Debug, Default)]
+pub struct VmState {
+    dist_regs: Vec<(u32, u32)>,
+    redist_regs: Vec<(u64, u32)>,
+    icc_regs: Vec<(u64, u64)>,
+}
+
+/// In-kernel vGICv3 state transfer via `KVM_{GET,SET}_DEVICE_ATTR`, the KVM
+/// device-attribute API (Documentation/virt/kvm/devices/arm-vgic-v3.rst).
+/// Distributor registers are addressed by byte offset with 32-bit accesses
+/// (64-bit registers such as `GICD_IROUTERn` read as two halves); per-CPU
+/// state is addressed by packing the CPU's MPIDR affinity into attr[63:32].
+#[cfg(target_arch = "aarch64")]
+mod vgic {
+    use super::{VgicSnapshotHandle, VmState};
+    use kvm_bindings::{
+        KVM_DEV_ARM_VGIC_GRP_CPU_SYSREGS, KVM_DEV_ARM_VGIC_GRP_CTRL,
+        KVM_DEV_ARM_VGIC_GRP_DIST_REGS, KVM_DEV_ARM_VGIC_GRP_REDIST_REGS,
+        KVM_DEV_ARM_VGIC_SAVE_PENDING_TABLES, kvm_device_attr,
+    };
+    use kvm_ioctls::DeviceFd;
+
+    // Only the set-variants (IS*) of the enable/pending/active banks are
+    // walked: KVM's uaccess semantics make an IS* write install the value and
+    // an IC* write CLEAR the bits in the value — replaying a saved IC* mask
+    // after its IS* twin would wipe the state just restored.
+    const GICD_CTLR: u32 = 0x0000;
+    const GICD_TYPER: u32 = 0x0004;
+    const GICD_STATUSR: u32 = 0x0010;
+    const GICD_IGROUPR: u32 = 0x0080;
+    const GICD_ISENABLER: u32 = 0x0100;
+    const GICD_ISPENDR: u32 = 0x0200;
+    const GICD_ISACTIVER: u32 = 0x0300;
+    const GICD_IPRIORITYR: u32 = 0x0400;
+    const GICD_ICFGR: u32 = 0x0c00;
+    const GICD_IROUTER: u32 = 0x6000;
+
+    /// Redistributor offsets: RD_base frame, then the SGI_base frame at
+    /// +0x10000 (per-CPU banked SGI/PPI configuration).
+    const SGI_BASE: u32 = 0x10000;
+    const REDIST_OFFSETS: [u32; 21] = [
+        0x0000,           // GICR_CTLR
+        0x0010,           // GICR_STATUSR
+        0x0014,           // GICR_WAKER
+        0x0070,           // GICR_PROPBASER (lo)
+        0x0074,           // GICR_PROPBASER (hi)
+        0x0078,           // GICR_PENDBASER (lo)
+        0x007c,           // GICR_PENDBASER (hi)
+        SGI_BASE + 0x080, // GICR_IGROUPR0
+        SGI_BASE + 0x100, // GICR_ISENABLER0
+        SGI_BASE + 0x200, // GICR_ISPENDR0
+        SGI_BASE + 0x300, // GICR_ISACTIVER0
+        SGI_BASE + 0x400, // GICR_IPRIORITYR0..7
+        SGI_BASE + 0x404,
+        SGI_BASE + 0x408,
+        SGI_BASE + 0x40c,
+        SGI_BASE + 0x410,
+        SGI_BASE + 0x414,
+        SGI_BASE + 0x418,
+        SGI_BASE + 0x41c,
+        SGI_BASE + 0xc00, // GICR_ICFGR0
+        SGI_BASE + 0xc04, // GICR_ICFGR1
+    ];
+
+    /// CPU-interface sysreg id in the `KVM_DEV_ARM_VGIC_GRP_CPU_SYSREGS`
+    /// encoding: op0 in bits 15:14, op1 13:11, CRn 10:7, CRm 6:3, op2 2:0.
+    const fn icc(op0: u64, op1: u64, crn: u64, crm: u64, op2: u64) -> u64 {
+        (op0 << 14) | (op1 << 11) | (crn << 7) | (crm << 3) | op2
+    }
+    /// Restore replays in array order, so control/config registers come before
+    /// masks and active-priority state.
+    const ICC_REGS: [u64; 15] = [
+        icc(3, 0, 12, 12, 5), // ICC_SRE_EL1
+        icc(3, 0, 12, 12, 4), // ICC_CTLR_EL1
+        icc(3, 0, 12, 12, 6), // ICC_IGRPEN0_EL1
+        icc(3, 0, 12, 12, 7), // ICC_IGRPEN1_EL1
+        icc(3, 0, 4, 6, 0),   // ICC_PMR_EL1
+        icc(3, 0, 12, 8, 3),  // ICC_BPR0_EL1
+        icc(3, 0, 12, 12, 3), // ICC_BPR1_EL1
+        icc(3, 0, 12, 8, 4),  // ICC_AP0R0_EL1
+        icc(3, 0, 12, 8, 5),  // ICC_AP0R1_EL1
+        icc(3, 0, 12, 8, 6),  // ICC_AP0R2_EL1
+        icc(3, 0, 12, 8, 7),  // ICC_AP0R3_EL1
+        icc(3, 0, 12, 9, 0),  // ICC_AP1R0_EL1
+        icc(3, 0, 12, 9, 1),  // ICC_AP1R1_EL1
+        icc(3, 0, 12, 9, 2),  // ICC_AP1R2_EL1
+        icc(3, 0, 12, 9, 3),  // ICC_AP1R3_EL1
+    ];
+
+    /// Whether `reg` is one of `ICC_AP0R1..3_EL1` / `ICC_AP1R1..3_EL1` — the
+    /// higher active-priority registers that only exist with >5 (>6)
+    /// implemented priority bits.
+    const fn is_higher_aprn(reg: u64) -> bool {
+        let crm = (reg >> 3) & 0xf;
+        let op2 = reg & 0x7;
+        (crm == 8 && op2 >= 5) || (crm == 9 && op2 >= 1 && op2 <= 3)
+    }
+
+    /// Pack a vCPU's MPIDR affinity fields into the device-attribute id's
+    /// CPU-affinity field (bits 63:32): Aff3 (MPIDR bits 39:32) moves down to
+    /// bits 31:24 next to Aff2..Aff0.
+    fn affinity(mpidr: u64) -> u64 {
+        (((mpidr & 0xff_0000_0000) >> 8) | (mpidr & 0x00ff_ffff)) << 32
+    }
+
+    fn get_reg<T: Copy + Default>(fd: &DeviceFd, group: u32, attr: u64) -> Result<T, String> {
+        let mut val = T::default();
+        let mut dev_attr = kvm_device_attr {
+            group,
+            attr,
+            addr: &mut val as *mut T as u64,
+            flags: 0,
+        };
+        // Safety: `dev_attr.addr` points at `val`, which lives until after the
+        // ioctl returns and is exactly the size the attribute group writes.
+        unsafe { fd.get_device_attr(&mut dev_attr) }
+            .map_err(|e| format!("get GIC reg group={group} attr={attr:#x}: {e}"))?;
+        Ok(val)
+    }
+
+    fn set_reg<T: Copy>(fd: &DeviceFd, group: u32, attr: u64, val: T) -> Result<(), String> {
+        let dev_attr = kvm_device_attr {
+            group,
+            attr,
+            addr: &val as *const T as u64,
+            flags: 0,
+        };
+        fd.set_device_attr(&dev_attr)
+            .map_err(|e| format!("set GIC reg group={group} attr={attr:#x}: {e}"))
+    }
+
+    fn has_reg(fd: &DeviceFd, group: u32, attr: u64) -> bool {
+        let dev_attr = kvm_device_attr {
+            group,
+            attr,
+            addr: 0,
+            flags: 0,
+        };
+        fd.has_device_attr(&dev_attr).is_ok()
+    }
+
+    /// Distributor register offsets for `nr_irqs` interrupt IDs. SGIs/PPIs
+    /// (IDs 0..31) are banked in the redistributor, so distributor per-IRQ
+    /// ranges start at ID 32.
+    fn dist_offsets(nr_irqs: u32) -> Vec<u32> {
+        let mut offsets = vec![GICD_CTLR, GICD_STATUSR];
+        for base in [GICD_IGROUPR, GICD_ISENABLER, GICD_ISPENDR, GICD_ISACTIVER] {
+            for irq in (32..nr_irqs).step_by(32) {
+                offsets.push(base + (irq / 32) * 4); // one bit per IRQ
+            }
+        }
+        for irq in (32..nr_irqs).step_by(4) {
+            offsets.push(GICD_IPRIORITYR + irq); // one byte per IRQ
+        }
+        for irq in (32..nr_irqs).step_by(16) {
+            offsets.push(GICD_ICFGR + (irq / 16) * 4); // two bits per IRQ
+        }
+        for irq in 32..nr_irqs {
+            // 64-bit affinity routing, accessed as two 32-bit halves.
+            offsets.push(GICD_IROUTER + irq * 8);
+            offsets.push(GICD_IROUTER + irq * 8 + 4);
+        }
+        offsets
+    }
+
+    pub(super) fn save(handle: &VgicSnapshotHandle) -> Result<VmState, String> {
+        let fd = &handle.fd;
+        // Flush LPI pending state into guest RAM first. Without an ITS there
+        // are no LPIs and some kernels reject the request — best-effort.
+        let flush = kvm_device_attr {
+            group: KVM_DEV_ARM_VGIC_GRP_CTRL,
+            attr: u64::from(KVM_DEV_ARM_VGIC_SAVE_PENDING_TABLES),
+            addr: 0,
+            flags: 0,
+        };
+        if let Err(e) = fd.set_device_attr(&flush) {
+            debug!("vGIC SAVE_PENDING_TABLES not applied (no LPIs in use?): {e}");
+        }
+
+        // Size the register walk from the distributor's own view.
+        let typer: u32 = get_reg(fd, KVM_DEV_ARM_VGIC_GRP_DIST_REGS, GICD_TYPER as u64)?;
+        let nr_irqs = 32 * ((typer & 0x1f) + 1);
+
+        let mut dist_regs = Vec::new();
+        for offset in dist_offsets(nr_irqs) {
+            let val: u32 = get_reg(fd, KVM_DEV_ARM_VGIC_GRP_DIST_REGS, offset as u64)?;
+            dist_regs.push((offset, val));
+        }
+
+        let mut redist_regs = Vec::new();
+        let mut icc_regs = Vec::new();
+        for &mpidr in &handle.mpidrs {
+            let aff = affinity(mpidr);
+            for offset in REDIST_OFFSETS {
+                let attr = aff | offset as u64;
+                let val: u32 = get_reg(fd, KVM_DEV_ARM_VGIC_GRP_REDIST_REGS, attr)?;
+                redist_regs.push((attr, val));
+            }
+            for reg in ICC_REGS {
+                let attr = aff | reg;
+                if !has_reg(fd, KVM_DEV_ARM_VGIC_GRP_CPU_SYSREGS, attr) {
+                    continue;
+                }
+                match get_reg::<u64>(fd, KVM_DEV_ARM_VGIC_GRP_CPU_SYSREGS, attr) {
+                    Ok(val) => icc_regs.push((attr, val)),
+                    // The kernel lists AP<n>R1..3 as attributes but rejects
+                    // access when the implemented priority bits don't
+                    // materialize them — absent state, nothing to save.
+                    Err(_) if is_higher_aprn(reg) => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        Ok(VmState {
+            dist_regs,
+            redist_regs,
+            icc_regs,
+        })
+    }
+
+    pub(super) fn restore(handle: &VgicSnapshotHandle, state: &VmState) -> Result<(), String> {
+        let fd = &handle.fd;
+        // Everything except GICD_CTLR first, so the distributor only starts
+        // delivering once pending/enable/routing state is fully in place.
+        let mut ctlr = None;
+        for &(offset, val) in &state.dist_regs {
+            if offset == GICD_CTLR {
+                ctlr = Some(val);
+                continue;
+            }
+            set_reg(fd, KVM_DEV_ARM_VGIC_GRP_DIST_REGS, offset as u64, val)?;
+        }
+        for &(attr, val) in &state.redist_regs {
+            set_reg(fd, KVM_DEV_ARM_VGIC_GRP_REDIST_REGS, attr, val)?;
+        }
+        for &(attr, val) in &state.icc_regs {
+            set_reg(fd, KVM_DEV_ARM_VGIC_GRP_CPU_SYSREGS, attr, val)?;
+        }
+        if let Some(val) = ctlr {
+            set_reg(fd, KVM_DEV_ARM_VGIC_GRP_DIST_REGS, GICD_CTLR as u64, val)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+impl VmState {
+    /// Serialize to a byte blob (mirrors the x86 `VmState::serialize`
+    /// signature so the cross-platform `VmCheckpoint` can call it uniformly).
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(self.dist_regs.len() as u32).to_le_bytes());
+        for &(offset, val) in &self.dist_regs {
+            out.extend_from_slice(&offset.to_le_bytes());
+            out.extend_from_slice(&val.to_le_bytes());
+        }
+        out.extend_from_slice(&(self.redist_regs.len() as u32).to_le_bytes());
+        for &(attr, val) in &self.redist_regs {
+            out.extend_from_slice(&attr.to_le_bytes());
+            out.extend_from_slice(&val.to_le_bytes());
+        }
+        out.extend_from_slice(&(self.icc_regs.len() as u32).to_le_bytes());
+        for &(attr, val) in &self.icc_regs {
+            out.extend_from_slice(&attr.to_le_bytes());
+            out.extend_from_slice(&val.to_le_bytes());
+        }
+        out
+    }
+
+    /// Reconstruct from a blob produced by [`Self::serialize`].
+    pub fn deserialize(bytes: &[u8]) -> std::result::Result<VmState, String> {
+        let err = || "aarch64 VmState blob truncated".to_string();
+        let mut pos = 0usize;
+        let take = |pos: &mut usize, n: usize| -> std::result::Result<&[u8], String> {
+            let s = bytes.get(*pos..*pos + n).ok_or_else(err)?;
+            *pos += n;
+            Ok(s)
+        };
+        let count = |pos: &mut usize| -> std::result::Result<usize, String> {
+            Ok(u32::from_le_bytes(take(pos, 4)?.try_into().unwrap()) as usize)
+        };
+        let n = count(&mut pos)?;
+        let mut dist_regs = Vec::with_capacity(n);
+        for _ in 0..n {
+            let offset = u32::from_le_bytes(take(&mut pos, 4)?.try_into().unwrap());
+            let val = u32::from_le_bytes(take(&mut pos, 4)?.try_into().unwrap());
+            dist_regs.push((offset, val));
+        }
+        let n = count(&mut pos)?;
+        let mut redist_regs = Vec::with_capacity(n);
+        for _ in 0..n {
+            let attr = u64::from_le_bytes(take(&mut pos, 8)?.try_into().unwrap());
+            let val = u32::from_le_bytes(take(&mut pos, 4)?.try_into().unwrap());
+            redist_regs.push((attr, val));
+        }
+        let n = count(&mut pos)?;
+        let mut icc_regs = Vec::with_capacity(n);
+        for _ in 0..n {
+            let attr = u64::from_le_bytes(take(&mut pos, 8)?.try_into().unwrap());
+            let val = u64::from_le_bytes(take(&mut pos, 8)?.try_into().unwrap());
+            icc_regs.push((attr, val));
+        }
+        Ok(VmState {
+            dist_regs,
+            redist_regs,
+            icc_regs,
+        })
+    }
 }
 
 /// Encapsulates configuration parameters for the guest vCPUS.
@@ -1516,6 +1934,60 @@ impl Vcpu {
         Ok(())
     }
 
+    /// Capture the full aarch64 vCPU state: the MP (power) state plus every
+    /// register KVM enumerates via `KVM_GET_REG_LIST` — core registers, FP/SIMD,
+    /// system registers, the generic timer (`CNTVCT`/`CNTV_CTL`/`CNTV_CVAL`,
+    /// so the clone's virtual counter resumes from the checkpoint), and the
+    /// PSCI firmware registers. The in-kernel GIC's CPU-interface state is
+    /// deliberately absent from the list; it travels in `VmState`.
+    #[cfg(target_arch = "aarch64")]
+    fn save_state(&self) -> Result<VcpuState> {
+        let mp_state = self.fd.get_mp_state().map_err(Error::VcpuGetMpState)?;
+        // 500 is the kvm-bindings `RegList` capacity ceiling and comfortably
+        // above the ~260-450 registers current kernels list for a non-SVE
+        // vCPU (SVE is never enabled at vcpu_init). A larger kernel list
+        // surfaces as E2BIG from the ioctl below rather than truncation.
+        let mut reg_list = RegList::new(500)
+            .map_err(|_| Error::VcpuGetRegList(kvm_ioctls::Error::new(libc::ENOMEM)))?;
+        self.fd
+            .get_reg_list(&mut reg_list)
+            .map_err(Error::VcpuGetRegList)?;
+        let mut regs = Vec::with_capacity(reg_list.as_slice().len());
+        for &id in reg_list.as_slice() {
+            let size = reg_size_bytes(id);
+            if size > 16 {
+                // Only SVE state is wider than 128 bits and it is never
+                // enabled; skip rather than silently truncate.
+                warn!("skipping oversized vCPU register {id:#x} ({size} bytes) in checkpoint");
+                continue;
+            }
+            let mut data = [0u8; 16];
+            self.fd
+                .get_one_reg(id, &mut data[..size])
+                .map_err(|e| Error::VcpuGetOneReg(id, e))?;
+            regs.push((id, u128::from_le_bytes(data)));
+        }
+        Ok(VcpuState { mp_state, regs })
+    }
+
+    /// Restore aarch64 vCPU state captured by [`Self::save_state`] onto this
+    /// freshly-initialized (never-run) vCPU. Writing the saved `CNTVCT` value
+    /// back makes KVM derive the clone's virtual-counter offset, giving the
+    /// guest a continuous timeline across the fork.
+    #[cfg(target_arch = "aarch64")]
+    fn restore_state(&self, state: VcpuState) -> Result<()> {
+        self.fd
+            .set_mp_state(state.mp_state)
+            .map_err(Error::VcpuSetMpState)?;
+        for &(id, val) in &state.regs {
+            let size = reg_size_bytes(id);
+            self.fd
+                .set_one_reg(id, &val.to_le_bytes()[..size])
+                .map_err(|e| Error::VcpuSetOneReg(id, e))?;
+        }
+        Ok(())
+    }
+
     /// Runs the vCPU in KVM context and handles the kvm exit reason.
     ///
     /// Returns error or enum specifying whether emulation was handled or interrupted.
@@ -1762,7 +2234,7 @@ impl Vcpu {
             // Save/restore are only valid while paused; the orchestrator always
             // pauses first, so receiving one here is a protocol error — ignore
             // it rather than capturing mid-instruction state.
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             Ok(VcpuEvent::SaveState | VcpuEvent::RestoreState(_)) => {
                 error!("ignoring vcpu SaveState/RestoreState received while running");
             }
@@ -1796,7 +2268,7 @@ impl Vcpu {
             // Checkpoint: capture full vCPU register state while paused (the
             // only safe point — KVM_GET_VCPU_EVENTS is unsafe while other vCPUs
             // run). Stays paused afterwards.
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             Ok(VcpuEvent::SaveState) => match self.save_state() {
                 Ok(state) => {
                     self.response_sender
@@ -1810,7 +2282,7 @@ impl Vcpu {
                 }
             },
             // Restore: load captured register state onto the paused vCPU.
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             Ok(VcpuEvent::RestoreState(state)) => {
                 if let Err(e) = self.restore_state(*state) {
                     error!("failed to restore vcpu state: {e:?}");
@@ -2022,6 +2494,62 @@ impl VmState {
     }
 }
 
+/// Byte width of a KVM register, encoded in bits 52+ of its id.
+#[cfg(target_arch = "aarch64")]
+fn reg_size_bytes(id: u64) -> usize {
+    1usize << ((id & KVM_REG_SIZE_MASK) >> KVM_REG_SIZE_SHIFT)
+}
+
+/// Full aarch64 vCPU state for a checkpoint: the MP (power) state plus every
+/// `KVM_GET_REG_LIST`-enumerated register as an (id, value) pair. Values are
+/// stored as `u128` (the widest non-SVE register); each register's true width
+/// is derived from its id on the way back in.
+#[cfg(target_arch = "aarch64")]
+#[derive(Debug)]
+pub struct VcpuState {
+    mp_state: kvm_mp_state,
+    regs: Vec<(u64, u128)>,
+}
+
+#[cfg(target_arch = "aarch64")]
+impl VcpuState {
+    /// Serialize the full vCPU register state to a self-describing byte blob
+    /// (mirrors the x86 signature for the cross-platform `VmCheckpoint`).
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + self.regs.len() * 24);
+        out.extend_from_slice(&self.mp_state.mp_state.to_le_bytes());
+        out.extend_from_slice(&(self.regs.len() as u32).to_le_bytes());
+        for &(id, val) in &self.regs {
+            out.extend_from_slice(&id.to_le_bytes());
+            out.extend_from_slice(&val.to_le_bytes());
+        }
+        out
+    }
+
+    /// Reconstruct a [`VcpuState`] from a blob produced by [`Self::serialize`].
+    pub fn deserialize(bytes: &[u8]) -> std::result::Result<VcpuState, String> {
+        let err = || "aarch64 VcpuState blob truncated".to_string();
+        let mut pos = 0usize;
+        let take = |pos: &mut usize, n: usize| -> std::result::Result<&[u8], String> {
+            let s = bytes.get(*pos..*pos + n).ok_or_else(err)?;
+            *pos += n;
+            Ok(s)
+        };
+        let mp = u32::from_le_bytes(take(&mut pos, 4)?.try_into().unwrap());
+        let n = u32::from_le_bytes(take(&mut pos, 4)?.try_into().unwrap()) as usize;
+        let mut regs = Vec::with_capacity(n);
+        for _ in 0..n {
+            let id = u64::from_le_bytes(take(&mut pos, 8)?.try_into().unwrap());
+            let val = u128::from_le_bytes(take(&mut pos, 16)?.try_into().unwrap());
+            regs.push((id, val));
+        }
+        Ok(VcpuState {
+            mp_state: kvm_mp_state { mp_state: mp },
+            regs,
+        })
+    }
+}
+
 // Allow currently unused Pause and Exit events. These will be used by the vmm later on.
 #[allow(unused)]
 #[derive(Debug)]
@@ -2033,11 +2561,11 @@ pub enum VcpuEvent {
     Resume { paused_ns: u64 },
     /// Capture the full vCPU register state into a [`VcpuState`] (vCPU must be
     /// paused). The vCPU replies with [`VcpuResponse::SavedState`].
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     SaveState,
     /// Restore a previously-captured [`VcpuState`] onto the (paused) vCPU. The
     /// vCPU replies with [`VcpuResponse::RestoredState`].
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     RestoreState(Box<VcpuState>),
 }
 
@@ -2051,10 +2579,10 @@ pub enum VcpuResponse {
     /// Vcpu is stopped.
     Exited(u8),
     /// Captured vCPU register state, in reply to [`VcpuEvent::SaveState`].
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     SavedState(Box<VcpuState>),
     /// Acknowledges a [`VcpuEvent::RestoreState`].
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     RestoredState,
 }
 

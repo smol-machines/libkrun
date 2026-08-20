@@ -331,9 +331,6 @@ impl MMIODeviceManager {
     /// device type and re-activate it from the saved queue state + features
     /// (bypassing the guest handshake). Used by restore-into-a-fresh-VM (fork).
     /// Errors if a snapshot has no matching transport.
-    // The fork restore path (Vmm::restore_activate_devices) is x86_64-only on
-    // Linux, so this is unused on aarch64-linux.
-    #[cfg(target_arch = "x86_64")]
     pub fn restore_activate_devices(
         &self,
         state: &VmDevicesState,
