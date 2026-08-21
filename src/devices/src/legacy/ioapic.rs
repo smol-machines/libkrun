@@ -100,8 +100,8 @@ impl IoApicRegs {
         self.ioregsel = bytes[1];
         self.version = bytes[2];
         self.irr = u32::from_le_bytes(bytes[3..7].try_into().unwrap());
-        for (i, chunk) in bytes[7..].chunks_exact(8).enumerate() {
-            self.ioredtbl[i] = u64::from_le_bytes(chunk.try_into().unwrap());
+        for (i, chunk) in bytes[7..].as_chunks::<8>().0.iter().enumerate() {
+            self.ioredtbl[i] = u64::from_le_bytes(*chunk);
         }
         true
     }
