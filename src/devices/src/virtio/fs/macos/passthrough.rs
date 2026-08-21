@@ -2679,7 +2679,17 @@ impl FileSystem for PassthroughFs {
         // and we need the value from Linux.
         const VIRTIO_IOC_EXIT_CODE_REQ: u32 = 0x7602;
         const VIRTIO_IOC_REMOVE_ROOT_DIR_REQ: u32 = 0x7603;
+        // `FS_IOC_GETFLAGS` reads an inode's Linux attribute flags; overlayfs
+        // copy-up issues it and treats an error as fatal.
+        const FS_IOC_GETFLAGS: u32 = 0x8008_6601;
 
+        // Allowlist: answer only the ioctls a macOS-backed file can meaningfully
+        // support and reject the rest with a real errno — the opposite of a
+        // blanket zero-filled success. A fake success silently corrupts any
+        // caller that acts on the (bogus) reply; `isatty()` reading every
+        // mounted file as a tty was one such victim, and other ioctl families
+        // (FS_IOC_*, block, etc.) had the same latent hazard. This mirrors the
+        // Linux backend, which likewise errors on everything it doesn't handle.
         match cmd {
             VIRTIO_IOC_EXIT_CODE_REQ => {
                 exit_code.store(arg as i32, Ordering::SeqCst);
@@ -2689,18 +2699,20 @@ impl FileSystem for PassthroughFs {
                 std::fs::remove_dir_all(&self.cfg.root_dir)?;
                 Ok(Vec::new())
             }
+            // macOS has no Linux inode flags: report "none set" so overlayfs
+            // copy-up proceeds (an error here fails copy-up; nothing is lost
+            // because there are no flags to preserve).
+            FS_IOC_GETFLAGS => Ok(vec![0u8; std::mem::size_of::<u32>()]),
             // A regular file is never a terminal, so reject the terminal ioctl
-            // family with ENOTTY. Without this the catch-all below reports
-            // success, and glibc's `isatty()` — which probes with a terminal
-            // ioctl and reads success as "is a tty" (TCGETS before glibc 2.42,
-            // TCGETS2 since) — treats every virtiofs-mounted file as a terminal,
-            // so e.g. `python3 script.py` on a mount drops into interactive mode.
-            _ if is_terminal_ioctl(cmd) => Err(io::Error::from_raw_os_error(libc::ENOTTY)),
-            // For FS_IOC_GETFLAGS (used by overlayfs copy-up): return zero flags
-            // instead of an error. macOS doesn't support Linux file attributes, so
-            // report "no flags set" which lets overlayfs proceed normally.
-            // Returning EOPNOTSUPP/ENOTSUPP causes overlayfs copy-up to fail.
-            _ => Ok(vec![0u8; std::mem::size_of::<u32>()]),
+            // family (TCGETS/TCGETS2/TIOCGWINSZ, …) with ENOTTY specifically —
+            // the errno `isatty()`/`tcgetattr()` expect for "not a tty". Route
+            // through `linux_error` so the guest reads the Linux errno, not the
+            // (differing) macOS one.
+            _ if is_terminal_ioctl(cmd) => {
+                Err(linux_error(io::Error::from_raw_os_error(libc::ENOTTY)))
+            }
+            // Everything else is unsupported on a macOS-backed file.
+            _ => Err(linux_error(io::Error::from_raw_os_error(libc::EOPNOTSUPP))),
         }
     }
 }
@@ -2736,8 +2748,9 @@ mod tests {
 
     #[test]
     fn non_terminal_ioctls_are_not_misclassified() {
-        // FS_IOC_GETFLAGS (type 'f') is used by overlayfs copy-up and must
-        // still reach the catch-all, not be rejected as a terminal ioctl.
+        // FS_IOC_GETFLAGS (type 'f') is allowlisted for overlayfs copy-up and
+        // FS_IOC_SETFLAGS falls through to the EOPNOTSUPP arm — neither must be
+        // misclassified as a terminal ioctl and rejected with ENOTTY.
         const FS_IOC_GETFLAGS: u32 = 0x8008_6601;
         const FS_IOC_SETFLAGS: u32 = 0x4008_6602;
         assert!(!is_terminal_ioctl(FS_IOC_GETFLAGS));
