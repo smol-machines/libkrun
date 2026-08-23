@@ -413,6 +413,15 @@ impl VirtioGpu {
         }
         let rutabaga_channels_opt = Some(rutabaga_channels);
 
+        // VIRGL_RENDERER_THREAD_SYNC | VIRGL_RENDERER_USE_ASYNC_FENCE_CB.
+        // Without these, virglrenderer only retires fences while processing
+        // new guest commands, so a client that submits work and then blocks
+        // on its final fence never gets it back. This device relies on the
+        // async callback path (see create_fence_handler), so the flags are a
+        // correctness requirement, not a tuning knob.
+        #[cfg(target_os = "linux")]
+        let virgl_flags = virgl_flags | (1 << 1) | (1 << 8);
+
         let builder = RutabagaBuilder::new(
             rutabaga_gfx::RutabagaComponentType::VirglRenderer,
             virgl_flags,

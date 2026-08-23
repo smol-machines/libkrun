@@ -217,6 +217,14 @@ impl Worker {
                 continue;
             }
 
+            // Classic virgl exposes no global poll fd, so pending fences would
+            // otherwise only retire while new guest commands are processed —
+            // deadlocking any client blocked on its last fence. Poll on idle
+            // ticks so fences retire even with no incoming traffic.
+            if n == 0 {
+                virtio_gpu.event_poll();
+            }
+
             let mut process_queue = false;
             for event in events.iter().take(n as usize) {
                 // Copy the token out of the packed epoll_event field before
