@@ -768,10 +768,15 @@ impl VirtioGpu {
             offset: 0,
         };
 
-        rutabaga
-            .transfer_read(0, resource.id, transfer, Some(IoSliceMut::new(output)))
-            .map_err(|e| format!("{e}"))
-            .unwrap();
+        if let Err(e) =
+            rutabaga.transfer_read(0, resource.id, transfer, Some(IoSliceMut::new(output)))
+        {
+            error!(
+                "read_2d_resource: transfer_read failed for resource {}: {e}",
+                resource.id
+            );
+            return Err(ErrUnspec);
+        }
 
         Ok(OkNoData)
     }
@@ -996,7 +1001,8 @@ impl VirtioGpu {
         let mut rutabaga_iovecs = None;
 
         if resource_create_blob.blob_flags & VIRTIO_GPU_BLOB_FLAG_CREATE_GUEST_HANDLE != 0 {
-            panic!("GUEST_HANDLE unimplemented");
+            error!("resource_create_blob: GUEST_HANDLE unimplemented");
+            return Err(ErrUnspec);
         } else if resource_create_blob.blob_mem != VIRTIO_GPU_BLOB_MEM_HOST3D {
             rutabaga_iovecs =
                 Some(sglist_to_rutabaga_iovecs(&vecs[..], mem).map_err(|_| ErrUnspec)?);
@@ -1043,7 +1049,10 @@ impl VirtioGpu {
                     RUTABAGA_MAP_ACCESS_READ => libc::PROT_READ,
                     RUTABAGA_MAP_ACCESS_WRITE => libc::PROT_WRITE,
                     RUTABAGA_MAP_ACCESS_RW => libc::PROT_READ | libc::PROT_WRITE,
-                    _ => panic!("unexpected prot mode for mapping"),
+                    _ => {
+                        error!("resource_map_blob: unexpected prot mode {map_info:#x}");
+                        return Err(ErrUnspec);
+                    }
                 };
 
                 // A blob that does not fit the shm region must be rejected, not
@@ -1104,7 +1113,10 @@ impl VirtioGpu {
             RUTABAGA_MAP_ACCESS_READ => libc::PROT_READ,
             RUTABAGA_MAP_ACCESS_WRITE => libc::PROT_WRITE,
             RUTABAGA_MAP_ACCESS_RW => libc::PROT_READ | libc::PROT_WRITE,
-            _ => panic!("unexpected prot mode for mapping"),
+            _ => {
+                error!("resource_map_blob: unexpected prot mode {map_info:#x}");
+                return Err(ErrUnspec);
+            }
         };
 
         let end = offset.checked_add(resource.size).ok_or(ErrUnspec)?;

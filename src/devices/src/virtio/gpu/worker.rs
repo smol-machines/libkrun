@@ -376,10 +376,12 @@ impl Worker {
             }
             GpuCommand::ResourceDetachBacking(info) => virtio_gpu.detach_backing(info.resource_id),
             GpuCommand::UpdateCursor(_info) => {
-                panic!("virtio_gpu: GpuCommand:UpdateCursor unimplemented");
+                error!("virtio_gpu: GpuCommand::UpdateCursor unimplemented");
+                Err(GpuResponse::ErrUnspec)
             }
             GpuCommand::MoveCursor(_info) => {
-                panic!("virtio_gpu: GpuCommand::MoveCursor unimplemented");
+                error!("virtio_gpu: GpuCommand::MoveCursor unimplemented");
+                Err(GpuResponse::ErrUnspec)
             }
             GpuCommand::ResourceAssignUuid(info) => {
                 let resource_id = info.resource_id;
@@ -549,7 +551,8 @@ impl Worker {
                 )
             }
             GpuCommand::SetScanoutBlob(_info) => {
-                panic!("virtio_gpu: GpuCommand::SetScanoutBlob unimplemented");
+                error!("virtio_gpu: GpuCommand::SetScanoutBlob unimplemented");
+                Err(GpuResponse::ErrUnspec)
             }
             GpuCommand::ResourceMapBlob(info) => {
                 let resource_id = info.resource_id;
