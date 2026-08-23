@@ -1176,6 +1176,18 @@ impl VirtioGpu {
                     libc::MAP_SHARED | libc::MAP_FIXED,
                 )?;
             }
+        } else {
+            // export_blob failing does not mean the resource is unmappable:
+            // classic virgl GL memory has no exportable fd. Let rutabaga map
+            // it (and propagate a real error if it cannot) instead of falling
+            // through and reporting success with the guest pages unmapped.
+            self.rutabaga.resource_map(
+                resource_id,
+                addr,
+                resource.size,
+                prot,
+                libc::MAP_SHARED | libc::MAP_FIXED,
+            )?;
         }
 
         resource.shmem_offset = Some(offset);
