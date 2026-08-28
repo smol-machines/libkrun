@@ -14,6 +14,8 @@
 //! paused-vCPU register state (`vstate` save_state), and the virtio device
 //! state (`devices::virtio::persist`). See [`SnapshotManifest`] for the layout.
 
+#[cfg(unix)]
+use std::fs::File;
 use std::io::{self, Read, Write};
 
 use vm_memory::{Address, FileOffset, GuestAddress, GuestMemory, GuestMemoryRegion};
@@ -138,6 +140,60 @@ pub fn load_guest_memory<R: Read>(
         ));
     }
     Ok(memory)
+}
+
+/// Map a complete memory image as the writable backing for guest RAM.
+///
+/// Unlike [`load_guest_memory`], this does not touch every configured byte at
+/// restore time. Sparse holes remain holes and pages enter the host working set
+/// only when the resumed guest accesses them. Each region retains a
+/// [`FileOffset`], allowing a Linux restore to become a fork source without an
+/// additional full-RAM materialization pass.
+#[cfg(unix)]
+pub fn map_guest_memory_file(
+    descs: &[MemoryRegionDesc],
+    file: &File,
+) -> io::Result<GuestMemoryMmap> {
+    if descs.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "snapshot contains no guest-memory regions",
+        ));
+    }
+
+    let mut offset = 0_u64;
+    let ranges = descs
+        .iter()
+        .map(|desc| {
+            let len = usize::try_from(desc.len).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "guest-memory region does not fit host address space",
+                )
+            })?;
+            if len == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "zero-length guest-memory region",
+                ));
+            }
+            let region_offset = offset;
+            offset = offset.checked_add(desc.len).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "guest-memory image offset overflow",
+                )
+            })?;
+            Ok((
+                GuestAddress(desc.gpa),
+                len,
+                Some(FileOffset::new(file.try_clone()?, region_offset)),
+            ))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+
+    GuestMemoryMmap::from_ranges_with_files(ranges)
+        .map_err(|error| io::Error::other(format!("map guest memory image: {error:?}")))
 }
 
 /// Total byte length of all regions in a descriptor list (the size of the
@@ -278,7 +334,7 @@ pub fn cow_clone_guest_memory(parent: &GuestMemoryMmap) -> std::io::Result<Guest
 
         // Safety: `ptr` is a live mapping of `size` bytes we just created; the
         // resulting MmapRegion takes ownership and munmaps it on drop.
-        let mmap_region = unsafe { MmapRegion::build_raw(ptr as *mut u8, size, prot, flags) }
+        let mmap_region = unsafe { MmapRegion::build_raw_owned(ptr as *mut u8, size, prot, flags) }
             .map_err(|e| io_err(format!("build_raw: {e:?}")))?;
         let guest_region = GuestRegionMmap::new(mmap_region, gpa)
             .ok_or_else(|| io_err("guest region address overflow".to_string()))?;
@@ -418,7 +474,7 @@ pub fn open_cow_memory_from_pid(
         if ptr == libc::MAP_FAILED {
             return Err(io::Error::last_os_error());
         }
-        let mmap_region = unsafe { MmapRegion::build_raw(ptr as *mut u8, size, prot, flags) }
+        let mmap_region = unsafe { MmapRegion::build_raw_owned(ptr as *mut u8, size, prot, flags) }
             .map_err(|e| io_err(format!("build_raw: {e:?}")))?;
         let guest_region = GuestRegionMmap::new(mmap_region, GuestAddress(d.gpa))
             .ok_or_else(|| io_err("guest region address overflow".to_string()))?;
@@ -473,7 +529,7 @@ pub fn open_cow_memory_from_paths(descs: &[MemfdRegionDesc]) -> io::Result<Guest
         if ptr == libc::MAP_FAILED {
             return Err(io::Error::last_os_error());
         }
-        let mmap_region = unsafe { MmapRegion::build_raw(ptr as *mut u8, size, prot, flags) }
+        let mmap_region = unsafe { MmapRegion::build_raw_owned(ptr as *mut u8, size, prot, flags) }
             .map_err(|e| io_err(format!("build_raw: {e:?}")))?;
         let guest_region = GuestRegionMmap::new(mmap_region, GuestAddress(d.gpa))
             .ok_or_else(|| io_err("guest region address overflow".to_string()))?;
@@ -874,5 +930,54 @@ mod tests {
                 .kind(),
             io::ErrorKind::InvalidData
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mapped_memory_image_is_file_backed_and_forkable() {
+        use crate::builder::create_guest_ram_memfd;
+        use std::os::unix::fs::FileExt;
+
+        let descs = [
+            MemoryRegionDesc {
+                gpa: 0,
+                len: 0x2000,
+            },
+            MemoryRegionDesc {
+                gpa: 0x10_0000,
+                len: 0x1000,
+            },
+        ];
+        let file = create_guest_ram_memfd(0x3000).expect("memory image");
+        file.write_all_at(&[0xA5; 0x2000], 0).unwrap();
+        file.write_all_at(&[0x5A; 0x1000], 0x2000).unwrap();
+
+        let memory = map_guest_memory_file(&descs, &file).expect("map memory image");
+        let regions = memory.iter().collect::<Vec<_>>();
+        assert_eq!(regions[0].file_offset().unwrap().start(), 0);
+        assert_eq!(regions[1].file_offset().unwrap().start(), 0x2000);
+
+        let mut low = [0_u8; 16];
+        let mut high = [0_u8; 16];
+        memory.read_slice(&mut low, GuestAddress(0)).unwrap();
+        memory
+            .read_slice(&mut high, GuestAddress(0x10_0000))
+            .unwrap();
+        assert_eq!(low, [0xA5; 16]);
+        assert_eq!(high, [0x5A; 16]);
+
+        memory.write_slice(&[0x11; 16], GuestAddress(0)).unwrap();
+        let mut backing = [0_u8; 16];
+        file.read_exact_at(&mut backing, 0).unwrap();
+        assert_eq!(backing, [0x11; 16]);
+
+        let child = cow_clone_guest_memory(&memory).expect("CoW child");
+        child.read_slice(&mut low, GuestAddress(0)).unwrap();
+        assert_eq!(low, [0x11; 16]);
+        child.write_slice(&[0x22; 16], GuestAddress(0)).unwrap();
+        memory.read_slice(&mut low, GuestAddress(0)).unwrap();
+        assert_eq!(low, [0x11; 16]);
+        file.read_exact_at(&mut backing, 0).unwrap();
+        assert_eq!(backing, [0x11; 16]);
     }
 }

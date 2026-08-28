@@ -884,7 +884,11 @@ fn build_restore_ctx(
         let checkpoint =
             std::fs::read(dir.join("checkpoint.bin")).map_err(|e| format!("checkpoint: {e}"))?;
         let memory_path = dir.join("memory.bin");
-        let memory_file = std::fs::File::open(&memory_path).map_err(|e| format!("memory: {e}"))?;
+        let memory_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&memory_path)
+            .map_err(|e| format!("memory: {e}"))?;
         let actual_memory_len = memory_file
             .metadata()
             .map_err(|e| format!("memory metadata: {e}"))?
@@ -895,9 +899,18 @@ fn build_restore_ctx(
                 "memory: image length {actual_memory_len} does not match manifest {expected_memory_len}"
             ));
         }
-        let mut memory_reader = std::io::BufReader::new(memory_file);
-        let guest_memory = vmm::snapshot::load_guest_memory(&descs, &mut memory_reader)
-            .map_err(|e| format!("load guest memory: {e}"))?;
+        #[cfg(unix)]
+        let guest_memory = vmm::snapshot::map_guest_memory_file(&descs, &memory_file)
+            .map_err(|e| format!("map guest memory: {e}"))?;
+        // Windows cannot unlink a live file mapping when smolvm consumes the
+        // one-shot checkpoint after restore, so retain the eager owned-memory
+        // fallback there.
+        #[cfg(windows)]
+        let guest_memory = {
+            let mut memory_reader = std::io::BufReader::new(memory_file);
+            vmm::snapshot::load_guest_memory(&descs, &mut memory_reader)
+                .map_err(|e| format!("load guest memory: {e}"))?
+        };
         return Ok(vmm::builder::RestoreCtx {
             guest_memory,
             fork_backed_regions: vec![true; descs.len()],
