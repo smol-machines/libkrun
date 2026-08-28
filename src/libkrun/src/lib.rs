@@ -1369,7 +1369,7 @@ pub extern "C" fn krun_set_cpu_template(ctx_id: u32, cpu_template: u32) -> i32 {
     #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
     {
         let _ = (ctx_id, cpu_template);
-        return -libc::ENOTSUP;
+        -libc::ENOTSUP
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
