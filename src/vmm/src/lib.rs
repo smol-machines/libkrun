@@ -783,6 +783,26 @@ impl Vmm {
         &mut self,
         mem_out: &mut W,
     ) -> Result<(VmCheckpoint, Vec<snapshot::MemoryRegionDesc>)> {
+        self.checkpoint_frozen_with(|memory| snapshot::write_guest_memory(memory, mem_out))
+    }
+
+    /// Durable checkpoint variant that preserves sparse guest-RAM extents.
+    #[cfg(all(snapshot_supported, unix))]
+    pub fn checkpoint_frozen_sparse(
+        &mut self,
+        mem_out: &mut std::fs::File,
+    ) -> Result<(VmCheckpoint, Vec<snapshot::MemoryRegionDesc>)> {
+        self.checkpoint_frozen_with(|memory| snapshot::write_guest_memory_sparse(memory, mem_out))
+    }
+
+    #[cfg(snapshot_supported)]
+    fn checkpoint_frozen_with<F>(
+        &mut self,
+        dump_memory: F,
+    ) -> Result<(VmCheckpoint, Vec<snapshot::MemoryRegionDesc>)>
+    where
+        F: FnOnce(&GuestMemoryMmap) -> std::io::Result<Vec<snapshot::MemoryRegionDesc>>,
+    {
         self.pause()?;
         self.quiesce_devices();
         let capture = (|| {
@@ -793,7 +813,7 @@ impl Vmm {
                 .validate_migration_clock(&vm_state, &vcpu_states)
                 .map_err(Error::Vm)?;
             let devices = self.snapshot_devices();
-            let mem_descs = snapshot::write_guest_memory(&self.guest_memory, mem_out)
+            let mem_descs = dump_memory(&self.guest_memory)
                 .map_err(|e| Error::Snapshot(format!("guest-memory dump: {e}")))?;
             #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
             let ioapic = self.intc.lock().unwrap().save_state();

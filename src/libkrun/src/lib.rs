@@ -664,6 +664,13 @@ fn handle_save(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
             .create_new(true)
             .open(&memory_partial)
             .map_err(|error| format!("create memory image: {error}"))?;
+        #[cfg(unix)]
+        let (checkpoint, descs) = vmm
+            .lock()
+            .unwrap()
+            .checkpoint_frozen_sparse(&mut memory)
+            .map_err(|error| format!("capture VM: {error}"))?;
+        #[cfg(not(unix))]
         let (checkpoint, descs) = vmm
             .lock()
             .unwrap()
