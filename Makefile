@@ -218,7 +218,9 @@ ifeq ($(OS),Darwin)
 		$(MAKE) BLK=1 NET=1 GPU=1 INPUT=1
 	cp $(LIBRARY_RELEASE_$(OS)) $(SMOLVM_DEST)
 	@EPOXY_DYLIB="$$(brew --prefix libepoxy)/lib/libepoxy.0.dylib"; \
+	VIRGL_DYLIB="$$(brew --prefix virglrenderer)/lib/libvirglrenderer.1.dylib"; \
 	install_name_tool -change "$$EPOXY_DYLIB" @loader_path/libepoxy.0.dylib $(SMOLVM_DEST); \
+	install_name_tool -change "$$VIRGL_DYLIB" @loader_path/libvirglrenderer.1.dylib $(SMOLVM_DEST); \
 	codesign --force --sign - $(SMOLVM_DEST)
 	@echo "Installed: $(SMOLVM_DEST)"
 	@echo "Re-codesign smolvm: codesign --force --sign - --entitlements ../smolvm.entitlements ../target/release/smolvm"
