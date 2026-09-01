@@ -1155,6 +1155,31 @@ impl FileSystem for PassthroughFs {
             self.announce_submounts.store(true, Ordering::Relaxed);
         }
 
+        // Without this the guest kernel holds a directory's lock across every
+        // lookup and create in it, so a host mount serves one entry at a time
+        // no matter how many threads either side has — the reason unpacking a
+        // dependency tree onto a host mount crawls. Concurrent directory
+        // operations are safe here: the inode and handle maps are behind
+        // `RwLock`, and the requests are plain positional syscalls.
+        if capable.contains(FsOptions::PARALLEL_DIROPS) {
+            opts |= FsOptions::PARALLEL_DIROPS;
+        }
+
+        // `> file` is an open with `O_TRUNC`. Without this the kernel cannot
+        // send the truncation with the open and has to follow it with a
+        // separate `SETATTR`, doubling the round trips for the commonest write
+        // in a build. `open_inode` passes the flags straight to `openat`, so
+        // the truncation already happens where the kernel expects it.
+        if capable.contains(FsOptions::ATOMIC_O_TRUNC) {
+            opts |= FsOptions::ATOMIC_O_TRUNC;
+        }
+
+        // Symlink targets are immutable, so let the guest cache them instead of
+        // paying a `READLINK` per traversal.
+        if capable.contains(FsOptions::CACHE_SYMLINKS) {
+            opts |= FsOptions::CACHE_SYMLINKS;
+        }
+
         Ok(opts)
     }
 
