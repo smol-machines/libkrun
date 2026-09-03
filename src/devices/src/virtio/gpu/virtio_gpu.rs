@@ -1054,9 +1054,17 @@ impl VirtioGpu {
                 .resources
                 .get(&info.resource_id)
                 .ok_or(ErrInvalidResourceId)?;
-            let needed = resource.width as usize * resource.height as usize * 4;
+            // A blob carries no size of its own; the virtio-gpu cursor is
+            // defined as 64x64, which is also what the compositor allocates.
+            let (width, height) = if resource.width > 0 && resource.height > 0 {
+                (resource.width, resource.height)
+            } else {
+                (64, 64)
+            };
+            let needed = width as usize * height as usize * 4;
             let mut pixels = Vec::with_capacity(needed);
             if let Some(iovs) = self.rutabaga.backing_iovecs(info.resource_id) {
+                // A dumb buffer keeps its pixels in guest pages.
                 for iov in iovs {
                     if pixels.len() >= needed {
                         break;
@@ -1070,18 +1078,37 @@ impl VirtioGpu {
                 }
             }
             if pixels.len() < needed {
-                return Err(ErrUnspec);
+                // A GPU-allocated buffer lives in host memory: read it back the
+                // way a blob scanout is, if the renderer offers that.
+                pixels.clear();
+                pixels.resize(needed, 0);
+                let read = renderer_read_resource_pixels().map(|read_pixels| unsafe {
+                    read_pixels(
+                        0,
+                        info.resource_id,
+                        pixels.as_mut_ptr() as *mut c_void,
+                        width * 4,
+                        width,
+                        height,
+                    )
+                });
+                if read != Some(0) {
+                    debug!(
+                        "update_cursor: no pixels for resource {} (readback {read:?})",
+                        info.resource_id
+                    );
+                    return Err(ErrUnspec);
+                }
             }
-            self.display_backend.set_cursor(
-                scanout_id,
-                resource.width,
-                resource.height,
-                info.hot_x,
-                info.hot_y,
-                &pixels,
-            )
+            self.display_backend
+                .set_cursor(scanout_id, width, height, info.hot_x, info.hot_y, &pixels)
         };
-        match result {
+        // An update carries the position too, and a guest that changes the
+        // pointer buffer on every move never sends a separate move.
+        let moved = self
+            .display_backend
+            .move_cursor(scanout_id, info.pos.x, info.pos.y);
+        match result.and(moved) {
             Ok(()) | Err(DisplayBackendError::MethodNotSupported) => Ok(OkNoData),
             Err(_) => Err(ErrUnspec),
         }
