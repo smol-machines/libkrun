@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use super::super::Queue as VirtQueue;
 use super::protocol::GpuResponse::*;
+use super::protocol::virtio_gpu_update_cursor;
 use super::protocol::{
     GpuResponse, GpuResponsePlaneInfo, VIRTIO_GPU_BLOB_FLAG_CREATE_GUEST_HANDLE,
     VIRTIO_GPU_BLOB_MEM_HOST3D, VIRTIO_GPU_MAX_SCANOUTS, VirtioGpuResult,
@@ -15,7 +16,8 @@ use super::protocol::{
 #[cfg(target_os = "macos")]
 use crossbeam_channel::{Sender, unbounded};
 use krun_display::{
-    DisplayBackend, DisplayBackendBasicFramebuffer, DisplayBackendInstance, Rect, ResourceFormat,
+    DisplayBackend, DisplayBackendBasicFramebuffer, DisplayBackendError, DisplayBackendInstance,
+    Rect, ResourceFormat,
 };
 use libc::c_void;
 #[cfg(target_os = "macos")]
@@ -1037,6 +1039,63 @@ impl VirtioGpu {
         }
 
         Ok(OkNoData)
+    }
+
+    /// The guest replaced its pointer image. The image lives in a small 2D
+    /// resource backed by guest pages, so it is read straight from there;
+    /// resource 0 hides the pointer. A backend without pointer support just
+    /// keeps showing whatever the guest composited.
+    pub fn update_cursor(&mut self, info: virtio_gpu_update_cursor) -> VirtioGpuResult {
+        let scanout_id = info.pos.scanout_id;
+        let result = if info.resource_id == 0 {
+            self.display_backend.set_cursor(scanout_id, 0, 0, 0, 0, &[])
+        } else {
+            let resource = *self
+                .resources
+                .get(&info.resource_id)
+                .ok_or(ErrInvalidResourceId)?;
+            let needed = resource.width as usize * resource.height as usize * 4;
+            let mut pixels = Vec::with_capacity(needed);
+            if let Some(iovs) = self.rutabaga.backing_iovecs(info.resource_id) {
+                for iov in iovs {
+                    if pixels.len() >= needed {
+                        break;
+                    }
+                    let take = (needed - pixels.len()).min(iov.len);
+                    // Safe: the iovec describes guest memory the device owns for
+                    // this resource, and `take` stays inside it.
+                    pixels.extend_from_slice(unsafe {
+                        std::slice::from_raw_parts(iov.base as *const u8, take)
+                    });
+                }
+            }
+            if pixels.len() < needed {
+                return Err(ErrUnspec);
+            }
+            self.display_backend.set_cursor(
+                scanout_id,
+                resource.width,
+                resource.height,
+                info.hot_x,
+                info.hot_y,
+                &pixels,
+            )
+        };
+        match result {
+            Ok(()) | Err(DisplayBackendError::MethodNotSupported) => Ok(OkNoData),
+            Err(_) => Err(ErrUnspec),
+        }
+    }
+
+    /// The guest moved its pointer; the position is where the hot spot sits.
+    pub fn move_cursor(&mut self, info: virtio_gpu_update_cursor) -> VirtioGpuResult {
+        match self
+            .display_backend
+            .move_cursor(info.pos.scanout_id, info.pos.x, info.pos.y)
+        {
+            Ok(()) | Err(DisplayBackendError::MethodNotSupported) => Ok(OkNoData),
+            Err(_) => Err(ErrUnspec),
+        }
     }
 
     /// If the resource is the scanout resource, flush it to the display.
