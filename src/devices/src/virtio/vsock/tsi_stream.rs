@@ -19,7 +19,7 @@ use super::packet::{
 };
 use super::proxy::{
     Family, ListenerDesc, NewProxyType, Proxy, ProxyError, ProxyRawHandle, ProxyRemoval,
-    ProxyStatus, ProxyUpdate, RecvPkt, raw_handle,
+    ProxyStatus, ProxyUpdate, RecvPkt, connected_event_set, raw_handle,
 };
 use super::snapshot_gate::SnapshotGate;
 use super::sys;
@@ -533,21 +533,7 @@ impl TsiStreamProxy {
     /// buffered guest->host bytes still to flush. Keeping the two composable is
     /// what lets a stalled send keep OUT armed without losing the RX side.
     fn conn_evset(&self) -> EventSet {
-        let mut e = EventSet::empty();
-        if !self.rx_paused {
-            e |= EventSet::IN;
-        }
-        if !self.tx_buf.is_empty() {
-            e |= EventSet::OUT;
-        }
-        // Edge-triggered: a partially-writable host socket (a slow, not-yet-full
-        // remote peer) would otherwise re-fire OUT every epoll cycle and spin the
-        // muxer (#1093 second-order livelock). Both `flush_tx` and `recv_pkt`
-        // drain until WouldBlock, which is exactly what edge-triggering requires.
-        if !e.is_empty() {
-            e |= EventSet::EDGE_TRIGGERED;
-        }
-        e
+        connected_event_set(self.rx_paused, !self.tx_buf.is_empty())
     }
 
     fn repoll(&self) -> Option<(u64, ProxyRawHandle, EventSet)> {

@@ -16,7 +16,8 @@ use super::muxer::{MuxerRx, push_packet};
 use super::muxer_rxq::MuxerRxQ;
 use super::packet::{TsiAcceptReq, TsiConnectReq, TsiListenReq, TsiSendtoAddr, VsockPacket};
 use super::proxy::{
-    Family, NewProxyType, Proxy, ProxyError, ProxyRawHandle, ProxyStatus, ProxyUpdate, raw_handle,
+    Family, NewProxyType, Proxy, ProxyError, ProxyRawHandle, ProxyStatus, ProxyUpdate,
+    connected_event_set, raw_handle,
 };
 use super::snapshot_gate::SnapshotGate;
 use super::sys;
@@ -341,20 +342,7 @@ impl UnixProxy {
     }
 
     fn conn_evset(&self) -> EventSet {
-        let mut e = EventSet::empty();
-        if !self.rx_paused {
-            e |= EventSet::IN;
-        }
-        if !self.tx_buf.is_empty() {
-            e |= EventSet::OUT;
-        }
-        // Edge-triggered: a partially-writable host socket would otherwise
-        // re-fire OUT every cycle and spin the muxer (#1093). Both `flush_tx`
-        // and `recv_pkt` drain to WouldBlock, as edge-triggering requires.
-        if !e.is_empty() {
-            e |= EventSet::EDGE_TRIGGERED;
-        }
-        e
+        connected_event_set(self.rx_paused, !self.tx_buf.is_empty())
     }
 
     fn repoll(&self) -> Option<(u64, ProxyRawHandle, EventSet)> {
