@@ -49,6 +49,20 @@ use crate::virtio::fs::ExportTable;
 use crate::virtio::gpu::protocol::VIRTIO_GPU_FLAG_INFO_RING_IDX;
 use crate::virtio::{InterruptTransport, VirtioShmRegion};
 
+/// Whether virglrenderer may retire fences from a thread of its own.
+///
+/// `KRUN_VIRGL_THREAD_SYNC=1` forces the thread on, `=0` forces it off. Left
+/// unset, the thread is used unless the NVIDIA driver is loaded, whose EGL
+/// crashes when two threads use it at once (see the flag setup in `new`).
+#[cfg(target_os = "linux")]
+fn virgl_fence_thread_enabled() -> bool {
+    match std::env::var("KRUN_VIRGL_THREAD_SYNC").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => !std::path::Path::new("/proc/driver/nvidia/version").exists(),
+    }
+}
+
 fn sglist_to_rutabaga_iovecs(
     vecs: &[(GuestAddress, usize)],
     mem: &GuestMemoryMmap,
@@ -482,13 +496,22 @@ impl VirtioGpu {
         let rutabaga_channels_opt = Some(rutabaga_channels);
 
         // VIRGL_RENDERER_THREAD_SYNC | VIRGL_RENDERER_USE_ASYNC_FENCE_CB.
-        // Without these, virglrenderer only retires fences while processing
-        // new guest commands, so a client that submits work and then blocks
-        // on its final fence never gets it back. This device relies on the
-        // async callback path (see create_fence_handler), so the flags are a
-        // correctness requirement, not a tuning knob.
+        // With these, virglrenderer retires fences from a thread of its own,
+        // so a client that submits work and then blocks on its final fence
+        // gets it back even while no new guest commands arrive. That thread
+        // makes EGL calls concurrently with this worker's, which NVIDIA's
+        // proprietary EGL does not survive: it intermittently jumps through
+        // a NULL dispatch pointer in both threads and takes the VMM down.
+        // On such hosts the fences retire on the worker instead: the epoll
+        // loop already polls virglrenderer on its poll descriptor and on
+        // every idle tick, so nothing waits on a thread that does not exist.
         #[cfg(target_os = "linux")]
-        let virgl_flags = virgl_flags | (1 << 1) | (1 << 8);
+        let virgl_flags = if virgl_fence_thread_enabled() {
+            virgl_flags | (1 << 1) | (1 << 8)
+        } else {
+            info!("virglrenderer fence thread disabled; fences retire from the gpu worker");
+            virgl_flags
+        };
 
         // KRUN_GPU_BACKEND=2d selects rutabaga's CPU 2D component instead of
         // virglrenderer. Display-only guests (software-rendered compositor
