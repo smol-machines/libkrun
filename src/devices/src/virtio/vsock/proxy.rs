@@ -20,6 +20,24 @@ pub type ProxyRawHandle = RawFd;
 #[cfg(windows)]
 pub type ProxyRawHandle = utils::windows::RawFd;
 
+/// Polling interest for an established proxied stream.
+///
+/// Keep this level-triggered. Host input can remain readable while the guest
+/// temporarily has no RX descriptors. In that case the receive loop cannot
+/// drain the socket to `WouldBlock`; edge-triggered polling would consume the
+/// only readiness edge and leave the stream stalled after the guest replenishes
+/// its virtqueue.
+pub(super) fn connected_event_set(rx_paused: bool, tx_pending: bool) -> EventSet {
+    let mut events = EventSet::empty();
+    if !rx_paused {
+        events |= EventSet::IN;
+    }
+    if tx_pending {
+        events |= EventSet::OUT;
+    }
+    events
+}
+
 /// Compute the [`ProxyRawHandle`] for a socket2 socket, cross-platform.
 #[cfg(unix)]
 pub fn raw_handle(sock: &Socket) -> ProxyRawHandle {
@@ -179,5 +197,28 @@ pub trait Proxy: Send {
     /// agent unix acceptor, datagram proxies).
     fn listener_desc(&self) -> Option<ListenerDesc> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::connected_event_set;
+    use utils::epoll::EventSet;
+
+    #[test]
+    fn connected_stream_readiness_is_level_triggered() {
+        let events = connected_event_set(false, true);
+
+        assert!(events.contains(EventSet::IN));
+        assert!(events.contains(EventSet::OUT));
+        assert!(!events.contains(EventSet::EDGE_TRIGGERED));
+    }
+
+    #[test]
+    fn connected_stream_can_pause_reads_without_dropping_writes() {
+        let events = connected_event_set(true, true);
+
+        assert!(!events.contains(EventSet::IN));
+        assert!(events.contains(EventSet::OUT));
     }
 }
