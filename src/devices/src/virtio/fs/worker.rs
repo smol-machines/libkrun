@@ -1,6 +1,6 @@
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use crossbeam_channel::Sender;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use utils::worker_message::WorkerMessage;
 
 use std::io;
@@ -64,7 +64,9 @@ impl FsServer {
         w: Writer,
         shm_region: &Option<VirtioShmRegion>,
         exit_code: &Arc<AtomicI32>,
-        #[cfg(target_os = "macos")] map_sender: &Option<Sender<WorkerMessage>>,
+        #[cfg(any(target_os = "macos", target_os = "windows"))] map_sender: &Option<
+            Sender<WorkerMessage>,
+        >,
     ) -> super::Result<usize> {
         match self {
             FsServer::ReadWrite(s) => s.handle_message(
@@ -72,7 +74,7 @@ impl FsServer {
                 w,
                 shm_region,
                 exit_code,
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
                 map_sender,
             ),
             FsServer::ReadOnly(s) => s.handle_message(
@@ -80,7 +82,7 @@ impl FsServer {
                 w,
                 shm_region,
                 exit_code,
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
                 map_sender,
             ),
             FsServer::Null(s) => s.handle_message(
@@ -88,7 +90,7 @@ impl FsServer {
                 w,
                 shm_region,
                 exit_code,
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
                 map_sender,
             ),
         }
@@ -105,7 +107,7 @@ pub(super) struct FsWorker {
     exit_code: Arc<AtomicI32>,
     #[cfg(target_os = "linux")]
     request_poll_after: Instant,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     map_sender: Option<Sender<WorkerMessage>>,
 }
 
@@ -169,7 +171,9 @@ impl FsWorker {
         server: Arc<FsServer>,
         stop_fd: EventFd,
         exit_code: Arc<AtomicI32>,
-        #[cfg(target_os = "macos")] map_sender: Option<Sender<WorkerMessage>>,
+        #[cfg(any(target_os = "macos", target_os = "windows"))] map_sender: Option<
+            Sender<WorkerMessage>,
+        >,
     ) -> Self {
         Self {
             queues,
@@ -181,7 +185,7 @@ impl FsWorker {
             exit_code,
             #[cfg(target_os = "linux")]
             request_poll_after: Instant::now(),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             map_sender,
         }
     }
@@ -297,7 +301,7 @@ impl FsWorker {
                 &self.shm_region,
                 &self.interrupt,
                 &self.exit_code,
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
                 &self.map_sender,
             );
 
@@ -405,7 +409,7 @@ impl FsWorker {
             &self.shm_region,
             &self.interrupt,
             &self.exit_code,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             &self.map_sender,
         )
     }
@@ -418,7 +422,9 @@ impl FsWorker {
         shm_region: &Option<VirtioShmRegion>,
         interrupt: &InterruptTransport,
         exit_code: &Arc<AtomicI32>,
-        #[cfg(target_os = "macos")] map_sender: &Option<Sender<WorkerMessage>>,
+        #[cfg(any(target_os = "macos", target_os = "windows"))] map_sender: &Option<
+            Sender<WorkerMessage>,
+        >,
     ) -> bool {
         let mut signal_needed = false;
         let mut processed = false;
@@ -436,7 +442,7 @@ impl FsWorker {
                 writer,
                 shm_region,
                 exit_code,
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
                 map_sender,
             ) {
                 Ok(len) => len,

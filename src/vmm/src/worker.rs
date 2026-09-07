@@ -45,9 +45,9 @@ pub fn start_worker_thread(
 impl super::Vmm {
     fn match_worker_message(&self, msg: WorkerMessage) {
         match msg {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             WorkerMessage::GpuAddMapping(s, h, g, l) => self.add_mapping(s, h, g, l),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             WorkerMessage::GpuRemoveMapping(s, g, l) => self.remove_mapping(s, g, l),
             #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
             WorkerMessage::GsiRoute(sender, entries) => {

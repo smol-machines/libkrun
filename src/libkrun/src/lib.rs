@@ -4763,6 +4763,14 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         vmm::worker::start_worker_thread(_vmm.clone(), _receiver.clone()).unwrap();
     }
 
+    // On Windows the worker services virtiofs DAX remap requests (see
+    // Vm::add_mapping); it must run whenever the fs device might issue them,
+    // independent of split_irqchip.
+    #[cfg(target_os = "windows")]
+    if !ctx_cfg.vmr.split_irqchip {
+        vmm::worker::start_worker_thread(_vmm.clone(), _receiver.clone()).unwrap();
+    }
+
     #[cfg(any(feature = "amd-sev", feature = "tdx"))]
     vmm::worker::start_worker_thread(_vmm.clone(), _receiver.clone()).unwrap();
 

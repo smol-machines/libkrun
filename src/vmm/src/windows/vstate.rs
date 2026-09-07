@@ -92,6 +92,11 @@ pub type Result<T> = result::Result<T, Error>;
 /// A WHP partition wrapper, analogous to the KVM/HVF `Vm`.
 pub struct Vm {
     whp_vm: Arc<WhpVm>,
+    /// Every guest-memory region as registered at boot: (guest_addr, host_addr,
+    /// len). A DAX mapping replaces the backing of a sub-range; removing it
+    /// restores the range to these original pages, which the hypervisor has no
+    /// memory of once they were replaced.
+    regions: Vec<(u64, u64, u64)>,
 }
 
 impl Vm {
@@ -100,6 +105,7 @@ impl Vm {
         let whp_vm = WhpVm::new(vcpu_count).map_err(Error::VmSetup)?;
         Ok(Vm {
             whp_vm: Arc::new(whp_vm),
+            regions: Vec::new(),
         })
     }
 
@@ -149,8 +155,68 @@ impl Vm {
                     )
                     .map_err(Error::SetUserMemoryRegion)?;
             }
+            self.regions.push((
+                region.start_addr().raw_value(),
+                host_addr as u64,
+                region.len(),
+            ));
         }
         Ok(())
+    }
+
+    /// Point a guest-physical range at new host memory. WHP binds a GPA range
+    /// to the host pages it was given and does not follow later changes to the
+    /// host address space, so a file view mapped for virtiofs DAX is invisible
+    /// to the guest until the range is re-registered. `WHvMapGpaRange` replaces
+    /// any previous mapping of the pages, so no unmap is needed first.
+    pub fn add_mapping(
+        &self,
+        reply_sender: Sender<bool>,
+        host_addr: u64,
+        guest_addr: u64,
+        len: u64,
+    ) {
+        debug!("add_mapping: host_addr={host_addr:x}, guest_addr={guest_addr:x}, len={len}");
+        // SAFETY: the caller keeps `host_addr..+len` mapped until the matching
+        // remove_mapping, and both addresses are page-aligned by the caller.
+        let result = unsafe {
+            self.whp_vm
+                .map_memory(host_addr as *mut std::ffi::c_void, guest_addr, len)
+        };
+        if let Err(e) = result {
+            error!("Error adding memory map: {e:?}");
+            reply_sender.send(false).unwrap();
+        } else {
+            reply_sender.send(true).unwrap();
+        }
+    }
+
+    /// Restore a guest-physical range to the pages it had at boot. Unlike HVF,
+    /// simply unmapping would leave the guest with no backing for the range and
+    /// the next DAX use of it would fault; re-pointing at the original window
+    /// pages is what "remove" means here.
+    pub fn remove_mapping(&self, reply_sender: Sender<bool>, guest_addr: u64, len: u64) {
+        debug!("remove_mapping: guest_addr={guest_addr:x}, len={len}");
+        let original = self.regions.iter().find(|(g, _, l)| {
+            guest_addr >= *g && guest_addr.saturating_add(len) <= g.saturating_add(*l)
+        });
+        let Some((region_guest, region_host, _)) = original else {
+            error!("remove_mapping: guest_addr={guest_addr:x} is not inside any registered region");
+            reply_sender.send(false).unwrap();
+            return;
+        };
+        let host_addr = region_host + (guest_addr - region_guest);
+        // SAFETY: the original region mapping outlives the partition.
+        let result = unsafe {
+            self.whp_vm
+                .map_memory(host_addr as *mut std::ffi::c_void, guest_addr, len)
+        };
+        if let Err(e) = result {
+            error!("Error restoring memory map: {e:?}");
+            reply_sender.send(false).unwrap();
+        } else {
+            reply_sender.send(true).unwrap();
+        }
     }
 }
 
