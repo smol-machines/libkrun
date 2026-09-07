@@ -64,6 +64,11 @@ macro_rules! MSR_RANGE {
     };
 }
 
+/// IA32_U_CET: first of the nine CET MSRs (0x6a0..=0x6a8).
+const MSR_IA32_U_CET_INDEX: u32 = 0x06a0;
+/// IA32_XSS: supervisor-state XSAVE feature mask.
+const MSR_IA32_XSS_INDEX: u32 = 0x0da0;
+
 // List of MSRs that can be serialized. List is sorted in ascending order of MSRs addresses.
 static WHITELISTED_MSR_RANGES: &[MsrRange] = &[
     SINGLE_MSR!(MSR_IA32_P5_MC_ADDR),
@@ -139,9 +144,26 @@ static WHITELISTED_MSR_RANGES: &[MsrRange] = &[
     SINGLE_MSR!(MSR_CONFIG_TDP_LEVEL_2),
     SINGLE_MSR!(MSR_CONFIG_TDP_CONTROL),
     SINGLE_MSR!(MSR_TURBO_ACTIVATION_RATIO),
+    // CET state MSRs (U_CET, S_CET, PL0..PL3_SSP, ISST_ADDR): the register
+    // half of the CET xstate, which KVM_GET_XSAVE does not carry. KVM lists
+    // them only on CET-capable hosts, so the retain() filter drops them
+    // elsewhere.
+    MSR_RANGE!(MSR_IA32_U_CET_INDEX, 9),
     SINGLE_MSR!(MSR_IA32_TSCDEADLINE),
     MSR_RANGE!(APIC_BASE_MSR, APIC_MSR_INDEXES),
     SINGLE_MSR!(MSR_IA32_BNDCFGS),
+    // IA32_XSS enables supervisor XSAVE components (e.g. CET user state,
+    // bit 11). A guest kernel that enabled any of them keeps every task's FPU
+    // context in the compacted XSAVES format with those bits in XCOMP_BV.
+    // Restoring such a checkpoint into a fresh vCPU whose XSS is still 0 makes
+    // the guest's first XRSTORS #GP; the kernel's fixup handler re-executes
+    // XRSTORS on the init state, and the fault recurses until the task stack
+    // overflows ("BUG: TASK stack guard page was hit", then "Kernel panic -
+    // not syncing: Fatal exception in interrupt"). Seen on every fork clone
+    // and portable restore on AMD Zen 5 hosts, where the portable CPU template
+    // is not applied and the guest sees CET. KVM lists this MSR only when it
+    // supports it.
+    SINGLE_MSR!(MSR_IA32_XSS_INDEX),
     SINGLE_MSR!(MSR_KVM_WALL_CLOCK_NEW),
     SINGLE_MSR!(MSR_KVM_SYSTEM_TIME_NEW),
     SINGLE_MSR!(MSR_KVM_ASYNC_PF_EN),
