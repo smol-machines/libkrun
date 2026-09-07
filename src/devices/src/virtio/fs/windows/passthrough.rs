@@ -3,7 +3,8 @@
 // Alternate Data Streams (ADS) for extended-attribute emulation.
 
 use super::super::inode_alloc::InodeAllocator;
-use std::collections::BTreeMap;
+use crossbeam_channel::{Sender, unbounded};
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::{CStr, OsString};
 use std::fs::{self, File};
 use std::io;
@@ -16,6 +17,7 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
+use utils::worker_message::WorkerMessage;
 
 use libc::S_IFREG;
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
@@ -1061,6 +1063,9 @@ pub struct PassthroughFs {
     writeback: AtomicBool,
     announce_submounts: AtomicBool,
     cfg: Config,
+    // guest_addr -> the host view address created by MapViewOfFileEx for a DAX
+    // window, so removemapping can UnmapViewOfFile the right view.
+    map_windows: std::sync::Mutex<HashMap<u64, u64>>,
 }
 
 // Windows HANDLEs (*mut c_void) are thread-safe to move and share across OS threads.
@@ -1087,6 +1092,7 @@ impl PassthroughFs {
             root_handle: RwLock::new(root_handle),
             writeback: AtomicBool::new(false),
             announce_submounts: AtomicBool::new(false),
+            map_windows: std::sync::Mutex::new(HashMap::new()),
             cfg,
         })
     }
@@ -2586,20 +2592,25 @@ impl FileSystem for PassthroughFs {
         len: u64,
         flags: u64,
         moffset: u64,
-        host_shm_base: u64,
+        guest_shm_base: u64,
         shm_size: u64,
+        map_sender: &Option<Sender<WorkerMessage>>,
     ) -> io::Result<()> {
-        use std::os::windows::io::AsRawHandle;
         use std::ptr;
         use windows_sys::Win32::System::Memory::{
-            CreateFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE, MapViewOfFileEx, PAGE_READONLY,
+            CreateFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE, MapViewOfFile, PAGE_READONLY,
             PAGE_READWRITE,
+        };
+
+        // WHP re-registers the guest range at the host view (add_mapping), so a
+        // worker channel is required; without it DAX cannot be made coherent.
+        let Some(sender) = map_sender.as_ref() else {
+            return Err(io::Error::from_raw_os_error(libc::ENOSYS));
         };
 
         let mut sys_info: SYSTEM_INFO = unsafe { std::mem::zeroed() };
         unsafe { GetSystemInfo(&mut sys_info) };
         let granularity = sys_info.dwAllocationGranularity as u64;
-
         if foffset % granularity != 0 {
             error!("foffset {foffset} is not aligned to {granularity}");
             return Err(io::Error::from_raw_os_error(libc::EINVAL));
@@ -2609,6 +2620,7 @@ impl FileSystem for PassthroughFs {
         if end > shm_size {
             return Err(einval());
         }
+        let guest_addr = guest_shm_base.checked_add(moffset).ok_or_else(einval)?;
 
         let is_write = (flags & (fuse::SetupmappingFlags::WRITE.bits() as u64)) != 0;
         let page_flags = if is_write {
@@ -2622,41 +2634,63 @@ impl FileSystem for PassthroughFs {
             FILE_MAP_READ
         };
 
-        let addr = host_shm_base.checked_add(moffset).ok_or_else(einval)?;
-        debug!("setupmapping: ino {inode:?} addr={addr:x} len={len}");
-
         let file = self
             .reopen_inode(inode, handle, GENERIC_READ)
             .map_err(win_err_to_linux)?;
         let handle_raw = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
 
-        // 1. Create a file mapping object from the open file handle
+        // 1. Create a file mapping object from the open file handle.
         let mapping_handle =
             unsafe { CreateFileMappingW(handle_raw, ptr::null(), page_flags, 0, 0, ptr::null()) };
-
         if mapping_handle.is_null() {
             return Err(io::Error::last_os_error());
         }
 
-        // 2. Map the view exactly into the guest's DAX window address
-        let ret = unsafe {
-            MapViewOfFileEx(
+        // 2. Map the view anywhere the OS chooses. Unlike the old code, this must
+        //    NOT target the guest window address: WHP does not follow host page
+        //    tables, so overlaying the process address did nothing for the guest.
+        //    Instead we get a fresh host view and re-register the guest range at
+        //    it below.
+        let view = unsafe {
+            MapViewOfFile(
                 mapping_handle,
                 map_flags,
                 (foffset >> 32) as u32,
-                (foffset & 0xFFFFFFFF) as u32,
+                (foffset & 0xFFFF_FFFF) as u32,
                 len as usize,
-                addr as *mut _,
             )
         };
-
-        // The mapping handle can be safely closed after the view is mapped;
-        // the mapping remains valid until UnmapViewOfFile is called.
         unsafe { windows_sys::Win32::Foundation::CloseHandle(mapping_handle) };
-
-        if ret.Value.is_null() {
+        if view.Value.is_null() {
             return Err(io::Error::last_os_error());
         }
+        let host_addr = view.Value as u64;
+
+        // 3. Ask the worker to point the guest range at this host view.
+        let (reply_sender, reply_receiver) = unbounded();
+        sender
+            .send(WorkerMessage::GpuAddMapping(
+                reply_sender,
+                host_addr,
+                guest_addr,
+                len,
+            ))
+            .unwrap();
+        if !reply_receiver.recv().unwrap() {
+            error!("WHP rejected the DAX window remap at guest_addr={guest_addr:x}");
+            unsafe {
+                windows_sys::Win32::System::Memory::UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: host_addr as *mut _,
+                })
+            };
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+
+        self.map_windows
+            .lock()
+            .unwrap()
+            .insert(guest_addr, host_addr);
+        debug!("setupmapping: guest_addr={guest_addr:x} host_view={host_addr:x} len={len}");
 
         Ok(())
     }
@@ -2665,22 +2699,44 @@ impl FileSystem for PassthroughFs {
         &self,
         _ctx: Context,
         requests: Vec<fuse::RemovemappingOne>,
-        host_shm_base: u64,
+        guest_shm_base: u64,
         shm_size: u64,
+        map_sender: &Option<Sender<WorkerMessage>>,
     ) -> io::Result<()> {
         use windows_sys::Win32::System::Memory::UnmapViewOfFile;
 
+        let Some(sender) = map_sender.as_ref() else {
+            return Err(io::Error::from_raw_os_error(libc::ENOSYS));
+        };
+
         for req in requests {
-            let addr = host_shm_base + req.moffset;
-            if (req.moffset + req.len) > shm_size {
+            let end = req.moffset.checked_add(req.len).ok_or_else(einval)?;
+            if end > shm_size {
                 return Err(einval());
             }
-            debug!("removemapping: addr={addr:x} len={}", req.len);
+            let guest_addr = guest_shm_base.checked_add(req.moffset).ok_or_else(einval)?;
+            let host_addr = match self.map_windows.lock().unwrap().remove(&guest_addr) {
+                Some(a) => a,
+                None => return Err(io::Error::from_raw_os_error(libc::EINVAL)),
+            };
+            debug!("removemapping: guest_addr={guest_addr:x} len={}", req.len);
 
-            // Unmap the file view from the guest's DAX window
+            // Restore the guest range to its original boot pages, then drop the view.
+            let (reply_sender, reply_receiver) = unbounded();
+            sender
+                .send(WorkerMessage::GpuRemoveMapping(
+                    reply_sender,
+                    guest_addr,
+                    req.len,
+                ))
+                .unwrap();
+            if !reply_receiver.recv().unwrap() {
+                error!("WHP rejected the DAX window restore at guest_addr={guest_addr:x}");
+                return Err(io::Error::from_raw_os_error(libc::EINVAL));
+            }
             let ret = unsafe {
                 UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
-                    Value: addr as *mut _,
+                    Value: host_addr as *mut _,
                 })
             };
             if ret == 0 {

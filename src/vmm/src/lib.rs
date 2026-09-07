@@ -68,7 +68,7 @@ use crate::vstate::VcpuEvent;
 use crate::vstate::{Vcpu, VcpuHandle, VcpuResponse, Vm};
 
 use arch::{ArchMemoryInfo, InitrdConfig};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use crossbeam_channel::Sender;
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use devices::fdt;
@@ -1642,7 +1642,7 @@ impl Vmm {
         &self.vm
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub fn add_mapping(
         &self,
         reply_sender: Sender<bool>,
@@ -1654,7 +1654,7 @@ impl Vmm {
             .add_mapping(reply_sender, host_addr, guest_addr, len);
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub fn remove_mapping(&self, reply_sender: Sender<bool>, guest_addr: u64, len: u64) {
         self.vm.remove_mapping(reply_sender, guest_addr, len);
     }

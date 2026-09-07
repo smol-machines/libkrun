@@ -2,9 +2,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use crossbeam_channel::Sender;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use utils::worker_message::WorkerMessage;
 
 use std::convert::TryInto;
@@ -93,7 +93,9 @@ impl<F: FileSystem + Sync> Server<F> {
         w: Writer,
         shm_region: &Option<VirtioShmRegion>,
         exit_code: &Arc<AtomicI32>,
-        #[cfg(target_os = "macos")] map_sender: &Option<Sender<WorkerMessage>>,
+        #[cfg(any(target_os = "macos", target_os = "windows"))] map_sender: &Option<
+            Sender<WorkerMessage>,
+        >,
     ) -> Result<usize> {
         let in_header: InHeader = r.read_obj().map_err(Error::DecodeMessage)?;
 
@@ -153,9 +155,12 @@ impl<F: FileSystem + Sync> Server<F> {
             x if x == Opcode::CopyFileRange as u32 => self.copyfilerange(in_header, r, w),
             x if (x == Opcode::SetupMapping as u32) && shm_region.is_some() => {
                 let shm = shm_region.as_ref().unwrap();
-                #[cfg(any(target_os = "linux", target_os = "windows"))]
+                // Linux overlays the file into the host window directly (the
+                // hypervisor follows host page tables). macOS and Windows must
+                // re-register the guest range instead, so they work in GPAs.
+                #[cfg(target_os = "linux")]
                 let shm_base_addr = shm.host_addr;
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
                 let shm_base_addr = shm.guest_addr;
                 self.setupmapping(
                     in_header,
@@ -163,15 +168,18 @@ impl<F: FileSystem + Sync> Server<F> {
                     w,
                     shm_base_addr,
                     shm.size as u64,
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "windows"))]
                     map_sender,
                 )
             }
             x if (x == Opcode::RemoveMapping as u32) && shm_region.is_some() => {
                 let shm = shm_region.as_ref().unwrap();
-                #[cfg(any(target_os = "linux", target_os = "windows"))]
+                // Linux overlays the file into the host window directly (the
+                // hypervisor follows host page tables). macOS and Windows must
+                // re-register the guest range instead, so they work in GPAs.
+                #[cfg(target_os = "linux")]
                 let shm_base_addr = shm.host_addr;
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
                 let shm_base_addr = shm.guest_addr;
                 self.removemapping(
                     in_header,
@@ -179,7 +187,7 @@ impl<F: FileSystem + Sync> Server<F> {
                     w,
                     shm_base_addr,
                     shm.size as u64,
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "windows"))]
                     map_sender,
                 )
             }
@@ -1371,7 +1379,9 @@ impl<F: FileSystem + Sync> Server<F> {
         w: Writer,
         host_shm_base: u64,
         shm_size: u64,
-        #[cfg(target_os = "macos")] map_sender: &Option<Sender<WorkerMessage>>,
+        #[cfg(any(target_os = "macos", target_os = "windows"))] map_sender: &Option<
+            Sender<WorkerMessage>,
+        >,
     ) -> Result<usize> {
         let SetupmappingIn {
             fh,
@@ -1391,7 +1401,7 @@ impl<F: FileSystem + Sync> Server<F> {
             moffset,
             host_shm_base,
             shm_size,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             map_sender,
         ) {
             Ok(()) => reply_ok(None::<u8>, None, in_header.unique, w),
@@ -1406,7 +1416,9 @@ impl<F: FileSystem + Sync> Server<F> {
         w: Writer,
         host_shm_base: u64,
         shm_size: u64,
-        #[cfg(target_os = "macos")] map_sender: &Option<Sender<WorkerMessage>>,
+        #[cfg(any(target_os = "macos", target_os = "windows"))] map_sender: &Option<
+            Sender<WorkerMessage>,
+        >,
     ) -> Result<usize> {
         let RemovemappingIn { count } = r.read_obj().map_err(Error::DecodeMessage)?;
 
@@ -1439,7 +1451,7 @@ impl<F: FileSystem + Sync> Server<F> {
             requests,
             host_shm_base,
             shm_size,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             map_sender,
         ) {
             Ok(()) => reply_ok(None::<u8>, None, in_header.unique, w),

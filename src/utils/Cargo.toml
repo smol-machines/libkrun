@@ -24,6 +24,7 @@ kvm-bindings = { version = "0.14", features = ["fam-wrappers"] }
 nix = { version = "0.30.1", features = ["fs"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+crossbeam-channel = ">=0.5.15"
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Networking_WinSock",

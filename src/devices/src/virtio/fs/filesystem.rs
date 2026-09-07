@@ -2,9 +2,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use crossbeam_channel::Sender;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use utils::worker_message::WorkerMessage;
 
 use std::collections::BTreeMap;
@@ -1156,7 +1156,9 @@ pub trait FileSystem {
         moffset: u64,
         host_shm_base: u64,
         shm_size: u64,
-        #[cfg(target_os = "macos")] map_sender: &Option<Sender<WorkerMessage>>,
+        #[cfg(any(target_os = "macos", target_os = "windows"))] map_sender: &Option<
+            Sender<WorkerMessage>,
+        >,
     ) -> io::Result<()> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
@@ -1167,7 +1169,9 @@ pub trait FileSystem {
         requests: Vec<RemovemappingOne>,
         host_shm_base: u64,
         shm_size: u64,
-        #[cfg(target_os = "macos")] map_sender: &Option<Sender<WorkerMessage>>,
+        #[cfg(any(target_os = "macos", target_os = "windows"))] map_sender: &Option<
+            Sender<WorkerMessage>,
+        >,
     ) -> io::Result<()> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }

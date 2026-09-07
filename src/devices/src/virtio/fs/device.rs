@@ -1,4 +1,4 @@
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use crossbeam_channel::Sender;
 use std::cmp;
 use std::io::Write;
@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
 use utils::eventfd::{EFD_NONBLOCK, EventFd};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use utils::worker_message::WorkerMessage;
 use virtio_bindings::{virtio_config::VIRTIO_F_VERSION_1, virtio_ring::VIRTIO_RING_F_EVENT_IDX};
 use vm_memory::{ByteValued, GuestMemoryMmap};
@@ -60,7 +60,7 @@ pub struct Fs {
     /// `activate` to rebuild the worker's passthrough inode/handle maps.
     pending_fuse: Option<FuseServerState>,
     exit_code: Arc<AtomicI32>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     map_sender: Option<Sender<WorkerMessage>>,
 }
 
@@ -180,7 +180,7 @@ impl Fs {
             quiesced_workers: Vec::new(),
             pending_fuse: None,
             exit_code,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             map_sender: None,
         })
     }
@@ -208,7 +208,7 @@ impl Fs {
         cfg.export_fsid
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub fn set_map_sender(&mut self, map_sender: Sender<WorkerMessage>) {
         self.map_sender = Some(map_sender);
     }
@@ -389,7 +389,7 @@ impl VirtioDevice for Fs {
                 server.clone(),
                 stopfd.try_clone().unwrap(),
                 self.exit_code.clone(),
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
                 self.map_sender.clone(),
             );
             self.worker_threads.push(worker.run());

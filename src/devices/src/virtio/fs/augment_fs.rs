@@ -10,7 +10,7 @@
 // One-shot files can only be looked up once — the name is removed from the
 // directory on first lookup so subsequent lookups return ENOENT.
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use crossbeam_channel::Sender;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use utils::worker_message::WorkerMessage;
 
 use super::filesystem::{
@@ -650,7 +650,9 @@ impl<T: FileSystem<Inode = Inode, Handle = Handle>> FileSystem for AugmentFs<T> 
         moffset: u64,
         host_shm_base: u64,
         shm_size: u64,
-        #[cfg(target_os = "macos")] map_sender: &Option<Sender<WorkerMessage>>,
+        #[cfg(any(target_os = "macos", target_os = "windows"))] map_sender: &Option<
+            Sender<WorkerMessage>,
+        >,
     ) -> io::Result<()> {
         {
             let inodes = self.inodes.read().unwrap();
@@ -716,7 +718,7 @@ impl<T: FileSystem<Inode = Inode, Handle = Handle>> FileSystem for AugmentFs<T> 
             moffset,
             host_shm_base,
             shm_size,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             map_sender,
         )
     }
@@ -727,14 +729,16 @@ impl<T: FileSystem<Inode = Inode, Handle = Handle>> FileSystem for AugmentFs<T> 
         requests: Vec<fuse::RemovemappingOne>,
         host_shm_base: u64,
         shm_size: u64,
-        #[cfg(target_os = "macos")] map_sender: &Option<Sender<WorkerMessage>>,
+        #[cfg(any(target_os = "macos", target_os = "windows"))] map_sender: &Option<
+            Sender<WorkerMessage>,
+        >,
     ) -> io::Result<()> {
         self.inner.removemapping(
             ctx,
             requests,
             host_shm_base,
             shm_size,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             map_sender,
         )
     }

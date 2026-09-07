@@ -8,7 +8,7 @@
 // Unoverridden methods fall back to the trait defaults (which return ENOSYS),
 // so the wrapper fails closed -- but new methods should still be explicitly
 // handled here for correct error semantics.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use crossbeam_channel::Sender;
 use std::ffi::CStr;
 use std::io;
@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicI32;
 use std::time::Duration;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use utils::worker_message::WorkerMessage;
 
 use super::filesystem::{
@@ -283,7 +283,9 @@ impl FileSystem for PassthroughFsRo {
         moffset: u64,
         host_shm_base: u64,
         shm_size: u64,
-        #[cfg(target_os = "macos")] map_sender: &Option<Sender<WorkerMessage>>,
+        #[cfg(any(target_os = "macos", target_os = "windows"))] map_sender: &Option<
+            Sender<WorkerMessage>,
+        >,
     ) -> io::Result<()> {
         // Reject writable mappings.
         if (flags & fuse::SetupmappingFlags::WRITE.bits()) != 0 {
@@ -299,7 +301,7 @@ impl FileSystem for PassthroughFsRo {
             moffset,
             host_shm_base,
             shm_size,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             map_sender,
         )
     }
@@ -310,14 +312,16 @@ impl FileSystem for PassthroughFsRo {
         requests: Vec<fuse::RemovemappingOne>,
         host_shm_base: u64,
         shm_size: u64,
-        #[cfg(target_os = "macos")] map_sender: &Option<Sender<WorkerMessage>>,
+        #[cfg(any(target_os = "macos", target_os = "windows"))] map_sender: &Option<
+            Sender<WorkerMessage>,
+        >,
     ) -> io::Result<()> {
         self.inner.removemapping(
             ctx,
             requests,
             host_shm_base,
             shm_size,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             map_sender,
         )
     }
