@@ -1319,6 +1319,9 @@ pub fn start_fork_generation_copy(parent: &GuestMemoryMmap) -> io::Result<ForkGe
 #[cfg(target_os = "macos")]
 pub struct MacForkGenerationCopy {
     worker: Option<std::thread::JoinHandle<io::Result<MacGenerationOutput>>>,
+    /// A generation that was complete when captured (an APFS clone), so no
+    /// worker is needed and `finish` returns immediately.
+    ready: Option<MacGenerationOutput>,
 }
 
 #[cfg(target_os = "macos")]
@@ -1377,7 +1380,17 @@ impl Drop for MacGenerationArtifacts {
 
 #[cfg(target_os = "macos")]
 impl MacForkGenerationCopy {
+    fn ready(output: MacGenerationOutput) -> Self {
+        Self {
+            worker: None,
+            ready: Some(output),
+        }
+    }
+
     pub fn finish(mut self) -> io::Result<Vec<MemfdRegionDesc>> {
+        if let Some(output) = self.ready.take() {
+            return Ok(output.descs);
+        }
         let worker = self
             .worker
             .take()
@@ -1392,6 +1405,11 @@ impl MacForkGenerationCopy {
 #[cfg(target_os = "macos")]
 impl Drop for MacForkGenerationCopy {
     fn drop(&mut self) {
+        if let Some(output) = self.ready.take() {
+            for path in output.paths {
+                let _ = std::fs::remove_file(path);
+            }
+        }
         if let Some(worker) = self.worker.take()
             && let Ok(Ok(output)) = worker.join()
         {
@@ -1428,10 +1446,13 @@ impl DeferredMemorySave {
         let mut output_offset = 0_u64;
         let mut portable = Vec::with_capacity(descs.len());
         let mut buffer = vec![0_u8; 1024 * 1024];
+        let mut consumed: Vec<String> = Vec::new();
         for desc in &descs {
             output.seek(SeekFrom::Start(output_offset))?;
             if !desc.path.is_empty() {
                 let mut source = File::open(&desc.path)?;
+                // Regions that share one clone sit at their own offsets in it.
+                source.seek(SeekFrom::Start(desc.offset))?;
                 let mut remaining = desc.len;
                 let mut sparse = SparseFileWriter::new(output)?;
                 while remaining > 0 {
@@ -1447,7 +1468,9 @@ impl DeferredMemorySave {
                     remaining -= read as u64;
                 }
                 sparse.finish()?;
-                std::fs::remove_file(&desc.path)?;
+                if !consumed.contains(&desc.path) {
+                    consumed.push(desc.path.clone());
+                }
             }
             portable.push(MemoryRegionDesc {
                 gpa: desc.gpa,
@@ -1459,6 +1482,9 @@ impl DeferredMemorySave {
         }
         output.set_len(output_offset)?;
         output.seek(SeekFrom::Start(output_offset))?;
+        for path in consumed {
+            std::fs::remove_file(path)?;
+        }
         Ok(portable)
     }
 }
@@ -1548,8 +1574,149 @@ fn macos_cow_alias(source: *mut u8, len: usize) -> io::Result<MachCowAlias> {
 /// materializing those aliases into the snapshot directory. Anonymous device
 /// SHM retains the established fork behavior and is represented as anonymous
 /// clone memory; ordinary guest RAM is always file-backed for a forkable VM.
+/// Capture a point-in-time macOS RAM generation without copying guest RAM.
+///
+/// Forkable guest RAM on macOS is a regular file mapped `MAP_SHARED`, so a
+/// generation is an APFS clone of that file: `fclonefileat` shares the file's
+/// extents and costs the same for 512 MiB as for 64 GiB. The source keeps
+/// running on its own file afterwards; APFS gives whichever side writes first
+/// private extents, so the clone stays frozen without remapping the live VM or
+/// re-registering anything with the hypervisor. The caller has already paused
+/// the vCPUs, so the `msync` here flushes every dirty guest page before the
+/// clone is taken and nothing can dirty the file in between.
+///
+/// A backing file that cannot be cloned (a non-APFS or cross-volume `TMPDIR`)
+/// falls back to the page-copy generation, so the fast path never changes what
+/// a branch is allowed to do.
 #[cfg(target_os = "macos")]
 pub fn start_macos_fork_generation_copy(
+    parent: &GuestMemoryMmap,
+    generation_dir: &std::path::Path,
+) -> io::Result<MacForkGenerationCopy> {
+    match start_macos_fork_generation_clone(parent, generation_dir) {
+        Ok(generation) => Ok(generation),
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::EXDEV) | Some(libc::ENOTSUP) | Some(libc::EOPNOTSUPP)
+            ) =>
+        {
+            start_macos_fork_generation_by_write(parent, generation_dir)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn start_macos_fork_generation_clone(
+    parent: &GuestMemoryMmap,
+    generation_dir: &std::path::Path,
+) -> io::Result<MacForkGenerationCopy> {
+    use std::os::fd::AsRawFd;
+
+    let generation_dir = generation_dir.canonicalize()?;
+    let dir = File::open(&generation_dir)?;
+    let mut artifacts = MacGenerationArtifacts::new();
+    let mut descs = Vec::new();
+    // One clone per distinct backing file; regions that share a file share it.
+    let mut clones: Vec<((libc::dev_t, libc::ino_t), std::path::PathBuf)> = Vec::new();
+
+    for (index, region) in parent.iter().enumerate() {
+        let gpa = region.start_addr();
+        let Some(file_offset) = region.file_offset() else {
+            descs.push(MemfdRegionDesc {
+                gpa: gpa.raw_value(),
+                len: region.len(),
+                fd: -1,
+                offset: 0,
+                path: String::new(),
+            });
+            continue;
+        };
+        let len = region.len() as usize;
+        let host = parent
+            .get_host_address(gpa)
+            .map_err(|error| io::Error::other(format!("guest RAM host address: {error:?}")))?;
+
+        // Flush this region's dirty guest pages so the clone holds the paused
+        // VM's exact state rather than whatever writeback had reached the file.
+        if unsafe { libc::msync(host.cast(), len, libc::MS_SYNC) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let fd = file_offset.file().as_raw_fd();
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let key = (stat.st_dev, stat.st_ino);
+        let clone_path = match clones.iter().find(|(k, _)| *k == key) {
+            Some((_, path)) => path.clone(),
+            None => {
+                let name = format!("memory-{index}.bin");
+                let final_path = generation_dir.join(&name);
+                match std::fs::metadata(&final_path) {
+                    Ok(_) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            format!(
+                                "macOS RAM generation already exists: {}",
+                                final_path.display()
+                            ),
+                        ));
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+                let c_name = std::ffi::CString::new(name).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "generation name has NUL")
+                })?;
+                if unsafe { libc::fclonefileat(fd, dir.as_raw_fd(), c_name.as_ptr(), 0) } != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                artifacts.own(final_path.clone());
+                clones.push((key, final_path.clone()));
+                final_path
+            }
+        };
+        let path = clone_path
+            .to_str()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "macOS RAM generation path is not UTF-8",
+                )
+            })?
+            .to_string();
+        descs.push(MemfdRegionDesc {
+            gpa: gpa.raw_value(),
+            len: region.len(),
+            fd: 0,
+            offset: file_offset.start(),
+            path,
+        });
+    }
+    if clones.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "guest RAM has no file-backed regions",
+        ));
+    }
+    dir.sync_all()?;
+    descs.sort_by_key(|desc| desc.gpa);
+    let paths = clones.into_iter().map(|(_, path)| path).collect();
+    artifacts.commit();
+    Ok(MacForkGenerationCopy::ready(MacGenerationOutput {
+        descs,
+        paths,
+    }))
+}
+
+/// Page-copy generation: Mach COW aliases taken while the VM is quiesced, then
+/// materialized into per-region files by a worker after the source resumes.
+/// Kept as the fallback for backing files that cannot be cloned.
+#[cfg(target_os = "macos")]
+fn start_macos_fork_generation_by_write(
     parent: &GuestMemoryMmap,
     generation_dir: &std::path::Path,
 ) -> io::Result<MacForkGenerationCopy> {
@@ -1709,6 +1876,7 @@ pub fn start_macos_fork_generation_copy(
         })?;
     Ok(MacForkGenerationCopy {
         worker: Some(worker),
+        ready: None,
     })
 }
 
