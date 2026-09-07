@@ -60,6 +60,14 @@ use super::fs_utils::{ebadf, einval, enosys, win_err_to_linux};
 
 use windows_sys::Win32::Storage::FileSystem::{FindClose, FindFirstFileW, WIN32_FIND_DATAW};
 
+/// WHP registers guest memory in whole 4 KiB pages.
+const PAGE_SIZE: u64 = 4096;
+
+/// Round `len` up to a whole number of pages, or `None` on overflow.
+fn page_round_up(len: u64) -> Option<u64> {
+    len.checked_add(PAGE_SIZE - 1).map(|v| v & !(PAGE_SIZE - 1))
+}
+
 const OVERRIDE_STAT_STREAM: &str = ":user.containers.override_stat";
 const SECURITY_CAPABILITY_STREAM: &str = ":security.capability";
 
@@ -2621,6 +2629,14 @@ impl FileSystem for PassthroughFs {
             return Err(einval());
         }
         let guest_addr = guest_shm_base.checked_add(moffset).ok_or_else(einval)?;
+        // WHvMapGpaRange only accepts whole pages, but the final chunk of a file
+        // is almost never a page multiple. The host view's last partial page is
+        // zero-filled by Windows, so registering the rounded-up range exposes no
+        // memory beyond the mapping and keeps the tail of the file readable.
+        if moffset % PAGE_SIZE != 0 {
+            error!("moffset {moffset} is not aligned to {PAGE_SIZE}");
+            return Err(einval());
+        }
 
         let is_write = (flags & (fuse::SetupmappingFlags::WRITE.bits() as u64)) != 0;
         let page_flags = if is_write {
@@ -2638,6 +2654,20 @@ impl FileSystem for PassthroughFs {
             .reopen_inode(inode, handle, GENERIC_READ)
             .map_err(win_err_to_linux)?;
         let handle_raw = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+
+        // The mapping object is sized to the file, so a view that runs past EOF
+        // fails outright. The guest maps in fixed windows (2 MiB), so the final
+        // window of a file almost always overhangs the end. Clamp the view to the
+        // bytes that exist and register only the pages that view actually covers;
+        // Windows zero-fills the tail of the last page, and the guest never reads
+        // past EOF anyway.
+        let file_size = file.metadata().map_err(|_| einval())?.len();
+        let avail = file_size.saturating_sub(foffset);
+        if avail == 0 {
+            return Err(einval());
+        }
+        let view_len = std::cmp::min(len, avail);
+        let map_len = page_round_up(view_len).ok_or_else(einval)?;
 
         // 1. Create a file mapping object from the open file handle.
         let mapping_handle =
@@ -2657,7 +2687,7 @@ impl FileSystem for PassthroughFs {
                 map_flags,
                 (foffset >> 32) as u32,
                 (foffset & 0xFFFF_FFFF) as u32,
-                len as usize,
+                view_len as usize,
             )
         };
         unsafe { windows_sys::Win32::Foundation::CloseHandle(mapping_handle) };
@@ -2673,10 +2703,11 @@ impl FileSystem for PassthroughFs {
                 reply_sender,
                 host_addr,
                 guest_addr,
-                len,
+                map_len,
             ))
             .unwrap();
-        if !reply_receiver.recv().unwrap() {
+        let whp_ok = reply_receiver.recv().unwrap();
+        if !whp_ok {
             error!("WHP rejected the DAX window remap at guest_addr={guest_addr:x}");
             unsafe {
                 windows_sys::Win32::System::Memory::UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
@@ -2715,6 +2746,12 @@ impl FileSystem for PassthroughFs {
                 return Err(einval());
             }
             let guest_addr = guest_shm_base.checked_add(req.moffset).ok_or_else(einval)?;
+            // Mirror the rounding used when the window was installed.
+            if req.moffset % PAGE_SIZE != 0 {
+                error!("moffset {} is not aligned to {PAGE_SIZE}", req.moffset);
+                return Err(einval());
+            }
+            let restore_len = page_round_up(req.len).ok_or_else(einval)?;
             let host_addr = match self.map_windows.lock().unwrap().remove(&guest_addr) {
                 Some(a) => a,
                 None => return Err(io::Error::from_raw_os_error(libc::EINVAL)),
@@ -2727,7 +2764,7 @@ impl FileSystem for PassthroughFs {
                 .send(WorkerMessage::GpuRemoveMapping(
                     reply_sender,
                     guest_addr,
-                    req.len,
+                    restore_len,
                 ))
                 .unwrap();
             if !reply_receiver.recv().unwrap() {
