@@ -2097,6 +2097,8 @@ pub unsafe extern "C" fn krun_add_disk(
                     sync_mode: SyncMode::Full,
                     #[cfg(target_os = "macos")]
                     sync_mode: SyncMode::Relaxed,
+                    io_engine: devices::virtio::block::BlockIoEngine::Sync,
+                    prepared_async: None,
                 };
                 cfg.add_block_cfg(block_device_config);
             }
@@ -2147,6 +2149,8 @@ pub unsafe extern "C" fn krun_add_disk2(
                     sync_mode: SyncMode::Full,
                     #[cfg(target_os = "macos")]
                     sync_mode: SyncMode::Relaxed,
+                    io_engine: devices::virtio::block::BlockIoEngine::Sync,
+                    prepared_async: None,
                 };
                 cfg.add_block_cfg(block_device_config);
             }
@@ -2241,12 +2245,104 @@ pub unsafe extern "C" fn krun_add_disk3(
                     is_disk_read_only: read_only,
                     direct_io,
                     sync_mode,
+                    io_engine: devices::virtio::block::BlockIoEngine::Sync,
+                    prepared_async: None,
                 };
                 cfg.add_block_cfg(block_device_config);
             }
             Entry::Vacant(_) => return -libc::ENOENT,
         }
 
+        KRUN_SUCCESS
+    }
+}
+
+/// Add a disk with an explicit host I/O engine.
+///
+/// `io_engine` is 0 for the historical synchronous worker and 1 for restricted
+/// io_uring reads on buffered raw images. Buffered writes remain synchronous.
+/// The async engine intentionally rejects direct I/O, whose alignment contract
+/// it cannot currently preserve.
+#[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
+#[cfg(feature = "blk")]
+pub unsafe extern "C" fn krun_add_disk4(
+    ctx_id: u32,
+    c_block_id: *const c_char,
+    c_disk_path: *const c_char,
+    disk_format: u32,
+    read_only: bool,
+    direct_io: bool,
+    sync_mode: u32,
+    io_engine: u32,
+) -> i32 {
+    unsafe {
+        let disk_path = match CStr::from_ptr(c_disk_path).to_str() {
+            Ok(disk) => disk,
+            Err(_) => return -libc::EINVAL,
+        };
+        let block_id = match CStr::from_ptr(c_block_id).to_str() {
+            Ok(block_id) => block_id,
+            Err(_) => return -libc::EINVAL,
+        };
+        let format = match ImageType::try_from(disk_format) {
+            Ok(format) => format,
+            Err(_) => return -libc::EINVAL,
+        };
+        let sync_mode = match SyncMode::try_from(sync_mode) {
+            Ok(mode) => mode,
+            Err(_) => return -libc::EINVAL,
+        };
+        let io_engine = match devices::virtio::block::BlockIoEngine::try_from(io_engine) {
+            Ok(engine) => engine,
+            Err(_) => return -libc::EINVAL,
+        };
+        if io_engine == devices::virtio::block::BlockIoEngine::Async && direct_io {
+            return -libc::ENOTSUP;
+        }
+
+        // Ring setup and file registration must happen before the launcher
+        // installs its final seccomp filter. Structured formats retain the
+        // synchronous metadata path and therefore need no ring.
+        let prepared_async = if io_engine == devices::virtio::block::BlockIoEngine::Async
+            && format == ImageType::Raw
+        {
+            match devices::virtio::block::prepare_async_io(disk_path, !read_only) {
+                Ok(prepared) => Some(prepared),
+                Err(error) => {
+                    let errno = error.raw_os_error().unwrap_or(libc::EIO);
+                    error!("Error preparing async block I/O for {disk_path}: {error}");
+                    set_last_error(format!(
+                        "prepare restricted async block I/O for {disk_path}: {error}"
+                    ));
+                    return -errno;
+                }
+            }
+        } else {
+            None
+        };
+
+        match CTX_MAP.lock().unwrap().entry(ctx_id) {
+            Entry::Occupied(mut ctx_cfg) => {
+                ctx_cfg.get_mut().add_block_cfg(BlockDeviceConfig {
+                    block_id: block_id.to_string(),
+                    cache_type: CacheType::auto(disk_path),
+                    disk_image_path: disk_path.to_string(),
+                    disk_image_format: format,
+                    is_disk_read_only: read_only,
+                    direct_io,
+                    sync_mode,
+                    io_engine,
+                    prepared_async,
+                });
+            }
+            Entry::Vacant(_) => {
+                if let Some(prepared) = prepared_async {
+                    devices::virtio::block::discard_prepared_async_io(prepared);
+                }
+                return -libc::ENOENT;
+            }
+        }
         KRUN_SUCCESS
     }
 }
@@ -4873,6 +4969,110 @@ mod test_disable_implicit_init {
         );
         drop(ctx_map);
 
+        assert_eq!(krun_free_ctx(ctx), KRUN_SUCCESS);
+    }
+}
+
+#[cfg(all(test, feature = "blk"))]
+mod block_io_engine_tests {
+    use super::*;
+    use devices::virtio::block::BlockIoEngine;
+
+    #[test]
+    fn legacy_disk_api_remains_sync_and_disk4_is_explicitly_async() {
+        let ctx = krun_create_ctx() as u32;
+        unsafe {
+            assert_eq!(
+                krun_add_disk2(
+                    ctx,
+                    c"legacy".as_ptr(),
+                    c"/tmp/legacy.raw".as_ptr(),
+                    0,
+                    false
+                ),
+                KRUN_SUCCESS
+            );
+            assert_eq!(
+                krun_add_disk4(
+                    ctx,
+                    c"queued".as_ptr(),
+                    c"/tmp/queued.qcow2".as_ptr(),
+                    1,
+                    false,
+                    false,
+                    2,
+                    1,
+                ),
+                KRUN_SUCCESS
+            );
+        }
+
+        let engines = {
+            let contexts = CTX_MAP.lock().unwrap();
+            contexts
+                .get(&ctx)
+                .unwrap()
+                .block_cfgs
+                .iter()
+                .map(|disk| disk.io_engine)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(engines, vec![BlockIoEngine::Sync, BlockIoEngine::Async]);
+        assert_eq!(krun_free_ctx(ctx), KRUN_SUCCESS);
+    }
+
+    #[test]
+    fn async_disk_rejects_direct_io() {
+        let ctx = krun_create_ctx() as u32;
+        let result = unsafe {
+            krun_add_disk4(
+                ctx,
+                c"queued".as_ptr(),
+                c"/tmp/queued.raw".as_ptr(),
+                0,
+                false,
+                true,
+                2,
+                1,
+            )
+        };
+        assert_eq!(result, -libc::ENOTSUP);
+        assert!(
+            CTX_MAP
+                .lock()
+                .unwrap()
+                .get(&ctx)
+                .unwrap()
+                .block_cfgs
+                .is_empty()
+        );
+        assert_eq!(krun_free_ctx(ctx), KRUN_SUCCESS);
+    }
+
+    #[test]
+    fn async_raw_disk_prepares_its_restricted_ring_before_start() {
+        let backing = utils::tempfile::TempFile::new().unwrap();
+        backing.as_file().set_len(1024 * 1024).unwrap();
+        let path = std::ffi::CString::new(backing.as_path().to_str().unwrap()).unwrap();
+        let ctx = krun_create_ctx() as u32;
+        let result = unsafe {
+            krun_add_disk4(
+                ctx,
+                c"queued".as_ptr(),
+                path.as_ptr(),
+                0,
+                false,
+                false,
+                2,
+                1,
+            )
+        };
+        assert_eq!(result, KRUN_SUCCESS);
+        assert!(
+            CTX_MAP.lock().unwrap().get(&ctx).unwrap().block_cfgs[0]
+                .prepared_async
+                .is_some()
+        );
         assert_eq!(krun_free_ctx(ctx), KRUN_SUCCESS);
     }
 }

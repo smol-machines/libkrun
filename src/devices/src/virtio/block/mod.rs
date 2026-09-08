@@ -5,6 +5,7 @@ pub mod device;
 mod worker;
 
 pub use self::device::{Block, BlockState, CacheType, create_overlay};
+pub use self::worker::{PreparedAsyncIo, discard_prepared_async_io, prepare_async_io};
 
 use vm_memory::GuestMemoryError;
 
@@ -41,6 +42,29 @@ pub enum ImageType {
     Raw,
     Qcow2,
     Vmdk,
+}
+
+/// Host I/O engine used by the virtio block worker.
+///
+/// `Sync` preserves the historical, single-worker behavior. `Async` lets the
+/// worker submit multiple raw-disk reads through io_uring. Buffered writes remain inline.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BlockIoEngine {
+    #[default]
+    Sync,
+    Async,
+}
+
+impl TryFrom<u32> for BlockIoEngine {
+    type Error = ();
+
+    fn try_from(io_engine: u32) -> Result<Self, Self::Error> {
+        match io_engine {
+            0 => Ok(Self::Sync),
+            1 => Ok(Self::Async),
+            _ => Err(()),
+        }
+    }
 }
 
 impl TryFrom<u32> for ImageType {

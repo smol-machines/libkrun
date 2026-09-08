@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use devices::virtio::{
     Block, CacheType,
-    block::{ImageType, SyncMode},
+    block::{BlockIoEngine, ImageType, PreparedAsyncIo, SyncMode},
 };
 
 #[derive(Debug)]
@@ -33,6 +33,8 @@ pub struct BlockDeviceConfig {
     pub is_disk_read_only: bool,
     pub direct_io: bool,
     pub sync_mode: SyncMode,
+    pub io_engine: BlockIoEngine,
+    pub prepared_async: Option<PreparedAsyncIo>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -70,6 +72,8 @@ impl BlockBuilder {
             config.is_disk_read_only,
             config.direct_io,
             config.sync_mode,
+            config.io_engine,
+            config.prepared_async,
         )
         .map_err(BlockConfigError::CreateBlockDevice)
     }
