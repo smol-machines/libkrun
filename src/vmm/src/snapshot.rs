@@ -1601,6 +1601,11 @@ pub fn start_macos_fork_generation_copy(
                 Some(libc::EXDEV) | Some(libc::ENOTSUP) | Some(libc::EOPNOTSUPP)
             ) =>
         {
+            warn!(
+                "guest RAM file cannot be cloned ({error}); this branch copies guest RAM \
+                 instead, so it costs time and disk proportional to the VM's memory. \
+                 Keep TMPDIR on the same APFS volume as the machine's data directory."
+            );
             start_macos_fork_generation_by_write(parent, generation_dir)
         }
         Err(error) => Err(error),
