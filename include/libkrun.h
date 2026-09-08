@@ -223,6 +223,26 @@ int32_t krun_add_disk2(uint32_t ctx_id,
                        bool direct_io,
                        uint32_t sync_mode);
 
+/* Supported host block I/O engines. */
+#define KRUN_BLOCK_IO_SYNC 0
+#define KRUN_BLOCK_IO_ASYNC 1
+
+/**
+ * Adds a disk with an explicit host I/O engine.
+ *
+ * The synchronous engine is the default used by krun_add_disk{,2,3}. The
+ * asynchronous engine uses a restricted io_uring for queued reads from
+ * buffered raw images and returns -ENOTSUP for unsupported combinations.
+ */
+int32_t krun_add_disk4(uint32_t ctx_id,
+                       const char *block_id,
+                       const char *disk_path,
+                       uint32_t disk_format,
+                       bool read_only,
+                       bool direct_io,
+                       uint32_t sync_mode,
+                       uint32_t io_engine);
+
 /**
  * Creates a copy-on-write qcow2 overlay backed by an existing disk image.
  *

@@ -1,19 +1,33 @@
 use crate::virtio::descriptor_utils::{Reader, Writer};
 
 use super::super::DeviceQueue;
+use super::BlockIoEngine;
 use super::device::{CacheType, DiskProperties};
 
 use crate::virtio::InterruptTransport;
+#[cfg(target_os = "linux")]
+use io_uring::{IoUring, opcode, register::Restriction, squeue, types};
+#[cfg(target_os = "linux")]
+use std::collections::HashMap;
 use std::io::{self, Write};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::result;
+use std::sync::Arc;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(target_os = "linux")]
+use std::sync::{LazyLock, Mutex};
 use std::thread;
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
+#[cfg(target_os = "linux")]
+use utils::eventfd::EFD_NONBLOCK;
 use utils::eventfd::EventFd;
 #[cfg(target_os = "windows")]
 use utils::windows::AsRawFd;
 use virtio_bindings::virtio_blk::*;
+#[cfg(target_os = "linux")]
+use vm_memory::VolatileSlice;
 use vm_memory::{ByteValued, GuestMemoryMmap};
 
 #[allow(dead_code)]
@@ -58,12 +72,326 @@ pub struct DiscardWriteData {
 // Safe because DiscardWriteData only contains plain data.
 unsafe impl ByteValued for DiscardWriteData {}
 
+#[cfg(target_os = "linux")]
+const MAX_ASYNC_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const MAX_ASYNC_IN_FLIGHT_BYTES: usize = 64 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const MAX_ASYNC_IN_FLIGHT_REQUESTS: usize = 128;
+
+/// Opaque handle for an io_uring created while the launcher can still perform
+/// setup syscalls. The ring itself stays in this crate and can be consumed
+/// exactly once when the block device is constructed after seccomp is active.
+#[derive(Clone)]
+pub struct PreparedAsyncIo(Arc<PreparedAsyncIoInner>);
+
+struct PreparedAsyncIoInner(u64);
+
+impl std::fmt::Debug for PreparedAsyncIo {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("PreparedAsyncIo")
+            .field(&self.0.0)
+            .finish()
+    }
+}
+
+impl PartialEq for PreparedAsyncIo {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.0 == other.0.0
+    }
+}
+
+impl Eq for PreparedAsyncIo {}
+
+impl Drop for PreparedAsyncIoInner {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        {
+            PREPARED_ASYNC_IO.lock().unwrap().remove(&self.0);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+static NEXT_PREPARED_ASYNC_IO: AtomicU64 = AtomicU64::new(1);
+#[cfg(target_os = "linux")]
+static PREPARED_ASYNC_IO: LazyLock<Mutex<HashMap<u64, AsyncIo>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub fn prepare_async_io(path: &str, writable: bool) -> io::Result<PreparedAsyncIo> {
+    #[cfg(target_os = "linux")]
+    {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(writable)
+            .open(path)?;
+        let ring = AsyncIo::new(&file)?;
+        let token = NEXT_PREPARED_ASYNC_IO.fetch_add(1, Ordering::Relaxed);
+        if token == 0 {
+            return Err(io::Error::other(
+                "async block I/O token namespace exhausted",
+            ));
+        }
+        PREPARED_ASYNC_IO.lock().unwrap().insert(token, ring);
+        Ok(PreparedAsyncIo(Arc::new(PreparedAsyncIoInner(token))))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (path, writable);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "async block I/O requires Linux",
+        ))
+    }
+}
+
+pub fn discard_prepared_async_io(prepared: PreparedAsyncIo) {
+    drop(prepared);
+}
+
+pub(crate) fn take_prepared_async_io(prepared: PreparedAsyncIo) -> Option<AsyncIo> {
+    #[cfg(target_os = "linux")]
+    {
+        return PREPARED_ASYNC_IO.lock().unwrap().remove(&prepared.0.0);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = prepared;
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct AsyncJob {
+    head_index: u16,
+    destination: AsyncReadDestination,
+    offset: u64,
+    bytes: usize,
+}
+
+#[cfg(target_os = "linux")]
+enum AsyncReadDestination {
+    Guest {
+        mem: GuestMemoryMmap,
+        iovecs: Box<[libc::iovec]>,
+    },
+    #[cfg(test)]
+    Owned(Vec<u8>),
+}
+
+#[derive(Debug)]
+struct AsyncCompletion {
+    head_index: u16,
+    bytes: usize,
+    result: io::Result<usize>,
+    #[cfg(test)]
+    owned_data: Option<Vec<u8>>,
+}
+
+#[cfg(target_os = "linux")]
+enum PendingBuffer {
+    Guest {
+        _mem: GuestMemoryMmap,
+        _iovecs: Box<[libc::iovec]>,
+    },
+    #[cfg(test)]
+    Owned {
+        _data: Vec<u8>,
+        _iovecs: Box<[libc::iovec]>,
+    },
+}
+
+// SAFETY: The raw pointers in the retained iovec array refer either to the
+// GuestMemoryMmap stored in the same variant or to its owned Vec.  AsyncIo is
+// moved into one block worker before submission and never accessed from a
+// second userspace thread; the kernel stops using every pointer before the
+// corresponding PendingBuffer is removed.
+#[cfg(target_os = "linux")]
+unsafe impl Send for PendingBuffer {}
+
+#[cfg(target_os = "linux")]
+struct PendingRequest {
+    head_index: u16,
+    bytes: usize,
+    _buffer: PendingBuffer,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct AsyncIo {
+    ring: IoUring,
+    pending: HashMap<u64, PendingRequest>,
+    completion_fd: EventFd,
+    next_id: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl AsyncIo {
+    pub(crate) fn new(file: &std::fs::File) -> io::Result<Self> {
+        let completion_fd = EventFd::new(EFD_NONBLOCK)?;
+        let mut builder = IoUring::builder();
+        builder.setup_r_disabled().setup_submit_all();
+        let ring = builder.build(MAX_ASYNC_IN_FLIGHT_REQUESTS as u32)?;
+        ring.submitter()
+            .register_eventfd(completion_fd.as_raw_fd())?;
+        ring.submitter().register_files(&[file.as_raw_fd()])?;
+        let mut restrictions = [
+            Restriction::sqe_op(opcode::Readv::CODE),
+            Restriction::sqe_flags_required(squeue::Flags::FIXED_FILE.bits()),
+        ];
+        ring.submitter().register_restrictions(&mut restrictions)?;
+        ring.submitter().register_enable_rings()?;
+        Ok(Self {
+            ring,
+            pending: HashMap::new(),
+            completion_fd,
+            next_id: 1,
+        })
+    }
+
+    fn submit_read(&mut self, job: AsyncJob) -> io::Result<()> {
+        let (buffer, iovec_ptr, iovec_len) = match job.destination {
+            AsyncReadDestination::Guest { mem, iovecs } => {
+                let ptr = iovecs.as_ptr();
+                let len = iovecs.len() as u32;
+                (
+                    PendingBuffer::Guest {
+                        _mem: mem,
+                        _iovecs: iovecs,
+                    },
+                    ptr,
+                    len,
+                )
+            }
+            #[cfg(test)]
+            AsyncReadDestination::Owned(mut data) => {
+                let iovecs: Box<[libc::iovec]> = vec![libc::iovec {
+                    iov_base: data.as_mut_ptr().cast(),
+                    iov_len: data.len(),
+                }]
+                .into_boxed_slice();
+                let ptr = iovecs.as_ptr();
+                let len = iovecs.len() as u32;
+                (
+                    PendingBuffer::Owned {
+                        _data: data,
+                        _iovecs: iovecs,
+                    },
+                    ptr,
+                    len,
+                )
+            }
+        };
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+        let entry = opcode::Readv::new(types::Fixed(0), iovec_ptr.cast_mut(), iovec_len)
+            .offset(job.offset)
+            .build()
+            .user_data(id);
+        self.pending.insert(
+            id,
+            PendingRequest {
+                head_index: job.head_index,
+                bytes: job.bytes,
+                _buffer: buffer,
+            },
+        );
+        // SAFETY: PendingRequest owns the iovec array and its backing guest or
+        // test buffer until the corresponding completion is consumed.
+        if unsafe { self.ring.submission().push(&entry) }.is_err() {
+            self.pending.remove(&id);
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "io_uring submission queue is full",
+            ));
+        }
+        Ok(())
+    }
+
+    fn submit(&self) -> io::Result<()> {
+        self.ring.submit().map(|_| ())
+    }
+
+    fn completions(&mut self) -> Vec<AsyncCompletion> {
+        self.ring
+            .completion()
+            .filter_map(|entry| {
+                let request = self.pending.remove(&entry.user_data())?;
+                #[cfg(test)]
+                let owned_data = match request._buffer {
+                    PendingBuffer::Owned { _data, .. } => Some(_data),
+                    PendingBuffer::Guest { .. } => None,
+                };
+                let result = if entry.result() < 0 {
+                    Err(io::Error::from_raw_os_error(-entry.result()))
+                } else if entry.result() as usize != request.bytes {
+                    Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "short asynchronous block I/O: {} of {} bytes",
+                            entry.result(),
+                            request.bytes
+                        ),
+                    ))
+                } else {
+                    Ok(entry.result() as usize)
+                };
+                Some(AsyncCompletion {
+                    head_index: request.head_index,
+                    bytes: request.bytes,
+                    result,
+                    #[cfg(test)]
+                    owned_data,
+                })
+            })
+            .collect()
+    }
+
+    fn wait_all(&mut self) -> io::Result<Vec<AsyncCompletion>> {
+        if self.pending.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.ring.submit_and_wait(self.pending.len())?;
+        Ok(self.completions())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn guest_iovecs(slices: Vec<VolatileSlice<'_>>) -> Box<[libc::iovec]> {
+    slices
+        .iter()
+        .map(|slice| libc::iovec {
+            iov_base: slice.ptr_guard_mut().as_ptr().cast(),
+            iov_len: slice.len(),
+        })
+        .collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) struct AsyncIo {
+    completion_fd: EventFd,
+}
+
+#[cfg(not(target_os = "linux"))]
+impl AsyncIo {
+    fn completions(&mut self) -> Vec<AsyncCompletion> {
+        unreachable!("async block I/O requires Linux")
+    }
+
+    fn wait_all(&mut self) -> io::Result<Vec<AsyncCompletion>> {
+        unreachable!("async block I/O requires Linux")
+    }
+}
+
 pub struct BlockWorker {
     device_queue: DeviceQueue,
     interrupt: InterruptTransport,
     mem: GuestMemoryMmap,
     disk: DiskProperties,
     stop_fd: EventFd,
+    async_io: Option<AsyncIo>,
+    in_flight: usize,
+    in_flight_bytes: usize,
 }
 
 impl BlockWorker {
@@ -73,14 +401,27 @@ impl BlockWorker {
         mem: GuestMemoryMmap,
         disk: DiskProperties,
         stop_fd: EventFd,
-    ) -> Self {
-        Self {
+        io_engine: BlockIoEngine,
+    ) -> io::Result<Self> {
+        let async_io = if io_engine == BlockIoEngine::Async && disk.backend().supports_async_io() {
+            Some(
+                disk.backend()
+                    .take_async_io()
+                    .ok_or_else(|| io::Error::other("async block ring was not prepared"))?,
+            )
+        } else {
+            None
+        };
+        Ok(Self {
             device_queue,
             interrupt,
             mem,
             disk,
             stop_fd,
-        }
+            async_io,
+            in_flight: 0,
+            in_flight_bytes: 0,
+        })
     }
 
     /// Snapshot the worker's virtqueue indices (for checkpoint/fork). Call only
@@ -103,7 +444,12 @@ impl BlockWorker {
     /// it impossible for an active worker thread to observe a half-pivoted
     /// device.
     pub(crate) fn replace_disk(&mut self, disk: DiskProperties) -> DiskProperties {
-        std::mem::replace(&mut self.disk, disk)
+        if let Some(async_io) = self.async_io.take() {
+            self.disk.backend().return_async_io(async_io);
+        }
+        let old = std::mem::replace(&mut self.disk, disk);
+        self.async_io = self.disk.backend().take_async_io();
+        old
     }
 
     /// Spawn the worker thread. On stop (a write to `stop_fd`) the thread drains
@@ -121,6 +467,10 @@ impl BlockWorker {
     fn work(mut self) -> BlockWorker {
         let virtq_ev_fd = self.device_queue.event.as_raw_fd();
         let stop_ev_fd = self.stop_fd.as_raw_fd();
+        let async_ev_fd = self
+            .async_io
+            .as_ref()
+            .map(|io| io.completion_fd.as_raw_fd());
 
         let mut epoll = Epoll::new().unwrap();
 
@@ -129,6 +479,14 @@ impl BlockWorker {
             virtq_ev_fd,
             &EpollEvent::new(EventSet::IN, virtq_ev_fd as u64),
         );
+
+        if let Some(fd) = async_ev_fd {
+            let _ = epoll.ctl(
+                ControlOperation::Add,
+                fd,
+                &EpollEvent::new(EventSet::IN, fd as u64),
+            );
+        }
 
         let _ = epoll.ctl(
             ControlOperation::Add,
@@ -154,7 +512,11 @@ impl BlockWorker {
                                 // available before the stop so we yield the
                                 // queue at a clean boundary (no in-flight I/O).
                                 self.process_virtio_queues();
+                                self.drain_async();
                                 return self;
+                            }
+                            EventSet::IN if Some(source) == async_ev_fd => {
+                                self.process_async_completions();
                             }
                             _ => {
                                 log::warn!(
@@ -198,6 +560,10 @@ impl BlockWorker {
     }
 
     fn process_queue(&mut self, mem: &GuestMemoryMmap) {
+        if self.async_io.is_some() {
+            self.process_queue_async(mem);
+            return;
+        }
         let mut signal_needed = false;
         while let Some(head) = self.device_queue.queue.pop(mem) {
             let mut reader = match Reader::new(mem, head.clone()) {
@@ -255,6 +621,299 @@ impl BlockWorker {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    fn process_queue_async(&mut self, mem: &GuestMemoryMmap) {
+        let mut signal_needed = false;
+        while let Some(head) = self.device_queue.queue.pop(mem) {
+            let mut reader = match Reader::new(mem, head.clone()) {
+                Ok(reader) => reader,
+                Err(error) => {
+                    error!("invalid descriptor chain: {error:?}");
+                    continue;
+                }
+            };
+            let mut writer = match Writer::new(mem, head.clone()) {
+                Ok(writer) => writer,
+                Err(error) => {
+                    error!("invalid descriptor chain: {error:?}");
+                    continue;
+                }
+            };
+            let request_header: RequestHeader = match reader.read_obj() {
+                Ok(header) => header,
+                Err(error) => {
+                    error!("invalid request header: {error:?}");
+                    continue;
+                }
+            };
+
+            let async_job = match request_header.request_type {
+                VIRTIO_BLK_T_IN => {
+                    let Some(offset) = request_header.sector.checked_mul(512) else {
+                        self.complete_inline(
+                            mem,
+                            head.index,
+                            &mut writer,
+                            Err(RequestError::InvalidDataLength),
+                            &mut signal_needed,
+                        );
+                        continue;
+                    };
+                    let Some(data_len) = writer.available_bytes().checked_sub(1) else {
+                        self.complete_inline(
+                            mem,
+                            head.index,
+                            &mut writer,
+                            Err(RequestError::InvalidDataLength),
+                            &mut signal_needed,
+                        );
+                        continue;
+                    };
+                    if !data_len.is_multiple_of(512) || data_len > MAX_ASYNC_REQUEST_BYTES {
+                        self.complete_inline(
+                            mem,
+                            head.index,
+                            &mut writer,
+                            Err(RequestError::InvalidDataLength),
+                            &mut signal_needed,
+                        );
+                        continue;
+                    }
+                    if self.in_flight >= MAX_ASYNC_IN_FLIGHT_REQUESTS
+                        || self.in_flight_bytes.saturating_add(data_len) > MAX_ASYNC_IN_FLIGHT_BYTES
+                    {
+                        self.drain_async();
+                    }
+                    let _status = match writer.split_at(data_len) {
+                        Ok(status) => status,
+                        Err(error) => {
+                            self.complete_inline(
+                                mem,
+                                head.index,
+                                &mut writer,
+                                Err(RequestError::WritingToDescriptor(io::Error::other(error))),
+                                &mut signal_needed,
+                            );
+                            continue;
+                        }
+                    };
+                    Some(AsyncJob {
+                        head_index: head.index,
+                        destination: AsyncReadDestination::Guest {
+                            mem: mem.clone(),
+                            iovecs: guest_iovecs(writer.remaining_volatile_slices()),
+                        },
+                        offset,
+                        bytes: data_len,
+                    })
+                }
+                VIRTIO_BLK_T_OUT => {
+                    // Buffered pwritev normally completes into the host page cache. Queueing it
+                    // through io_uring adds completion overhead without overlapping storage I/O,
+                    // and measured worse at higher queue depths. Keep it on the historical inline
+                    // path; flush/discard/write-zero requests below remain explicit barriers.
+                    let result = self.process_request(request_header, &mut reader, &mut writer);
+                    self.complete_inline(mem, head.index, &mut writer, result, &mut signal_needed);
+                    continue;
+                }
+                _ => None,
+            };
+
+            if let Some(job) = async_job {
+                let job_bytes = job.bytes;
+                let submitted = self
+                    .async_io
+                    .as_mut()
+                    .expect("async engine missing")
+                    .submit_read(job);
+                let submission_error = match submitted {
+                    Ok(()) => {
+                        self.in_flight += 1;
+                        self.in_flight_bytes += job_bytes;
+                        continue;
+                    }
+                    Err(error) => error,
+                };
+                // The read path narrowed `writer` to the data descriptors before
+                // submission. Reconstruct it and advance to the trailing status
+                // descriptor so an admission failure cannot corrupt guest data.
+                let mut status_writer = match Writer::new(mem, head.clone()) {
+                    Ok(writer) => writer,
+                    Err(error) => {
+                        error!("async submission error has an invalid descriptor: {error:?}");
+                        continue;
+                    }
+                };
+                status_writer = match status_writer.split_at(job_bytes) {
+                    Ok(writer) => writer,
+                    Err(error) => {
+                        error!(
+                            "async submission error has an invalid status descriptor: {error:?}"
+                        );
+                        continue;
+                    }
+                };
+                self.complete_inline(
+                    mem,
+                    head.index,
+                    &mut status_writer,
+                    Err(RequestError::WritingToDescriptor(submission_error)),
+                    &mut signal_needed,
+                );
+                continue;
+            }
+
+            // Flush/discard/write-zeroes are barriers with respect to earlier
+            // asynchronous requests. Drain first, execute the format-aware
+            // operation synchronously, then continue admitting later requests.
+            if self.in_flight > 0 {
+                self.drain_async();
+            }
+            let result = self.process_request(request_header, &mut reader, &mut writer);
+            self.complete_inline(mem, head.index, &mut writer, result, &mut signal_needed);
+        }
+        if self.in_flight > 0
+            && let Some(async_io) = self.async_io.as_ref()
+            && let Err(error) = async_io.submit()
+        {
+            error!("failed to submit asynchronous block requests: {error:?}");
+            self.drain_async();
+        }
+        if signal_needed && let Err(error) = self.interrupt.try_signal_used_queue() {
+            error!("error signalling queue: {error:?}");
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn process_queue_async(&mut self, _mem: &GuestMemoryMmap) {
+        unreachable!("async block I/O requires Linux")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn complete_inline(
+        &mut self,
+        mem: &GuestMemoryMmap,
+        head_index: u16,
+        writer: &mut Writer,
+        result: result::Result<usize, RequestError>,
+        signal_needed: &mut bool,
+    ) {
+        let (status, len) = match result {
+            Ok(len) => (VIRTIO_BLK_S_OK as u8, len),
+            Err(error) => {
+                error!("error processing request: {error:?}");
+                (VIRTIO_BLK_S_IOERR as u8, 0)
+            }
+        };
+        if let Err(error) = writer.write_obj(status) {
+            error!("failed to write virtio block status: {error:?}");
+        }
+        if let Err(error) = self
+            .device_queue
+            .queue
+            .add_used(mem, head_index, len as u32)
+        {
+            error!("failed to add used elements to the queue: {error:?}");
+        }
+        if self
+            .device_queue
+            .queue
+            .needs_notification(mem)
+            .unwrap_or(false)
+        {
+            *signal_needed = true;
+        }
+    }
+
+    fn process_async_completions(&mut self) {
+        let Some(async_io) = self.async_io.as_mut() else {
+            return;
+        };
+        let _ = async_io.completion_fd.read();
+        let completions = async_io.completions();
+        let mut signal_needed = false;
+        for completion in completions {
+            signal_needed |= self.finish_async_completion(completion);
+        }
+        if signal_needed && let Err(error) = self.interrupt.try_signal_used_queue() {
+            error!("error signalling queue: {error:?}");
+        }
+    }
+
+    fn drain_async(&mut self) {
+        if self.in_flight == 0 {
+            return;
+        }
+        let completions = match self.async_io.as_mut() {
+            Some(async_io) => match async_io.wait_all() {
+                Ok(completions) => completions,
+                Err(error) => {
+                    error!("failed to drain asynchronous block requests: {error:?}");
+                    return;
+                }
+            },
+            None => return,
+        };
+        let mut signal_needed = false;
+        for completion in completions {
+            signal_needed |= self.finish_async_completion(completion);
+        }
+        if signal_needed && let Err(error) = self.interrupt.try_signal_used_queue() {
+            error!("error signalling queue: {error:?}");
+        }
+    }
+
+    fn finish_async_completion(&mut self, completion: AsyncCompletion) -> bool {
+        self.in_flight = self.in_flight.saturating_sub(1);
+        self.in_flight_bytes = self.in_flight_bytes.saturating_sub(completion.bytes);
+        let Some(head) = crate::virtio::queue::DescriptorChain::checked_new(
+            &self.mem,
+            self.device_queue.queue.desc_table,
+            self.device_queue.queue.actual_size(),
+            completion.head_index,
+        ) else {
+            error!("async completion has an invalid descriptor chain");
+            return false;
+        };
+        let mut writer = match Writer::new(&self.mem, head) {
+            Ok(writer) => writer,
+            Err(error) => {
+                error!("async completion writer is invalid: {error:?}");
+                return false;
+            }
+        };
+        writer = match writer.split_at(completion.bytes) {
+            Ok(status_writer) => status_writer,
+            Err(error) => {
+                error!("async read completion has an invalid status descriptor: {error:?}");
+                return false;
+            }
+        };
+        let mut len = 0;
+        let mut status = VIRTIO_BLK_S_IOERR as u8;
+        match completion.result {
+            Ok(count) => {
+                status = VIRTIO_BLK_S_OK as u8;
+                len = count;
+            }
+            Err(error) => error!("asynchronous block request failed: {error:?}"),
+        }
+        if let Err(error) = writer.write_obj(status) {
+            error!("failed to write async block status: {error:?}");
+        }
+        if let Err(error) =
+            self.device_queue
+                .queue
+                .add_used(&self.mem, completion.head_index, len as u32)
+        {
+            error!("failed to add async used element: {error:?}");
+        }
+        self.device_queue
+            .queue
+            .needs_notification(&self.mem)
+            .unwrap_or(false)
+    }
+
     fn process_request(
         &mut self,
         request_header: RequestHeader,
@@ -284,9 +943,14 @@ impl BlockWorker {
             }
             VIRTIO_BLK_T_FLUSH => match self.disk.cache_type() {
                 CacheType::Writeback => {
-                    let diskfile = self.disk.file.lock().unwrap();
-                    diskfile.flush().map_err(RequestError::FlushingToDisk)?;
-                    diskfile.sync().map_err(RequestError::FlushingToDisk)?;
+                    self.disk
+                        .file
+                        .flush()
+                        .map_err(RequestError::FlushingToDisk)?;
+                    self.disk
+                        .file
+                        .sync()
+                        .map_err(RequestError::FlushingToDisk)?;
                     Ok(0)
                 }
                 CacheType::Unsafe => Ok(0),
@@ -309,8 +973,6 @@ impl BlockWorker {
                     .map_err(RequestError::ReadingFromDescriptor)?;
                 self.disk
                     .file
-                    .lock()
-                    .unwrap()
                     .discard_to_any(
                         discard_write_data.sector * 512,
                         discard_write_data.num_sectors as u64 * 512,
@@ -326,8 +988,6 @@ impl BlockWorker {
                 if unmap {
                     self.disk
                         .file
-                        .lock()
-                        .unwrap()
                         .discard_to_zero(
                             discard_write_data.sector * 512,
                             discard_write_data.num_sectors as u64 * 512,
@@ -336,8 +996,6 @@ impl BlockWorker {
                 } else {
                     self.disk
                         .file
-                        .lock()
-                        .unwrap()
                         .write_zeroes(
                             discard_write_data.sector * 512,
                             discard_write_data.num_sectors as u64 * 512,
@@ -348,5 +1006,86 @@ impl BlockWorker {
             }
             _ => Err(RequestError::UnknownRequest),
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    fn submit_reads(io: &mut AsyncIo, requests: u16) {
+        for index in 0..requests {
+            io.submit_read(AsyncJob {
+                head_index: index,
+                destination: AsyncReadDestination::Owned(vec![0; 4096]),
+                offset: index as u64 * 4096,
+                bytes: 4096,
+            })
+            .unwrap();
+        }
+        io.submit().unwrap();
+        let completions = io.wait_all().unwrap();
+        assert_eq!(completions.len(), requests as usize);
+        for completion in completions {
+            assert_eq!(completion.result.unwrap(), 4096);
+            assert_eq!(
+                completion.owned_data.unwrap(),
+                vec![completion.head_index as u8; 4096]
+            );
+        }
+    }
+
+    #[test]
+    fn async_io_overlaps_raw_requests_and_preserves_payloads() {
+        let backing = utils::tempfile::TempFile::new().unwrap();
+        backing.as_file().set_len(1024 * 1024).unwrap();
+        for index in 0..32 {
+            std::os::unix::fs::FileExt::write_all_at(
+                backing.as_file(),
+                &vec![index as u8; 4096],
+                index as u64 * 4096,
+            )
+            .unwrap();
+        }
+        let (disk, _) = super::super::device::open_disk_format(
+            backing.as_path().to_str().unwrap(),
+            super::super::ImageType::Raw,
+            true,
+            false,
+            false,
+            BlockIoEngine::Async,
+            Some(
+                super::super::prepare_async_io(backing.as_path().to_str().unwrap(), true).unwrap(),
+            ),
+        )
+        .unwrap();
+        assert!(disk.supports_async_io());
+        let mut io = disk.take_async_io().unwrap();
+        submit_reads(&mut io, 32);
+    }
+
+    #[test]
+    fn async_engine_keeps_qcow2_on_the_synchronous_format_path() {
+        let base = utils::tempfile::TempFile::new().unwrap();
+        base.as_file().set_len(1024 * 1024).unwrap();
+        let overlay = base.as_path().with_extension("qcow2");
+        super::super::device::create_overlay(
+            overlay.to_str().unwrap(),
+            base.as_path().to_str().unwrap(),
+            super::super::ImageType::Raw,
+        )
+        .unwrap();
+        let (disk, _) = super::super::device::open_disk_format(
+            overlay.to_str().unwrap(),
+            super::super::ImageType::Qcow2,
+            true,
+            false,
+            false,
+            BlockIoEngine::Async,
+            None,
+        )
+        .unwrap();
+        assert!(!disk.supports_async_io());
+        std::fs::remove_file(overlay).unwrap();
     }
 }

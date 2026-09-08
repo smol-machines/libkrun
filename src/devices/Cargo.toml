@@ -70,6 +70,7 @@ lru = ">=0.9"
 [target.'cfg(target_os = "linux")'.dependencies]
 rutabaga_gfx = { package = "krun-rutabaga-gfx", version = "=0.1.0-2.0.0-dev", path = "../rutabaga_gfx", features = ["x"], optional = true }
 caps = "0.5.5"
+io-uring = "0.7.10"
 kvm-bindings = { version = "0.14", features = ["fam-wrappers"] }
 kvm-ioctls = "0.24"
 

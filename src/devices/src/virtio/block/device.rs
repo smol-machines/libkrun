@@ -20,8 +20,13 @@ use std::thread::JoinHandle;
 
 use imago::{
     DynStorage, FormatCreateBuilder, FormatDriverBuilder, PermissiveImplicitOpenGate, Storage,
-    StorageCreateOptions, StorageOpenOptions, SyncFormatAccess, file::File as ImagoFile,
-    qcow2::Qcow2, raw::Raw, vmdk::Vmdk,
+    StorageCreateOptions, StorageOpenOptions, SyncFormatAccess,
+    file::File as ImagoFile,
+    format::drivers::FormatDriverInstance,
+    io_buffers::{IoVector, IoVectorMut},
+    qcow2::Qcow2,
+    raw::Raw,
+    vmdk::Vmdk,
 };
 use log::{error, warn};
 use utils::eventfd::{EFD_NONBLOCK, EventFd};
@@ -39,7 +44,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
 };
 
-use super::worker::BlockWorker;
+use super::worker::{AsyncIo, BlockWorker, PreparedAsyncIo, take_prepared_async_io};
 use super::{
     super::{ActivateResult, DeviceQueue, DeviceState, QueueConfig, TYPE_BLOCK, VirtioDevice},
     Error, NUM_QUEUES, QUEUE_CONFIG, SECTOR_SHIFT, SECTOR_SIZE,
@@ -47,7 +52,7 @@ use super::{
 
 use crate::virtio::{
     ActivateError, InterruptTransport,
-    block::{ImageType, SyncMode},
+    block::{BlockIoEngine, ImageType, SyncMode},
     queue::QueueState,
 };
 
@@ -79,18 +84,128 @@ impl CacheType {
 /// Helper object for setting up all `Block` fields derived from its backing file.
 pub(crate) struct DiskProperties {
     cache_type: CacheType,
-    pub(crate) file: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
+    pub(crate) file: Arc<DiskBackend>,
     nsectors: u64,
     image_id: Vec<u8>,
 }
 
+/// Format-aware disk accessor selected when the device is created.
+///
+/// Both variants retain libkrun's original format wrapper for inline requests.
+/// Raw images can additionally use a restricted io_uring for queued reads;
+/// buffered writes and structured image formats stay synchronous so their
+/// metadata has one owner.
+pub(crate) enum DiskBackend {
+    Sync(Mutex<SyncFormatAccess<Box<dyn DynStorage>>>),
+    AsyncRaw {
+        access: Mutex<SyncFormatAccess<Box<dyn DynStorage>>>,
+        prepared_async: Box<Mutex<Option<AsyncIo>>>,
+    },
+}
+
+impl DiskBackend {
+    pub(crate) fn supports_async_io(&self) -> bool {
+        matches!(self, Self::AsyncRaw { .. })
+    }
+
+    pub(crate) fn take_async_io(&self) -> Option<AsyncIo> {
+        match self {
+            Self::AsyncRaw { prepared_async, .. } => prepared_async.lock().unwrap().take(),
+            Self::Sync(_) => None,
+        }
+    }
+
+    pub(crate) fn return_async_io(&self, async_io: AsyncIo) {
+        if let Self::AsyncRaw { prepared_async, .. } = self {
+            *prepared_async.lock().unwrap() = Some(async_io);
+        }
+    }
+
+    pub(crate) fn size(&self) -> u64 {
+        match self {
+            Self::Sync(access) => access.lock().unwrap().size(),
+            Self::AsyncRaw { access, .. } => access.lock().unwrap().size(),
+        }
+    }
+
+    pub(crate) fn readv(&self, buf: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
+        match self {
+            Self::Sync(access) => access.lock().unwrap().readv(buf, offset),
+            Self::AsyncRaw { access, .. } => access.lock().unwrap().readv(buf, offset),
+        }
+    }
+
+    pub(crate) fn writev(&self, buf: IoVector<'_>, offset: u64) -> io::Result<()> {
+        match self {
+            Self::Sync(access) => access.lock().unwrap().writev(buf, offset),
+            Self::AsyncRaw { access, .. } => access.lock().unwrap().writev(buf, offset),
+        }
+    }
+
+    pub(crate) fn flush(&self) -> io::Result<()> {
+        match self {
+            Self::Sync(access) => access.lock().unwrap().flush(),
+            Self::AsyncRaw { access, .. } => access.lock().unwrap().flush(),
+        }
+    }
+
+    pub(crate) fn sync(&self) -> io::Result<()> {
+        match self {
+            Self::Sync(access) => access.lock().unwrap().sync(),
+            Self::AsyncRaw { access, .. } => access.lock().unwrap().sync(),
+        }
+    }
+
+    pub(crate) fn write_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
+        match self {
+            Self::Sync(access) => access.lock().unwrap().write_zeroes(offset, length),
+            Self::AsyncRaw { access, .. } => access.lock().unwrap().write_zeroes(offset, length),
+        }
+    }
+
+    pub(crate) fn discard_to_zero(&self, offset: u64, length: u64) -> io::Result<()> {
+        match self {
+            Self::Sync(access) => access.lock().unwrap().discard_to_zero(offset, length),
+            Self::AsyncRaw { access, .. } => access.lock().unwrap().discard_to_zero(offset, length),
+        }
+    }
+
+    pub(crate) fn discard_to_any(&self, offset: u64, length: u64) -> io::Result<()> {
+        match self {
+            Self::Sync(access) => access.lock().unwrap().discard_to_any(offset, length),
+            Self::AsyncRaw { access, .. } => access.lock().unwrap().discard_to_any(offset, length),
+        }
+    }
+}
+
+fn disk_backend<D>(
+    driver: D,
+    io_engine: BlockIoEngine,
+    prepared_async: Option<AsyncIo>,
+) -> io::Result<Arc<DiskBackend>>
+where
+    D: FormatDriverInstance<Storage = Box<dyn DynStorage>> + 'static,
+{
+    let backend = match io_engine {
+        BlockIoEngine::Sync => DiskBackend::Sync(Mutex::new(SyncFormatAccess::new(driver)?)),
+        BlockIoEngine::Async => match prepared_async {
+            Some(prepared_async) => DiskBackend::AsyncRaw {
+                access: Mutex::new(SyncFormatAccess::new(driver)?),
+                prepared_async: Box::new(Mutex::new(Some(prepared_async))),
+            },
+            None => DiskBackend::Sync(Mutex::new(SyncFormatAccess::new(driver)?)),
+        },
+    };
+    Ok(Arc::new(backend))
+}
+
 impl DiskProperties {
     pub fn new(
-        disk_image: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
+        disk_image: Arc<DiskBackend>,
         disk_image_id: Vec<u8>,
         cache_type: CacheType,
     ) -> io::Result<Self> {
-        let disk_size = disk_image.lock().unwrap().size();
+        let disk_size = disk_image.size();
 
         // We only support disk size, which uses the first two words of the configuration space.
         // If the image is not a multiple of the sector size, the tail bits are not exposed.
@@ -167,6 +282,10 @@ impl DiskProperties {
     pub fn cache_type(&self) -> CacheType {
         self.cache_type
     }
+
+    pub(crate) fn backend(&self) -> Arc<DiskBackend> {
+        self.file.clone()
+    }
 }
 
 impl Drop for DiskProperties {
@@ -174,11 +293,11 @@ impl Drop for DiskProperties {
         match self.cache_type {
             CacheType::Writeback => {
                 // flush() first to force any cached data out.
-                if self.file.lock().unwrap().flush().is_err() {
+                if self.file.flush().is_err() {
                     error!("Failed to flush block data on drop.");
                 }
                 // Sync data out to physical media on host.
-                if self.file.lock().unwrap().sync().is_err() {
+                if self.file.sync().is_err() {
                     error!("Failed to sync block data on drop.")
                 }
             }
@@ -234,10 +353,11 @@ pub struct Block {
     // Host file and properties.
     disk: Option<DiskProperties>,
     cache_type: CacheType,
-    disk_image: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
+    disk_image: Arc<DiskBackend>,
     disk_image_id: Vec<u8>,
     direct_io: bool,
     sync_mode: SyncMode,
+    io_engine: BlockIoEngine,
     worker_thread: Option<JoinHandle<BlockWorker>>,
     worker_stopfd: EventFd,
     /// A worker reclaimed by [`Self::quiesce_for_snapshot`] (stopped, drained):
@@ -264,26 +384,28 @@ pub struct Block {
 /// every device first lets the VMM fail without changing any running device.
 pub struct PreparedDiskPivot {
     disk: DiskProperties,
-    disk_image: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
+    disk_image: Arc<DiskBackend>,
 }
 
 /// The previous backing retained until a live block pivot is committed.
 pub struct DiskPivotRollback {
     disk: DiskProperties,
-    disk_image: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
+    disk_image: Arc<DiskBackend>,
 }
 
 /// Open `path` as the given image format, returning the format accessor together
 /// with the backing file's discard alignment. Shared by [`Block::new`] and
 /// [`create_overlay`] so both agree on raw/qcow2/vmdk open semantics (including
 /// recursive backing-chain resolution for qcow2).
-fn open_disk_format(
+pub(crate) fn open_disk_format(
     path: &str,
     format: ImageType,
     writable: bool,
     direct_io: bool,
     relaxed_sync: bool,
-) -> io::Result<(SyncFormatAccess<Box<dyn DynStorage>>, usize)> {
+    io_engine: BlockIoEngine,
+    prepared_async: Option<PreparedAsyncIo>,
+) -> io::Result<(Arc<DiskBackend>, usize)> {
     let file_opts = StorageOpenOptions::new()
         .write(writable)
         .filename(path)
@@ -295,7 +417,7 @@ fn open_disk_format(
     let file = ImagoFile::open_sync(file_opts)?;
     let discard_alignment = file.discard_align();
 
-    let disk_image = match format {
+    let backend = match format {
         ImageType::Qcow2 => {
             let mut qcow2 =
                 Qcow2::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::open_image_sync(
@@ -303,20 +425,30 @@ fn open_disk_format(
                     writable,
                 )?;
             qcow2.open_implicit_dependencies_sync()?;
-            SyncFormatAccess::new(qcow2)?
+            disk_backend(qcow2, io_engine, None)?
         }
         ImageType::Raw => {
+            let prepared_async = if io_engine == BlockIoEngine::Async {
+                let prepared = prepared_async.ok_or_else(|| {
+                    io::Error::other("async raw block ring was not prepared before seccomp")
+                })?;
+                Some(take_prepared_async_io(prepared).ok_or_else(|| {
+                    io::Error::other("async raw block ring token is invalid or already consumed")
+                })?)
+            } else {
+                None
+            };
             let raw = Raw::<Box<dyn DynStorage>>::open_image_sync(Box::new(file), writable)?;
-            SyncFormatAccess::new(raw)?
+            disk_backend(raw, io_engine, prepared_async)?
         }
         ImageType::Vmdk => {
             let vmdk =
                 Vmdk::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::builder(Box::new(file))
                     .open_sync(PermissiveImplicitOpenGate::default())?;
-            SyncFormatAccess::new(vmdk)?
+            disk_backend(vmdk, io_engine, None)?
         }
     };
-    Ok((disk_image, discard_alignment))
+    Ok((backend, discard_alignment))
 }
 
 /// Create a qcow2 overlay at `overlay_path` backed by `base_path` (format
@@ -333,7 +465,15 @@ pub fn create_overlay(
     base_format: ImageType,
 ) -> io::Result<()> {
     // The overlay's virtual size must equal the base's.
-    let (base, _discard) = open_disk_format(base_path, base_format, false, false, false)?;
+    let (base, _discard) = open_disk_format(
+        base_path,
+        base_format,
+        false,
+        false,
+        false,
+        BlockIoEngine::Sync,
+        None,
+    )?;
     let virtual_size = base.size();
     drop(base);
 
@@ -379,7 +519,22 @@ impl Block {
         is_disk_read_only: bool,
         direct_io: bool,
         sync_mode: SyncMode,
+        io_engine: BlockIoEngine,
+        prepared_async: Option<PreparedAsyncIo>,
     ) -> io::Result<Block> {
+        #[cfg(not(target_os = "linux"))]
+        if io_engine == BlockIoEngine::Async {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "the async block engine is currently available on Linux only",
+            ));
+        }
+        if io_engine == BlockIoEngine::Async && direct_io {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "the async block engine currently supports buffered disks only",
+            ));
+        }
         let disk_image = OpenOptions::new()
             .read(true)
             .write(!is_disk_read_only)
@@ -403,9 +558,9 @@ impl Block {
             !is_disk_read_only,
             direct_io,
             relaxed_sync,
+            io_engine,
+            prepared_async,
         )?;
-
-        let disk_image = Arc::new(Mutex::new(disk_image));
 
         let disk_properties =
             DiskProperties::new(disk_image.clone(), disk_image_id.clone(), cache_type)?;
@@ -448,6 +603,7 @@ impl Block {
             disk_image_id,
             direct_io,
             sync_mode,
+            io_engine,
             avail_features,
             acked_features: 0u64,
             device_state: DeviceState::Inactive,
@@ -498,9 +654,30 @@ impl Block {
         }
 
         let relaxed_sync = self.sync_mode == SyncMode::Relaxed;
-        let (disk_image, _discard_alignment) =
-            open_disk_format(path, format, true, self.direct_io, relaxed_sync)?;
-        let disk_image = Arc::new(Mutex::new(disk_image));
+        // Async rings are prepared before the launcher installs seccomp and
+        // are fixed to one backing file. A live fork pivot introduces a path
+        // that did not exist at launch, so safely fall back to the synchronous
+        // backend for the continued source. Its persisted engine remains async,
+        // and the next process start prepares a new ring for the new backing.
+        let pivot_io_engine = match self.io_engine {
+            BlockIoEngine::Async => {
+                warn!(
+                    "block '{}': live disk pivot uses synchronous I/O until the next VM start",
+                    self.id
+                );
+                BlockIoEngine::Sync
+            }
+            engine => engine,
+        };
+        let (disk_image, _discard_alignment) = open_disk_format(
+            path,
+            format,
+            true,
+            self.direct_io,
+            relaxed_sync,
+            pivot_io_engine,
+            None,
+        )?;
         let disk = DiskProperties::new(
             Arc::clone(&disk_image),
             self.disk_image_id.clone(),
@@ -709,7 +886,9 @@ impl VirtioDevice for Block {
             mem.clone(),
             disk,
             self.worker_stopfd.try_clone().unwrap(),
-        );
+            self.io_engine,
+        )
+        .map_err(|_| ActivateError::BadActivate)?;
         self.worker_thread = Some(worker.run());
 
         self.device_state = DeviceState::Activated(mem, interrupt);
@@ -738,11 +917,10 @@ impl VirtioDevice for Block {
         // this, but snapshot quiescence may retain the device or rotate it onto
         // a new writable layer without dropping it, so it must happen here too.
         if self.cache_type == CacheType::Writeback {
-            let img = self.disk_image.lock().unwrap();
-            if img.flush().is_err() {
+            if self.disk_image.flush().is_err() {
                 error!("block: failed to flush before snapshot");
             }
-            if img.sync().is_err() {
+            if self.disk_image.sync().is_err() {
                 error!("block: failed to sync before snapshot");
             }
         }
@@ -772,8 +950,16 @@ mod overlay_tests {
 
         // Reopening the overlay must resolve the backing chain and report the
         // base's virtual size.
-        let (overlay, _discard) =
-            open_disk_format(&overlay_path, ImageType::Qcow2, false, false, false).unwrap();
+        let (overlay, _discard) = open_disk_format(
+            &overlay_path,
+            ImageType::Qcow2,
+            false,
+            false,
+            false,
+            BlockIoEngine::Sync,
+            None,
+        )
+        .unwrap();
         assert_eq!(overlay.size(), size);
         drop(overlay);
 

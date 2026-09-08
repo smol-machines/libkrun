@@ -155,9 +155,9 @@ impl<'a> DescriptorChainConsumer<'a> {
                 // There must be at least one element in `other` because we checked
                 // its `size` value in the call to `position` above.
                 let front = other.pop_front().expect("empty VecDeque after split");
-                self.buffers
-                    .push_back(front.offset(rem).map_err(Error::VolatileMemoryError)?);
-                other.push_front(front.offset(rem).map_err(Error::VolatileMemoryError)?);
+                let (before, after) = front.split_at(rem).map_err(Error::VolatileMemoryError)?;
+                self.buffers.push_back(before);
+                other.push_front(after);
             }
 
             Ok(DescriptorChainConsumer {
@@ -383,6 +383,15 @@ impl<'a> Writer<'a> {
     /// lengths of all the buffers in the DescriptorChain would cause an overflow.
     pub fn available_bytes(&self) -> usize {
         self.buffer.available_bytes()
+    }
+
+    /// Borrow the unwritten descriptor payload as volatile guest-memory
+    /// slices.  Use [`Writer::split_at`] first when the final writable
+    /// descriptor contains a status byte that must not be part of the I/O.
+    #[cfg(feature = "blk")]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn remaining_volatile_slices(&self) -> Vec<VolatileSlice<'a>> {
+        self.buffer.buffers.iter().copied().collect()
     }
 
     /// Writes data to the descriptor chain buffer from a file descriptor.
@@ -841,9 +850,19 @@ mod tests {
         .expect("create_descriptor_chain failed");
         let mut reader = Reader::new(&memory, chain).expect("failed to create Reader");
 
-        let other = reader.split_at(24).expect("failed to split Reader");
+        memory
+            .write_slice(&(0_u8..128).collect::<Vec<_>>(), GuestAddress(0x100))
+            .unwrap();
+        let mut other = reader.split_at(24).expect("failed to split Reader");
         assert_eq!(reader.available_bytes(), 24);
         assert_eq!(other.available_bytes(), 104);
+
+        let mut before = Vec::new();
+        let mut after = Vec::new();
+        reader.read_to_end(&mut before).unwrap();
+        other.read_to_end(&mut after).unwrap();
+        assert_eq!(before, (0_u8..24).collect::<Vec<_>>());
+        assert_eq!(after, (24_u8..128).collect::<Vec<_>>());
     }
 
     #[test]
