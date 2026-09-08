@@ -20,7 +20,7 @@ members = [
     "src/rutabaga_gfx",
     "src/whp",
 ]
-exclude = ["examples/gtk_display", "vendor/linux-loader", "vendor/vm-memory"]
+exclude = ["examples/gtk_display", "vendor/imago", "vendor/linux-loader", "vendor/vm-memory"]
 resolver = "2"
 
 # Vendored linux-loader patched to pull vm-memory with default-features = false.
@@ -31,7 +31,12 @@ resolver = "2"
 # UnmapViewOfFile views) so a fork clone can wrap a `FILE_MAP_COPY` (CoW) view of
 # the golden's guest-RAM file as guest memory — dense, page-shared clones instead
 # of a full eager copy. See vendor/vm-memory/src/mmap/windows.rs.
+# imago 0.2.4 passes an inclusive end to FSCTL_SET_ZERO_DATA on Windows, so every
+# guest zero request also zeroed the first byte of the block after it. ext4's
+# lazy inode-table init made that the next group's block bitmap, corrupting the
+# disk on every idle machine. See vendor/imago/src/file.rs.
 [patch.crates-io]
+imago = { path = "vendor/imago" }
 linux-loader = { path = "vendor/linux-loader" }
 vm-memory = { path = "vendor/vm-memory" }
 

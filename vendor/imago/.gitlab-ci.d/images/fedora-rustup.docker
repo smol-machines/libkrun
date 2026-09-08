@@ -1,0 +1,16 @@
+FROM fedora:latest
+ARG RUST_TARGETS="x86_64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-gnu"
+ENV RUST_BACKTRACE=full \
+    RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+RUN set -e; \
+    dnf install -y openssl-devel curl gcc make findutils; \
+    dnf clean all; \
+    curl https://sh.rustup.rs > rustup-init.sh; \
+    chmod +x ./rustup-init.sh; \
+    ./rustup-init.sh --verbose -y --default-toolchain none  --no-modify-path; \
+    for TARGET in $RUST_TARGETS; do \
+      rustup --verbose toolchain install stable nightly --profile minimal --component clippy --target $TARGET; \
+    done; \
+    rustup --verbose component add --toolchain nightly rustfmt

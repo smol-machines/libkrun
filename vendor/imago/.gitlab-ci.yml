@@ -1,0 +1,183 @@
+stages:
+  - containers
+  - check
+  - build
+  - test
+  - publish
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+.base_job_template:
+  interruptible: true
+  timeout: 30m
+  variables:
+    CARGO_HOME: $CI_PROJECT_DIR/cargo
+    CACHE_FALLBACK_KEY: $CI_DEFAULT_BRANCH
+
+.container_job_template:
+  extends: .base_job_template
+  image: docker:latest
+  stage: containers
+  services:
+    - docker:dind
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes:
+        - .gitlab-ci.yml
+        - .gitlab-ci.d/images/$NAME.docker
+  before_script:
+    - docker login $CI_REGISTRY -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD"
+    - until docker info; do sleep 1; done
+  script:
+    - export TAG="$CI_REGISTRY_IMAGE/imago-ci/$NAME:latest"
+    - export COMMON_TAG="$CI_REGISTRY/hreitz/imago/imago-ci/$NAME:latest"
+    - docker build --tag "$TAG" --cache-from "$TAG" --cache-from "$COMMON_TAG"
+      --build-arg BUILDKIT_INLINE_CACHE=1
+      -f ".gitlab-ci.d/images/$NAME.docker" "."
+    - docker push "$TAG"
+  after_script:
+    - docker logout
+
+.rust_template:
+  extends: .base_job_template
+  image: $CI_REGISTRY/hreitz/imago/imago-ci/fedora-rustup:latest
+  cache:
+    - key: $CI_COMMIT_REF
+      paths: [ target/ ]
+    - key: cargo
+      paths: [ cargo/ ]
+  before_script:
+    - rustup --version && rustc --version && cargo --version
+
+fedora-rustup-container:
+  extends: .container_job_template
+  variables:
+    NAME: fedora-rustup
+
+check:clippy:
+  extends: .rust_template
+  stage: check
+  parallel:
+    matrix:
+      - TARGET: [ "x86_64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-pc-windows-gnu" ]
+        CARGO_OPTS: [ "--features=async,sync-wrappers,vm-memory", "--no-default-features --features=sync,vm-memory" ]
+  script:
+    - 'if test "$TARGET" = x86_64-pc-windows-gnu; then
+        CARGO_OPTS=$(echo "$CARGO_OPTS" | sed -e "s/,vm-memory//");
+      fi'
+    - 'cargo +stable clippy
+      --target $TARGET
+      --color always
+      --verbose
+      --all-targets
+      $CARGO_OPTS'
+
+check:clippy-nightly:
+  extends: .rust_template
+  stage: check
+  parallel:
+    matrix:
+      - TARGET: [ "x86_64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-pc-windows-gnu" ]
+        CARGO_OPTS: [ "--features=async,sync-wrappers,vm-memory", "--no-default-features --features=sync,vm-memory" ]
+  allow_failure: true
+  script:
+    - 'if test "$TARGET" = x86_64-pc-windows-gnu; then
+        CARGO_OPTS=$(echo "$CARGO_OPTS" | sed -e "s/,vm-memory//");
+      fi'
+    - 'RUSTFLAGS=-Dunknown_lints cargo +nightly clippy
+      --target $TARGET
+      --color always
+      --verbose
+      --all-targets
+      $CARGO_OPTS'
+
+check:fmt:
+  extends: .rust_template
+  stage: check
+  script:
+    - cargo +nightly fmt $CARGO_OPTS -- --check
+  allow_failure: true
+
+build:
+  extends: .rust_template
+  stage: build
+  needs:
+    - job: "check:clippy"
+  timeout: 1h
+  parallel:
+    matrix:
+    - CARGO_OPTS: [ "", "--features=async,sync-wrappers,vm-memory", "--no-default-features --features=sync,vm-memory" ]
+  script:
+    - cargo +stable build --verbose --color always $CARGO_OPTS
+
+build:docs:
+  extends: .rust_template
+  stage: build
+  needs:
+    - job: "check:clippy"
+  script:
+    - cargo +stable doc --color=always --verbose --no-deps --features=async,sync-wrappers,vm-memory --document-private-items
+  artifacts:
+    paths:
+      - target/doc
+
+build:sync_docs:
+  extends: .rust_template
+  stage: build
+  needs:
+    - job: "check:clippy"
+  script:
+    - 'cargo +stable doc
+      --color=always
+      --verbose
+      --no-deps
+      --no-default-features
+      --features=sync,vm-memory
+      --document-private-items
+      --target-dir=target/sync'
+  artifacts:
+    paths:
+      - target/sync/doc
+
+test:test:
+  extends: .rust_template
+  stage: test
+  parallel:
+    matrix:
+      - CARGO_OPTS: [ "", "--features=async,sync-wrappers,vm-memory", "--no-default-features --features=sync,vm-memory" ]
+  needs:
+    - job: build
+  script:
+    - 'cargo +stable test
+      --verbose
+      --color always
+      --workspace
+      --all-targets
+      --no-fail-fast
+      $CARGO_OPTS'
+
+publish:docs:
+  stage: publish
+  image: alpine
+  dependencies:
+    - build:docs
+    - build:sync_docs
+  script:
+    - mkdir -p public
+    - mv target/doc public/doc
+    - mv target/sync/doc public/sync-doc
+    - echo '/imago /imago/doc/imago/index.html 302' > public/_redirects
+    - echo '/imago-sync /imago/sync-doc/imago/index.html 302' >> public/_redirects
+    - echo '/imago/sync /imago/sync-doc/imago/index.html 302' >> public/_redirects
+    - echo '/ /doc/imago/index.html 302' >> public/_redirects
+    - echo '/sync /sync-doc/imago/index.html 302' >> public/_redirects
+  artifacts:
+    paths:
+      - public
+  only:
+    - main
+  pages: true
