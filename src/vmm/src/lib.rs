@@ -1276,17 +1276,22 @@ impl Vmm {
         // pivot by closing the old worker-owned handles.
         drop(disk_rollback);
 
-        let generation = if let Some(guardian) = generation_guardian {
-            ForkContinueRamGeneration::Guardian(guardian)
+        let (generation, retained_generation_files) = if let Some(guardian) = generation_guardian {
+            (ForkContinueRamGeneration::Guardian(guardian), Vec::new())
         } else if let Some(copy) = generation_copy {
             let (descs, files) = copy.finish().map_err(|error| {
                 Error::Snapshot(format!("finish RAM generation worker: {error}"))
             })?;
-            self.retained_generation_files = files;
-            ForkContinueRamGeneration::Mapped(descs)
+            (ForkContinueRamGeneration::Mapped(descs), files)
         } else {
-            ForkContinueRamGeneration::Mapped(source_descs)
+            (ForkContinueRamGeneration::Mapped(source_descs), Vec::new())
         };
+        // Retain only handles needed by the newly captured generation. Every
+        // previously booted clone holds its own mapping reference. In
+        // particular, switching from an eagerly materialized generation to a
+        // guardian must drop the old files; otherwise each one pins a full
+        // guest-RAM generation in the source cgroup indefinitely.
+        self.retained_generation_files = retained_generation_files;
         Ok((checkpoint, generation))
     }
 

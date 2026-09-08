@@ -861,6 +861,13 @@ const FORK_MANIFEST_MAGIC: u64 = 0x534d4f4c464f524b;
 const GUARDIAN_MANIFEST_MAGIC: u64 = 0x534d4f4c4752444e;
 #[cfg(all(fork_supported, target_os = "linux"))]
 const GUARDIAN_MANIFEST_VERSION: u32 = 1;
+#[cfg(all(
+    fork_supported,
+    target_os = "linux",
+    target_arch = "x86_64",
+    any(feature = "blk", test)
+))]
+const GUARDIAN_SOCKET_NAME: &str = "g";
 
 #[cfg(fork_supported)]
 fn atomic_write_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -1234,7 +1241,11 @@ fn handle_fork_continue_inner(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str, demand_page
         Err(error) => return format!("ERR EINVAL read block pivots: {error}\n"),
     };
     #[cfg(target_os = "linux")]
-    let guardian_socket = demand_paged.then(|| dir.join("ram-guardian.sock"));
+    // The snapshot directory already carries an unpredictable generation id;
+    // keep the socket basename minimal so a cache path that can host agent.sock
+    // does not fail only on its second live branch at sockaddr_un's much lower
+    // path ceiling.
+    let guardian_socket = demand_paged.then(|| dir.join(GUARDIAN_SOCKET_NAME));
     #[cfg(target_os = "macos")]
     let guardian_socket: Option<std::path::PathBuf> = None;
     let commit_marker = dir.join("source-continues-v1");
@@ -1679,7 +1690,7 @@ mod control_command_tests {
             .unwrap();
         let guardian = vmm::generation_guardian::GenerationGuardian::start(
             &memory,
-            &dir.join("ram-guardian.sock"),
+            &dir.join(GUARDIAN_SOCKET_NAME),
         )
         .unwrap();
         atomic_write_file(&dir.join("checkpoint.bin"), b"checkpoint").unwrap();
