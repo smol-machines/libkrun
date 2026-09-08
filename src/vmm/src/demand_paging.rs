@@ -54,6 +54,9 @@ const fn iowr(nr: u32, size: usize) -> libc::c_ulong {
 const UFFDIO_REGISTER: libc::c_ulong = iowr(0x00, std::mem::size_of::<UffdRegister>());
 const UFFDIO_COPY: libc::c_ulong = iowr(0x03, std::mem::size_of::<UffdCopy>());
 const UFFDIO_API: libc::c_ulong = iowr(0x3f, std::mem::size_of::<UffdApi>());
+// `_IO(USERFAULTFD_IOC, 0x00)` creates a userfaultfd through Linux 6.1's
+// permission-governed `/dev/userfaultfd` control device.
+const USERFAULTFD_IOC_NEW: libc::c_ulong = 0xaa00;
 
 #[repr(C)]
 struct UffdApi {
@@ -220,20 +223,49 @@ fn create_userfaultfd(mode: UserfaultfdMode) -> io::Result<OwnedFd> {
             #[cfg(test)]
             UserfaultfdMode::UserModeTest => UFFD_USER_MODE_ONLY,
         };
-    let fd = unsafe { libc::syscall(libc::SYS_userfaultfd, flags) as libc::c_int };
-    if fd < 0 {
-        let error = io::Error::last_os_error();
-        let context = if mode == UserfaultfdMode::KernelFaults
-            && error.raw_os_error() == Some(libc::EPERM)
-        {
-            "kernel-fault-capable userfaultfd is unavailable; grant the VMM a pre-opened /dev/userfaultfd descriptor or enable the host policy"
-        } else {
-            "create userfaultfd"
-        };
-        return Err(io::Error::new(error.kind(), format!("{context}: {error}")));
+    let syscall_fd = unsafe { libc::syscall(libc::SYS_userfaultfd, flags) as libc::c_int };
+    if syscall_fd >= 0 {
+        return initialize_userfaultfd(unsafe { OwnedFd::from_raw_fd(syscall_fd) });
     }
-    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    initialize_userfaultfd(fd)
+    let syscall_error = io::Error::last_os_error();
+
+    if mode == UserfaultfdMode::KernelFaults {
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/userfaultfd")
+        {
+            Ok(control) => {
+                let device_fd =
+                    unsafe { libc::ioctl(control.as_raw_fd(), USERFAULTFD_IOC_NEW, flags) };
+                if device_fd >= 0 {
+                    return initialize_userfaultfd(unsafe {
+                        OwnedFd::from_raw_fd(device_fd as libc::c_int)
+                    });
+                }
+                let device_error = io::Error::last_os_error();
+                return Err(io::Error::new(
+                    device_error.kind(),
+                    format!(
+                        "userfaultfd syscall failed ({syscall_error}) and USERFAULTFD_IOC_NEW failed ({device_error})"
+                    ),
+                ));
+            }
+            Err(device_error) => {
+                return Err(io::Error::new(
+                    device_error.kind(),
+                    format!(
+                        "userfaultfd syscall failed ({syscall_error}) and /dev/userfaultfd could not be opened ({device_error}); grant the VMM a pre-opened descriptor or read/write access to /dev/userfaultfd"
+                    ),
+                ));
+            }
+        }
+    }
+
+    Err(io::Error::new(
+        syscall_error.kind(),
+        format!("create userfaultfd: {syscall_error}"),
+    ))
 }
 
 fn initialize_userfaultfd(fd: OwnedFd) -> io::Result<OwnedFd> {
@@ -687,10 +719,9 @@ mod tests {
         if std::fs::read_to_string("/proc/sys/vm/unprivileged_userfaultfd")
             .is_ok_and(|value| value.trim() == "0")
             && unsafe { libc::geteuid() } != 0
+            && let Err(error) = create_userfaultfd(UserfaultfdMode::KernelFaults)
         {
-            let result = create_userfaultfd(UserfaultfdMode::KernelFaults);
-            let error = result.expect_err("host policy should reject kernel-fault userfaultfd");
-            assert!(error.to_string().contains("pre-opened /dev/userfaultfd"));
+            assert!(error.to_string().contains("/dev/userfaultfd"));
         }
     }
 }
