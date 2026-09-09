@@ -17,10 +17,9 @@ use bindings::*;
 #[cfg(target_arch = "aarch64")]
 use std::arch::asm;
 
-use std::collections::BTreeMap;
 use std::convert::TryInto;
 use std::fmt::{Display, Formatter};
-use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Duration;
 
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
@@ -883,26 +882,15 @@ pub enum VcpuExit<'a> {
 // Guest RAM mapped into the VM with hv_vm_map is pinned by the hypervisor:
 // no madvise variant releases it while the stage-2 mapping exists. To honor
 // virtio-balloon free-page reports we unmap the reported range from stage-2,
-// madvise the host mapping (which can now actually purge), and lazily remap
-// zero-filled pages when the guest faults on the range again. The reporting
-// protocol guarantees the guest does not access a reported range until the
-// report is acked and makes no assumption about its contents afterwards, so
-// zero-fill on refault is conformant.
+// madvise the host mapping (which can now actually purge), and remap it before
+// acknowledging the report. The reporting protocol guarantees the guest does
+// not access a reported range until it is acknowledged and makes no assumption
+// about its contents afterwards, so the purge is safe. Remapping before the
+// acknowledgement also keeps vCPUs from ever observing an unmapped RAM range.
 //
 // Safety gates: opt-in via SMOLVM_BALLOON_RECLAIM=1 and hard-disabled for
 // forkable VMs (SMOLVM_FORKABLE=1), whose file-backed CoW RAM must never be
 // hole-punched or unmapped underneath clones.
-
-struct ReclaimEntry {
-    host: u64,
-    len: u64,
-}
-
-static RECLAIMED: OnceLock<Mutex<BTreeMap<u64, ReclaimEntry>>> = OnceLock::new();
-
-fn reclaimed_map() -> &'static Mutex<BTreeMap<u64, ReclaimEntry>> {
-    RECLAIMED.get_or_init(|| Mutex::new(BTreeMap::new()))
-}
 
 /// Balloon reclaim is opt-in and never coexists with forkable (CoW-shared)
 /// guest RAM.
@@ -917,6 +905,42 @@ pub fn balloon_reclaim_enabled() -> bool {
 fn host_page_size() -> u64 {
     static PS: OnceLock<u64> = OnceLock::new();
     *PS.get_or_init(|| unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 })
+}
+
+#[derive(Debug)]
+enum BalloonReclaimError {
+    Unmap(hv_return_t),
+    Purge(std::io::Error),
+    Remap(hv_return_t),
+}
+
+/// Run the host mapping transition for one free-page report. Returning from
+/// this function is the acknowledgement boundary: the guest may reuse the
+/// range immediately afterwards, so the stage-2 mapping must already exist.
+fn reclaim_range_with_ops<U, P, M>(unmap: U, purge: P, remap: M) -> Result<(), BalloonReclaimError>
+where
+    U: FnOnce() -> hv_return_t,
+    P: FnOnce() -> std::io::Result<()>,
+    M: FnOnce() -> hv_return_t,
+{
+    let ret = unmap();
+    if ret != HV_SUCCESS {
+        return Err(BalloonReclaimError::Unmap(ret));
+    }
+
+    // A failed purge only loses density. Always restore the stage-2 mapping
+    // before returning so the guest cannot observe an unmapped RAM range.
+    let purge_error = purge().err();
+
+    let ret = remap();
+    if ret != HV_SUCCESS {
+        return Err(BalloonReclaimError::Remap(ret));
+    }
+
+    match purge_error {
+        Some(error) => Err(BalloonReclaimError::Purge(error)),
+        None => Ok(()),
+    }
 }
 
 /// Release a balloon-reported guest range: drop its stage-2 mapping so the
@@ -934,23 +958,6 @@ pub fn balloon_reclaim_range(gpa: u64, host_addr: u64, len: u64) {
     let host = host_addr + (start - gpa);
     let alen = end - start;
 
-    // The lock is held across unmap/insert so a concurrent vCPU refault of a
-    // neighboring entry serializes with us.
-    let mut map = reclaimed_map().lock().unwrap();
-    // Entries are disjoint; refuse a report overlapping an outstanding entry
-    // (double hv_vm_unmap would fail and split bookkeeping).
-    if map
-        .range(..end)
-        .next_back()
-        .is_some_and(|(&prev_start, prev)| prev_start + prev.len > start)
-    {
-        return;
-    }
-    let ret = unsafe { hv_vm_unmap(start, alen as usize) };
-    if ret != HV_SUCCESS {
-        error!("balloon reclaim: hv_vm_unmap(0x{start:x}, {alen}) failed: {ret:x}");
-        return;
-    }
     // With the stage-2 mapping gone nothing pins the pages; REUSABLE drops
     // them from phys_footprint immediately and permits eager reclaim.
     // (The crate also compiles on non-macOS hosts where the constant does
@@ -959,41 +966,42 @@ pub fn balloon_reclaim_range(gpa: u64, host_addr: u64, len: u64) {
     let advice = libc::MADV_FREE_REUSABLE;
     #[cfg(not(target_os = "macos"))]
     let advice = libc::MADV_DONTNEED;
-    unsafe { libc::madvise(host as *mut libc::c_void, alen as usize, advice) };
-    map.insert(start, ReclaimEntry { host, len: alen });
-}
-
-/// If `pa` falls inside a reclaimed range, remap the whole range and return
-/// true so the vCPU retries the faulting instruction. Also covers stage-1
-/// page-table walks that land in reclaimed memory (s1ptw aborts report the
-/// walked PA the same way).
-fn balloon_remap_if_reclaimed(pa: u64) -> bool {
-    let mut map = reclaimed_map().lock().unwrap();
-    let (&gpa, entry) = match map.range(..=pa).next_back() {
-        Some(e) => e,
-        None => return false,
-    };
-    if pa >= gpa + entry.len {
-        return false;
+    // Do not leave this range unmapped until a guest refault. Two vCPUs can
+    // exit on the same unmapped range concurrently; after one remaps it, the
+    // other's already-recorded data abort cannot be distinguished from MMIO.
+    // Mapping immediately preserves the reclaimed host pages (hv_vm_map does
+    // not populate them) while eliminating that SMP race entirely.
+    let result = reclaim_range_with_ops(
+        || unsafe { hv_vm_unmap(start, alen as usize) },
+        || {
+            let ret = unsafe { libc::madvise(host as *mut libc::c_void, alen as usize, advice) };
+            if ret == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        },
+        || unsafe {
+            hv_vm_map(
+                host as *mut core::ffi::c_void,
+                start,
+                alen as usize,
+                (HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC).into(),
+            )
+        },
+    );
+    match result {
+        Ok(()) => {}
+        Err(BalloonReclaimError::Unmap(ret)) => {
+            error!("balloon reclaim: hv_vm_unmap(0x{start:x}, {alen}) failed: {ret:x}");
+        }
+        Err(BalloonReclaimError::Purge(error)) => {
+            error!("balloon reclaim: madvise(0x{host:x}, {alen}) failed: {error}");
+        }
+        Err(BalloonReclaimError::Remap(ret)) => {
+            panic!("balloon reclaim: hv_vm_map(0x{start:x}, {alen}) failed after unmap: {ret:x}");
+        }
     }
-    let ret = unsafe {
-        hv_vm_map(
-            entry.host as *mut core::ffi::c_void,
-            gpa,
-            entry.len as usize,
-            (HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC).into(),
-        )
-    };
-    if ret != HV_SUCCESS {
-        // Falling through to MMIO dispatch would corrupt the guest; this is
-        // unrecoverable state, surface it loudly.
-        panic!(
-            "balloon refault: hv_vm_map(0x{gpa:x}, {}) failed: {ret:x}",
-            entry.len
-        );
-    }
-    map.remove(&gpa);
-    true
 }
 
 struct MmioRead {
@@ -1263,167 +1271,264 @@ impl HvfVcpu<'_> {
             vcpu_set_pending_irq(self.vcpuid, InterruptType::Irq, true)?;
         }
 
-        // Loop only for balloon refaults: a data abort in a reclaimed RAM
-        // range remaps the range and retries the instruction without leaving
-        // the vCPU thread (PC untouched). Every other exit returns.
-        loop {
-            let ret = unsafe { hv_vcpu_run(self.vcpuid) };
-            if ret != HV_SUCCESS {
-                return Err(Error::VcpuRun);
-            }
-
-            match self.vcpu_exit.reason {
-                HV_EXIT_REASON_EXCEPTION => { /* This is the main one, handle below. */ }
-                HV_EXIT_REASON_VTIMER_ACTIVATED => {
-                    self.vtimer_masked = true;
-                    return Ok(VcpuExit::VtimerActivated);
-                }
-                HV_EXIT_REASON_CANCELED => return Ok(VcpuExit::Canceled),
-                _ => {
-                    let pc = self.read_reg(hv_reg_t_HV_REG_PC)?;
-                    panic!(
-                        "unexpected exit reason: vcpuid={} 0x{:x} at pc=0x{:x}",
-                        self.id(),
-                        self.vcpu_exit.reason,
-                        pc
-                    );
-                }
-            }
-
-            self.hvf_sync_vtimer(vcpu_list.clone());
-
-            let syndrome = self.vcpu_exit.exception.syndrome;
-            let ec = (syndrome >> 26) & 0x3f;
-            return match ec {
-                EC_AA64_BKPT => {
-                    debug!("vcpu[{}]: BRK exit", self.vcpuid);
-                    Ok(VcpuExit::Breakpoint)
-                }
-                EC_DATAABORT => {
-                    let isv: bool = (syndrome & (1 << 24)) != 0;
-                    let iswrite: bool = ((syndrome >> 6) & 1) != 0;
-                    let s1ptw: bool = ((syndrome >> 7) & 1) != 0;
-                    let sas: u32 = ((syndrome >> 22) & 3) as u32;
-                    let len: usize = (1 << sas) as usize;
-                    let srt: u32 = ((syndrome >> 16) & 0x1f) as u32;
-                    let cm: u32 = ((syndrome >> 8) & 0x1) as u32;
-
-                    debug!(
-                        "EC_DATAABORT {} {} {} {} {} {} {} {}",
-                        syndrome, isv as u8, iswrite as u8, s1ptw as u8, sas, len, srt, cm
-                    );
-
-                    let pa = self.vcpu_exit.exception.physical_address;
-
-                    // A fault inside a balloon-reclaimed RAM range is not MMIO:
-                    // remap it and retry the instruction (PC not advanced). This
-                    // must precede MMIO classification — RAM addresses are never
-                    // valid MMIO and misdispatching them would corrupt the guest.
-                    if balloon_reclaim_enabled() && balloon_remap_if_reclaimed(pa) {
-                        continue;
-                    }
-
-                    self.pending_advance_pc = true;
-
-                    if iswrite {
-                        let val = if srt < 31 {
-                            self.read_reg(hv_reg_t_HV_REG_X0 + srt)?
-                        } else {
-                            0
-                        };
-
-                        match len {
-                            1 => self.mmio_buf[0..1].copy_from_slice(&(val as u8).to_le_bytes()),
-                            4 => self.mmio_buf[0..4].copy_from_slice(&(val as u32).to_le_bytes()),
-                            8 => self.mmio_buf[0..8].copy_from_slice(&val.to_le_bytes()),
-                            _ => panic!("unsupported mmio len={len}"),
-                        };
-
-                        Ok(VcpuExit::MmioWrite(pa, &self.mmio_buf[0..len]))
-                    } else {
-                        self.pending_mmio_read = Some(MmioRead { addr: pa, srt, len });
-                        Ok(VcpuExit::MmioRead(pa, &mut self.mmio_buf[0..len]))
-                    }
-                }
-                #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-                EC_SYSTEMREGISTERTRAP => {
-                    let isread: bool = (syndrome & 1) != 0;
-                    let rt: u32 = ((syndrome >> 5) & 0x1f) as u32;
-                    let reg: u32 = syndrome as u32 & SYSREG_MASK;
-                    debug!(
-                        "EC_SYSTEMREGISTERTRAP isread={}, syndrome={}, rt={}, reg={}, reg_name={}",
-                        isread as u32,
-                        syndrome,
-                        rt,
-                        reg,
-                        sys_reg_name(reg).unwrap_or("unknown sysreg")
-                    );
-
-                    self.pending_advance_pc = true;
-
-                    if isread {
-                        assert!(rt < 32);
-
-                        // See https://developer.arm.com/documentation/dui0801/l/Overview-of-AArch64-state/Registers-in-AArch64-state
-                        if rt == 31 {
-                            return Ok(VcpuExit::SystemRegister);
-                        }
-
-                        match vcpu_list.handle_sysreg_read(self.vcpuid, reg) {
-                            Some(val) => {
-                                self.write_reg(rt, val)?;
-                                Ok(VcpuExit::SystemRegister)
-                            }
-                            None => panic!(
-                                "UNKNOWN rt={}, reg={} name={}",
-                                rt,
-                                reg,
-                                sys_reg_name(reg).unwrap_or("unknown sysreg")
-                            ),
-                        }
-                    } else {
-                        assert!(rt < 32);
-
-                        // See https://developer.arm.com/documentation/dui0801/l/Overview-of-AArch64-state/Registers-in-AArch64-state
-                        let val = if rt == 31 { 0u64 } else { self.read_reg(rt)? };
-
-                        if vcpu_list.handle_sysreg_write(self.vcpuid, reg, val) {
-                            Ok(VcpuExit::SystemRegister)
-                        } else {
-                            panic!(
-                                "unexpected write: {} name={}",
-                                reg,
-                                sys_reg_name(reg).unwrap_or("unknown sysreg")
-                            );
-                        }
-                    }
-                }
-                EC_WFX_TRAP => {
-                    let ctl = self.read_sys_reg(hv_sys_reg_t_HV_SYS_REG_CNTV_CTL_EL0)?;
-
-                    self.pending_advance_pc = true;
-                    if ((ctl & 1) == 0) || (ctl & 2) != 0 {
-                        return Ok(VcpuExit::WaitForEvent);
-                    }
-
-                    // Also CNTV_CVAL & CNTV_CVAL_EL0
-                    let cval = self.read_sys_reg(hv_sys_reg_t_HV_SYS_REG_CNTV_CVAL_EL0)?;
-                    let now = unsafe { mach_absolute_time() };
-                    if now > cval {
-                        return Ok(VcpuExit::WaitForEventExpired);
-                    }
-
-                    let timeout =
-                        Duration::from_nanos((cval - now) * (1_000_000_000 / self.cntfrq));
-                    Ok(VcpuExit::WaitForEventTimeout(timeout))
-                }
-                EC_AA64_HVC => self.handle_psci_request(),
-                EC_AA64_SMC => {
-                    self.pending_advance_pc = true;
-                    self.handle_psci_request()
-                }
-                _ => panic!("unexpected exception: 0x{ec:x}"),
-            };
+        let ret = unsafe { hv_vcpu_run(self.vcpuid) };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuRun);
         }
+
+        match self.vcpu_exit.reason {
+            HV_EXIT_REASON_EXCEPTION => { /* This is the main one, handle below. */ }
+            HV_EXIT_REASON_VTIMER_ACTIVATED => {
+                self.vtimer_masked = true;
+                return Ok(VcpuExit::VtimerActivated);
+            }
+            HV_EXIT_REASON_CANCELED => return Ok(VcpuExit::Canceled),
+            _ => {
+                let pc = self.read_reg(hv_reg_t_HV_REG_PC)?;
+                panic!(
+                    "unexpected exit reason: vcpuid={} 0x{:x} at pc=0x{:x}",
+                    self.id(),
+                    self.vcpu_exit.reason,
+                    pc
+                );
+            }
+        }
+
+        self.hvf_sync_vtimer(vcpu_list.clone());
+
+        let syndrome = self.vcpu_exit.exception.syndrome;
+        let ec = (syndrome >> 26) & 0x3f;
+        match ec {
+            EC_AA64_BKPT => {
+                debug!("vcpu[{}]: BRK exit", self.vcpuid);
+                Ok(VcpuExit::Breakpoint)
+            }
+            EC_DATAABORT => {
+                let isv: bool = (syndrome & (1 << 24)) != 0;
+                let iswrite: bool = ((syndrome >> 6) & 1) != 0;
+                let s1ptw: bool = ((syndrome >> 7) & 1) != 0;
+                let sas: u32 = ((syndrome >> 22) & 3) as u32;
+                let len: usize = (1 << sas) as usize;
+                let srt: u32 = ((syndrome >> 16) & 0x1f) as u32;
+                let cm: u32 = ((syndrome >> 8) & 0x1) as u32;
+
+                debug!(
+                    "EC_DATAABORT {} {} {} {} {} {} {} {}",
+                    syndrome, isv as u8, iswrite as u8, s1ptw as u8, sas, len, srt, cm
+                );
+
+                let pa = self.vcpu_exit.exception.physical_address;
+
+                self.pending_advance_pc = true;
+
+                if iswrite {
+                    let val = if srt < 31 {
+                        self.read_reg(hv_reg_t_HV_REG_X0 + srt)?
+                    } else {
+                        0
+                    };
+
+                    match len {
+                        1 => self.mmio_buf[0..1].copy_from_slice(&(val as u8).to_le_bytes()),
+                        4 => self.mmio_buf[0..4].copy_from_slice(&(val as u32).to_le_bytes()),
+                        8 => self.mmio_buf[0..8].copy_from_slice(&val.to_le_bytes()),
+                        _ => panic!("unsupported mmio len={len}"),
+                    };
+
+                    Ok(VcpuExit::MmioWrite(pa, &self.mmio_buf[0..len]))
+                } else {
+                    self.pending_mmio_read = Some(MmioRead { addr: pa, srt, len });
+                    Ok(VcpuExit::MmioRead(pa, &mut self.mmio_buf[0..len]))
+                }
+            }
+            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+            EC_SYSTEMREGISTERTRAP => {
+                let isread: bool = (syndrome & 1) != 0;
+                let rt: u32 = ((syndrome >> 5) & 0x1f) as u32;
+                let reg: u32 = syndrome as u32 & SYSREG_MASK;
+                debug!(
+                    "EC_SYSTEMREGISTERTRAP isread={}, syndrome={}, rt={}, reg={}, reg_name={}",
+                    isread as u32,
+                    syndrome,
+                    rt,
+                    reg,
+                    sys_reg_name(reg).unwrap_or("unknown sysreg")
+                );
+
+                self.pending_advance_pc = true;
+
+                if isread {
+                    assert!(rt < 32);
+
+                    // See https://developer.arm.com/documentation/dui0801/l/Overview-of-AArch64-state/Registers-in-AArch64-state
+                    if rt == 31 {
+                        return Ok(VcpuExit::SystemRegister);
+                    }
+
+                    match vcpu_list.handle_sysreg_read(self.vcpuid, reg) {
+                        Some(val) => {
+                            self.write_reg(rt, val)?;
+                            Ok(VcpuExit::SystemRegister)
+                        }
+                        None => panic!(
+                            "UNKNOWN rt={}, reg={} name={}",
+                            rt,
+                            reg,
+                            sys_reg_name(reg).unwrap_or("unknown sysreg")
+                        ),
+                    }
+                } else {
+                    assert!(rt < 32);
+
+                    // See https://developer.arm.com/documentation/dui0801/l/Overview-of-AArch64-state/Registers-in-AArch64-state
+                    let val = if rt == 31 { 0u64 } else { self.read_reg(rt)? };
+
+                    if vcpu_list.handle_sysreg_write(self.vcpuid, reg, val) {
+                        Ok(VcpuExit::SystemRegister)
+                    } else {
+                        panic!(
+                            "unexpected write: {} name={}",
+                            reg,
+                            sys_reg_name(reg).unwrap_or("unknown sysreg")
+                        );
+                    }
+                }
+            }
+            EC_WFX_TRAP => {
+                let ctl = self.read_sys_reg(hv_sys_reg_t_HV_SYS_REG_CNTV_CTL_EL0)?;
+
+                self.pending_advance_pc = true;
+                if ((ctl & 1) == 0) || (ctl & 2) != 0 {
+                    return Ok(VcpuExit::WaitForEvent);
+                }
+
+                // Also CNTV_CVAL & CNTV_CVAL_EL0
+                let cval = self.read_sys_reg(hv_sys_reg_t_HV_SYS_REG_CNTV_CVAL_EL0)?;
+                let now = unsafe { mach_absolute_time() };
+                if now > cval {
+                    return Ok(VcpuExit::WaitForEventExpired);
+                }
+
+                let timeout = Duration::from_nanos((cval - now) * (1_000_000_000 / self.cntfrq));
+                Ok(VcpuExit::WaitForEventTimeout(timeout))
+            }
+            EC_AA64_HVC => self.handle_psci_request(),
+            EC_AA64_SMC => {
+                self.pending_advance_pc = true;
+                self.handle_psci_request()
+            }
+            _ => panic!("unexpected exception: 0x{ec:x}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod balloon_reclaim_tests {
+    use super::*;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    #[test]
+    fn reclaim_restores_mapping_before_ack_boundary() {
+        let mapped = Arc::new(AtomicBool::new(true));
+        let order = Arc::new(Mutex::new(Vec::new()));
+
+        reclaim_range_with_ops(
+            {
+                let mapped = Arc::clone(&mapped);
+                let order = Arc::clone(&order);
+                move || {
+                    assert!(mapped.swap(false, Ordering::SeqCst));
+                    order.lock().unwrap().push("unmap");
+                    HV_SUCCESS
+                }
+            },
+            {
+                let mapped = Arc::clone(&mapped);
+                let order = Arc::clone(&order);
+                move || {
+                    assert!(!mapped.load(Ordering::SeqCst));
+                    order.lock().unwrap().push("purge");
+                    Ok(())
+                }
+            },
+            {
+                let mapped = Arc::clone(&mapped);
+                let order = Arc::clone(&order);
+                move || {
+                    assert!(!mapped.swap(true, Ordering::SeqCst));
+                    order.lock().unwrap().push("remap");
+                    HV_SUCCESS
+                }
+            },
+        )
+        .unwrap();
+
+        assert!(mapped.load(Ordering::SeqCst));
+        assert_eq!(*order.lock().unwrap(), ["unmap", "purge", "remap"]);
+
+        // Model two vCPUs resuming immediately after the report is acked.
+        // Neither may observe an unmapped guest-RAM range.
+        let observers: Vec<_> = (0..2)
+            .map(|_| {
+                let mapped = Arc::clone(&mapped);
+                std::thread::spawn(move || mapped.load(Ordering::Acquire))
+            })
+            .collect();
+        assert!(observers.into_iter().all(|thread| thread.join().unwrap()));
+    }
+
+    /// The safety property the happy path cannot express: a purge failure must
+    /// still leave the range mapped. Losing density is acceptable; returning
+    /// with guest RAM unmapped is the corruption this fix exists to prevent, so
+    /// the error is reported only after the mapping is restored.
+    ///
+    /// Without this, an early `return Err(..)` on the purge result -- the more
+    /// idiomatic-looking shape -- reintroduces the unmapped window and every
+    /// other test in this module still passes.
+    #[test]
+    fn a_failed_purge_still_restores_the_mapping() {
+        let mapped = Arc::new(AtomicBool::new(true));
+        let order = Arc::new(Mutex::new(Vec::new()));
+
+        let result = reclaim_range_with_ops(
+            {
+                let mapped = Arc::clone(&mapped);
+                let order = Arc::clone(&order);
+                move || {
+                    assert!(mapped.swap(false, Ordering::SeqCst));
+                    order.lock().unwrap().push("unmap");
+                    HV_SUCCESS
+                }
+            },
+            {
+                let order = Arc::clone(&order);
+                move || {
+                    order.lock().unwrap().push("purge");
+                    Err(std::io::Error::other("purge failed"))
+                }
+            },
+            {
+                let mapped = Arc::clone(&mapped);
+                let order = Arc::clone(&order);
+                move || {
+                    assert!(!mapped.swap(true, Ordering::SeqCst));
+                    order.lock().unwrap().push("remap");
+                    HV_SUCCESS
+                }
+            },
+        );
+
+        assert!(
+            matches!(result, Err(BalloonReclaimError::Purge(_))),
+            "the purge failure must still be reported"
+        );
+        assert!(
+            mapped.load(Ordering::SeqCst),
+            "the range must be mapped again even though the purge failed"
+        );
+        assert_eq!(*order.lock().unwrap(), ["unmap", "purge", "remap"]);
     }
 }
