@@ -58,6 +58,29 @@ pub(super) struct WorkerQueue {
 }
 
 impl FsServer {
+    /// Re-establish this server's DAX window mappings.
+    ///
+    /// The window lives inside guest RAM, so anything that replaces those host
+    /// mappings — a clone's fresh pages, or the source's own `MAP_FIXED` rebase
+    /// when it takes a fork generation — leaves the guest's DAX page-table
+    /// entries pointing at zero pages while the guest kernel still believes the
+    /// file is mapped: reads return zeros instead of file bytes.
+    #[cfg(target_os = "linux")]
+    pub(super) fn replay_dax_maps(&self, host_shm_base: u64, shm_size: u64) {
+        match self {
+            FsServer::ReadWrite(server) => {
+                server.fs().inner().replay_dax_maps(host_shm_base, shm_size)
+            }
+            FsServer::ReadOnly(server) => server
+                .fs()
+                .inner()
+                .inner()
+                .replay_dax_maps(host_shm_base, shm_size),
+            // No passthrough host files, so no window mappings to replay.
+            FsServer::Null(_) => {}
+        }
+    }
+
     fn handle_message(
         &self,
         r: Reader,

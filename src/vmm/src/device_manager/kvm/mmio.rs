@@ -407,6 +407,28 @@ impl MMIODeviceManager {
         }
     }
 
+    /// Repair every virtio-fs DAX window after guest RAM was remapped.
+    ///
+    /// The windows live inside guest RAM, so a `MAP_FIXED` rebase replaces the
+    /// file mappings inside them with zero pages while the guest keeps its DAX
+    /// page-table entries — every read of a mapped file returns zeros until the
+    /// mappings are re-applied.
+    ///
+    /// Gated like [`Self::pivot_block_devices`]: the live-fork path that remaps
+    /// guest RAM is only built for those targets, and it is the only caller.
+    #[cfg(all(feature = "blk", target_arch = "x86_64"))]
+    pub(crate) fn replay_fs_dax_maps(&self) {
+        // A confidential-guest build has no virtio-fs device at all, so there is
+        // no window to repair.
+        #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+        for device in &self.virtio_devices {
+            let guard = device.lock().expect("poisoned virtio device lock");
+            if let Some(fs) = guard.as_any().downcast_ref::<devices::virtio::Fs>() {
+                fs.replay_dax_maps();
+            }
+        }
+    }
+
     /// Replace every requested quiesced block device as one transaction.
     ///
     /// All images are opened and validated before the first device changes.
