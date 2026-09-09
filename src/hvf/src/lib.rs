@@ -1004,62 +1004,6 @@ pub fn balloon_reclaim_range(gpa: u64, host_addr: u64, len: u64) {
     }
 }
 
-#[cfg(test)]
-mod balloon_reclaim_tests {
-    use super::*;
-    use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
-
-    #[test]
-    fn reclaim_restores_mapping_before_ack_boundary() {
-        let mapped = Arc::new(AtomicBool::new(true));
-        let order = Arc::new(Mutex::new(Vec::new()));
-
-        reclaim_range_with_ops(
-            {
-                let mapped = Arc::clone(&mapped);
-                let order = Arc::clone(&order);
-                move || {
-                    assert!(mapped.swap(false, Ordering::SeqCst));
-                    order.lock().unwrap().push("unmap");
-                    HV_SUCCESS
-                }
-            },
-            {
-                let mapped = Arc::clone(&mapped);
-                let order = Arc::clone(&order);
-                move || {
-                    assert!(!mapped.load(Ordering::SeqCst));
-                    order.lock().unwrap().push("purge");
-                    Ok(())
-                }
-            },
-            {
-                let mapped = Arc::clone(&mapped);
-                let order = Arc::clone(&order);
-                move || {
-                    assert!(!mapped.swap(true, Ordering::SeqCst));
-                    order.lock().unwrap().push("remap");
-                    HV_SUCCESS
-                }
-            },
-        )
-        .unwrap();
-
-        assert!(mapped.load(Ordering::SeqCst));
-        assert_eq!(*order.lock().unwrap(), ["unmap", "purge", "remap"]);
-
-        // Model two vCPUs resuming immediately after the report is acked.
-        // Neither may observe an unmapped guest-RAM range.
-        let observers: Vec<_> = (0..2)
-            .map(|_| {
-                let mapped = Arc::clone(&mapped);
-                std::thread::spawn(move || mapped.load(Ordering::Acquire))
-            })
-            .collect();
-        assert!(observers.into_iter().all(|thread| thread.join().unwrap()));
-    }
-}
-
 struct MmioRead {
     addr: u64,
     len: usize,
@@ -1475,5 +1419,116 @@ impl HvfVcpu<'_> {
             }
             _ => panic!("unexpected exception: 0x{ec:x}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod balloon_reclaim_tests {
+    use super::*;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    #[test]
+    fn reclaim_restores_mapping_before_ack_boundary() {
+        let mapped = Arc::new(AtomicBool::new(true));
+        let order = Arc::new(Mutex::new(Vec::new()));
+
+        reclaim_range_with_ops(
+            {
+                let mapped = Arc::clone(&mapped);
+                let order = Arc::clone(&order);
+                move || {
+                    assert!(mapped.swap(false, Ordering::SeqCst));
+                    order.lock().unwrap().push("unmap");
+                    HV_SUCCESS
+                }
+            },
+            {
+                let mapped = Arc::clone(&mapped);
+                let order = Arc::clone(&order);
+                move || {
+                    assert!(!mapped.load(Ordering::SeqCst));
+                    order.lock().unwrap().push("purge");
+                    Ok(())
+                }
+            },
+            {
+                let mapped = Arc::clone(&mapped);
+                let order = Arc::clone(&order);
+                move || {
+                    assert!(!mapped.swap(true, Ordering::SeqCst));
+                    order.lock().unwrap().push("remap");
+                    HV_SUCCESS
+                }
+            },
+        )
+        .unwrap();
+
+        assert!(mapped.load(Ordering::SeqCst));
+        assert_eq!(*order.lock().unwrap(), ["unmap", "purge", "remap"]);
+
+        // Model two vCPUs resuming immediately after the report is acked.
+        // Neither may observe an unmapped guest-RAM range.
+        let observers: Vec<_> = (0..2)
+            .map(|_| {
+                let mapped = Arc::clone(&mapped);
+                std::thread::spawn(move || mapped.load(Ordering::Acquire))
+            })
+            .collect();
+        assert!(observers.into_iter().all(|thread| thread.join().unwrap()));
+    }
+
+    /// The safety property the happy path cannot express: a purge failure must
+    /// still leave the range mapped. Losing density is acceptable; returning
+    /// with guest RAM unmapped is the corruption this fix exists to prevent, so
+    /// the error is reported only after the mapping is restored.
+    ///
+    /// Without this, an early `return Err(..)` on the purge result -- the more
+    /// idiomatic-looking shape -- reintroduces the unmapped window and every
+    /// other test in this module still passes.
+    #[test]
+    fn a_failed_purge_still_restores_the_mapping() {
+        let mapped = Arc::new(AtomicBool::new(true));
+        let order = Arc::new(Mutex::new(Vec::new()));
+
+        let result = reclaim_range_with_ops(
+            {
+                let mapped = Arc::clone(&mapped);
+                let order = Arc::clone(&order);
+                move || {
+                    assert!(mapped.swap(false, Ordering::SeqCst));
+                    order.lock().unwrap().push("unmap");
+                    HV_SUCCESS
+                }
+            },
+            {
+                let order = Arc::clone(&order);
+                move || {
+                    order.lock().unwrap().push("purge");
+                    Err(std::io::Error::other("purge failed"))
+                }
+            },
+            {
+                let mapped = Arc::clone(&mapped);
+                let order = Arc::clone(&order);
+                move || {
+                    assert!(!mapped.swap(true, Ordering::SeqCst));
+                    order.lock().unwrap().push("remap");
+                    HV_SUCCESS
+                }
+            },
+        );
+
+        assert!(
+            matches!(result, Err(BalloonReclaimError::Purge(_))),
+            "the purge failure must still be reported"
+        );
+        assert!(
+            mapped.load(Ordering::SeqCst),
+            "the range must be mapped again even though the purge failed"
+        );
+        assert_eq!(*order.lock().unwrap(), ["unmap", "purge", "remap"]);
     }
 }
