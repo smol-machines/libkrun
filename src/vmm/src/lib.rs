@@ -1206,6 +1206,15 @@ impl Vmm {
                     ),
                 }));
             }
+            // The rebase replaced every host mapping inside guest RAM, including
+            // the virtio-fs DAX windows that live there. The guest keeps its DAX
+            // page-table entries, so without re-applying those mappings the
+            // source reads zeros for every file it had mapped — and because its
+            // executables come from that share, every exec into the still-running
+            // source fails with ENOEXEC until it is restarted.
+            if !needs_materialization {
+                self.mmio_device_manager.replay_fs_dax_maps();
+            }
             Ok((
                 VmCheckpoint {
                     vm_state,

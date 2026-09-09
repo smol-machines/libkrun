@@ -19,6 +19,8 @@ use super::super::{
 use super::ExportTable;
 use super::passthrough;
 use super::virtual_entry::VirtualDirEntry;
+#[cfg(target_os = "linux")]
+use super::worker::FsServer;
 use super::worker::{FsWorker, WorkerQueue};
 use super::{defs, defs::uapi};
 use crate::virtio::InterruptTransport;
@@ -60,6 +62,10 @@ pub struct Fs {
     /// `activate` to rebuild the worker's passthrough inode/handle maps.
     pending_fuse: Option<FuseServerState>,
     exit_code: Arc<AtomicI32>,
+    /// The live FUSE server, retained so the DAX window can be repaired after
+    /// the guest RAM holding it is remapped (see [`Self::replay_dax_maps`]).
+    #[cfg(target_os = "linux")]
+    server: Option<Arc<FsServer>>,
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     map_sender: Option<Sender<WorkerMessage>>,
 }
@@ -172,6 +178,8 @@ impl Fs {
             device_state: DeviceState::Inactive,
             config,
             shm_region: None,
+            #[cfg(target_os = "linux")]
+            server: None,
             passthrough_cfg: fs_cfg,
             read_only,
             virtual_entries,
@@ -187,6 +195,17 @@ impl Fs {
 
     pub fn id(&self) -> &str {
         defs::FS_DEV_ID
+    }
+
+    /// Repair this device's DAX window after the host mappings inside it were
+    /// replaced. Safe to call at any time: it re-applies exactly the mappings
+    /// the guest still has, and is a no-op without a window or an active server.
+    #[cfg(target_os = "linux")]
+    pub fn replay_dax_maps(&self) {
+        let (Some(shm), Some(server)) = (self.shm_region.as_ref(), self.server.as_ref()) else {
+            return;
+        };
+        server.replay_dax_maps(shm.host_addr, shm.size as u64);
     }
 
     pub fn set_shm_region(&mut self, shm_region: VirtioShmRegion) {
@@ -358,6 +377,10 @@ impl VirtioDevice for Fs {
             error!("virtio_fs: failed to create worker: {}", e);
             ActivateError::BadActivate
         })?;
+        #[cfg(target_os = "linux")]
+        {
+            self.server = Some(server.clone());
+        }
         let mut worker_queues: Vec<Vec<WorkerQueue>> =
             (0..defs::NUM_REQUEST_QUEUES).map(|_| Vec::new()).collect();
         for (queue_index, dq) in queues.into_iter().enumerate() {
