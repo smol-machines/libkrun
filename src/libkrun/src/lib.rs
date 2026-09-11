@@ -663,16 +663,18 @@ fn decode_portable_manifest(bytes: &[u8]) -> std::io::Result<Vec<vmm::snapshot::
 #[cfg(snapshot_supported)]
 fn publish_portable_save(
     dir: &std::path::Path,
-    memory: File,
+    memory: Option<File>,
     checkpoint: vmm::VmCheckpoint,
     descs: &[vmm::snapshot::MemoryRegionDesc],
 ) -> std::result::Result<(u64, usize), String> {
     let memory_partial = dir.join("memory.bin.partial");
     let checkpoint_partial = dir.join("checkpoint.bin.partial");
     let manifest_partial = dir.join("manifest.bin.partial");
-    memory
-        .sync_all()
-        .map_err(|error| format!("sync memory image: {error}"))?;
+    if let Some(memory) = &memory {
+        memory
+            .sync_all()
+            .map_err(|error| format!("sync memory image: {error}"))?;
+    }
 
     let checkpoint_bytes = checkpoint.serialize();
     let checkpoint_file = std::fs::OpenOptions::new()
@@ -700,8 +702,10 @@ fn publish_portable_save(
         .sync_all()
         .map_err(|error| format!("sync snapshot manifest: {error}"))?;
 
-    std::fs::rename(&memory_partial, dir.join("memory.bin"))
-        .map_err(|error| format!("publish memory image: {error}"))?;
+    if memory.is_some() {
+        std::fs::rename(&memory_partial, dir.join("memory.bin"))
+            .map_err(|error| format!("publish memory image: {error}"))?;
+    }
     std::fs::rename(&checkpoint_partial, dir.join("checkpoint.bin"))
         .map_err(|error| format!("publish checkpoint state: {error}"))?;
     // Publish the manifest last: its presence is the completeness marker.
@@ -744,7 +748,7 @@ fn handle_save(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
             .unwrap()
             .checkpoint_frozen(&mut memory)
             .map_err(|error| format!("capture VM: {error}"))?;
-        publish_portable_save(dir, memory, checkpoint, &descs)
+        publish_portable_save(dir, Some(memory), checkpoint, &descs)
     })();
 
     match result {
@@ -825,7 +829,7 @@ fn handle_finish_save(dir: &str) -> String {
             .memory
             .finish(&mut memory)
             .map_err(|error| format!("serialize retained RAM generation: {error}"))?;
-        publish_portable_save(dir_path, memory, prepared.checkpoint, &descs)
+        publish_portable_save(dir_path, Some(memory), prepared.checkpoint, &descs)
     })();
     match result {
         Ok((bytes, regions)) => format!("OK saved ({bytes} bytes, {regions} regions)\n"),
@@ -833,6 +837,27 @@ fn handle_finish_save(dir: &str) -> String {
             let _ = std::fs::remove_dir_all(dir_path);
             format!("ERR EIO {error}\n")
         }
+    }
+}
+
+#[cfg(all(
+    snapshot_supported,
+    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
+))]
+fn handle_finish_save_stream<W: Write>(dir: &str, stream: &mut W) -> String {
+    let Some(prepared) = PREPARED_SAVES.lock().unwrap().remove(dir) else {
+        return "ERR ENOENT no prepared durable save\n".to_string();
+    };
+    let result = prepared
+        .memory
+        .finish_stream(stream)
+        .map_err(|error| format!("stream retained RAM: {error}"))
+        .and_then(|descs| {
+            publish_portable_save(std::path::Path::new(dir), None, prepared.checkpoint, &descs)
+        });
+    match result {
+        Ok((bytes, regions)) => format!("OK saved ({bytes} bytes, {regions} regions)\n"),
+        Err(error) => format!("ERR EIO {error}\n"),
     }
 }
 
@@ -1478,6 +1503,11 @@ fn handle_control_stream<S: std::io::Read + std::io::Write + Send + 'static>(
             // be an unused-variable error under -D warnings.
             let _arg = parts.next().map(str::trim).unwrap_or("");
             match verb.as_str() {
+                #[cfg(all(
+                    snapshot_supported,
+                    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
+                ))]
+                "SAVE_CAPABILITIES" => "OK deferred-stream-v1\n".to_string(),
                 "PAUSE" => match vmm.lock().unwrap().pause() {
                     Ok(()) => "OK paused\n".to_string(),
                     Err(e) => format!("ERR EIO {e}\n"),
@@ -1550,19 +1580,24 @@ fn handle_control_stream<S: std::io::Read + std::io::Write + Send + 'static>(
                     snapshot_supported,
                     any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
                 ))]
-                "FINISH_SAVE" => {
+                "FINISH_SAVE" | "FINISH_SAVE_STREAM" => {
                     // RAM persistence can take seconds for large resident
                     // guests. Keep the control listener available so a resumed
                     // source can fork, checkpoint again, or answer health
                     // probes while this caller waits for durable completion.
                     let dir = _arg.to_string();
+                    let send_memory = verb == "FINISH_SAVE_STREAM";
                     let stream = Arc::new(Mutex::new(Some(stream)));
                     let worker_stream = Arc::clone(&stream);
                     let worker = std::thread::Builder::new()
                         .name("krun durable save".into())
                         .spawn(move || {
-                            let response = handle_finish_save(&dir);
                             if let Some(mut stream) = worker_stream.lock().unwrap().take() {
+                                let response = if send_memory {
+                                    handle_finish_save_stream(&dir, &mut stream)
+                                } else {
+                                    handle_finish_save(&dir)
+                                };
                                 let _ = stream.write_all(response.as_bytes());
                             }
                         });
