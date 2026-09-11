@@ -11,7 +11,7 @@ use super::super::{
     ActivateError, ActivateResult, BalloonError, DeviceQueue, DeviceState, QueueConfig,
     VirtioDevice,
 };
-use super::{defs, defs::uapi};
+use super::{BalloonStats, defs, defs::uapi};
 use crate::virtio::InterruptTransport;
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::System::Memory::DiscardVirtualMemory;
@@ -66,6 +66,48 @@ pub struct Balloon {
     pub(crate) activate_evt: EventFd,
     pub(crate) device_state: DeviceState,
     config: VirtioBalloonConfig,
+    /// Most recent sample the guest published on the stats queue.
+    stats: Option<BalloonStats>,
+    /// The guest parks one buffer on the stats queue and only refills it after
+    /// the host acks. Holding the index here means a sample is requested when
+    /// someone actually reads the stats, rather than in a loop with the guest.
+    stats_pending_ack: Option<u16>,
+    /// When the parked buffer was last acked, so refreshes stay rate-limited.
+    stats_last_request: Option<std::time::Instant>,
+}
+
+/// A stats entry is a packed le16 tag followed by a le64 value. `repr(C)` would
+/// pad that to 16 bytes, so the fields are read individually.
+const STAT_ENTRY_LEN: usize = 10;
+
+/// Decode the guest's stats buffer. Returns `None` if it holds no complete
+/// entry; a trailing partial entry is ignored rather than rejecting the sample.
+fn parse_stats_buffer(buf: &[u8]) -> Option<BalloonStats> {
+    let mut stats = BalloonStats::default();
+    let mut saw_entry = false;
+
+    let (entries, _partial) = buf.as_chunks::<STAT_ENTRY_LEN>();
+    for entry in entries {
+        let tag = u16::from_le_bytes([entry[0], entry[1]]);
+        let value = u64::from_le_bytes(entry[2..STAT_ENTRY_LEN].try_into().unwrap());
+        match tag {
+            uapi::VIRTIO_BALLOON_S_SWAP_IN => stats.swap_in = value,
+            uapi::VIRTIO_BALLOON_S_SWAP_OUT => stats.swap_out = value,
+            uapi::VIRTIO_BALLOON_S_MAJFLT => stats.major_faults = value,
+            uapi::VIRTIO_BALLOON_S_MINFLT => stats.minor_faults = value,
+            uapi::VIRTIO_BALLOON_S_MEMFREE => stats.mem_free = value,
+            uapi::VIRTIO_BALLOON_S_MEMTOT => stats.mem_total = value,
+            uapi::VIRTIO_BALLOON_S_AVAIL => stats.mem_available = value,
+            uapi::VIRTIO_BALLOON_S_CACHES => stats.caches = value,
+            // Unknown tags are skipped rather than treated as an error: the set
+            // grows with kernel versions, and a newer guest must not invalidate
+            // the fields this build does understand.
+            _ => {}
+        }
+        saw_entry = true;
+    }
+
+    saw_entry.then_some(stats)
 }
 
 impl Balloon {
@@ -78,6 +120,9 @@ impl Balloon {
                 .map_err(BalloonError::EventFd)?,
             device_state: DeviceState::Inactive,
             config: VirtioBalloonConfig::default(),
+            stats: None,
+            stats_pending_ack: None,
+            stats_last_request: None,
         })
     }
 
@@ -156,6 +201,123 @@ impl Balloon {
         }
 
         have_used
+    }
+
+    /// Stats queue: the guest writes an array of `{ le16 tag, le64 value }`
+    /// entries describing its own memory. Parse the newest one and keep the
+    /// descriptor index without acking, so the guest does not immediately
+    /// refill; `take_stats` acks it to ask for the next sample.
+    ///
+    /// Returns true if a sample was parsed.
+    pub(crate) fn process_stq(&mut self) -> bool {
+        let mem = match self.device_state {
+            DeviceState::Activated(ref mem, _) => mem,
+            DeviceState::Inactive => return false,
+        };
+        let queues = self
+            .queues
+            .as_mut()
+            .expect("queues should exist when activated");
+
+        let mut parsed = None;
+        while let Some(head) = queues[STQ_INDEX].queue.pop(mem) {
+            // A superseded buffer must be returned or the queue stalls; only the
+            // newest sample is worth keeping.
+            if let Some(stale) = self.stats_pending_ack.replace(head.index)
+                && let Err(e) = queues[STQ_INDEX].queue.add_used(mem, stale, 0)
+            {
+                error!("balloon: failed to release a superseded stats buffer: {e:?}");
+            }
+
+            let mut buf = Vec::new();
+            for desc in head.into_iter() {
+                let at = buf.len();
+                buf.resize(at + desc.len as usize, 0);
+                if let Err(e) = mem.read_slice(&mut buf[at..], desc.addr) {
+                    error!("balloon: unreadable stats buffer: {e:?}");
+                    buf.truncate(at);
+                    break;
+                }
+            }
+
+            if let Some(stats) = parse_stats_buffer(&buf) {
+                parsed = Some(stats);
+            }
+        }
+
+        match parsed {
+            Some(stats) => {
+                // Logged at info: this is the only accurate account of the
+                // machine's memory, and it is rate-limited to one sample per
+                // refresh interval, so it does not flood the console.
+                info!(
+                    "balloon stats: total={} available={} free={} caches={} in_use={}",
+                    stats.mem_total,
+                    stats.mem_available,
+                    stats.mem_free,
+                    stats.caches,
+                    stats.in_use()
+                );
+                self.stats = Some(stats);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Ack the parked stats buffer, which is what makes the guest publish a
+    /// fresh sample. Returns true if a request was actually issued.
+    fn request_stats_sample(&mut self) -> bool {
+        let Some(index) = self.stats_pending_ack.take() else {
+            return false;
+        };
+        let DeviceState::Activated(ref mem, _) = self.device_state else {
+            // Re-park it: an inactive device has no queue to ack against, and
+            // dropping the index would strand the buffer for good.
+            self.stats_pending_ack = Some(index);
+            return false;
+        };
+        let queues = self
+            .queues
+            .as_mut()
+            .expect("queues should exist when activated");
+        if let Err(e) = queues[STQ_INDEX].queue.add_used(mem, index, 0) {
+            error!("balloon: failed to request the next stats sample: {e:?}");
+            return false;
+        }
+        self.stats_last_request = Some(std::time::Instant::now());
+        true
+    }
+
+    /// Ask for a fresh sample if the last request is old enough, and say whether
+    /// the guest needs an interrupt to notice.
+    ///
+    /// Called from the balloon's other queue handlers rather than a timer: the
+    /// guest is reporting memory activity precisely when its memory is moving,
+    /// which is when a stale figure would be wrong. Acking on every sample
+    /// instead would leave host and guest refilling the queue in a loop.
+    pub(crate) fn refresh_stats_if_due(&mut self) -> bool {
+        const MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+        if self.stats_pending_ack.is_none() {
+            return false;
+        }
+        if let Some(last) = self.stats_last_request
+            && last.elapsed() < MIN_INTERVAL
+        {
+            return false;
+        }
+        self.request_stats_sample()
+    }
+
+    /// The guest's own account of its memory, and a request for the next one.
+    ///
+    /// Acking the parked descriptor is what makes the guest publish a fresh
+    /// sample, so the value returned here is the state as of the previous
+    /// request. Callers needing a current figure should read twice.
+    pub fn take_stats(&mut self) -> Option<BalloonStats> {
+        self.request_stats_sample();
+        self.stats
     }
 
     /// Inflate queue: the guest surrenders pages as arrays of little-endian
@@ -353,5 +515,100 @@ impl VirtioDevice for Balloon {
 
     fn is_activated(&self) -> bool {
         self.device_state.is_activated()
+    }
+}
+
+#[cfg(test)]
+mod stats_tests {
+    use super::*;
+
+    /// Build a stats buffer the way the guest lays it out: packed 10-byte
+    /// entries, little-endian, with no padding between them.
+    fn entries(pairs: &[(u16, u64)]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(pairs.len() * STAT_ENTRY_LEN);
+        for (tag, value) in pairs {
+            buf.extend_from_slice(&tag.to_le_bytes());
+            buf.extend_from_slice(&value.to_le_bytes());
+        }
+        buf
+    }
+
+    #[test]
+    fn a_guest_sample_decodes_to_the_values_it_carried() {
+        let buf = entries(&[
+            (uapi::VIRTIO_BALLOON_S_MEMTOT, 8 * 1024 * 1024 * 1024),
+            (uapi::VIRTIO_BALLOON_S_MEMFREE, 512 * 1024 * 1024),
+            (uapi::VIRTIO_BALLOON_S_AVAIL, 6 * 1024 * 1024 * 1024),
+            (uapi::VIRTIO_BALLOON_S_CACHES, 1024 * 1024 * 1024),
+            (uapi::VIRTIO_BALLOON_S_SWAP_IN, 7),
+            (uapi::VIRTIO_BALLOON_S_SWAP_OUT, 9),
+            (uapi::VIRTIO_BALLOON_S_MAJFLT, 11),
+            (uapi::VIRTIO_BALLOON_S_MINFLT, 13),
+        ]);
+
+        let stats = parse_stats_buffer(&buf).expect("a full sample parses");
+        assert_eq!(stats.mem_total, 8 * 1024 * 1024 * 1024);
+        assert_eq!(stats.mem_free, 512 * 1024 * 1024);
+        assert_eq!(stats.mem_available, 6 * 1024 * 1024 * 1024);
+        assert_eq!(stats.caches, 1024 * 1024 * 1024);
+        assert_eq!(stats.swap_in, 7);
+        assert_eq!(stats.swap_out, 9);
+        assert_eq!(stats.major_faults, 11);
+        assert_eq!(stats.minor_faults, 13);
+        // 8 GiB total, 6 GiB available -> 2 GiB the guest cannot hand back.
+        assert_eq!(stats.in_use(), 2 * 1024 * 1024 * 1024);
+    }
+
+    /// Entries are packed, not `repr(C)`-aligned. Reading them on a 16-byte
+    /// stride silently shifts every field after the first, which is the bug
+    /// this asserts against: parsing the same bytes on the wrong stride would
+    /// not see the second tag at all.
+    #[test]
+    fn entries_are_read_on_a_ten_byte_stride() {
+        let buf = entries(&[
+            (uapi::VIRTIO_BALLOON_S_MEMTOT, 4096),
+            (uapi::VIRTIO_BALLOON_S_AVAIL, 1024),
+        ]);
+        assert_eq!(buf.len(), 20, "two packed entries are 20 bytes, not 32");
+
+        let stats = parse_stats_buffer(&buf).expect("parses");
+        assert_eq!(stats.mem_total, 4096);
+        assert_eq!(stats.mem_available, 1024);
+    }
+
+    /// A newer guest sends tags this build has never heard of. They must be
+    /// skipped, leaving the known fields intact rather than derailing the rest
+    /// of the buffer.
+    #[test]
+    fn an_unknown_tag_does_not_discard_the_rest_of_the_sample() {
+        let buf = entries(&[
+            (9999, 0xdead_beef),
+            (uapi::VIRTIO_BALLOON_S_MEMTOT, 2048),
+            (4242, 1),
+            (uapi::VIRTIO_BALLOON_S_AVAIL, 512),
+        ]);
+
+        let stats = parse_stats_buffer(&buf).expect("known tags still parse");
+        assert_eq!(stats.mem_total, 2048);
+        assert_eq!(stats.mem_available, 512);
+    }
+
+    /// A short buffer carries no complete entry; reporting a zeroed sample as
+    /// though it were real would claim the guest has no memory at all.
+    #[test]
+    fn a_buffer_too_short_for_one_entry_yields_no_sample() {
+        assert_eq!(parse_stats_buffer(&[]), None);
+        assert_eq!(parse_stats_buffer(&[0u8; STAT_ENTRY_LEN - 1]), None);
+    }
+
+    /// A trailing partial entry is dropped, but the complete ones before it
+    /// still count.
+    #[test]
+    fn a_trailing_partial_entry_is_ignored() {
+        let mut buf = entries(&[(uapi::VIRTIO_BALLOON_S_MEMTOT, 777)]);
+        buf.extend_from_slice(&[0xff; 4]);
+
+        let stats = parse_stats_buffer(&buf).expect("the complete entry parses");
+        assert_eq!(stats.mem_total, 777);
     }
 }
