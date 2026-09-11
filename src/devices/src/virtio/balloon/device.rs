@@ -72,6 +72,8 @@ pub struct Balloon {
     /// the host acks. Holding the index here means a sample is requested when
     /// someone actually reads the stats, rather than in a loop with the guest.
     stats_pending_ack: Option<u16>,
+    /// When the parked buffer was last acked, so refreshes stay rate-limited.
+    stats_last_request: Option<std::time::Instant>,
 }
 
 /// A stats entry is a packed le16 tag followed by a le64 value. `repr(C)` would
@@ -120,6 +122,7 @@ impl Balloon {
             config: VirtioBalloonConfig::default(),
             stats: None,
             stats_pending_ack: None,
+            stats_last_request: None,
         })
     }
 
@@ -244,7 +247,10 @@ impl Balloon {
 
         match parsed {
             Some(stats) => {
-                debug!(
+                // Logged at info: this is the only accurate account of the
+                // machine's memory, and it is rate-limited to one sample per
+                // refresh interval, so it does not flood the console.
+                info!(
                     "balloon stats: total={} available={} free={} caches={} in_use={}",
                     stats.mem_total,
                     stats.mem_available,
@@ -259,23 +265,58 @@ impl Balloon {
         }
     }
 
+    /// Ack the parked stats buffer, which is what makes the guest publish a
+    /// fresh sample. Returns true if a request was actually issued.
+    fn request_stats_sample(&mut self) -> bool {
+        let Some(index) = self.stats_pending_ack.take() else {
+            return false;
+        };
+        let DeviceState::Activated(ref mem, _) = self.device_state else {
+            // Re-park it: an inactive device has no queue to ack against, and
+            // dropping the index would strand the buffer for good.
+            self.stats_pending_ack = Some(index);
+            return false;
+        };
+        let queues = self
+            .queues
+            .as_mut()
+            .expect("queues should exist when activated");
+        if let Err(e) = queues[STQ_INDEX].queue.add_used(mem, index, 0) {
+            error!("balloon: failed to request the next stats sample: {e:?}");
+            return false;
+        }
+        self.stats_last_request = Some(std::time::Instant::now());
+        true
+    }
+
+    /// Ask for a fresh sample if the last request is old enough, and say whether
+    /// the guest needs an interrupt to notice.
+    ///
+    /// Called from the balloon's other queue handlers rather than a timer: the
+    /// guest is reporting memory activity precisely when its memory is moving,
+    /// which is when a stale figure would be wrong. Acking on every sample
+    /// instead would leave host and guest refilling the queue in a loop.
+    pub(crate) fn refresh_stats_if_due(&mut self) -> bool {
+        const MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+        if self.stats_pending_ack.is_none() {
+            return false;
+        }
+        if let Some(last) = self.stats_last_request
+            && last.elapsed() < MIN_INTERVAL
+        {
+            return false;
+        }
+        self.request_stats_sample()
+    }
+
     /// The guest's own account of its memory, and a request for the next one.
     ///
     /// Acking the parked descriptor is what makes the guest publish a fresh
-    /// sample, so the value returned here is the state as of the previous call.
-    /// Callers that need a current figure should read twice, a moment apart.
+    /// sample, so the value returned here is the state as of the previous
+    /// request. Callers needing a current figure should read twice.
     pub fn take_stats(&mut self) -> Option<BalloonStats> {
-        if let Some(index) = self.stats_pending_ack.take()
-            && let DeviceState::Activated(ref mem, _) = self.device_state
-        {
-            let queues = self
-                .queues
-                .as_mut()
-                .expect("queues should exist when activated");
-            if let Err(e) = queues[STQ_INDEX].queue.add_used(mem, index, 0) {
-                error!("balloon: failed to request the next stats sample: {e:?}");
-            }
-        }
+        self.request_stats_sample();
         self.stats
     }
 

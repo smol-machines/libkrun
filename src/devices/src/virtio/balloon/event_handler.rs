@@ -25,7 +25,12 @@ impl Balloon {
 
         if let Err(e) = self.queue_event(IFQ_INDEX).read() {
             error!("Failed to read balloon inflate queue event: {e:?}");
-        } else if self.process_ifq() {
+            return;
+        }
+        // The guest is moving memory, so any cached stats figure is going stale
+        // right now; piggyback the refresh on the same interrupt.
+        let used = self.process_ifq() | self.refresh_stats_if_due();
+        if used {
             self.device_state.signal_used_queue();
         }
     }
@@ -41,7 +46,12 @@ impl Balloon {
 
         if let Err(e) = self.queue_event(DFQ_INDEX).read() {
             error!("Failed to read balloon deflate queue event: {e:?}");
-        } else if self.process_dfq() {
+            return;
+        }
+        // The guest is moving memory, so any cached stats figure is going stale
+        // right now; piggyback the refresh on the same interrupt.
+        let used = self.process_dfq() | self.refresh_stats_if_due();
+        if used {
             self.device_state.signal_used_queue();
         }
     }
@@ -89,7 +99,12 @@ impl Balloon {
 
         if let Err(e) = self.queue_event(FRQ_INDEX).read() {
             error!("Failed to read balloon free-page reporting queue event: {e:?}");
-        } else if self.process_frq() {
+            return;
+        }
+        // The guest is moving memory, so any cached stats figure is going stale
+        // right now; piggyback the refresh on the same interrupt.
+        let used = self.process_frq() | self.refresh_stats_if_due();
+        if used {
             self.device_state.signal_used_queue();
         }
     }
