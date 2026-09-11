@@ -2320,6 +2320,67 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn deferred_macos_stream_preserves_boundary_and_cleans_files() {
+        const SIZE: usize = 4 * 1024 * 1024;
+        let backing = crate::builder::create_guest_ram_memfd(SIZE).unwrap();
+        let memory = GuestMemoryMmap::from_ranges_with_files(&[(
+            GuestAddress(0),
+            SIZE,
+            Some(FileOffset::new(backing, 0)),
+        )])
+        .unwrap();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "libkrun-macos-stream-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        for value in [0x11, 0x44, 0x00] {
+            memory
+                .write_slice(&[value; 16384], GuestAddress(16384))
+                .unwrap();
+            let generation = start_deferred_memory_save(&memory, &directory).unwrap();
+            memory
+                .write_slice(&[0x77; 16384], GuestAddress(16384))
+                .unwrap();
+            let mut bytes = Vec::new();
+            let regions = generation.finish_stream(&mut bytes).unwrap();
+            assert_eq!(regions.len(), 1);
+            assert_eq!(&bytes[..8], b"SMOLRAM1");
+            assert_eq!(
+                u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+                SIZE as u64
+            );
+            assert_eq!(bytes.len(), SIZE + 16);
+            assert_eq!(&bytes[16 + 16384..16 + 32768], &[value; 16384]);
+            assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
+        }
+        struct Disconnected;
+        impl Write for Disconnected {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::from(io::ErrorKind::BrokenPipe))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let generation = start_deferred_memory_save(&memory, &directory).unwrap();
+        assert_eq!(
+            generation
+                .finish_stream(&mut Disconnected)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn mach_cow_worker_materializes_the_capture_boundary_after_source_writes() {
         const REGION_SIZE: usize = 4 * 1024 * 1024;
         let backing = crate::builder::create_guest_ram_memfd(REGION_SIZE).unwrap();
@@ -2751,11 +2812,29 @@ mod tests {
         assert_eq!(descs, expected_descs);
         let metadata = file.metadata().unwrap();
         assert_eq!(metadata.len(), expected.len() as u64);
+        // Filesystems differ in sparse allocation granularity (notably APFS
+        // for small files). Compare with the minimum explicit writes on this
+        // same volume instead of assuming ext4's block accounting everywhere.
+        let reference_path = path.with_extension("reference");
+        let mut reference = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&reference_path)
+            .unwrap();
+        reference.seek(SeekFrom::Start(4096)).unwrap();
+        reference.write_all(&[0xA5; 4096]).unwrap();
+        reference.seek(SeekFrom::Start(0x18_0000)).unwrap();
+        reference.write_all(&[0x5A; 4096]).unwrap();
+        reference.set_len(expected.len() as u64).unwrap();
+        reference.sync_all().unwrap();
+        let reference_blocks = reference.metadata().unwrap().blocks();
+        drop(reference);
+        fs::remove_file(reference_path).unwrap();
         assert!(
-            metadata.blocks() * 512 < metadata.len() / 4,
-            "sparse memory image allocated {} bytes for {} logical bytes",
+            metadata.blocks() <= reference_blocks,
+            "sparse memory image allocated {} bytes versus {} for explicit sparse writes",
             metadata.blocks() * 512,
-            metadata.len()
+            reference_blocks * 512
         );
 
         file.seek(SeekFrom::Start(0)).unwrap();
