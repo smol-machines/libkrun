@@ -46,6 +46,38 @@ pub struct MemoryRegionDesc {
     pub len: u64,
 }
 
+#[cfg(any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos"))]
+fn write_memory_stream_header<W: Write>(
+    output: &mut W,
+    regions: &[MemoryRegionDesc],
+) -> io::Result<()> {
+    let len = regions
+        .iter()
+        .try_fold(0_u64, |n, r| n.checked_add(r.len))
+        .ok_or_else(|| io::Error::other("RAM stream length overflow"))?;
+    output.write_all(b"SMOLRAM1")?;
+    output.write_all(&len.to_le_bytes())
+}
+
+#[cfg(any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos"))]
+fn stream_memory_file<W: Write>(
+    file: &File,
+    mut offset: u64,
+    mut len: u64,
+    output: &mut W,
+) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    let mut buffer = vec![0; 1024 * 1024];
+    while len > 0 {
+        let count = len.min(buffer.len() as u64) as usize;
+        file.read_exact_at(&mut buffer[..count], offset)?;
+        output.write_all(&buffer[..count])?;
+        offset += count as u64;
+        len -= count as u64;
+    }
+    Ok(())
+}
+
 /// A file writer that preserves zero guest-memory pages as filesystem holes.
 ///
 /// Durable checkpoints have a fixed logical memory layout, so restore still
@@ -1110,6 +1142,33 @@ pub fn start_deferred_memory_save(
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 impl DeferredMemorySave {
+    /// Stream a retained RAM generation without first writing a memory image.
+    /// The wire format is `SMOLRAM1`, a little-endian u64 logical length, then
+    /// exactly that many bytes in portable region order.
+    pub fn finish_stream<W: Write>(self, output: &mut W) -> io::Result<Vec<MemoryRegionDesc>> {
+        let (descs, files) = match self.generation {
+            DeferredLinuxGeneration::Stable { descs, files } => (descs, files),
+            DeferredLinuxGeneration::Copy(copy) => copy.finish()?,
+        };
+        if descs.len() != files.len() {
+            return Err(io::Error::other(
+                "RAM generation descriptor/file count mismatch",
+            ));
+        }
+        let regions: Vec<_> = descs
+            .iter()
+            .map(|d| MemoryRegionDesc {
+                gpa: d.gpa,
+                len: d.len,
+            })
+            .collect();
+        write_memory_stream_header(output, &regions)?;
+        for (desc, file) in descs.iter().zip(&files) {
+            stream_memory_file(file, desc.offset, desc.len, output)?;
+        }
+        Ok(regions)
+    }
+
     /// Materialize this immutable generation into the portable sparse-memory
     /// stream after the source has resumed.
     pub fn finish(self, output: &mut File) -> io::Result<Vec<MemoryRegionDesc>> {
@@ -1439,6 +1498,33 @@ pub fn start_deferred_memory_save(
 
 #[cfg(target_os = "macos")]
 impl DeferredMemorySave {
+    /// Stream an immutable APFS/Mach generation directly to its consumer.
+    pub fn finish_stream<W: Write>(self, output: &mut W) -> io::Result<Vec<MemoryRegionDesc>> {
+        let descs = self.generation.finish()?;
+        let result = (|| {
+            let regions: Vec<_> = descs
+                .iter()
+                .map(|d| MemoryRegionDesc {
+                    gpa: d.gpa,
+                    len: d.len,
+                })
+                .collect();
+            write_memory_stream_header(output, &regions)?;
+            for desc in &descs {
+                if desc.path.is_empty() {
+                    io::copy(&mut io::repeat(0).take(desc.len), output)?;
+                } else {
+                    stream_memory_file(&File::open(&desc.path)?, desc.offset, desc.len, output)?;
+                }
+            }
+            Ok(regions)
+        })();
+        for path in descs.iter().map(|d| &d.path).filter(|p| !p.is_empty()) {
+            let _ = std::fs::remove_file(path);
+        }
+        result
+    }
+
     /// Combine the materialized Mach aliases into the portable sparse-memory
     /// stream and remove the intermediate per-region files.
     pub fn finish(self, output: &mut File) -> io::Result<Vec<MemoryRegionDesc>> {
@@ -2234,6 +2320,67 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn deferred_macos_stream_preserves_boundary_and_cleans_files() {
+        const SIZE: usize = 4 * 1024 * 1024;
+        let backing = crate::builder::create_guest_ram_memfd(SIZE).unwrap();
+        let memory = GuestMemoryMmap::from_ranges_with_files(&[(
+            GuestAddress(0),
+            SIZE,
+            Some(FileOffset::new(backing, 0)),
+        )])
+        .unwrap();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "libkrun-macos-stream-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        for value in [0x11, 0x44, 0x00] {
+            memory
+                .write_slice(&[value; 16384], GuestAddress(16384))
+                .unwrap();
+            let generation = start_deferred_memory_save(&memory, &directory).unwrap();
+            memory
+                .write_slice(&[0x77; 16384], GuestAddress(16384))
+                .unwrap();
+            let mut bytes = Vec::new();
+            let regions = generation.finish_stream(&mut bytes).unwrap();
+            assert_eq!(regions.len(), 1);
+            assert_eq!(&bytes[..8], b"SMOLRAM1");
+            assert_eq!(
+                u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+                SIZE as u64
+            );
+            assert_eq!(bytes.len(), SIZE + 16);
+            assert_eq!(&bytes[16 + 16384..16 + 32768], &[value; 16384]);
+            assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
+        }
+        struct Disconnected;
+        impl Write for Disconnected {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::from(io::ErrorKind::BrokenPipe))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let generation = start_deferred_memory_save(&memory, &directory).unwrap();
+        assert_eq!(
+            generation
+                .finish_stream(&mut Disconnected)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn mach_cow_worker_materializes_the_capture_boundary_after_source_writes() {
         const REGION_SIZE: usize = 4 * 1024 * 1024;
         let backing = crate::builder::create_guest_ram_memfd(REGION_SIZE).unwrap();
@@ -2502,6 +2649,87 @@ mod tests {
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
+    fn deferred_stream_preserves_generations_without_memory_files() {
+        // Other tests fork this test runner. If they inherit this test's
+        // writable memfd before its initial seal, F_SEAL_WRITE correctly
+        // returns EBUSY. A real VMM owns its address space, so exercise the
+        // complete sequence in a dedicated process with the same ownership.
+        const CHILD: &str = "KRUN_MEMORY_STREAM_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "snapshot::tests::deferred_stream_preserves_generations_without_memory_files",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "isolated stream regression failed");
+            return;
+        }
+        use crate::builder::create_guest_ram_memfd;
+        const SIZE: usize = 2 * 1024 * 1024;
+        let file = create_guest_ram_memfd(SIZE).unwrap();
+        let memory = GuestMemoryMmap::from_ranges_with_files([(
+            GuestAddress(0),
+            SIZE,
+            Some(FileOffset::new(file, 0)),
+        )])
+        .unwrap();
+        let mut expected = vec![0; SIZE];
+        expected[4096..8192].fill(0x31);
+        memory.write_slice(&expected, GuestAddress(0)).unwrap();
+        for value in [0x42, 0x53, 0x64] {
+            let snapshot =
+                start_deferred_memory_save(&memory, std::path::Path::new("unused")).unwrap();
+            memory
+                .write_slice(&[value; 4096], GuestAddress(4096))
+                .unwrap();
+            let mut wire = Vec::new();
+            let regions = snapshot.finish_stream(&mut wire).unwrap();
+            assert_eq!(
+                regions,
+                vec![MemoryRegionDesc {
+                    gpa: 0,
+                    len: SIZE as u64
+                }]
+            );
+            assert_eq!(&wire[..8], b"SMOLRAM1");
+            assert_eq!(
+                u64::from_le_bytes(wire[8..16].try_into().unwrap()),
+                SIZE as u64
+            );
+            assert_eq!(&wire[16..], expected.as_slice());
+            expected[4096..8192].fill(value);
+        }
+        let snapshot = start_deferred_memory_save(&memory, std::path::Path::new("unused")).unwrap();
+        struct Disconnected;
+        impl Write for Disconnected {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        assert_eq!(
+            snapshot
+                .finish_stream(&mut Disconnected)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        // A failed consumer must not damage the running source or prevent a
+        // later capture from completing.
+        let next = start_deferred_memory_save(&memory, std::path::Path::new("unused")).unwrap();
+        let mut wire = Vec::new();
+        next.finish_stream(&mut wire).unwrap();
+        assert_eq!(&wire[16..], expected.as_slice());
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
     fn deferred_durable_save_rejects_non_memfd_ram_without_mutation() {
         const REGION_SIZE: usize = 2 * 1024 * 1024;
         let directory = std::env::temp_dir();
@@ -2584,11 +2812,29 @@ mod tests {
         assert_eq!(descs, expected_descs);
         let metadata = file.metadata().unwrap();
         assert_eq!(metadata.len(), expected.len() as u64);
+        // Filesystems differ in sparse allocation granularity (notably APFS
+        // for small files). Compare with the minimum explicit writes on this
+        // same volume instead of assuming ext4's block accounting everywhere.
+        let reference_path = path.with_extension("reference");
+        let mut reference = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&reference_path)
+            .unwrap();
+        reference.seek(SeekFrom::Start(4096)).unwrap();
+        reference.write_all(&[0xA5; 4096]).unwrap();
+        reference.seek(SeekFrom::Start(0x18_0000)).unwrap();
+        reference.write_all(&[0x5A; 4096]).unwrap();
+        reference.set_len(expected.len() as u64).unwrap();
+        reference.sync_all().unwrap();
+        let reference_blocks = reference.metadata().unwrap().blocks();
+        drop(reference);
+        fs::remove_file(reference_path).unwrap();
         assert!(
-            metadata.blocks() * 512 < metadata.len() / 4,
-            "sparse memory image allocated {} bytes for {} logical bytes",
+            metadata.blocks() <= reference_blocks,
+            "sparse memory image allocated {} bytes versus {} for explicit sparse writes",
             metadata.blocks() * 512,
-            metadata.len()
+            reference_blocks * 512
         );
 
         file.seek(SeekFrom::Start(0)).unwrap();
