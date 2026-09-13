@@ -29,7 +29,7 @@ runs:
     - name: Install packages (macOS)
       if: runner.os == 'macOS'
       shell: bash
-      run: brew tap libkrun/krun && brew trust libkrun/krun && brew install virglrenderer clang-format llvm
+      run: brew trust --tap libkrun/krun && brew tap libkrun/krun && brew install virglrenderer clang-format llvm
 
     - name: Install packages (Linux)
       if: runner.os == 'Linux'
