@@ -24,7 +24,7 @@ runs:
 
     - name: Set up Homebrew (macOS)
       if: runner.os == 'macOS'
-      uses: Homebrew/actions/setup-homebrew@master
+      uses: Homebrew/actions/setup-homebrew@082c94ee19e776205cfa8e43802917d1425e2fe7 # main
 
     - name: Install packages (macOS)
       if: runner.os == 'macOS'
