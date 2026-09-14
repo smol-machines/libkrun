@@ -3426,6 +3426,51 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn readonly_restore_input_keeps_two_promotions_independent() {
+        use crate::builder::create_guest_ram_memfd;
+        use std::os::{fd::AsRawFd, unix::fs::FileExt};
+
+        let original = create_guest_ram_memfd(0x40_0000).unwrap();
+        original.write_all_at(&[0xA5; 4096], 0x1000).unwrap();
+        let input = File::open(format!("/proc/self/fd/{}", original.as_raw_fd())).unwrap();
+        assert!(input.write_all_at(&[0], 0).is_err());
+        let descs = [MemoryRegionDesc {
+            gpa: 0,
+            len: 0x40_0000,
+        }];
+        let first = map_guest_memory_file_forkable(&descs, &input).unwrap();
+        let second = map_guest_memory_file_forkable(&descs, &input).unwrap();
+        first
+            .write_slice(&[0x11; 16], GuestAddress(0x1000))
+            .unwrap();
+        second
+            .write_slice(&[0x22; 16], GuestAddress(0x2000))
+            .unwrap();
+        let mut bytes = [0; 16];
+        input.read_exact_at(&mut bytes, 0x1000).unwrap();
+        assert_eq!(bytes, [0xA5; 16]);
+        input.read_exact_at(&mut bytes, 0x2000).unwrap();
+        assert_eq!(bytes, [0; 16]);
+        second.read_slice(&mut bytes, GuestAddress(0x1000)).unwrap();
+        assert_eq!(bytes, [0xA5; 16]);
+        first.read_slice(&mut bytes, GuestAddress(0x2000)).unwrap();
+        assert_eq!(bytes, [0; 16]);
+
+        drop(input);
+        drop(original);
+        rebase_guest_memory_private(&first).unwrap();
+        let child = cow_clone_guest_memory(&first).unwrap();
+        child.read_slice(&mut bytes, GuestAddress(0x1000)).unwrap();
+        assert_eq!(bytes, [0x11; 16]);
+        child
+            .write_slice(&[0x33; 16], GuestAddress(0x1000))
+            .unwrap();
+        first.read_slice(&mut bytes, GuestAddress(0x1000)).unwrap();
+        assert_eq!(bytes, [0x11; 16]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn sparse_memory_image_promotes_into_independent_fork_backing() {
         use crate::builder::create_guest_ram_memfd;
         use std::os::unix::fs::FileExt;
