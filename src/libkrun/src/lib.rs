@@ -233,6 +233,8 @@ struct ContextConfig {
     /// When set, boot this VM as a fork clone from the snapshot dir (checkpoint
     /// + manifest written by a golden VM's FORK command) instead of cold boot.
     snapshot_dir: Option<PathBuf>,
+    #[cfg(target_os = "linux")]
+    snapshot_memory: Option<std::fs::File>,
 }
 
 impl ContextConfig {
@@ -1351,9 +1353,17 @@ fn handle_rollback_fork(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
 /// manifest, CoW-map the golden VM's guest RAM (Linux: via `/proc/<pid>/fd`;
 /// macOS: by the backing-file path recorded in the manifest), and load the
 /// serialized checkpoint.
-#[cfg(fork_supported)]
+#[cfg(all(fork_supported, any(test, not(target_os = "linux"))))]
 fn build_restore_ctx(
     dir: &std::path::Path,
+) -> std::result::Result<vmm::builder::RestoreCtx, String> {
+    build_restore_ctx_with_memory(dir, None)
+}
+
+#[cfg(fork_supported)]
+fn build_restore_ctx_with_memory(
+    dir: &std::path::Path,
+    readonly_memory: Option<&std::fs::File>,
 ) -> std::result::Result<vmm::builder::RestoreCtx, String> {
     let manifest_path = dir.join("manifest.bin");
     let manifest = std::fs::read(&manifest_path).map_err(|e| format!("manifest: {e}"))?;
@@ -1361,16 +1371,32 @@ fn build_restore_ctx(
         .get(..8)
         .ok_or_else(|| "manifest: truncated".to_string())?;
     let magic = u64::from_le_bytes(magic_bytes.try_into().unwrap());
+    if readonly_memory.is_some() && magic != PORTABLE_MANIFEST_MAGIC {
+        return Err("read-only memory input requires a portable snapshot".into());
+    }
     if magic == PORTABLE_MANIFEST_MAGIC {
         let descs = decode_portable_manifest(&manifest).map_err(|e| format!("manifest: {e}"))?;
         let checkpoint =
             std::fs::read(dir.join("checkpoint.bin")).map_err(|e| format!("checkpoint: {e}"))?;
         let memory_path = dir.join("memory.bin");
-        let memory_file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&memory_path)
-            .map_err(|e| format!("memory: {e}"))?;
+        let memory_file = if let Some(_file) = readonly_memory {
+            #[cfg(target_os = "linux")]
+            if std::env::var_os("SMOLVM_FORKABLE").is_none_or(|value| value != "1") {
+                return Err("read-only restore memory requires Linux forkable promotion".into());
+            }
+            #[cfg(not(target_os = "linux"))]
+            return Err("read-only restore memory is unsupported on this platform".into());
+            #[cfg(target_os = "linux")]
+            _file
+                .try_clone()
+                .map_err(|e| format!("duplicate memory input: {e}"))?
+        } else {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&memory_path)
+                .map_err(|e| format!("memory: {e}"))?
+        };
         let actual_memory_len = memory_file
             .metadata()
             .map_err(|e| format!("memory metadata: {e}"))?
@@ -3617,6 +3643,45 @@ pub unsafe extern "C" fn krun_set_snapshot(ctx_id: u32, c_snapshot_dir: *const c
     }
 }
 
+/// Use a read-only regular-file descriptor for portable snapshot RAM.
+/// The library duplicates the descriptor; the caller retains ownership.
+/// Supported only by Linux branchable restores, which create private memfds.
+#[unsafe(no_mangle)]
+pub extern "C" fn krun_set_snapshot_memory_fd(ctx_id: u32, fd: i32) -> i32 {
+    #[cfg(all(target_os = "linux", fork_supported))]
+    {
+        use std::os::fd::BorrowedFd;
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 {
+            return -libc::EBADF;
+        }
+        if flags & libc::O_ACCMODE != libc::O_RDONLY || flags & libc::O_PATH != 0 {
+            return -libc::EINVAL;
+        }
+        // Safety: F_GETFL validated the descriptor; it is borrowed only for dup.
+        let owned = match unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned() {
+            Ok(fd) => fd,
+            Err(error) => return -error.raw_os_error().unwrap_or(libc::EIO),
+        };
+        let file = std::fs::File::from(owned);
+        if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
+            return -libc::EINVAL;
+        }
+        match CTX_MAP.lock().unwrap().entry(ctx_id) {
+            Entry::Occupied(mut config) => {
+                config.get_mut().snapshot_memory = Some(file);
+                KRUN_SUCCESS
+            }
+            Entry::Vacant(_) => -libc::ENOENT,
+        }
+    }
+    #[cfg(not(all(target_os = "linux", fork_supported)))]
+    {
+        let _ = (ctx_id, fd);
+        -libc::ENOTSUP
+    }
+}
+
 #[allow(clippy::missing_safety_doc)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn krun_set_nested_virt(ctx_id: u32, enabled: bool) -> i32 {
@@ -4846,16 +4911,28 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     // Fork clone: build a RestoreCtx from the snapshot dir (CoW-map the golden
     // VM's guest RAM + load its checkpoint) so build_microvm restores instead of
     // cold-booting.
+    #[cfg(all(target_os = "linux", fork_supported))]
+    if ctx_cfg.snapshot_memory.is_some() && ctx_cfg.snapshot_dir.is_none() {
+        set_last_error("read-only restore memory requires a snapshot directory");
+        return -libc::EINVAL;
+    }
     #[cfg(fork_supported)]
     let restore_ctx = match ctx_cfg.snapshot_dir.take() {
-        Some(dir) => match build_restore_ctx(&dir) {
-            Ok(rc) => Some(rc),
-            Err(e) => {
-                error!("fork restore from {}: {e}", dir.display());
-                set_last_error(format!("restore checkpoint from {}: {e}", dir.display()));
-                return -libc::EINVAL;
+        Some(dir) => {
+            #[cfg(target_os = "linux")]
+            let result =
+                build_restore_ctx_with_memory(&dir, ctx_cfg.snapshot_memory.take().as_ref());
+            #[cfg(not(target_os = "linux"))]
+            let result = build_restore_ctx(&dir);
+            match result {
+                Ok(rc) => Some(rc),
+                Err(e) => {
+                    error!("fork restore from {}: {e}", dir.display());
+                    set_last_error(format!("restore checkpoint from {}: {e}", dir.display()));
+                    return -libc::EINVAL;
+                }
             }
-        },
+        }
         None => None,
     };
     #[cfg(not(fork_supported))]
@@ -4991,6 +5068,50 @@ fn krun_start_enter_nitro(ctx_id: u32) -> i32 {
 
             -libc::EINVAL
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux", fork_supported))]
+mod test_snapshot_memory_fd {
+    use super::*;
+    use std::os::fd::AsRawFd;
+
+    #[test]
+    fn readonly_descriptor_is_duplicated_and_validated() {
+        let id = krun_create_ctx() as u32;
+        assert_eq!(krun_set_snapshot_memory_fd(id, -1), -libc::EBADF);
+        let writable = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .unwrap();
+        assert_eq!(
+            krun_set_snapshot_memory_fd(id, writable.as_raw_fd()),
+            -libc::EINVAL
+        );
+        let directory = std::fs::File::open("/tmp").unwrap();
+        assert_eq!(
+            krun_set_snapshot_memory_fd(id, directory.as_raw_fd()),
+            -libc::EINVAL
+        );
+        let input = std::fs::File::open("/proc/self/exe").unwrap();
+        let len = input.metadata().unwrap().len();
+        assert_eq!(krun_set_snapshot_memory_fd(id, input.as_raw_fd()), 0);
+        drop(input);
+        {
+            let map = CTX_MAP.lock().unwrap();
+            let retained = map.get(&id).unwrap().snapshot_memory.as_ref().unwrap();
+            assert_eq!(retained.metadata().unwrap().len(), len);
+            assert_eq!(
+                unsafe { libc::fcntl(retained.as_raw_fd(), libc::F_GETFL) } & libc::O_ACCMODE,
+                libc::O_RDONLY
+            );
+        }
+        assert_eq!(krun_free_ctx(id), 0);
+        let input = std::fs::File::open("/proc/self/exe").unwrap();
+        assert_eq!(
+            krun_set_snapshot_memory_fd(id, input.as_raw_fd()),
+            -libc::ENOENT
+        );
     }
 }
 
