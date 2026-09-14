@@ -826,41 +826,10 @@ impl File {
         err
     }
 
-    /// Attempt to discard range by truncating the file.
-    ///
-    /// If the given range is at the end of the file, discard it by simply truncating the file.
-    /// Return `true` on success.
-    ///
-    /// If the range is not at the end of the file, i.e. another method of discarding is needed,
-    /// return `false`.
-    fn try_discard_by_truncate(&self, offset: u64, length: u64) -> io::Result<bool> {
-        // Prevent modifications to the file length
-        #[allow(clippy::readonly_write_lock)]
-        let file = self.file.write().unwrap();
-
-        let size = self.size.load(Ordering::Relaxed);
-        if offset >= size {
-            // Nothing to do
-            return Ok(true);
-        }
-
-        // If `offset + length` overflows, we can just assume it ends at `size`.  (Anything past
-        // `size is irrelevant anyway.)
-        let end = offset.checked_add(length).unwrap_or(size);
-        if end < size {
-            return Ok(false);
-        }
-
-        file.set_len(offset)?;
-        Ok(true)
-    }
-
     /// Ensure the given range reads back as zeroes, or return an error.
     async fn discard_to_zero(&self, offset: u64, length: u64) -> io::Result<()> {
-        if self.try_discard_by_truncate(offset, length)? {
-            return Ok(());
-        }
-
+        // Discard must preserve file length: reopening a raw image derives its capacity
+        // from that length, not this handle's cached size. Use hole punching even at EOF.
         if self.discard_unsupported.load(Ordering::Relaxed) {
             Err(io::ErrorKind::Unsupported.into())
         } else if let Err(err) = self.discard_to_zero_os_specific(offset, length).await {
@@ -1057,4 +1026,42 @@ mod ioctl {
 
     #[cfg(target_os = "freebsd")]
     ioctl_read!(diocgmediasize, 'd', 129, libc::off_t);
+}
+
+#[cfg(all(test, feature = "async", not(feature = "sync")))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn tail_discard_preserves_reopened_capacity() -> io::Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "imago-tail-discard-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut backing = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        backing.write_all(&vec![0x5a; 1024 * 1024])?;
+        let disk = File::try_from(backing)?;
+        let result = disk.discard_to_zero(1024 * 1024 - 65536, 65536).await;
+        let bytes = fs::read(&path)?;
+        let reopened = File::try_from(fs::File::open(&path)?)?;
+        fs::remove_file(&path)?;
+        result?;
+        assert_eq!(disk.size()?, 1024 * 1024);
+        assert_eq!(
+            reopened.size()?,
+            disk.size()?,
+            "discard changed on-disk capacity"
+        );
+        assert!(bytes[..1024 * 1024 - 65536].iter().all(|b| *b == 0x5a));
+        assert!(bytes[1024 * 1024 - 65536..].iter().all(|b| *b == 0));
+        Ok(())
+    }
 }
