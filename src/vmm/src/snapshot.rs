@@ -633,8 +633,10 @@ pub fn copy_guest_memory(src: &GuestMemoryMmap, dst: &GuestMemoryMmap) -> io::Re
 /// A restored clone is made from raw `MAP_PRIVATE` mappings. Those mappings
 /// deliberately do not retain [`FileOffset`] metadata, so they cannot be
 /// described by [`memfd_region_descs`] for another process. Promotion pays one
-/// eager copy of the mapped address space; subsequent descendants are ordinary
-/// cheap CoW mappings of these new backing files.
+/// copy of nonzero pages; subsequent descendants are ordinary cheap CoW
+/// mappings of these new backing files. Empty RAM and device windows must stay
+/// sparse: faulting every destination page can exhaust a small VM's host budget
+/// before its vCPUs start.
 pub fn materialize_guest_memory(
     src: &GuestMemoryMmap,
     fork_backed_regions: &[bool],
@@ -667,7 +669,34 @@ pub fn materialize_guest_memory(
         .collect::<io::Result<Vec<_>>>()?;
     let dst = GuestMemoryMmap::from_ranges_with_files(ranges)
         .map_err(|error| io::Error::other(format!("materialize guest memory: {error:?}")))?;
-    copy_guest_memory(src, &dst)?;
+    // All destination mappings were just allocated and contain zeros. Skip
+    // zero source pages without changing their logical contents. Do not use
+    // this for rollback into existing mappings, where zeros must overwrite old
+    // data; copy_guest_memory intentionally retains its full-copy semantics.
+    const ZERO_PAGE: [u8; 4096] = [0; 4096];
+    for region in src.iter() {
+        let address = region.start_addr();
+        let source = src
+            .get_host_address(address)
+            .map_err(|error| io::Error::other(format!("source address: {error:?}")))?;
+        let destination = dst
+            .get_host_address(address)
+            .map_err(|error| io::Error::other(format!("destination address: {error:?}")))?;
+        // SAFETY: the restored image is quiescent, the entire region is mapped,
+        // and the newly allocated destination cannot overlap the source.
+        let bytes = unsafe { std::slice::from_raw_parts(source, region.len() as usize) };
+        for (index, page) in bytes.chunks(ZERO_PAGE.len()).enumerate() {
+            if page != &ZERO_PAGE[..page.len()] {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        page.as_ptr(),
+                        destination.add(index * ZERO_PAGE.len()),
+                        page.len(),
+                    );
+                }
+            }
+        }
+    }
     Ok(dst)
 }
 
@@ -2989,6 +3018,62 @@ mod tests {
         dst.read_slice(&mut got_hi, GuestAddress(0x100000)).unwrap();
         assert_eq!(got_lo, vec![0xAB; 0x10000]);
         assert_eq!(got_hi, vec![0xCD; 0x8000]);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn materialized_clone_keeps_zero_pages_sparse() {
+        use std::os::unix::fs::MetadataExt;
+
+        const LEN: usize = 32 * 1024 * 1024;
+        let restored = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), LEN)]).unwrap();
+        restored.write_slice(&[0xA5], GuestAddress(17)).unwrap();
+        restored
+            .write_slice(&[0x5A], GuestAddress((LEN - 1) as u64))
+            .unwrap();
+        let promoted = materialize_guest_memory(&restored, &[true]).unwrap();
+        let region = promoted.iter().next().unwrap();
+        let allocated = region
+            .file_offset()
+            .unwrap()
+            .file()
+            .metadata()
+            .unwrap()
+            .blocks()
+            * 512;
+        assert!(
+            allocated <= 64 * 1024,
+            "promotion allocated {allocated} bytes for two nonzero pages"
+        );
+        let mut expected = vec![0; LEN];
+        let mut actual = vec![0; LEN];
+        restored.read_slice(&mut expected, GuestAddress(0)).unwrap();
+        promoted.read_slice(&mut actual, GuestAddress(0)).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn materialized_clone_preserves_mixed_pages_and_partial_tail() {
+        let regions = [
+            (GuestAddress(0), 0x3001usize),
+            (GuestAddress(0x10000), 0x2001),
+        ];
+        let restored = GuestMemoryMmap::from_ranges(&regions).unwrap();
+        for (address, len) in regions {
+            restored.write_slice(&[0xA5; 4096], address).unwrap();
+            // Leave a zero page between dense data and the final partial page.
+            restored
+                .write_slice(&[0x5A], GuestAddress(address.0 + len as u64 - 1))
+                .unwrap();
+        }
+        let promoted = materialize_guest_memory(&restored, &[true, false]).unwrap();
+        for (address, len) in regions {
+            let mut expected = vec![0; len];
+            let mut actual = vec![0; len];
+            restored.read_slice(&mut expected, address).unwrap();
+            promoted.read_slice(&mut actual, address).unwrap();
+            assert_eq!(actual, expected);
+        }
     }
 
     #[test]

@@ -24,12 +24,12 @@ runs:
 
     - name: Set up Homebrew (macOS)
       if: runner.os == 'macOS'
-      uses: Homebrew/actions/setup-homebrew@master
+      uses: Homebrew/actions/setup-homebrew@082c94ee19e776205cfa8e43802917d1425e2fe7 # main
 
     - name: Install packages (macOS)
       if: runner.os == 'macOS'
       shell: bash
-      run: brew tap libkrun/krun && brew trust libkrun/krun && brew install virglrenderer clang-format llvm
+      run: brew trust --tap libkrun/krun && brew tap libkrun/krun && brew install virglrenderer clang-format llvm
 
     - name: Install packages (Linux)
       if: runner.os == 'Linux'
