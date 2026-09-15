@@ -18,7 +18,9 @@ use std::thread::{self, JoinHandle};
 
 use utils::eventfd::EventFd;
 use vm_memory::mmap::MmapRegion;
-use vm_memory::{GuestAddress, GuestMemoryMmap, GuestRegionMmap};
+use vm_memory::{
+    FileOffset, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion, GuestRegionMmap,
+};
 
 const PAGE_SIZE: usize = 4096;
 const INITIAL_PREFETCH_BYTES: usize = 64 * 1024;
@@ -295,6 +297,12 @@ fn register_range(uffd: RawFd, start: u64, len: u64) -> io::Result<()> {
     if unsafe { libc::ioctl(uffd, UFFDIO_REGISTER, &mut registration) } < 0 {
         return Err(io::Error::last_os_error());
     }
+    if registration.ioctls & (1 << 3) == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "registered RAM mapping does not support UFFDIO_COPY",
+        ));
+    }
     Ok(())
 }
 
@@ -552,6 +560,66 @@ pub fn create_demand_paged_memory(
     }
     let memory = GuestMemoryMmap::from_regions(guest_regions)
         .map_err(|error| io::Error::other(format!("build guest memory: {error:?}")))?;
+    start_pager(memory, host_regions, uffd, source)
+}
+
+/// Restore into sparse shared memfds without allocating snapshot pages up front.
+///
+/// The registered mapping must remain alive while faults can occur. An exported
+/// memfd descriptor alone is not a complete snapshot until its missing pages
+/// have been supplied: other mappings do not inherit this registration.
+pub fn create_demand_paged_memfd_memory(
+    regions: &[DemandPageRegion],
+    source: Box<dyn PageSource>,
+    mode: UserfaultfdMode,
+) -> io::Result<DemandPagedMemory> {
+    if regions.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "no RAM regions",
+        ));
+    }
+    let uffd = create_userfaultfd(mode)?;
+    let mut ranges = Vec::with_capacity(regions.len());
+    for region in regions {
+        let len = usize::try_from(region.len)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "RAM region exceeds usize"))?;
+        if len == 0 || !len.is_multiple_of(PAGE_SIZE) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid RAM region length",
+            ));
+        }
+        let file = crate::builder::create_guest_ram_memfd(len).map_err(io::Error::other)?;
+        ranges.push((
+            GuestAddress(region.gpa),
+            len,
+            Some(FileOffset::new(file, 0)),
+        ));
+    }
+    let memory = GuestMemoryMmap::from_ranges_with_files(ranges)
+        .map_err(|error| io::Error::other(format!("map sparse restore RAM: {error:?}")))?;
+    let mut host_regions = Vec::with_capacity(regions.len());
+    for region in memory.iter() {
+        let start = memory
+            .get_host_address(region.start_addr())
+            .map_err(|error| io::Error::other(format!("restore RAM address: {error:?}")))?
+            as u64;
+        register_range(uffd.as_raw_fd(), start, region.len())?;
+        host_regions.push(HostRegion {
+            start,
+            len: region.len(),
+        });
+    }
+    start_pager(memory, host_regions, uffd, source)
+}
+
+fn start_pager(
+    memory: GuestMemoryMmap,
+    host_regions: Vec<HostRegion>,
+    uffd: OwnedFd,
+    source: Box<dyn PageSource>,
+) -> io::Result<DemandPagedMemory> {
     let stop_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
     if stop_fd < 0 {
         return Err(io::Error::last_os_error());
@@ -583,6 +651,71 @@ mod tests {
     use vm_memory::Bytes;
 
     struct ByteSource(Vec<Vec<u8>>);
+
+    #[test]
+    #[ignore = "requires kernel-fault userfaultfd permission"]
+    fn sparse_memfd_faults_preserve_backing_and_guest_writes() {
+        use std::os::unix::fs::{FileExt, MetadataExt};
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        let size = 4 * 1024 * 1024;
+        let paged = create_demand_paged_memfd_memory(
+            &[
+                DemandPageRegion {
+                    gpa: 0,
+                    len: size as u64,
+                },
+                DemandPageRegion {
+                    gpa: 0x1000000,
+                    len: size as u64,
+                },
+            ],
+            Box::new(ByteSource(vec![vec![0x73; size], vec![0x49; size]])),
+            UserfaultfdMode::KernelFaults,
+        )
+        .unwrap();
+        let regions = paged.memory.iter().collect::<Vec<_>>();
+        for region in &regions {
+            assert_eq!(
+                region
+                    .file_offset()
+                    .unwrap()
+                    .file()
+                    .metadata()
+                    .unwrap()
+                    .blocks(),
+                0
+            );
+        }
+        assert_eq!(paged.memory.read_obj::<u8>(GuestAddress(0)).unwrap(), 0x73);
+        paged.memory.write_obj(0xa5u8, GuestAddress(0)).unwrap();
+        let file = regions[0].file_offset().unwrap().file();
+        let mut byte = [0];
+        file.read_exact_at(&mut byte, 0).unwrap();
+        assert_eq!(byte, [0xa5], "guest writes must update the shared backing");
+        assert!(file.metadata().unwrap().blocks() * 512 < size as u64);
+        // A bare backing descriptor is not yet a complete fork image.
+        file.read_exact_at(&mut byte, (size - PAGE_SIZE) as u64)
+            .unwrap();
+        assert_eq!(byte, [0]);
+        assert_eq!(
+            paged
+                .memory
+                .read_obj::<u8>(GuestAddress((size - PAGE_SIZE) as u64))
+                .unwrap(),
+            0x73
+        );
+        file.read_exact_at(&mut byte, (size - PAGE_SIZE) as u64)
+            .unwrap();
+        assert_eq!(byte, [0x73]);
+        assert_eq!(
+            paged
+                .memory
+                .read_obj::<u8>(GuestAddress(0x1000000))
+                .unwrap(),
+            0x49
+        );
+        assert!(paged.pager.failure().is_none());
+    }
 
     #[test]
     fn fatal_failure_notifies_the_vmm_with_a_nonzero_exit() {
