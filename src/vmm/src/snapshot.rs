@@ -1321,6 +1321,7 @@ enum DeferredLinuxGeneration {
         files: Vec<File>,
     },
     Copy(ForkGenerationCopy),
+    Layered(crate::layered_restore::Generation),
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -1397,6 +1398,12 @@ pub fn start_deferred_memory_save(
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 impl DeferredMemorySave {
+    pub(crate) fn from_layered(generation: crate::layered_restore::Generation) -> Self {
+        Self {
+            generation: DeferredLinuxGeneration::Layered(generation),
+        }
+    }
+
     /// Stream a retained RAM generation without first writing a memory image.
     /// The wire format is `SMOLRAM1`, a little-endian u64 logical length, then
     /// exactly that many bytes in portable region order.
@@ -1430,6 +1437,12 @@ impl DeferredMemorySave {
         let (descs, files) = match self.generation {
             DeferredLinuxGeneration::Stable { descs, files } => (descs, files),
             DeferredLinuxGeneration::Copy(copy) => copy.finish()?,
+            DeferredLinuxGeneration::Layered(generation) => {
+                let regions = generation.memory_regions();
+                write_memory_stream_header(output, &regions)?;
+                generation.write_to(output)?;
+                return Ok(regions);
+            }
         };
         if descs.len() != files.len() {
             return Err(io::Error::other(
@@ -1468,6 +1481,10 @@ impl DeferredMemorySave {
             DeferredLinuxGeneration::Copy(copy) => {
                 let (descs, files) = copy.finish()?;
                 (descs, files, true)
+            }
+            DeferredLinuxGeneration::Layered(generation) => {
+                generation.write_sparse_to(output)?;
+                return Ok(generation.memory_regions());
             }
         };
         if descs.len() != files.len() {

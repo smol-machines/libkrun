@@ -324,6 +324,12 @@ pub struct Vmm {
     // Must drop before `guest_memory`: the handler can reference its mappings.
     #[cfg(target_os = "linux")]
     demand_pager: Option<demand_paging::DemandPager>,
+    #[cfg(target_os = "linux")]
+    layered_ram: Option<layered_restore::Generation>,
+    #[cfg(target_os = "linux")]
+    layered_device_regions: Vec<u64>,
+    #[cfg(target_os = "linux")]
+    ram_remap_failure: Option<String>,
     guest_memory: GuestMemoryMmap,
     arch_memory_info: ArchMemoryInfo,
 
@@ -367,6 +373,15 @@ pub enum ForkContinueRamGeneration {
     /// A kernel-COW guardian serving the exact captured address space.
     #[cfg(target_os = "linux")]
     Guardian(generation_guardian::GenerationGuardian),
+    #[cfg(target_os = "linux")]
+    Layered(layered_restore::Generation),
+}
+
+#[cfg(fork_supported)]
+pub enum ForkMemory {
+    Mapped(Vec<snapshot::MemfdRegionDesc>),
+    #[cfg(target_os = "linux")]
+    Layered(layered_restore::Generation),
 }
 
 #[cfg(all(
@@ -412,6 +427,26 @@ fn has_memfd_backed_memory(descs: &[snapshot::MemfdRegionDesc]) -> bool {
 }
 
 impl Vmm {
+    #[cfg(target_os = "linux")]
+    fn capture_layered_ram(&mut self) -> Result<Option<layered_restore::Generation>> {
+        let Some(current) = &self.layered_ram else {
+            return Ok(None);
+        };
+        let (next, copied) = current
+            .capture_quiesced_excluding(&self.guest_memory, &self.layered_device_regions)
+            .map_err(|error| Error::Snapshot(format!("capture modified RAM pages: {error}")))?;
+        if let Err(error) =
+            next.rebase_quiesced_excluding(&self.guest_memory, &self.layered_device_regions)
+        {
+            self.ram_remap_failure = Some(error.to_string());
+            return Err(Error::Snapshot(format!(
+                "install captured RAM generation: {error}; VM remains stopped"
+            )));
+        }
+        log::debug!("captured layered RAM generation: {copied} private bytes copied");
+        self.layered_ram = Some(next.clone());
+        Ok(Some(next))
+    }
     #[cfg(not(feature = "tee"))]
     pub(crate) fn set_balloon(&mut self, balloon: Arc<Mutex<devices::virtio::Balloon>>) {
         self.balloon = Some(balloon);
@@ -901,6 +936,17 @@ impl Vmm {
                 .validate_migration_clock(&vm_state, &vcpu_states)
                 .map_err(Error::Vm)?;
             let devices = self.snapshot_devices();
+            #[cfg(target_os = "linux")]
+            let layered_generation = self.capture_layered_ram()?;
+            #[cfg(target_os = "linux")]
+            let memory = if let Some(generation) = layered_generation {
+                snapshot::DeferredMemorySave::from_layered(generation)
+            } else {
+                snapshot::start_deferred_memory_save(&self.guest_memory, generation_dir).map_err(
+                    |error| Error::Snapshot(format!("retain COW guest-memory generation: {error}")),
+                )?
+            };
+            #[cfg(not(target_os = "linux"))]
             let memory = snapshot::start_deferred_memory_save(&self.guest_memory, generation_dir)
                 .map_err(|error| {
                 Error::Snapshot(format!("retain COW guest-memory generation: {error}"))
@@ -1091,15 +1137,21 @@ impl Vmm {
     /// reach the fds via `/proc/<this_pid>/fd`. The caller keeps this process
     /// alive as the golden base.
     #[cfg(fork_supported)]
-    pub fn checkpoint_for_fork(
-        &mut self,
-    ) -> Result<(VmCheckpoint, Vec<snapshot::MemfdRegionDesc>)> {
+    pub fn checkpoint_for_fork(&mut self) -> Result<(VmCheckpoint, ForkMemory)> {
         // Validate the immutable prerequisite before pausing vCPUs or draining
         // device workers. A failed FORK must not alter the running VM.
         let descs = snapshot::memfd_region_descs(&self.guest_memory);
-        if !has_memfd_backed_memory(&descs) {
+        #[cfg(target_os = "linux")]
+        let layered = self.layered_ram.is_some();
+        #[cfg(not(target_os = "linux"))]
+        let layered = false;
+        if !has_memfd_backed_memory(&descs) && !layered {
             return Err(Error::ForkRequiresMemfd);
         }
+        #[cfg(target_os = "linux")]
+        let mut memory = ForkMemory::Mapped(descs);
+        #[cfg(not(target_os = "linux"))]
+        let memory = ForkMemory::Mapped(descs);
 
         self.pause()?;
         let checkpoint = (|| {
@@ -1107,6 +1159,10 @@ impl Vmm {
             let vcpu_states = self.save_vcpu_states()?;
             let vm_state = self.vm.save_state().map_err(Error::Vm)?;
             let devices = self.snapshot_devices();
+            #[cfg(target_os = "linux")]
+            if let Some(generation) = self.capture_layered_ram()? {
+                memory = ForkMemory::Layered(generation);
+            }
             #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
             let ioapic = self.intc.lock().unwrap().save_state();
             #[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
@@ -1122,7 +1178,7 @@ impl Vmm {
         match checkpoint {
             // Intentionally leave a successful checkpoint frozen as the stable
             // shared CoW base for its clones.
-            Ok(checkpoint) => Ok((checkpoint, descs)),
+            Ok(checkpoint) => Ok((checkpoint, memory)),
             Err(checkpoint_error) => match self.resume() {
                 Ok(()) => Err(checkpoint_error),
                 Err(resume_error) => Err(Error::Snapshot(format!(
@@ -1148,10 +1204,13 @@ impl Vmm {
     ) -> Result<(VmCheckpoint, ForkContinueRamGeneration)> {
         let source_descs = snapshot::memfd_region_descs(&self.guest_memory);
         let has_memfd_backing = has_memfd_backed_memory(&source_descs);
-        if !has_memfd_backing && guardian_socket.is_none() {
+        let layered = self.layered_ram.is_some();
+        if !has_memfd_backing && guardian_socket.is_none() && !layered {
             return Err(Error::ForkRequiresMemfd);
         }
-        let needs_materialization = if has_memfd_backing {
+        let needs_materialization = if layered {
+            false
+        } else if has_memfd_backing {
             snapshot::guest_memory_backing_is_immutable(&self.guest_memory).map_err(|error| {
                 Error::Snapshot(format!("inspect guest RAM generation: {error}"))
             })?
@@ -1165,6 +1224,7 @@ impl Vmm {
             let vcpu_states = self.save_vcpu_states()?;
             let vm_state = self.vm.save_state().map_err(Error::Vm)?;
             let devices = self.snapshot_devices();
+            let layered_generation = self.capture_layered_ram()?;
             let generation_guardian = if needs_materialization {
                 guardian_socket
                     .map(|path| {
@@ -1199,6 +1259,7 @@ impl Vmm {
                 .pivot_block_devices(&pivot_specs)
                 .map_err(|error| Error::Snapshot(format!("pivot source disks: {error}")))?;
             if !needs_materialization
+                && !layered
                 && let Err(error) = snapshot::rebase_guest_memory_private(&self.guest_memory)
             {
                 let rollback = self
@@ -1230,20 +1291,22 @@ impl Vmm {
                 generation_copy,
                 generation_guardian,
                 disk_rollback,
+                layered_generation,
             ))
         })();
 
-        let (checkpoint, generation_copy, generation_guardian, disk_rollback) = match capture {
-            Ok(capture) => capture,
-            Err(capture_error) => {
-                return match self.resume() {
-                    Ok(()) => Err(capture_error),
-                    Err(resume_error) => Err(Error::Snapshot(format!(
-                        "RAM generation capture failed ({capture_error}); source resume failed ({resume_error})"
-                    ))),
-                };
-            }
-        };
+        let (checkpoint, generation_copy, generation_guardian, disk_rollback, layered_generation) =
+            match capture {
+                Ok(capture) => capture,
+                Err(capture_error) => {
+                    return match self.resume() {
+                        Ok(()) => Err(capture_error),
+                        Err(resume_error) => Err(Error::Snapshot(format!(
+                            "RAM generation capture failed ({capture_error}); source resume failed ({resume_error})"
+                        ))),
+                    };
+                }
+            };
         if let Err(marker_error) = publish_generation_commit_marker(commit_marker) {
             drop(generation_copy);
             drop(generation_guardian);
@@ -1290,7 +1353,9 @@ impl Vmm {
         // pivot by closing the old worker-owned handles.
         drop(disk_rollback);
 
-        let (generation, retained_generation_files) = if let Some(guardian) = generation_guardian {
+        let (generation, retained_generation_files) = if let Some(generation) = layered_generation {
+            (ForkContinueRamGeneration::Layered(generation), Vec::new())
+        } else if let Some(guardian) = generation_guardian {
             (ForkContinueRamGeneration::Guardian(guardian), Vec::new())
         } else if let Some(copy) = generation_copy {
             let (descs, files) = copy.finish().map_err(|error| {
@@ -1498,6 +1563,12 @@ impl Vmm {
 
     /// Resume the microVM.
     pub fn resume(&mut self) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        if let Some(error) = &self.ram_remap_failure {
+            return Err(Error::Snapshot(format!(
+                "cannot resume after RAM remap failure: {error}; restore the saved generation"
+            )));
+        }
         match self.run_state {
             VmmRunState::Running => Ok(()),
             VmmRunState::Paused | VmmRunState::Pausing => {

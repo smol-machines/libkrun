@@ -111,7 +111,7 @@ use nix::unistd::isatty;
 use polly::event_manager::{Error as EventManagerError, EventManager};
 use utils::eventfd::EventFd;
 use utils::worker_message::WorkerMessage;
-#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+#[cfg(any(target_os = "linux", not(any(feature = "tee", feature = "aws-nitro"))))]
 use vm_memory::Address;
 use vm_memory::Bytes;
 #[cfg(all(feature = "vhost-user", target_os = "linux"))]
@@ -593,6 +593,8 @@ pub struct RestoreCtx {
     /// Fault handler for guardian-backed RAM. It must outlive `guest_memory`.
     #[cfg(target_os = "linux")]
     pub demand_pager: Option<super::demand_paging::DemandPager>,
+    #[cfg(target_os = "linux")]
+    pub layered_ram: Option<super::layered_restore::Generation>,
     /// Guest RAM for the clone — a CoW clone of the golden VM's memory (Linux
     /// `memfd` `MAP_PRIVATE`) / `vm_remap` (macOS), already holding the image.
     pub guest_memory: GuestMemoryMmap,
@@ -606,6 +608,14 @@ pub struct RestoreCtx {
     /// fork manifests use a same-host compatibility path on KVM versions that
     /// do not expose realtime/host-TSC samples.
     pub portable_clock: bool,
+}
+
+/// Typed backing ownership accompanies restored mappings through RAM setup.
+pub struct RestoredMemory {
+    pub guest_memory: GuestMemoryMmap,
+    pub fork_backed_regions: Vec<bool>,
+    #[cfg(target_os = "linux")]
+    pub layered_ram: Option<super::layered_restore::Generation>,
 }
 
 pub fn build_microvm(
@@ -631,22 +641,33 @@ pub fn build_microvm(
     // inherited mapping resident alongside the promoted copy (2x guest RAM).
     let restoring = restore.is_some();
     #[cfg(target_os = "linux")]
-    let (restore_mem, restore_checkpoint, restore_demand_pager, restore_portable_clock) =
-        match restore {
-            Some(RestoreCtx {
-                demand_pager,
+    let (
+        restore_mem,
+        restore_checkpoint,
+        restore_demand_pager,
+        restore_layered_ram,
+        restore_portable_clock,
+    ) = match restore {
+        Some(RestoreCtx {
+            demand_pager,
+            layered_ram,
+            guest_memory,
+            fork_backed_regions,
+            checkpoint,
+            portable_clock,
+        }) => (
+            Some(RestoredMemory {
                 guest_memory,
                 fork_backed_regions,
-                checkpoint,
-                portable_clock,
-            }) => (
-                Some((guest_memory, fork_backed_regions)),
-                Some(checkpoint),
-                demand_pager,
-                portable_clock,
-            ),
-            None => (None, None, None, false),
-        };
+                layered_ram: layered_ram.clone(),
+            }),
+            Some(checkpoint),
+            demand_pager,
+            layered_ram,
+            portable_clock,
+        ),
+        None => (None, None, None, None, false),
+    };
     #[cfg(not(target_os = "linux"))]
     let (restore_mem, restore_checkpoint, restore_portable_clock) = match restore {
         Some(RestoreCtx {
@@ -655,7 +676,10 @@ pub fn build_microvm(
             checkpoint,
             portable_clock,
         }) => (
-            Some((guest_memory, fork_backed_regions)),
+            Some(RestoredMemory {
+                guest_memory,
+                fork_backed_regions,
+            }),
             Some(checkpoint),
             portable_clock,
         ),
@@ -1135,6 +1159,16 @@ pub fn build_microvm(
     let mut vmm = Vmm {
         #[cfg(target_os = "linux")]
         demand_pager: restore_demand_pager,
+        #[cfg(target_os = "linux")]
+        layered_ram: restore_layered_ram,
+        #[cfg(target_os = "linux")]
+        layered_device_regions: _shm_manager
+            .regions()
+            .iter()
+            .map(|(gpa, _)| gpa.raw_value())
+            .collect(),
+        #[cfg(target_os = "linux")]
+        ram_remap_failure: None,
         guest_memory,
         arch_memory_info,
         kernel_cmdline,
@@ -2022,7 +2056,7 @@ pub fn create_guest_memory(
     // VM's RAM that already contains the running image) instead of allocating
     // fresh, and SKIP loading the kernel/firmware/initrd. The same memory layout
     // (config) must have produced it.
-    restore_mem: Option<(GuestMemoryMmap, Vec<bool>)>,
+    restore_mem: Option<RestoredMemory>,
 ) -> std::result::Result<
     (GuestMemoryMmap, ArchMemoryInfo, ShmManager, PayloadConfig),
     StartMicrovmError,
@@ -2109,7 +2143,24 @@ pub fn create_guest_memory(
 
     // Restore: the provided CoW-clone memory already holds the running image —
     // skip allocation + payload load entirely.
-    if let Some((guest_mem, fork_backed_regions)) = restore_mem {
+    if let Some(restored) = restore_mem {
+        let guest_mem = restored.guest_memory;
+        let fork_backed_regions = restored.fork_backed_regions;
+        #[cfg(target_os = "linux")]
+        let layered = if let Some(generation) = &restored.layered_ram {
+            generation
+                .validate_memory(&guest_mem, &[])
+                .map_err(|error| {
+                    StartMicrovmError::GuestMemoryMmap(format!(
+                        "validate layered restore backing: {error}"
+                    ))
+                })?;
+            true
+        } else {
+            false
+        };
+        #[cfg(not(target_os = "linux"))]
+        let layered = false;
         // A clone normally keeps its inherited raw MAP_PRIVATE mappings and is
         // therefore a cheap leaf. When explicitly launched forkable, give it
         // fresh file-backed memory containing its current state. This one-time
@@ -2127,7 +2178,7 @@ pub fn create_guest_memory(
                     "inspect restored fork backing: {error}"
                 ))
             })?;
-        let guest_mem = if memfd_backed_ram_enabled() && needs_fork_backing {
+        let guest_mem = if memfd_backed_ram_enabled() && needs_fork_backing && !layered {
             let promoted =
                 super::snapshot::materialize_guest_memory(&guest_mem, &fork_backed_regions)
                     .map_err(|error| {

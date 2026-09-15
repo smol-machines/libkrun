@@ -291,7 +291,11 @@ impl Generation {
             .map_err(|error| io::Error::other(format!("assemble layered RAM: {error:?}")))
     }
 
-    fn validate_memory(&self, memory: &GuestMemoryMmap) -> io::Result<()> {
+    pub(crate) fn validate_memory(
+        &self,
+        memory: &GuestMemoryMmap,
+        excluded: &[u64],
+    ) -> io::Result<()> {
         use vm_memory::{Address, GuestMemoryRegion};
         if memory.num_regions() != self.regions.len()
             || memory.iter().zip(&self.regions).any(|(actual, expected)| {
@@ -301,15 +305,40 @@ impl Generation {
         {
             return Err(invalid("layered RAM mapping/layout mismatch"));
         }
-        crate::generation_guardian::validate_private_memory_mappings(memory)
+        let mut regions = Vec::new();
+        for image in &self.regions {
+            if !excluded.contains(&image.gpa) {
+                let (_, region) = memory
+                    .remove_region(GuestAddress(image.gpa), image.len as u64)
+                    .map_err(|error| io::Error::other(format!("select private RAM: {error:?}")))?;
+                regions.push(region);
+            }
+        }
+        let private = GuestMemoryMmap::from_arc_regions(regions)
+            .map_err(|error| io::Error::other(format!("private RAM regions: {error:?}")))?;
+        crate::generation_guardian::validate_private_memory_mappings(&private)
     }
 
     /// All vCPUs and device writers must be quiesced for the entire operation.
     pub fn capture_quiesced(&self, memory: &GuestMemoryMmap) -> io::Result<(Self, usize)> {
-        self.validate_memory(memory)?;
+        self.capture_quiesced_excluding(memory, &[])
+    }
+
+    /// Device-owned shared windows are restored by their device snapshot, not
+    /// by inspecting their page-table entries as if they were private RAM.
+    pub(crate) fn capture_quiesced_excluding(
+        &self,
+        memory: &GuestMemoryMmap,
+        excluded: &[u64],
+    ) -> io::Result<(Self, usize)> {
+        self.validate_memory(memory, excluded)?;
         let mut regions = Vec::new();
         let mut copied = 0_usize;
         for image in &self.regions {
+            if excluded.contains(&image.gpa) {
+                regions.push(image.clone());
+                continue;
+            }
             let instance = Instance {
                 memory: memory.clone(),
                 image: image.clone(),
@@ -328,8 +357,19 @@ impl Generation {
     /// Call only while every writer is stopped. On error the caller MUST NOT
     /// resume without recovering the mapping; some extents may already change.
     pub fn rebase_quiesced(&self, memory: &GuestMemoryMmap) -> io::Result<()> {
-        self.validate_memory(memory)?;
+        self.rebase_quiesced_excluding(memory, &[])
+    }
+
+    pub(crate) fn rebase_quiesced_excluding(
+        &self,
+        memory: &GuestMemoryMmap,
+        excluded: &[u64],
+    ) -> io::Result<()> {
+        self.validate_memory(memory, excluded)?;
         for image in &self.regions {
+            if excluded.contains(&image.gpa) {
+                continue;
+            }
             let mut instance = Instance {
                 memory: memory.clone(),
                 image: image.clone(),
@@ -356,6 +396,44 @@ impl Generation {
                 }
             }
         }
+        Ok(())
+    }
+
+    pub fn memory_regions(&self) -> Vec<crate::snapshot::MemoryRegionDesc> {
+        self.regions
+            .iter()
+            .map(|image| crate::snapshot::MemoryRegionDesc {
+                gpa: image.gpa,
+                len: image.len as u64,
+            })
+            .collect()
+    }
+
+    pub fn write_sparse_to(&self, output: &mut File) -> io::Result<()> {
+        use std::io::Seek;
+        output.set_len(0)?;
+        let mut buffer = vec![0; 64 * 1024];
+        let mut logical = 0_u64;
+        for image in &self.regions {
+            for extent in &image.extents {
+                let mut offset = 0;
+                while offset < extent.end - extent.start {
+                    let len = (extent.end - extent.start - offset).min(buffer.len());
+                    extent
+                        .file
+                        .read_exact_at(&mut buffer[..len], extent.offset + offset as u64)?;
+                    if buffer[..len].iter().any(|byte| *byte != 0) {
+                        output.write_all_at(&buffer[..len], logical)?;
+                    }
+                    logical = logical
+                        .checked_add(len as u64)
+                        .ok_or_else(|| invalid("RAM export size overflow"))?;
+                    offset += len;
+                }
+            }
+        }
+        output.set_len(logical)?;
+        output.seek(io::SeekFrom::Start(logical))?;
         Ok(())
     }
 }
@@ -704,6 +782,55 @@ fn multi_region_import_capture_export_and_rebase() {
             .unwrap(),
         0x91
     );
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn deferred_checkpoint_preserves_boundary_after_source_continues() {
+    use crate::snapshot::{DeferredMemorySave, MemoryRegionDesc};
+    let file = crate::builder::create_guest_ram_memfd(3 * PAGE).unwrap();
+    file.write_all_at(&[0x31; 3 * PAGE], 0).unwrap();
+    let base = Generation::from_immutable_file(
+        &[MemoryRegionDesc {
+            gpa: 0,
+            len: (3 * PAGE) as u64,
+        }],
+        &file,
+    )
+    .unwrap();
+    let source = base.restore().unwrap();
+    source
+        .write_slice(&[0; PAGE], GuestAddress(PAGE as u64))
+        .unwrap();
+    let (saved, copied) = base.capture_quiesced(&source).unwrap();
+    assert_eq!(copied, PAGE);
+    saved.rebase_quiesced(&source).unwrap();
+    let stream = DeferredMemorySave::from_layered(saved.clone());
+    let sparse = DeferredMemorySave::from_layered(saved);
+    source
+        .write_slice(&[0x99; 3 * PAGE], GuestAddress(0))
+        .unwrap();
+    drop(base);
+    drop(file);
+    let mut expected = vec![0x31; 3 * PAGE];
+    expected[PAGE..2 * PAGE].fill(0);
+    let mut wire = Vec::new();
+    let regions = stream.finish_stream(&mut wire).unwrap();
+    assert_eq!(regions.len(), 1);
+    assert_eq!(&wire[..8], b"SMOLRAM1");
+    assert_eq!(
+        u64::from_le_bytes(wire[8..16].try_into().unwrap()),
+        (3 * PAGE) as u64
+    );
+    assert_eq!(&wire[16..], expected);
+    let mut output = crate::builder::create_guest_ram_memfd(4 * PAGE).unwrap();
+    output.write_all_at(&[0x77; 4 * PAGE], 0).unwrap();
+    sparse.finish(&mut output).unwrap();
+    assert_eq!(output.metadata().unwrap().len(), (3 * PAGE) as u64);
+    let mut bytes = vec![0; 3 * PAGE];
+    output.read_exact_at(&mut bytes, 0).unwrap();
+    assert_eq!(bytes, expected);
+    assert_eq!(source.read_obj::<u8>(GuestAddress(0)).unwrap(), 0x99);
 }
 
 #[test]

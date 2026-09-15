@@ -1283,7 +1283,7 @@ fn handle_fork(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
         return format!("ERR EIO create {}: {e}\n", dir.display());
     }
     // Capture + freeze (the VM stays paused as the CoW base).
-    let (checkpoint, descs) = match vmm.lock().unwrap().checkpoint_for_fork() {
+    let (checkpoint, memory) = match vmm.lock().unwrap().checkpoint_for_fork() {
         Ok(v) => v,
         Err(vmm::Error::ForkRequiresMemfd) => {
             return "ERR EINVAL no memfd-backed RAM (start the golden VM with SMOLVM_FORKABLE=1)\n"
@@ -1295,13 +1295,23 @@ fn handle_fork(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
         return rollback_failed_fork(vmm, dir, checkpoint, format!("write checkpoint: {e}"));
     }
     let pid = std::process::id() as i32;
-    if let Err(e) = write_fork_manifest(&dir.join("manifest.bin"), pid, &descs) {
+    let (regions, written) = match memory {
+        vmm::ForkMemory::Mapped(descs) => (
+            descs.len(),
+            write_fork_manifest(&dir.join("manifest.bin"), pid, &descs),
+        ),
+        #[cfg(target_os = "linux")]
+        vmm::ForkMemory::Layered(generation) => (
+            generation.memory_regions().len(),
+            generation
+                .encode_manifest()
+                .and_then(|bytes| atomic_write_file(&dir.join("manifest.bin"), &bytes)),
+        ),
+    };
+    if let Err(e) = written {
         return rollback_failed_fork(vmm, dir, checkpoint, format!("write manifest: {e}"));
     }
-    format!(
-        "OK forked (frozen base, pid {pid}, {} regions)\n",
-        descs.len()
-    )
+    format!("OK forked (frozen base, pid {pid}, {} regions)\n", regions)
 }
 
 #[cfg(all(
@@ -1405,6 +1415,23 @@ fn handle_fork_continue_inner(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str, demand_page
         return format!("ERR EIO write checkpoint: {error}; source already resumed\n");
     }
     match generation {
+        #[cfg(target_os = "linux")]
+        vmm::ForkContinueRamGeneration::Layered(generation) => {
+            if let Err(error) = generation
+                .encode_manifest()
+                .and_then(|bytes| atomic_write_file(&dir.join("manifest.bin"), &bytes))
+            {
+                let _ = std::fs::remove_file(dir.join("checkpoint.bin"));
+                return format!(
+                    "ERR EIO write layered manifest: {error}; source already resumed\n"
+                );
+            }
+            format!(
+                "OK forked generation (running source, layered RAM, {} regions, {} disks)\n",
+                generation.memory_regions().len(),
+                block_pivots.len()
+            )
+        }
         vmm::ForkContinueRamGeneration::Mapped(descs) => {
             let pid = std::process::id() as i32;
             if let Err(error) = write_fork_manifest(&dir.join("manifest.bin"), pid, &descs) {
@@ -1487,6 +1514,25 @@ fn build_restore_ctx_with_memory(
     if readonly_memory.is_some() && magic != PORTABLE_MANIFEST_MAGIC {
         return Err("read-only memory input requires a portable snapshot".into());
     }
+    #[cfg(target_os = "linux")]
+    if magic_bytes == vmm::layered_restore::MANIFEST_MAGIC {
+        let generation = vmm::layered_restore::Generation::decode_manifest(&manifest)
+            .map_err(|error| format!("layered RAM manifest: {error}"))?;
+        let guest_memory = generation
+            .restore()
+            .map_err(|error| format!("map layered RAM: {error}"))?;
+        let count = generation.memory_regions().len();
+        let checkpoint = std::fs::read(dir.join("checkpoint.bin"))
+            .map_err(|error| format!("checkpoint: {error}"))?;
+        return Ok(vmm::builder::RestoreCtx {
+            demand_pager: None,
+            layered_ram: Some(generation),
+            guest_memory,
+            fork_backed_regions: vec![true; count],
+            checkpoint,
+            portable_clock: false,
+        });
+    }
     if magic == PORTABLE_MANIFEST_MAGIC {
         let descs = decode_portable_manifest(&manifest).map_err(|e| format!("manifest: {e}"))?;
         let checkpoint =
@@ -1521,8 +1567,23 @@ fn build_restore_ctx_with_memory(
             ));
         }
         #[cfg(target_os = "linux")]
-        let guest_memory = if std::env::var_os("SMOLVM_FORKABLE").is_some_and(|value| value == "1")
+        let layered_ram = if std::env::var_os("SMOLVM_LAYERED_RESTORE")
+            .is_some_and(|value| value == "1")
+            && std::env::var_os("SMOLVM_FORKABLE").is_some_and(|value| value == "1")
         {
+            Some(
+                vmm::layered_restore::Generation::from_immutable_file(&descs, &memory_file)
+                    .map_err(|error| format!("retain layered restore input: {error}"))?,
+            )
+        } else {
+            None
+        };
+        #[cfg(target_os = "linux")]
+        let guest_memory = if let Some(generation) = &layered_ram {
+            generation
+                .restore()
+                .map_err(|error| format!("map layered restore input: {error}"))?
+        } else if std::env::var_os("SMOLVM_FORKABLE").is_some_and(|value| value == "1") {
             vmm::snapshot::map_guest_memory_file_forkable(&descs, &memory_file)
                 .map_err(|e| format!("promote portable guest memory: {e}"))?
         } else {
@@ -1544,6 +1605,8 @@ fn build_restore_ctx_with_memory(
         return Ok(vmm::builder::RestoreCtx {
             #[cfg(target_os = "linux")]
             demand_pager: None,
+            #[cfg(target_os = "linux")]
+            layered_ram,
             guest_memory,
             fork_backed_regions: vec![true; descs.len()],
             checkpoint,
@@ -1566,6 +1629,7 @@ fn build_restore_ctx_with_memory(
         .map_err(|error| format!("create demand-paged guest RAM: {error}"))?;
         return Ok(vmm::builder::RestoreCtx {
             demand_pager: Some(demand.pager),
+            layered_ram: None,
             guest_memory: demand.memory,
             // A leaf can keep these anonymous demand-paged mappings. An
             // explicitly forkable child must materialize them into fresh
@@ -1594,6 +1658,8 @@ fn build_restore_ctx_with_memory(
     Ok(vmm::builder::RestoreCtx {
         #[cfg(target_os = "linux")]
         demand_pager: None,
+        #[cfg(target_os = "linux")]
+        layered_ram: None,
         guest_memory,
         fork_backed_regions: descs
             .iter()
