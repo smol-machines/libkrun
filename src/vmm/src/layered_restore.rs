@@ -1,5 +1,5 @@
 // Copyright 2026. SPDX-License-Identifier: Apache-2.0
-//! Experimental generation backend. Not connected to VM restore/admission.
+//! Immutable layered RAM generations for Linux restore and branching.
 //! Complete immutable backing consists of a base plus sealed modified-page
 //! extents. Every mapping is private and kernel-faultable without a pager thread.
 
@@ -12,16 +12,378 @@ use vm_memory::mmap::MmapRegion;
 use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestRegionMmap};
 
 const PAGE: usize = 4096;
+/// Same-host live generation format, distinct from a portable checkpoint.
+pub const MANIFEST_MAGIC: [u8; 8] = *b"SMOLLAY1";
+
+/// A complete logical region, independent of the number of file extents.
+#[derive(Clone, Debug)]
+pub struct RegionDescription {
+    pub gpa: u64,
+    pub len: u64,
+    pub extents: Vec<ExtentDescription>,
+}
+
+/// Borrowed file descriptor in the generation owner's process. The owner must
+/// retain its generation until receivers have opened their own descriptors.
+#[derive(Clone, Debug)]
+pub struct ExtentDescription {
+    pub start: u64,
+    pub len: u64,
+    pub fd: i32,
+    pub offset: u64,
+}
+
+/// Owns every immutable backing needed to restore or export this generation.
+/// Dropping ancestors or unlinking their paths cannot invalidate these handles.
+#[derive(Clone)]
+pub struct Generation {
+    regions: Vec<Image>,
+}
+
+impl Generation {
+    /// Encode references to this process's retained immutable descriptors.
+    /// Keep this generation alive until importers acquire their own handles.
+    pub fn encode_manifest(&self) -> io::Result<Vec<u8>> {
+        self.check_limits()?;
+        let pid = std::process::id();
+        let start = process_start_time(pid)?;
+        let descriptions = self.descriptions();
+        let mut output = Vec::new();
+        output.extend_from_slice(&MANIFEST_MAGIC);
+        output.extend_from_slice(&pid.to_le_bytes());
+        output.extend_from_slice(&0_u32.to_le_bytes());
+        output.extend_from_slice(&start.to_le_bytes());
+        output.extend_from_slice(&(descriptions.len() as u32).to_le_bytes());
+        for region in descriptions {
+            output.extend_from_slice(&region.gpa.to_le_bytes());
+            output.extend_from_slice(&region.len.to_le_bytes());
+            output.extend_from_slice(&(region.extents.len() as u32).to_le_bytes());
+            for extent in region.extents {
+                output.extend_from_slice(&extent.start.to_le_bytes());
+                output.extend_from_slice(&extent.len.to_le_bytes());
+                output.extend_from_slice(&extent.fd.to_le_bytes());
+                output.extend_from_slice(&extent.offset.to_le_bytes());
+            }
+        }
+        Ok(output)
+    }
+
+    pub fn decode_manifest(input: &[u8]) -> io::Result<Self> {
+        fn take<const N: usize>(input: &mut &[u8]) -> io::Result<[u8; N]> {
+            let bytes = input
+                .get(..N)
+                .ok_or_else(|| invalid("truncated layered RAM manifest"))?;
+            let value = bytes.try_into().unwrap();
+            *input = &input[N..];
+            Ok(value)
+        }
+        if input.len() > 2 * 1024 * 1024 {
+            return Err(invalid("layered RAM manifest too large"));
+        }
+        let mut remaining = input;
+        if take::<8>(&mut remaining)? != MANIFEST_MAGIC {
+            return Err(invalid("invalid layered RAM manifest magic"));
+        }
+        let pid = u32::from_le_bytes(take(&mut remaining)?);
+        if pid == 0 || pid > i32::MAX as u32 || take::<4>(&mut remaining)? != [0; 4] {
+            return Err(invalid("invalid layered RAM owner/header"));
+        }
+        let start = u64::from_le_bytes(take(&mut remaining)?);
+        let count = u32::from_le_bytes(take(&mut remaining)?) as usize;
+        if count == 0 || count > 256 {
+            return Err(invalid("invalid RAM region count"));
+        }
+        let mut descriptions = Vec::with_capacity(count);
+        let mut total = 0;
+        for _ in 0..count {
+            let gpa = u64::from_le_bytes(take(&mut remaining)?);
+            let len = u64::from_le_bytes(take(&mut remaining)?);
+            let count = u32::from_le_bytes(take(&mut remaining)?) as usize;
+            total += count;
+            if count == 0 || total > 65536 || count > remaining.len() / 28 {
+                return Err(invalid("invalid layered RAM extent count"));
+            }
+            let mut extents = Vec::with_capacity(count);
+            for _ in 0..count {
+                extents.push(ExtentDescription {
+                    start: u64::from_le_bytes(take(&mut remaining)?),
+                    len: u64::from_le_bytes(take(&mut remaining)?),
+                    fd: i32::from_le_bytes(take(&mut remaining)?),
+                    offset: u64::from_le_bytes(take(&mut remaining)?),
+                });
+            }
+            descriptions.push(RegionDescription { gpa, len, extents });
+        }
+        if !remaining.is_empty() {
+            return Err(invalid("trailing layered RAM manifest data"));
+        }
+        if process_start_time(pid)? != start {
+            return Err(invalid("layered RAM owner identity changed"));
+        }
+        let generation = Self::from_descriptions(pid as i32, &descriptions)?;
+        if process_start_time(pid)? != start {
+            return Err(invalid("layered RAM owner changed during import"));
+        }
+        Ok(generation)
+    }
+    /// The caller must retain the immutable-file contract: a read-only handle
+    /// prevents writes through this handle, not through other host handles.
+    pub fn from_immutable_file(
+        descs: &[crate::snapshot::MemoryRegionDesc],
+        file: &File,
+    ) -> io::Result<Self> {
+        let mut descriptions = Vec::new();
+        let mut offset = 0_u64;
+        for desc in descs {
+            descriptions.push(RegionDescription {
+                gpa: desc.gpa,
+                len: desc.len,
+                extents: vec![ExtentDescription {
+                    start: 0,
+                    len: desc.len,
+                    fd: file.as_raw_fd(),
+                    offset,
+                }],
+            });
+            offset = offset
+                .checked_add(desc.len)
+                .ok_or_else(|| invalid("RAM size overflow"))?;
+        }
+        if file.metadata()?.len() != offset {
+            return Err(invalid("RAM file length mismatch"));
+        }
+        Self::from_descriptions(std::process::id() as i32, &descriptions)
+    }
+
+    /// Import immutable handles from a trusted, authenticated generation owner.
+    /// Validate the complete layout before creating any guest mapping.
+    pub fn from_descriptions(owner: i32, descriptions: &[RegionDescription]) -> io::Result<Self> {
+        if owner <= 0 || descriptions.is_empty() || descriptions.len() > 256 {
+            return Err(invalid("invalid layered RAM owner or region count"));
+        }
+        let mut files = std::collections::HashMap::<i32, Arc<File>>::new();
+        let mut regions = Vec::new();
+        let mut previous_end = 0;
+        let mut extent_count = 0_usize;
+        for region in descriptions {
+            let end = region
+                .gpa
+                .checked_add(region.len)
+                .ok_or_else(|| invalid("RAM address overflow"))?;
+            if region.gpa < previous_end
+                || !region.gpa.is_multiple_of(PAGE as u64)
+                || region.len == 0
+                || !region.len.is_multiple_of(PAGE as u64)
+            {
+                return Err(invalid("invalid or overlapping RAM region"));
+            }
+            let len = usize::try_from(region.len)
+                .map_err(|_| invalid("RAM region exceeds address space"))?;
+            let mut cursor = 0_u64;
+            let mut extents = Vec::new();
+            for extent in &region.extents {
+                extent_count += 1;
+                if extent_count > 65536 {
+                    return Err(invalid("too many layered RAM extents"));
+                }
+                if extent.fd < 0
+                    || extent.start != cursor
+                    || extent.len == 0
+                    || !extent.len.is_multiple_of(PAGE as u64)
+                    || !extent.offset.is_multiple_of(PAGE as u64)
+                {
+                    return Err(invalid("invalid layered RAM extent"));
+                }
+                cursor = cursor
+                    .checked_add(extent.len)
+                    .ok_or_else(|| invalid("extent overflow"))?;
+                let file_end = extent
+                    .offset
+                    .checked_add(extent.len)
+                    .ok_or_else(|| invalid("file extent overflow"))?;
+                if cursor > region.len || file_end > i64::MAX as u64 {
+                    return Err(invalid("extent exceeds its region or file offset range"));
+                }
+                let file = if let Some(file) = files.get(&extent.fd) {
+                    file.clone()
+                } else {
+                    if files.len() >= 1024 {
+                        return Err(invalid("too many layered RAM files"));
+                    }
+                    let file = Arc::new(File::open(format!("/proc/{owner}/fd/{}", extent.fd))?);
+                    files.insert(extent.fd, file.clone());
+                    file
+                };
+                if !file.metadata()?.is_file() || file.metadata()?.len() < file_end {
+                    return Err(invalid("layered RAM backing is truncated or not a file"));
+                }
+                extents.push(Extent {
+                    start: extent.start as usize,
+                    end: cursor as usize,
+                    offset: extent.offset,
+                    file,
+                });
+            }
+            if cursor != region.len {
+                return Err(invalid("layered RAM has uncovered pages"));
+            }
+            regions.push(Image {
+                gpa: region.gpa,
+                len,
+                extents,
+            });
+            previous_end = end;
+        }
+        Ok(Self { regions })
+    }
+
+    pub fn descriptions(&self) -> Vec<RegionDescription> {
+        self.regions
+            .iter()
+            .map(|region| RegionDescription {
+                gpa: region.gpa,
+                len: region.len as u64,
+                extents: region
+                    .extents
+                    .iter()
+                    .map(|extent| ExtentDescription {
+                        start: extent.start as u64,
+                        len: (extent.end - extent.start) as u64,
+                        fd: extent.file.as_raw_fd(),
+                        offset: extent.offset,
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
+    fn check_limits(&self) -> io::Result<()> {
+        let mut count = 0;
+        let mut files = std::collections::HashSet::new();
+        for image in &self.regions {
+            count += image.extents.len();
+            if count > 65536 {
+                return Err(invalid("layered RAM extent budget exceeded"));
+            }
+            for extent in &image.extents {
+                files.insert(extent.file.as_raw_fd());
+                if files.len() > 1024 {
+                    return Err(invalid("layered RAM file budget exceeded"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Logical regions remain unchanged even when the backing has many extents;
+    /// a KVM slot is not consumed for each extent.
+    pub fn restore(&self) -> io::Result<GuestMemoryMmap> {
+        let mut regions = Vec::new();
+        for image in &self.regions {
+            let instance = image.restore()?;
+            let (_, region) = instance
+                .memory
+                .remove_region(GuestAddress(image.gpa), image.len as u64)
+                .map_err(|error| io::Error::other(format!("extract RAM region: {error:?}")))?;
+            regions.push(region);
+        }
+        GuestMemoryMmap::from_arc_regions(regions)
+            .map_err(|error| io::Error::other(format!("assemble layered RAM: {error:?}")))
+    }
+
+    fn validate_memory(&self, memory: &GuestMemoryMmap) -> io::Result<()> {
+        use vm_memory::{Address, GuestMemoryRegion};
+        if memory.num_regions() != self.regions.len()
+            || memory.iter().zip(&self.regions).any(|(actual, expected)| {
+                actual.start_addr().raw_value() != expected.gpa
+                    || actual.len() != expected.len as u64
+            })
+        {
+            return Err(invalid("layered RAM mapping/layout mismatch"));
+        }
+        crate::generation_guardian::validate_private_memory_mappings(memory)
+    }
+
+    /// All vCPUs and device writers must be quiesced for the entire operation.
+    pub fn capture_quiesced(&self, memory: &GuestMemoryMmap) -> io::Result<(Self, usize)> {
+        self.validate_memory(memory)?;
+        let mut regions = Vec::new();
+        let mut copied = 0_usize;
+        for image in &self.regions {
+            let instance = Instance {
+                memory: memory.clone(),
+                image: image.clone(),
+            };
+            let (next, bytes) = instance.capture_quiesced()?;
+            copied = copied
+                .checked_add(bytes)
+                .ok_or_else(|| invalid("copied RAM size overflow"))?;
+            regions.push(next);
+        }
+        let next = Self { regions };
+        next.check_limits()?;
+        Ok((next, copied))
+    }
+
+    /// Call only while every writer is stopped. On error the caller MUST NOT
+    /// resume without recovering the mapping; some extents may already change.
+    pub fn rebase_quiesced(&self, memory: &GuestMemoryMmap) -> io::Result<()> {
+        self.validate_memory(memory)?;
+        for image in &self.regions {
+            let mut instance = Instance {
+                memory: memory.clone(),
+                image: image.clone(),
+            };
+            instance.rebase_quiesced(image.clone())?;
+        }
+        Ok(())
+    }
+
+    /// Export logical bytes directly from retained backing, including explicit
+    /// zero overwrites; never mistake a sparse delta file for a complete image.
+    pub fn write_to<W: io::Write>(&self, output: &mut W) -> io::Result<()> {
+        let mut buffer = vec![0; 64 * 1024];
+        for image in &self.regions {
+            for extent in &image.extents {
+                let mut offset = 0;
+                while offset < extent.end - extent.start {
+                    let len = (extent.end - extent.start - offset).min(buffer.len());
+                    extent
+                        .file
+                        .read_exact_at(&mut buffer[..len], extent.offset + offset as u64)?;
+                    output.write_all(&buffer[..len])?;
+                    offset += len;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn invalid(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+fn process_start_time(pid: u32) -> io::Result<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    stat.rsplit_once(") ")
+        .and_then(|(_, fields)| fields.split_whitespace().nth(19))
+        .ok_or_else(|| invalid("missing RAM owner identity"))?
+        .parse()
+        .map_err(|_| invalid("invalid RAM owner identity"))
+}
 
 #[derive(Clone)]
 struct Extent {
     start: usize,
     end: usize,
+    offset: u64,
     file: Arc<File>,
 }
 
 #[derive(Clone)]
 struct Image {
+    gpa: u64,
     len: usize,
     extents: Vec<Extent>,
 }
@@ -34,6 +396,7 @@ struct Instance {
 impl Image {
     // The caller owns the immutability contract for the original snapshot.
     // Holding a descriptor protects against unlink, not in-place modification.
+    #[cfg(test)]
     fn from_immutable_file(file: File, len: usize) -> io::Result<Self> {
         if len == 0 || !len.is_multiple_of(PAGE) || file.metadata()?.len() != len as u64 {
             return Err(io::Error::new(
@@ -42,10 +405,12 @@ impl Image {
             ));
         }
         Ok(Self {
+            gpa: 0,
             len,
             extents: vec![Extent {
                 start: 0,
                 end: len,
+                offset: 0,
                 file: Arc::new(file),
             }],
         })
@@ -60,11 +425,11 @@ impl Image {
             libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
         )
         .map_err(|error| io::Error::other(format!("reserve layered RAM: {error:?}")))?;
-        let region = GuestRegionMmap::new(region, GuestAddress(0))
+        let region = GuestRegionMmap::new(region, GuestAddress(self.gpa))
             .ok_or_else(|| io::Error::other("RAM address overflow"))?;
         let memory = GuestMemoryMmap::from_regions(vec![region])
             .map_err(|error| io::Error::other(format!("layered RAM regions: {error:?}")))?;
-        let base = memory.get_host_address(GuestAddress(0)).unwrap();
+        let base = memory.get_host_address(GuestAddress(self.gpa)).unwrap();
         for extent in &self.extents {
             // SAFETY: each aligned extent lies exclusively inside the reserved
             // mapping owned above. On failure its RAII owner unmaps the whole
@@ -76,7 +441,7 @@ impl Image {
                     prot,
                     libc::MAP_PRIVATE | libc::MAP_FIXED | libc::MAP_NORESERVE,
                     extent.file.as_raw_fd(),
-                    extent.start as libc::off_t,
+                    extent.offset as libc::off_t,
                 )
             };
             if result == libc::MAP_FAILED {
@@ -108,7 +473,10 @@ impl Instance {
                 "rebase size mismatch",
             ));
         }
-        let base = self.memory.get_host_address(GuestAddress(0)).unwrap();
+        let base = self
+            .memory
+            .get_host_address(GuestAddress(self.image.gpa))
+            .unwrap();
         for extent in &image.extents {
             // SAFETY: this instance owns the full reservation; all writers are
             // stopped and each backing contains the captured bytes for its run.
@@ -119,7 +487,7 @@ impl Instance {
                     libc::PROT_READ | libc::PROT_WRITE,
                     libc::MAP_PRIVATE | libc::MAP_FIXED | libc::MAP_NORESERVE,
                     extent.file.as_raw_fd(),
-                    extent.start as libc::off_t,
+                    extent.offset as libc::off_t,
                 )
             };
             if result == libc::MAP_FAILED {
@@ -134,7 +502,10 @@ impl Instance {
     // device mappings, admission accounting, capture and ABI ownership are wired.
     fn capture_quiesced(&self) -> io::Result<(Image, usize)> {
         let pagemap = File::open("/proc/self/pagemap")?;
-        let base = self.memory.get_host_address(GuestAddress(0)).unwrap() as u64;
+        let base = self
+            .memory
+            .get_host_address(GuestAddress(self.image.gpa))
+            .unwrap() as u64;
         let mut dirty = Vec::<(usize, usize)>::new();
         let mut entries = vec![0_u8; 8192 * 8];
         for first in (0..self.image.len / PAGE).step_by(8192) {
@@ -167,7 +538,10 @@ impl Instance {
             for offset in (start..end).step_by(buffer.len()) {
                 let len = (end - offset).min(buffer.len());
                 self.memory
-                    .read_slice(&mut buffer[..len], GuestAddress(offset as u64))
+                    .read_slice(
+                        &mut buffer[..len],
+                        GuestAddress(self.image.gpa + offset as u64),
+                    )
                     .map_err(|error| io::Error::other(format!("read private RAM: {error:?}")))?;
                 delta.write_all_at(&buffer[..len], offset as u64)?;
                 copied += len;
@@ -181,9 +555,13 @@ impl Instance {
         let delta = Arc::new(delta);
         let mut extents = Vec::new();
         // Flatten the mapping index now; a restore never walks a delta chain.
+        let mut first_dirty = 0;
         for old in &self.image.extents {
             let mut cursor = old.start;
-            for &(start, end) in &dirty {
+            while first_dirty < dirty.len() && dirty[first_dirty].1 <= old.start {
+                first_dirty += 1;
+            }
+            for &(start, end) in &dirty[first_dirty..] {
                 if end <= cursor {
                     continue;
                 }
@@ -194,6 +572,7 @@ impl Instance {
                     extents.push(Extent {
                         start: cursor,
                         end: start,
+                        offset: old.offset + (cursor - old.start) as u64,
                         file: old.file.clone(),
                     });
                 }
@@ -206,6 +585,7 @@ impl Instance {
                 extents.push(Extent {
                     start: cursor,
                     end: old.end,
+                    offset: old.offset + (cursor - old.start) as u64,
                     file: old.file.clone(),
                 });
             }
@@ -214,10 +594,24 @@ impl Instance {
             extents.push(Extent {
                 start,
                 end,
+                offset: start as u64,
                 file: delta.clone(),
             });
         }
         extents.sort_unstable_by_key(|extent| extent.start);
+        let mut merged: Vec<Extent> = Vec::with_capacity(extents.len());
+        for extent in extents {
+            if let Some(last) = merged.last_mut().filter(|last| {
+                last.end == extent.start
+                    && Arc::ptr_eq(&last.file, &extent.file)
+                    && last.offset + (last.end - last.start) as u64 == extent.offset
+            }) {
+                last.end = extent.end;
+            } else {
+                merged.push(extent);
+            }
+        }
+        let extents = merged;
         let mut cursor = 0;
         for extent in &extents {
             assert_eq!(extent.start, cursor);
@@ -226,6 +620,7 @@ impl Instance {
         assert_eq!(cursor, self.image.len);
         Ok((
             Image {
+                gpa: self.image.gpa,
                 len: self.image.len,
                 extents,
             },
@@ -240,6 +635,223 @@ fn swapped_pages_are_not_discarded() {
     assert!(!private_or_swapped((1 << 63) | (1 << 61)));
     assert!(private_or_swapped(1 << 63));
     assert!(private_or_swapped(1 << 62));
+}
+
+#[test]
+fn multi_region_import_capture_export_and_rebase() {
+    use crate::snapshot::MemoryRegionDesc;
+    use vm_memory::GuestMemoryRegion;
+    let file = crate::builder::create_guest_ram_memfd(5 * PAGE).unwrap();
+    file.write_all_at(&[0x11; 2 * PAGE], 0).unwrap();
+    file.write_all_at(&[0x73; 3 * PAGE], (2 * PAGE) as u64)
+        .unwrap();
+    let descs = [
+        MemoryRegionDesc {
+            gpa: 0,
+            len: (2 * PAGE) as u64,
+        },
+        MemoryRegionDesc {
+            gpa: 1 << 32,
+            len: (3 * PAGE) as u64,
+        },
+    ];
+    let generation = Generation::from_immutable_file(&descs, &file).unwrap();
+    drop(file);
+    let memory = generation.restore().unwrap();
+    assert_eq!(memory.num_regions(), 2);
+    assert_eq!(
+        memory.iter().map(|region| region.len()).collect::<Vec<_>>(),
+        vec![(2 * PAGE) as u64, (3 * PAGE) as u64]
+    );
+    memory.write_slice(&[0; PAGE], GuestAddress(0)).unwrap();
+    memory
+        .write_slice(&[0x91; PAGE], GuestAddress((1 << 32) + (2 * PAGE) as u64))
+        .unwrap();
+    let (captured, copied) = generation.capture_quiesced(&memory).unwrap();
+    assert_eq!(copied, 2 * PAGE);
+    let descriptions = captured.descriptions();
+    assert_eq!(
+        descriptions
+            .iter()
+            .map(|region| region.extents.len())
+            .sum::<usize>(),
+        4
+    );
+    let imported = Generation::from_descriptions(std::process::id() as i32, &descriptions).unwrap();
+    let mut bytes = Vec::new();
+    imported.write_to(&mut bytes).unwrap();
+    let mut expected = vec![0; PAGE];
+    expected.extend_from_slice(&[0x11; PAGE]);
+    expected.extend_from_slice(&[0x73; 2 * PAGE]);
+    expected.extend_from_slice(&[0x91; PAGE]);
+    assert_eq!(bytes, expected);
+    captured.rebase_quiesced(&memory).unwrap();
+    let (_, copied) = captured.capture_quiesced(&memory).unwrap();
+    assert_eq!(copied, 0);
+    drop(generation);
+    drop(captured);
+    drop(memory);
+    let restored = imported.restore().unwrap();
+    assert_eq!(restored.num_regions(), 2);
+    assert_eq!(restored.read_obj::<u8>(GuestAddress(0)).unwrap(), 0);
+    assert_eq!(
+        restored.read_obj::<u8>(GuestAddress(1 << 32)).unwrap(),
+        0x73
+    );
+    assert_eq!(
+        restored
+            .read_obj::<u8>(GuestAddress((1 << 32) + (2 * PAGE) as u64))
+            .unwrap(),
+        0x91
+    );
+}
+
+#[test]
+fn malformed_generation_descriptions_are_rejected_before_mapping() {
+    use crate::snapshot::MemoryRegionDesc;
+    let file = crate::builder::create_guest_ram_memfd(2 * PAGE).unwrap();
+    let generation = Generation::from_immutable_file(
+        &[MemoryRegionDesc {
+            gpa: 0,
+            len: (2 * PAGE) as u64,
+        }],
+        &file,
+    )
+    .unwrap();
+    let valid = generation.descriptions();
+    let mut cases = Vec::new();
+    let mut bad = valid.clone();
+    bad[0].extents[0].start = PAGE as u64;
+    cases.push(bad);
+    let mut bad = valid.clone();
+    bad[0].extents[0].len = PAGE as u64;
+    cases.push(bad);
+    let mut bad = valid.clone();
+    bad[0].extents[0].offset = PAGE as u64;
+    cases.push(bad);
+    let mut bad = valid.clone();
+    bad[0].extents[0].fd = -1;
+    cases.push(bad);
+    let mut bad = valid.clone();
+    bad[0].gpa = u64::MAX;
+    cases.push(bad);
+    let mut bad = valid.clone();
+    bad.push(bad[0].clone());
+    cases.push(bad);
+    let mut bad = valid.clone();
+    bad[0].extents.clear();
+    cases.push(bad);
+    let mut bad = valid.clone();
+    bad[0].extents[0].len = 1;
+    cases.push(bad);
+    let mut bad = valid.clone();
+    bad[0].extents[0].offset = 1;
+    cases.push(bad);
+    for bad in cases {
+        assert!(Generation::from_descriptions(std::process::id() as i32, &bad).is_err());
+    }
+    assert!(Generation::from_descriptions(0, &valid).is_err());
+    assert!(Generation::from_descriptions(std::process::id() as i32, &[]).is_err());
+}
+
+#[test]
+fn manifest_rejects_truncation_trailing_data_and_stale_owner() {
+    let file = crate::builder::create_guest_ram_memfd(PAGE).unwrap();
+    let generation = Generation::from_immutable_file(
+        &[crate::snapshot::MemoryRegionDesc {
+            gpa: 0,
+            len: PAGE as u64,
+        }],
+        &file,
+    )
+    .unwrap();
+    let bytes = generation.encode_manifest().unwrap();
+    for len in 0..bytes.len() {
+        assert!(
+            Generation::decode_manifest(&bytes[..len]).is_err(),
+            "prefix {len}"
+        );
+    }
+    let mut trailing = bytes.clone();
+    trailing.push(0);
+    assert!(Generation::decode_manifest(&trailing).is_err());
+    let mut stale = bytes.clone();
+    stale[16] ^= 1;
+    assert!(Generation::decode_manifest(&stale).is_err());
+    let imported = Generation::decode_manifest(&bytes).unwrap();
+    drop(generation);
+    drop(file);
+    assert_eq!(
+        imported
+            .restore()
+            .unwrap()
+            .read_obj::<u8>(GuestAddress(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn manifest_imports_backing_in_an_independent_process() {
+    const INPUT: &str = "LIBKRUN_LAYERED_TEST_MANIFEST";
+    if let Some(path) = std::env::var_os(INPUT) {
+        let bytes = std::fs::read(path).unwrap();
+        let image = Generation::decode_manifest(&bytes).unwrap();
+        let memory = image.restore().unwrap();
+        assert_eq!(memory.read_obj::<u8>(GuestAddress(0)).unwrap(), 0x42);
+        assert_eq!(
+            memory.read_obj::<u8>(GuestAddress(PAGE as u64)).unwrap(),
+            0x73
+        );
+        memory.write_slice(&[0x91], GuestAddress(0)).unwrap();
+        let (next, _) = image.capture_quiesced(&memory).unwrap();
+        let grandchild = next.restore().unwrap();
+        assert_eq!(grandchild.read_obj::<u8>(GuestAddress(0)).unwrap(), 0x91);
+        return;
+    }
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = crate::builder::create_guest_ram_memfd(2 * PAGE).unwrap();
+    file.write_all_at(&[0x73; PAGE], PAGE as u64).unwrap();
+    let image = Generation::from_immutable_file(
+        &[crate::snapshot::MemoryRegionDesc {
+            gpa: 0,
+            len: (2 * PAGE) as u64,
+        }],
+        &file,
+    )
+    .unwrap();
+    let memory = image.restore().unwrap();
+    memory.write_slice(&[0x42; PAGE], GuestAddress(0)).unwrap();
+    let (captured, _) = image.capture_quiesced(&memory).unwrap();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path =
+        std::env::temp_dir().join(format!("layered-manifest-{}-{nonce}", std::process::id()));
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .unwrap();
+    output
+        .write_all(&captured.encode_manifest().unwrap())
+        .unwrap();
+    drop(output);
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "layered_restore::manifest_imports_backing_in_an_independent_process",
+            "--nocapture",
+        ])
+        .env(INPUT, &path)
+        .status()
+        .unwrap();
+    std::fs::remove_file(path).unwrap();
+    assert!(status.success());
+    assert_eq!(memory.read_obj::<u8>(GuestAddress(0)).unwrap(), 0x42);
 }
 
 #[test]

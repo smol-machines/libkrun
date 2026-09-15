@@ -20,8 +20,8 @@ pub mod demand_paging;
 pub(crate) mod device_manager;
 #[cfg(target_os = "linux")]
 pub mod generation_guardian;
-#[cfg(all(test, target_os = "linux"))]
-mod layered_restore;
+#[cfg(target_os = "linux")]
+pub mod layered_restore;
 /// Resource store for configured microVM resources.
 pub mod resources;
 /// Signal handling utilities.

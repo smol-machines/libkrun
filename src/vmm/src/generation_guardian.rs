@@ -228,7 +228,7 @@ fn process_start_time(pid: libc::pid_t) -> io::Result<u64> {
 /// Verify that kernel fork will preserve every guest-RAM byte. `fork(2)` does
 /// not isolate a `MAP_SHARED` mapping, so accepting one would let later source
 /// writes silently mutate the supposedly immutable generation.
-fn validate_private_memory_mappings(memory: &GuestMemoryMmap) -> io::Result<()> {
+pub(crate) fn validate_private_memory_mappings(memory: &GuestMemoryMmap) -> io::Result<()> {
     let maps = fs::read_to_string("/proc/self/maps")?;
     for region in memory.iter() {
         let start = memory
