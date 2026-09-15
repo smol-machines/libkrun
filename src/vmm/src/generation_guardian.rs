@@ -767,6 +767,137 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "isolated immutable-file restore feasibility measurement"]
+    fn immutable_file_guardian_preserves_unfaulted_pages_after_unlink() {
+        use std::time::Instant;
+        use vm_memory::GuestAddress;
+        const SIZE: usize = 256 * 1024 * 1024;
+        let dir = test_dir("fg");
+        let path = dir.join("memory.bin");
+        let file = fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.set_len(SIZE as u64).unwrap();
+        // Fully populated input, not a zero-filled sparse-file shortcut.
+        let block = vec![0x73; 1024 * 1024];
+        for offset in (0..SIZE).step_by(block.len()) {
+            file.write_all_at(&block, offset as u64).unwrap();
+        }
+        file.sync_all().unwrap();
+        drop(file);
+        let file = fs::File::open(&path).unwrap();
+        let started = Instant::now();
+        let eager = crate::snapshot::map_guest_memory_file_forkable(
+            &[crate::snapshot::MemoryRegionDesc {
+                gpa: 0,
+                len: SIZE as u64,
+            }],
+            &file,
+        )
+        .unwrap();
+        let eager_us = started.elapsed().as_micros();
+        let allocated: u64 = eager
+            .iter()
+            .map(|region| {
+                use std::os::unix::fs::MetadataExt;
+                region
+                    .file_offset()
+                    .unwrap()
+                    .file()
+                    .metadata()
+                    .unwrap()
+                    .blocks()
+                    * 512
+            })
+            .sum();
+        drop(eager);
+        let started = Instant::now();
+        let memory = crate::snapshot::open_cow_memory_from_pid(
+            std::process::id() as i32,
+            &[crate::snapshot::MemfdRegionDesc {
+                gpa: 0,
+                len: SIZE as u64,
+                fd: file.as_raw_fd(),
+                offset: 0,
+                path: String::new(),
+            }],
+        )
+        .unwrap();
+        let map_us = started.elapsed().as_micros();
+        memory.write_slice(&[0x42; 4096], GuestAddress(0)).unwrap();
+        let started = Instant::now();
+        let first = GenerationGuardian::start(&memory, &dir.join("first.sock")).unwrap();
+        let first_us = started.elapsed().as_micros();
+        memory.write_slice(&[0x91; 4096], GuestAddress(0)).unwrap();
+        let second = GenerationGuardian::start(&memory, &dir.join("second.sock")).unwrap();
+        fs::remove_file(&path).unwrap();
+        drop(file);
+        drop(memory);
+        for (guardian, expected) in [(&first, 0x42), (&second, 0x91)] {
+            let mut source = GuardianPageSource::connect(guardian.description()).unwrap();
+            let mut bytes = [0; 4096];
+            source.read_exact_at(0, 0, &mut bytes).unwrap();
+            assert_eq!(bytes, [expected; 4096]);
+            source
+                .read_exact_at(0, (SIZE - 4096) as u64, &mut bytes)
+                .unwrap();
+            assert_eq!(bytes, [0x73; 4096]);
+            let usage = fs::read_to_string(format!(
+                "/proc/{}/smaps_rollup",
+                guardian.description().guardian_pid
+            ))
+            .unwrap();
+            println!(
+                "guardian_memory {}",
+                usage
+                    .lines()
+                    .filter(|line| line.starts_with("Pss:") || line.starts_with("Rss:"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
+        // Probe the next boundary separately: the existing anonymous clone
+        // pager is not inherited by a raw-forked guardian. This assertion
+        // documents an unsafe composition, not successful nested branching.
+        let source = GuardianPageSource::connect(first.description()).unwrap();
+        let clone = create_demand_paged_memory(
+            &first.description().regions,
+            Box::new(source),
+            UserfaultfdMode::UserModeTest,
+        )
+        .unwrap();
+        clone
+            .memory
+            .write_slice(&[0xA8; 4096], GuestAddress(0))
+            .unwrap();
+        let nested = GenerationGuardian::start(&clone.memory, &dir.join("nested.sock")).unwrap();
+        let mut source = GuardianPageSource::connect(nested.description()).unwrap();
+        let mut bytes = [0; 4096];
+        source.read_exact_at(0, 0, &mut bytes).unwrap();
+        assert_eq!(bytes, [0xA8; 4096]);
+        source
+            .read_exact_at(0, (SIZE - 4096) as u64, &mut bytes)
+            .unwrap();
+        assert_eq!(
+            bytes, [0; 4096],
+            "raw-forked anonymous holes lack the original pager"
+        );
+        println!("nested_guardian_probe untouched_page_correct=false populated_page_correct=true");
+        drop(source);
+        drop(nested);
+        drop(clone);
+        println!(
+            "file_guardian_probe bytes={SIZE} eager_us={eager_us} eager_backing_bytes={allocated} map_us={map_us} first_generation_us={first_us}"
+        );
+        drop(first);
+        drop(second);
+        fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
     fn guardian_rejects_wrong_token() {
         let size = MAX_READ_BYTES;
         let memory = GuestMemoryMmap::from_ranges(&[(vm_memory::GuestAddress(0), size)]).unwrap();
