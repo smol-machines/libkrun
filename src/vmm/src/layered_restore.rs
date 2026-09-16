@@ -791,6 +791,73 @@ fn swapped_pages_are_not_discarded() {
 }
 
 #[test]
+fn descriptor_pressure_before_capture_leaves_running_state_unchanged() {
+    const CHILD: &str = "KRUN_LAYERED_FD_LIMIT_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "layered_restore::descriptor_pressure_before_capture_leaves_running_state_unchanged",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+    let file = crate::builder::create_guest_ram_memfd(2 * PAGE).unwrap();
+    file.write_all_at(&[0x19; 2 * PAGE], 0).unwrap();
+    let base = Image::from_immutable_file(file, 2 * PAGE).unwrap();
+    let source = base.restore().unwrap();
+    source
+        .memory
+        .write_slice(&[0x43; PAGE], GuestAddress(0))
+        .unwrap();
+    let mut limits = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // This subprocess runs only this test; never change the parent test
+    // runner's limits or affect another concurrently running VM/test.
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) },
+        0
+    );
+    let constrained = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: limits.rlim_max,
+    };
+    assert_eq!(
+        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &constrained) },
+        0
+    );
+    let result = source.capture_quiesced();
+    // Restore limits before assertions, formatting, or spawning any work.
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limits) }, 0);
+    assert_eq!(result.err().unwrap().raw_os_error(), Some(libc::EMFILE));
+    let mut actual = [0; 2 * PAGE];
+    source
+        .memory
+        .read_slice(&mut actual, GuestAddress(0))
+        .unwrap();
+    assert_eq!(&actual[..PAGE], &[0x43; PAGE]);
+    assert_eq!(&actual[PAGE..], &[0x19; PAGE]);
+    // This was a pre-installation failure, so a later capture can safely
+    // retry without losing the still-private modifications.
+    let (saved, copied) = source.capture_quiesced().unwrap();
+    assert_eq!(copied, PAGE);
+    saved
+        .restore()
+        .unwrap()
+        .memory
+        .read_slice(&mut actual, GuestAddress(0))
+        .unwrap();
+    assert_eq!(&actual[..PAGE], &[0x43; PAGE]);
+    assert_eq!(&actual[PAGE..], &[0x19; PAGE]);
+}
+
+#[test]
 fn partial_remap_failure_keeps_complete_saved_generation_usable() {
     use std::os::unix::fs::OpenOptionsExt;
     let base_file = crate::builder::create_guest_ram_memfd(2 * PAGE).unwrap();
