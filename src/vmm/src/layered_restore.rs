@@ -152,16 +152,30 @@ impl Generation {
         if file.metadata()?.len() != offset {
             return Err(invalid("RAM file length mismatch"));
         }
-        Self::from_descriptions(std::process::id() as i32, &descriptions)
+        // Restore can run after the launcher has dropped to the VM's UID.
+        // The validated, pre-opened snapshot remains readable through its fd,
+        // but reopening /proc/self/fd would repeat pathname permission checks
+        // against a cache inode owned by the service. Preserve that capability
+        // rather than requiring broader access to the checkpoint cache.
+        let files =
+            std::collections::HashMap::from([(file.as_raw_fd(), Arc::new(file.try_clone()?))]);
+        Self::from_descriptions_with_files(std::process::id() as i32, &descriptions, files)
     }
 
     /// Import immutable handles from a trusted, authenticated generation owner.
     /// Validate the complete layout before creating any guest mapping.
     pub fn from_descriptions(owner: i32, descriptions: &[RegionDescription]) -> io::Result<Self> {
+        Self::from_descriptions_with_files(owner, descriptions, std::collections::HashMap::new())
+    }
+
+    fn from_descriptions_with_files(
+        owner: i32,
+        descriptions: &[RegionDescription],
+        mut files: std::collections::HashMap<i32, Arc<File>>,
+    ) -> io::Result<Self> {
         if owner <= 0 || descriptions.is_empty() || descriptions.len() > 256 {
             return Err(invalid("invalid layered RAM owner or region count"));
         }
-        let mut files = std::collections::HashMap::<i32, Arc<File>>::new();
         let mut regions = Vec::new();
         let mut previous_end = 0;
         let mut extent_count = 0_usize;
@@ -210,7 +224,14 @@ impl Generation {
                     if files.len() >= 1024 {
                         return Err(invalid("too many layered RAM files"));
                     }
-                    let file = Arc::new(File::open(format!("/proc/{owner}/fd/{}", extent.fd))?);
+                    let file = Arc::new(
+                        File::open(format!("/proc/{owner}/fd/{}", extent.fd)).map_err(|error| {
+                            io::Error::new(error.kind(), format!(
+                                "open retained RAM descriptor {} from generation owner {owner}: {error}",
+                                extent.fd
+                            ))
+                        })?,
+                    );
                     files.insert(extent.fd, file.clone());
                     file
                 };
@@ -713,6 +734,32 @@ fn swapped_pages_are_not_discarded() {
     assert!(!private_or_swapped((1 << 63) | (1 << 61)));
     assert!(private_or_swapped(1 << 63));
     assert!(private_or_swapped(1 << 62));
+}
+
+#[test]
+fn restore_keeps_preopened_descriptor_when_path_access_is_revoked() {
+    use crate::snapshot::MemoryRegionDesc;
+    use std::os::unix::fs::PermissionsExt;
+    let file = crate::builder::create_guest_ram_memfd(PAGE).unwrap();
+    file.write_all_at(&[0x6d; PAGE], 0).unwrap();
+    let readonly = File::open(format!("/proc/self/fd/{}", file.as_raw_fd())).unwrap();
+    file.set_permissions(std::fs::Permissions::from_mode(0o000))
+        .unwrap();
+    if unsafe { libc::geteuid() } != 0 {
+        assert!(File::open(format!("/proc/self/fd/{}", readonly.as_raw_fd())).is_err());
+    }
+    let generation = Generation::from_immutable_file(
+        &[MemoryRegionDesc {
+            gpa: 0,
+            len: PAGE as u64,
+        }],
+        &readonly,
+    )
+    .unwrap();
+    drop(readonly);
+    drop(file);
+    let memory = generation.restore().unwrap();
+    assert_eq!(memory.read_obj::<u8>(GuestAddress(0)).unwrap(), 0x6d);
 }
 
 #[test]
