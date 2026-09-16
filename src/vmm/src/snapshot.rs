@@ -1263,7 +1263,7 @@ impl DeferredMemorySave {
     /// The wire format is `SMOLRAM1`, a little-endian u64 logical length, then
     /// exactly that many bytes in portable region order.
     pub fn finish_stream<W: Write>(self, output: &mut W) -> io::Result<Vec<MemoryRegionDesc>> {
-        self.finish_stream_mode(output, false)
+        self.finish_stream_mode(output, false, |_, _| Ok(()))
     }
 
     /// Produce a bounded sparse map and payload from immutable generation RAM.
@@ -1271,13 +1271,23 @@ impl DeferredMemorySave {
         self,
         output: &mut W,
     ) -> io::Result<Vec<MemoryRegionDesc>> {
-        self.finish_stream_mode(output, true)
+        self.finish_stream_mode(output, true, |_, _| Ok(()))
+    }
+
+    /// Hand captured metadata to the consumer before RAM payload output.
+    pub fn finish_sparse_stream_with_header<W: Write>(
+        self,
+        output: &mut W,
+        header: impl FnOnce(&[MemoryRegionDesc], &mut W) -> io::Result<()>,
+    ) -> io::Result<Vec<MemoryRegionDesc>> {
+        self.finish_stream_mode(output, true, header)
     }
 
     fn finish_stream_mode<W: Write>(
         self,
         output: &mut W,
         sparse: bool,
+        header: impl FnOnce(&[MemoryRegionDesc], &mut W) -> io::Result<()>,
     ) -> io::Result<Vec<MemoryRegionDesc>> {
         let (descs, files) = match self.generation {
             DeferredLinuxGeneration::Stable { descs, files } => (descs, files),
@@ -1295,6 +1305,7 @@ impl DeferredMemorySave {
                 len: d.len,
             })
             .collect();
+        header(&regions, output)?;
         if sparse {
             let sources: Vec<_> = descs
                 .iter()
