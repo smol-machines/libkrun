@@ -11,7 +11,13 @@ use std::sync::Arc;
 use vm_memory::mmap::MmapRegion;
 use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestRegionMmap};
 
-const PAGE: usize = 4096;
+fn host_page_size() -> usize {
+    static SIZE: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+            .expect("host page size must be positive")
+    });
+    *SIZE
+}
 /// Same-host live generation format, distinct from a portable checkpoint.
 pub const MANIFEST_MAGIC: [u8; 8] = *b"SMOLLAY1";
 
@@ -233,15 +239,16 @@ impl Generation {
         let mut regions = Vec::new();
         let mut previous_end = 0;
         let mut extent_count = 0_usize;
+        let page_size = host_page_size() as u64;
         for region in descriptions {
             let end = region
                 .gpa
                 .checked_add(region.len)
                 .ok_or_else(|| invalid("RAM address overflow"))?;
             if region.gpa < previous_end
-                || !region.gpa.is_multiple_of(PAGE as u64)
+                || !region.gpa.is_multiple_of(page_size)
                 || region.len == 0
-                || !region.len.is_multiple_of(PAGE as u64)
+                || !region.len.is_multiple_of(page_size)
             {
                 return Err(invalid("invalid or overlapping RAM region"));
             }
@@ -257,8 +264,8 @@ impl Generation {
                 if extent.fd < 0
                     || extent.start != cursor
                     || extent.len == 0
-                    || !extent.len.is_multiple_of(PAGE as u64)
-                    || !extent.offset.is_multiple_of(PAGE as u64)
+                    || !extent.len.is_multiple_of(page_size)
+                    || !extent.offset.is_multiple_of(page_size)
                 {
                     return Err(invalid("invalid layered RAM extent"));
                 }
@@ -551,7 +558,8 @@ impl Image {
     // Holding a descriptor protects against unlink, not in-place modification.
     #[cfg(test)]
     fn from_immutable_file(file: File, len: usize) -> io::Result<Self> {
-        if len == 0 || !len.is_multiple_of(PAGE) || file.metadata()?.len() != len as u64 {
+        if len == 0 || !len.is_multiple_of(host_page_size()) || file.metadata()?.len() != len as u64
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "RAM image size mismatch",
@@ -615,6 +623,35 @@ fn private_or_swapped(entry: u64) -> bool {
     entry & (1 << 62) != 0 || (entry & (1 << 63) != 0 && entry & (1 << 61) == 0)
 }
 
+fn private_page_ranges(
+    pagemap: &File,
+    base: u64,
+    len: usize,
+    page_size: usize,
+) -> io::Result<Vec<(usize, usize)>> {
+    let mut dirty = Vec::<(usize, usize)>::new();
+    let mut entries = vec![0_u8; 8192 * 8];
+    for first in (0..len / page_size).step_by(8192) {
+        let count = (len / page_size - first).min(8192);
+        pagemap.read_exact_at(
+            &mut entries[..count * 8],
+            (base / page_size as u64 + first as u64) * 8,
+        )?;
+        for index in 0..count {
+            let entry = u64::from_ne_bytes(entries[index * 8..index * 8 + 8].try_into().unwrap());
+            if private_or_swapped(entry) {
+                let start = (first + index) * page_size;
+                if let Some(last) = dirty.last_mut().filter(|last| last.1 == start) {
+                    last.1 += page_size;
+                } else {
+                    dirty.push((start, start + page_size));
+                }
+            }
+        }
+    }
+    Ok(dirty)
+}
+
 impl Instance {
     // Requires stopped vCPUs AND devices. Keep the original host addresses so
     // KVM slots stay valid. If a mapping fails the caller must NOT resume;
@@ -659,27 +696,7 @@ impl Instance {
             .memory
             .get_host_address(GuestAddress(self.image.gpa))
             .unwrap() as u64;
-        let mut dirty = Vec::<(usize, usize)>::new();
-        let mut entries = vec![0_u8; 8192 * 8];
-        for first in (0..self.image.len / PAGE).step_by(8192) {
-            let count = (self.image.len / PAGE - first).min(8192);
-            pagemap.read_exact_at(
-                &mut entries[..count * 8],
-                (base / PAGE as u64 + first as u64) * 8,
-            )?;
-            for index in 0..count {
-                let entry =
-                    u64::from_ne_bytes(entries[index * 8..index * 8 + 8].try_into().unwrap());
-                if private_or_swapped(entry) {
-                    let start = (first + index) * PAGE;
-                    if let Some(last) = dirty.last_mut().filter(|last| last.1 == start) {
-                        last.1 += PAGE;
-                    } else {
-                        dirty.push((start, start + PAGE));
-                    }
-                }
-            }
-        }
+        let dirty = private_page_ranges(&pagemap, base, self.image.len, host_page_size())?;
         if dirty.is_empty() {
             return Ok((self.image.clone(), 0));
         }
@@ -783,6 +800,25 @@ impl Instance {
 }
 
 #[test]
+fn dirty_page_ranges_use_host_page_units() {
+    for page_size in [4096, 16384, 65536] {
+        let pagemap = crate::builder::create_guest_ram_memfd(10 * 8).unwrap();
+        // The kernel exposes one entry per host page, not per guest page.
+        let entries = [(1_u64 << 63) | (1_u64 << 61), 1_u64 << 63, 1_u64 << 62];
+        for (index, entry) in entries.iter().enumerate() {
+            pagemap
+                .write_all_at(&entry.to_ne_bytes(), ((7 + index) * 8) as u64)
+                .unwrap();
+        }
+        assert_eq!(
+            private_page_ranges(&pagemap, (7 * page_size) as u64, 3 * page_size, page_size)
+                .unwrap(),
+            vec![(page_size, 3 * page_size)]
+        );
+    }
+}
+
+#[test]
 fn swapped_pages_are_not_discarded() {
     assert!(!private_or_swapped(0));
     assert!(!private_or_swapped((1 << 63) | (1 << 61)));
@@ -802,20 +838,21 @@ fn mapping_exhaustion_during_restore_preserves_existing_instances() {
         (1024..=2_000_000).contains(&max_maps),
         "unexpected host limit; refuse an unbounded stress run"
     );
-    let file = crate::builder::create_guest_ram_memfd(2 * PAGE).unwrap();
-    file.write_all_at(&[0x29; 2 * PAGE], 0).unwrap();
-    let base = Image::from_immutable_file(file, 2 * PAGE).unwrap();
+    let file = crate::builder::create_guest_ram_memfd(2 * host_page_size()).unwrap();
+    file.write_all_at(&vec![0x29; 2 * host_page_size()], 0)
+        .unwrap();
+    let base = Image::from_immutable_file(file, 2 * host_page_size()).unwrap();
     let source = base.restore().unwrap();
     source
         .memory
-        .write_slice(&[0x61; PAGE], GuestAddress(0))
+        .write_slice(&vec![0x61; host_page_size()], GuestAddress(0))
         .unwrap();
     // Reserve virtual addresses without allocating payload RAM. Alternating
     // protection splits VMAs; the kernel's existing per-process limit stops
     // this loop. No sysctl or other process's limits are changed.
     let arena = MmapRegion::<()>::build(
         None,
-        max_maps * 2 * PAGE,
+        max_maps * 2 * host_page_size(),
         libc::PROT_NONE,
         libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
     )
@@ -825,8 +862,8 @@ fn mapping_exhaustion_during_restore_preserves_existing_instances() {
     for index in 0..max_maps {
         let rc = unsafe {
             libc::mprotect(
-                arena.as_ptr().add(index * 2 * PAGE).cast(),
-                PAGE,
+                arena.as_ptr().add(index * 2 * host_page_size()).cast(),
+                host_page_size(),
                 libc::PROT_READ,
             )
         };
@@ -846,29 +883,29 @@ fn mapping_exhaustion_during_restore_preserves_existing_instances() {
         "restore unexpectedly succeeded at the mapping limit"
     );
     println!("host_max_maps={max_maps} successful_splits={splits}");
-    let mut actual = [0; 2 * PAGE];
+    let mut actual = vec![0; 2 * host_page_size()];
     source
         .memory
         .read_slice(&mut actual, GuestAddress(0))
         .unwrap();
-    assert_eq!(&actual[..PAGE], &[0x61; PAGE]);
-    assert_eq!(&actual[PAGE..], &[0x29; PAGE]);
+    assert_eq!(&actual[..host_page_size()], &vec![0x61; host_page_size()]);
+    assert_eq!(&actual[host_page_size()..], &vec![0x29; host_page_size()]);
     let (saved, copied) = source.capture_quiesced().unwrap();
-    assert_eq!(copied, PAGE);
+    assert_eq!(copied, host_page_size());
     saved
         .restore()
         .unwrap()
         .memory
         .read_slice(&mut actual, GuestAddress(0))
         .unwrap();
-    assert_eq!(&actual[..PAGE], &[0x61; PAGE]);
-    assert_eq!(&actual[PAGE..], &[0x29; PAGE]);
+    assert_eq!(&actual[..host_page_size()], &vec![0x61; host_page_size()]);
+    assert_eq!(&actual[host_page_size()..], &vec![0x29; host_page_size()]);
     base.restore()
         .unwrap()
         .memory
         .read_slice(&mut actual, GuestAddress(0))
         .unwrap();
-    assert_eq!(actual, [0x29; 2 * PAGE]);
+    assert_eq!(actual, vec![0x29; 2 * host_page_size()]);
 }
 
 #[test]
@@ -888,7 +925,7 @@ fn capture_reads_back_actual_swapped_private_pages() {
         .write_slice(&vec![0x57; SIZE], GuestAddress(0))
         .unwrap();
     let pagemap = File::open("/proc/self/pagemap").unwrap();
-    let mut entries = vec![0; SIZE / PAGE * 8];
+    let mut entries = vec![0; SIZE / host_page_size() * 8];
     assert_eq!(
         unsafe { libc::madvise(address.cast(), SIZE, libc::MADV_PAGEOUT) },
         0
@@ -896,7 +933,7 @@ fn capture_reads_back_actual_swapped_private_pages() {
     let mut swapped = 0;
     for _ in 0..40 {
         pagemap
-            .read_exact_at(&mut entries, (address as u64 / PAGE as u64) * 8)
+            .read_exact_at(&mut entries, (address as u64 / host_page_size() as u64) * 8)
             .unwrap();
         swapped = entries
             .chunks_exact(8)
@@ -911,7 +948,10 @@ fn capture_reads_back_actual_swapped_private_pages() {
         swapped > 0,
         "no actual swapped pages observed; this is not swap coverage"
     );
-    println!("actual_swapped_pages={swapped} total_pages={}", SIZE / PAGE);
+    println!(
+        "actual_swapped_pages={swapped} total_pages={}",
+        SIZE / host_page_size()
+    );
     let (saved, copied) = source.capture_quiesced().unwrap();
     assert_eq!(copied, SIZE);
     drop(source);
@@ -946,13 +986,14 @@ fn descriptor_pressure_before_capture_leaves_running_state_unchanged() {
         assert!(status.success());
         return;
     }
-    let file = crate::builder::create_guest_ram_memfd(2 * PAGE).unwrap();
-    file.write_all_at(&[0x19; 2 * PAGE], 0).unwrap();
-    let base = Image::from_immutable_file(file, 2 * PAGE).unwrap();
+    let file = crate::builder::create_guest_ram_memfd(2 * host_page_size()).unwrap();
+    file.write_all_at(&vec![0x19; 2 * host_page_size()], 0)
+        .unwrap();
+    let base = Image::from_immutable_file(file, 2 * host_page_size()).unwrap();
     let source = base.restore().unwrap();
     source
         .memory
-        .write_slice(&[0x43; PAGE], GuestAddress(0))
+        .write_slice(&vec![0x43; host_page_size()], GuestAddress(0))
         .unwrap();
     let mut limits = libc::rlimit {
         rlim_cur: 0,
@@ -976,37 +1017,39 @@ fn descriptor_pressure_before_capture_leaves_running_state_unchanged() {
     // Restore limits before assertions, formatting, or spawning any work.
     assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limits) }, 0);
     assert_eq!(result.err().unwrap().raw_os_error(), Some(libc::EMFILE));
-    let mut actual = [0; 2 * PAGE];
+    let mut actual = vec![0; 2 * host_page_size()];
     source
         .memory
         .read_slice(&mut actual, GuestAddress(0))
         .unwrap();
-    assert_eq!(&actual[..PAGE], &[0x43; PAGE]);
-    assert_eq!(&actual[PAGE..], &[0x19; PAGE]);
+    assert_eq!(&actual[..host_page_size()], &vec![0x43; host_page_size()]);
+    assert_eq!(&actual[host_page_size()..], &vec![0x19; host_page_size()]);
     // This was a pre-installation failure, so a later capture can safely
     // retry without losing the still-private modifications.
     let (saved, copied) = source.capture_quiesced().unwrap();
-    assert_eq!(copied, PAGE);
+    assert_eq!(copied, host_page_size());
     saved
         .restore()
         .unwrap()
         .memory
         .read_slice(&mut actual, GuestAddress(0))
         .unwrap();
-    assert_eq!(&actual[..PAGE], &[0x43; PAGE]);
-    assert_eq!(&actual[PAGE..], &[0x19; PAGE]);
+    assert_eq!(&actual[..host_page_size()], &vec![0x43; host_page_size()]);
+    assert_eq!(&actual[host_page_size()..], &vec![0x19; host_page_size()]);
 }
 
 #[test]
 fn partial_remap_failure_keeps_complete_saved_generation_usable() {
     use std::os::unix::fs::OpenOptionsExt;
-    let base_file = crate::builder::create_guest_ram_memfd(2 * PAGE).unwrap();
-    base_file.write_all_at(&[0x11; 2 * PAGE], 0).unwrap();
-    let base = Image::from_immutable_file(base_file, 2 * PAGE).unwrap();
+    let base_file = crate::builder::create_guest_ram_memfd(2 * host_page_size()).unwrap();
+    base_file
+        .write_all_at(&vec![0x11; 2 * host_page_size()], 0)
+        .unwrap();
+    let base = Image::from_immutable_file(base_file, 2 * host_page_size()).unwrap();
     let mut source = base.restore().unwrap();
     source
         .memory
-        .write_slice(&[0x22; PAGE], GuestAddress(0))
+        .write_slice(&vec![0x22; host_page_size()], GuestAddress(0))
         .unwrap();
     let (saved, _) = source.capture_quiesced().unwrap();
     assert_eq!(saved.extents.len(), 2);
@@ -1031,30 +1074,30 @@ fn partial_remap_failure_keeps_complete_saved_generation_usable() {
     assert_eq!(copied, 0);
     drop(source);
     let recovered = saved.restore().unwrap();
-    let mut bytes = [0; 2 * PAGE];
+    let mut bytes = vec![0; 2 * host_page_size()];
     recovered
         .memory
         .read_slice(&mut bytes, GuestAddress(0))
         .unwrap();
-    assert_eq!(&bytes[..PAGE], &[0x22; PAGE]);
-    assert_eq!(&bytes[PAGE..], &[0x11; PAGE]);
+    assert_eq!(&bytes[..host_page_size()], &vec![0x22; host_page_size()]);
+    assert_eq!(&bytes[host_page_size()..], &vec![0x11; host_page_size()]);
     let ancestor = base.restore().unwrap();
     ancestor
         .memory
         .read_slice(&mut bytes, GuestAddress(0))
         .unwrap();
-    assert_eq!(bytes, [0x11; 2 * PAGE]);
+    assert_eq!(bytes, vec![0x11; 2 * host_page_size()]);
 }
 
 #[test]
 fn fragmented_writes_then_dense_capture_preserve_ancestors() {
     use crate::snapshot::MemoryRegionDesc;
     const PAGES: usize = 4096;
-    let file = crate::builder::create_guest_ram_memfd(PAGES * PAGE).unwrap();
+    let file = crate::builder::create_guest_ram_memfd(PAGES * host_page_size()).unwrap();
     let mut generation = Generation::from_immutable_file(
         &[MemoryRegionDesc {
             gpa: 0,
-            len: (PAGES * PAGE) as u64,
+            len: (PAGES * host_page_size()) as u64,
         }],
         &file,
     )
@@ -1065,13 +1108,13 @@ fn fragmented_writes_then_dense_capture_preserve_ancestors() {
         for page in (round..PAGES).step_by(4) {
             memory
                 .write_slice(
-                    &[(round + 1) as u8; PAGE],
-                    GuestAddress((page * PAGE) as u64),
+                    &vec![(round + 1) as u8; host_page_size()],
+                    GuestAddress((page * host_page_size()) as u64),
                 )
                 .unwrap();
         }
         let (next, copied) = generation.capture_quiesced(&memory).unwrap();
-        assert_eq!(copied, PAGES / 4 * PAGE);
+        assert_eq!(copied, PAGES / 4 * host_page_size());
         next.rebase_quiesced(&memory).unwrap();
         ancestors.push(next.clone());
         generation = next;
@@ -1080,10 +1123,10 @@ fn fragmented_writes_then_dense_capture_preserve_ancestors() {
     // A dense overwrite should collapse the fragmented index without changing
     // any previously retained checkpoint, including untouched zero pages.
     memory
-        .write_slice(&vec![0x71; PAGES * PAGE], GuestAddress(0))
+        .write_slice(&vec![0x71; PAGES * host_page_size()], GuestAddress(0))
         .unwrap();
     let (dense, copied) = generation.capture_quiesced(&memory).unwrap();
-    assert_eq!(copied, PAGES * PAGE);
+    assert_eq!(copied, PAGES * host_page_size());
     assert_eq!(dense.regions[0].extents.len(), 1);
     dense.rebase_quiesced(&memory).unwrap();
     for (round, ancestor) in ancestors.into_iter().enumerate() {
@@ -1094,15 +1137,19 @@ fn fragmented_writes_then_dense_capture_preserve_ancestors() {
             } else {
                 0
             };
-            let mut actual = [0; PAGE];
+            let mut actual = vec![0; host_page_size()];
             restored
-                .read_slice(&mut actual, GuestAddress((page * PAGE) as u64))
+                .read_slice(&mut actual, GuestAddress((page * host_page_size()) as u64))
                 .unwrap();
-            assert_eq!(actual, [expected; PAGE], "round={round} page={page}");
+            assert_eq!(
+                actual,
+                vec![expected; host_page_size()],
+                "round={round} page={page}"
+            );
         }
     }
     let restored = dense.restore().unwrap();
-    let mut actual = vec![0; PAGES * PAGE];
+    let mut actual = vec![0; PAGES * host_page_size()];
     restored.read_slice(&mut actual, GuestAddress(0)).unwrap();
     assert!(actual.iter().all(|byte| *byte == 0x71));
 }
@@ -1113,12 +1160,13 @@ fn concurrent_siblings_capture_independent_generations() {
     use std::sync::Barrier;
     const PAGES: usize = 32;
     const SIBLINGS: usize = 8;
-    let file = crate::builder::create_guest_ram_memfd(PAGES * PAGE).unwrap();
-    file.write_all_at(&vec![0x59; PAGES * PAGE], 0).unwrap();
+    let file = crate::builder::create_guest_ram_memfd(PAGES * host_page_size()).unwrap();
+    file.write_all_at(&vec![0x59; PAGES * host_page_size()], 0)
+        .unwrap();
     let base = Generation::from_immutable_file(
         &[MemoryRegionDesc {
             gpa: 0,
-            len: (PAGES * PAGE) as u64,
+            len: (PAGES * host_page_size()) as u64,
         }],
         &file,
     )
@@ -1134,22 +1182,22 @@ fn concurrent_siblings_capture_independent_generations() {
                 // sibling must not strand the others at a later barrier.
                 barrier.wait();
                 let memory = generation.restore().unwrap();
-                let mut expected = vec![0x59; PAGES * PAGE];
+                let mut expected = vec![0x59; PAGES * host_page_size()];
                 for round in 0..4 {
                     // Every sibling first reads untouched backing concurrently,
                     // then modifies the same address with its own distinct bytes.
-                    let offset = round * PAGE;
+                    let offset = round * host_page_size();
                     assert_eq!(
                         memory.read_obj::<u8>(GuestAddress(offset as u64)).unwrap(),
                         0x59
                     );
                     let value = (sibling * 4 + round) as u8;
                     memory
-                        .write_slice(&vec![value; PAGE], GuestAddress(offset as u64))
+                        .write_slice(&vec![value; host_page_size()], GuestAddress(offset as u64))
                         .unwrap();
-                    expected[offset..offset + PAGE].fill(value);
+                    expected[offset..offset + host_page_size()].fill(value);
                     let (next, copied) = generation.capture_quiesced(&memory).unwrap();
-                    assert_eq!(copied, PAGE);
+                    assert_eq!(copied, host_page_size());
                     next.rebase_quiesced(&memory).unwrap();
                     generation = next;
                 }
@@ -1175,8 +1223,8 @@ fn concurrent_siblings_capture_independent_generations() {
 fn restore_keeps_preopened_descriptor_when_path_access_is_revoked() {
     use crate::snapshot::MemoryRegionDesc;
     use std::os::unix::fs::PermissionsExt;
-    let file = crate::builder::create_guest_ram_memfd(PAGE).unwrap();
-    file.write_all_at(&[0x6d; PAGE], 0).unwrap();
+    let file = crate::builder::create_guest_ram_memfd(host_page_size()).unwrap();
+    file.write_all_at(&vec![0x6d; host_page_size()], 0).unwrap();
     let readonly = File::open(format!("/proc/self/fd/{}", file.as_raw_fd())).unwrap();
     file.set_permissions(std::fs::Permissions::from_mode(0o000))
         .unwrap();
@@ -1186,7 +1234,7 @@ fn restore_keeps_preopened_descriptor_when_path_access_is_revoked() {
     let generation = Generation::from_immutable_file(
         &[MemoryRegionDesc {
             gpa: 0,
-            len: PAGE as u64,
+            len: host_page_size() as u64,
         }],
         &readonly,
     )
@@ -1201,18 +1249,22 @@ fn restore_keeps_preopened_descriptor_when_path_access_is_revoked() {
 fn multi_region_import_capture_export_and_rebase() {
     use crate::snapshot::MemoryRegionDesc;
     use vm_memory::GuestMemoryRegion;
-    let file = crate::builder::create_guest_ram_memfd(5 * PAGE).unwrap();
-    file.write_all_at(&[0x11; 2 * PAGE], 0).unwrap();
-    file.write_all_at(&[0x73; 3 * PAGE], (2 * PAGE) as u64)
+    let file = crate::builder::create_guest_ram_memfd(5 * host_page_size()).unwrap();
+    file.write_all_at(&vec![0x11; 2 * host_page_size()], 0)
         .unwrap();
+    file.write_all_at(
+        &vec![0x73; 3 * host_page_size()],
+        (2 * host_page_size()) as u64,
+    )
+    .unwrap();
     let descs = [
         MemoryRegionDesc {
             gpa: 0,
-            len: (2 * PAGE) as u64,
+            len: (2 * host_page_size()) as u64,
         },
         MemoryRegionDesc {
             gpa: 1 << 32,
-            len: (3 * PAGE) as u64,
+            len: (3 * host_page_size()) as u64,
         },
     ];
     let generation = Generation::from_immutable_file(&descs, &file).unwrap();
@@ -1221,14 +1273,19 @@ fn multi_region_import_capture_export_and_rebase() {
     assert_eq!(memory.num_regions(), 2);
     assert_eq!(
         memory.iter().map(|region| region.len()).collect::<Vec<_>>(),
-        vec![(2 * PAGE) as u64, (3 * PAGE) as u64]
+        vec![(2 * host_page_size()) as u64, (3 * host_page_size()) as u64]
     );
-    memory.write_slice(&[0; PAGE], GuestAddress(0)).unwrap();
     memory
-        .write_slice(&[0x91; PAGE], GuestAddress((1 << 32) + (2 * PAGE) as u64))
+        .write_slice(&vec![0; host_page_size()], GuestAddress(0))
+        .unwrap();
+    memory
+        .write_slice(
+            &vec![0x91; host_page_size()],
+            GuestAddress((1 << 32) + (2 * host_page_size()) as u64),
+        )
         .unwrap();
     let (captured, copied) = generation.capture_quiesced(&memory).unwrap();
-    assert_eq!(copied, 2 * PAGE);
+    assert_eq!(copied, 2 * host_page_size());
     let descriptions = captured.descriptions();
     assert_eq!(
         descriptions
@@ -1240,10 +1297,10 @@ fn multi_region_import_capture_export_and_rebase() {
     let imported = Generation::from_descriptions(std::process::id() as i32, &descriptions).unwrap();
     let mut bytes = Vec::new();
     imported.write_to(&mut bytes).unwrap();
-    let mut expected = vec![0; PAGE];
-    expected.extend_from_slice(&[0x11; PAGE]);
-    expected.extend_from_slice(&[0x73; 2 * PAGE]);
-    expected.extend_from_slice(&[0x91; PAGE]);
+    let mut expected = vec![0; host_page_size()];
+    expected.extend_from_slice(&vec![0x11; host_page_size()]);
+    expected.extend_from_slice(&vec![0x73; 2 * host_page_size()]);
+    expected.extend_from_slice(&vec![0x91; host_page_size()]);
     assert_eq!(bytes, expected);
     captured.rebase_quiesced(&memory).unwrap();
     let (_, copied) = captured.capture_quiesced(&memory).unwrap();
@@ -1260,7 +1317,7 @@ fn multi_region_import_capture_export_and_rebase() {
     );
     assert_eq!(
         restored
-            .read_obj::<u8>(GuestAddress((1 << 32) + (2 * PAGE) as u64))
+            .read_obj::<u8>(GuestAddress((1 << 32) + (2 * host_page_size()) as u64))
             .unwrap(),
         0x91
     );
@@ -1270,25 +1327,29 @@ fn multi_region_import_capture_export_and_rebase() {
 fn manifest_handoff_retains_private_checkpoint_after_owner_drops() {
     use crate::snapshot::MemoryRegionDesc;
     use std::os::unix::fs::PermissionsExt;
-    let file = crate::builder::create_guest_ram_memfd(3 * PAGE).unwrap();
-    file.write_all_at(&[0x79; 3 * PAGE], 0).unwrap();
+    let file = crate::builder::create_guest_ram_memfd(3 * host_page_size()).unwrap();
+    file.write_all_at(&vec![0x79; 3 * host_page_size()], 0)
+        .unwrap();
     let readonly = File::open(format!("/proc/self/fd/{}", file.as_raw_fd())).unwrap();
     file.set_permissions(std::fs::Permissions::from_mode(0o000))
         .unwrap();
     let base = Generation::from_immutable_file(
         &[MemoryRegionDesc {
             gpa: 0,
-            len: (3 * PAGE) as u64,
+            len: (3 * host_page_size()) as u64,
         }],
         &readonly,
     )
     .unwrap();
     let parent = base.restore().unwrap();
     parent
-        .write_slice(&[0; PAGE], GuestAddress(PAGE as u64))
+        .write_slice(
+            &vec![0; host_page_size()],
+            GuestAddress(host_page_size() as u64),
+        )
         .unwrap();
     let (snapshot, copied) = base.capture_quiesced(&parent).unwrap();
-    assert_eq!(copied, PAGE);
+    assert_eq!(copied, host_page_size());
     let socket = std::env::temp_dir().join(format!("krun-generation-fds-{}", std::process::id()));
     let (manifest, service) = snapshot.publish_manifest(&socket).unwrap();
     let imported = Generation::decode_manifest(&manifest).unwrap();
@@ -1300,10 +1361,15 @@ fn manifest_handoff_retains_private_checkpoint_after_owner_drops() {
     drop(readonly);
     let child = imported.restore().unwrap();
     assert_eq!(child.read_obj::<u8>(GuestAddress(0)).unwrap(), 0x79);
-    assert_eq!(child.read_obj::<u8>(GuestAddress(PAGE as u64)).unwrap(), 0);
     assert_eq!(
         child
-            .read_obj::<u8>(GuestAddress((2 * PAGE) as u64))
+            .read_obj::<u8>(GuestAddress(host_page_size() as u64))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        child
+            .read_obj::<u8>(GuestAddress((2 * host_page_size()) as u64))
             .unwrap(),
         0x79
     );
@@ -1314,46 +1380,55 @@ fn manifest_handoff_retains_private_checkpoint_after_owner_drops() {
 #[test]
 fn deferred_checkpoint_preserves_boundary_after_source_continues() {
     use crate::snapshot::{DeferredMemorySave, MemoryRegionDesc};
-    let file = crate::builder::create_guest_ram_memfd(3 * PAGE).unwrap();
-    file.write_all_at(&[0x31; 3 * PAGE], 0).unwrap();
+    let file = crate::builder::create_guest_ram_memfd(3 * host_page_size()).unwrap();
+    file.write_all_at(&vec![0x31; 3 * host_page_size()], 0)
+        .unwrap();
     let base = Generation::from_immutable_file(
         &[MemoryRegionDesc {
             gpa: 0,
-            len: (3 * PAGE) as u64,
+            len: (3 * host_page_size()) as u64,
         }],
         &file,
     )
     .unwrap();
     let source = base.restore().unwrap();
     source
-        .write_slice(&[0; PAGE], GuestAddress(PAGE as u64))
+        .write_slice(
+            &vec![0; host_page_size()],
+            GuestAddress(host_page_size() as u64),
+        )
         .unwrap();
     let (saved, copied) = base.capture_quiesced(&source).unwrap();
-    assert_eq!(copied, PAGE);
+    assert_eq!(copied, host_page_size());
     saved.rebase_quiesced(&source).unwrap();
     let stream = DeferredMemorySave::from_layered(saved.clone());
     let sparse = DeferredMemorySave::from_layered(saved);
     source
-        .write_slice(&[0x99; 3 * PAGE], GuestAddress(0))
+        .write_slice(&vec![0x99; 3 * host_page_size()], GuestAddress(0))
         .unwrap();
     drop(base);
     drop(file);
-    let mut expected = vec![0x31; 3 * PAGE];
-    expected[PAGE..2 * PAGE].fill(0);
+    let mut expected = vec![0x31; 3 * host_page_size()];
+    expected[host_page_size()..2 * host_page_size()].fill(0);
     let mut wire = Vec::new();
     let regions = stream.finish_stream(&mut wire).unwrap();
     assert_eq!(regions.len(), 1);
     assert_eq!(&wire[..8], b"SMOLRAM1");
     assert_eq!(
         u64::from_le_bytes(wire[8..16].try_into().unwrap()),
-        (3 * PAGE) as u64
+        (3 * host_page_size()) as u64
     );
     assert_eq!(&wire[16..], expected);
-    let mut output = crate::builder::create_guest_ram_memfd(4 * PAGE).unwrap();
-    output.write_all_at(&[0x77; 4 * PAGE], 0).unwrap();
+    let mut output = crate::builder::create_guest_ram_memfd(4 * host_page_size()).unwrap();
+    output
+        .write_all_at(&vec![0x77; 4 * host_page_size()], 0)
+        .unwrap();
     sparse.finish(&mut output).unwrap();
-    assert_eq!(output.metadata().unwrap().len(), (3 * PAGE) as u64);
-    let mut bytes = vec![0; 3 * PAGE];
+    assert_eq!(
+        output.metadata().unwrap().len(),
+        (3 * host_page_size()) as u64
+    );
+    let mut bytes = vec![0; 3 * host_page_size()];
     output.read_exact_at(&mut bytes, 0).unwrap();
     assert_eq!(bytes, expected);
     assert_eq!(source.read_obj::<u8>(GuestAddress(0)).unwrap(), 0x99);
@@ -1362,11 +1437,11 @@ fn deferred_checkpoint_preserves_boundary_after_source_continues() {
 #[test]
 fn malformed_generation_descriptions_are_rejected_before_mapping() {
     use crate::snapshot::MemoryRegionDesc;
-    let file = crate::builder::create_guest_ram_memfd(2 * PAGE).unwrap();
+    let file = crate::builder::create_guest_ram_memfd(2 * host_page_size()).unwrap();
     let generation = Generation::from_immutable_file(
         &[MemoryRegionDesc {
             gpa: 0,
-            len: (2 * PAGE) as u64,
+            len: (2 * host_page_size()) as u64,
         }],
         &file,
     )
@@ -1374,13 +1449,13 @@ fn malformed_generation_descriptions_are_rejected_before_mapping() {
     let valid = generation.descriptions();
     let mut cases = Vec::new();
     let mut bad = valid.clone();
-    bad[0].extents[0].start = PAGE as u64;
+    bad[0].extents[0].start = host_page_size() as u64;
     cases.push(bad);
     let mut bad = valid.clone();
-    bad[0].extents[0].len = PAGE as u64;
+    bad[0].extents[0].len = host_page_size() as u64;
     cases.push(bad);
     let mut bad = valid.clone();
-    bad[0].extents[0].offset = PAGE as u64;
+    bad[0].extents[0].offset = host_page_size() as u64;
     cases.push(bad);
     let mut bad = valid.clone();
     bad[0].extents[0].fd = -1;
@@ -1409,11 +1484,11 @@ fn malformed_generation_descriptions_are_rejected_before_mapping() {
 
 #[test]
 fn manifest_rejects_truncation_trailing_data_and_stale_owner() {
-    let file = crate::builder::create_guest_ram_memfd(PAGE).unwrap();
+    let file = crate::builder::create_guest_ram_memfd(host_page_size()).unwrap();
     let generation = Generation::from_immutable_file(
         &[crate::snapshot::MemoryRegionDesc {
             gpa: 0,
-            len: PAGE as u64,
+            len: host_page_size() as u64,
         }],
         &file,
     )
@@ -1453,7 +1528,9 @@ fn manifest_imports_backing_in_an_independent_process() {
         let memory = image.restore().unwrap();
         assert_eq!(memory.read_obj::<u8>(GuestAddress(0)).unwrap(), 0x42);
         assert_eq!(
-            memory.read_obj::<u8>(GuestAddress(PAGE as u64)).unwrap(),
+            memory
+                .read_obj::<u8>(GuestAddress(host_page_size() as u64))
+                .unwrap(),
             0x73
         );
         memory.write_slice(&[0x91], GuestAddress(0)).unwrap();
@@ -1464,18 +1541,21 @@ fn manifest_imports_backing_in_an_independent_process() {
     }
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    let file = crate::builder::create_guest_ram_memfd(2 * PAGE).unwrap();
-    file.write_all_at(&[0x73; PAGE], PAGE as u64).unwrap();
+    let file = crate::builder::create_guest_ram_memfd(2 * host_page_size()).unwrap();
+    file.write_all_at(&vec![0x73; host_page_size()], host_page_size() as u64)
+        .unwrap();
     let image = Generation::from_immutable_file(
         &[crate::snapshot::MemoryRegionDesc {
             gpa: 0,
-            len: (2 * PAGE) as u64,
+            len: (2 * host_page_size()) as u64,
         }],
         &file,
     )
     .unwrap();
     let memory = image.restore().unwrap();
-    memory.write_slice(&[0x42; PAGE], GuestAddress(0)).unwrap();
+    memory
+        .write_slice(&vec![0x42; host_page_size()], GuestAddress(0))
+        .unwrap();
     let (captured, _) = image.capture_quiesced(&memory).unwrap();
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1510,7 +1590,7 @@ fn manifest_imports_backing_in_an_independent_process() {
 #[test]
 fn unlinked_readonly_file_outlives_parents_and_generations() {
     use std::os::unix::fs::OpenOptionsExt;
-    const LEN: usize = 32 * PAGE;
+    let len: usize = 32 * host_page_size();
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -1522,21 +1602,24 @@ fn unlinked_readonly_file_outlives_parents_and_generations() {
         .mode(0o600)
         .open(&path)
         .unwrap();
-    file.write_all_at(&[0x73; LEN], 0).unwrap();
+    file.write_all_at(&vec![0x73; len], 0).unwrap();
     drop(file);
     let file = File::open(&path).unwrap();
-    let image = Image::from_immutable_file(file, LEN).unwrap();
+    let image = Image::from_immutable_file(file, len).unwrap();
     let parent = image.restore().unwrap();
     std::fs::remove_file(&path).unwrap();
     parent
         .memory
-        .write_slice(&[0x42; PAGE], GuestAddress(0))
+        .write_slice(&vec![0x42; host_page_size()], GuestAddress(0))
         .unwrap();
     let (first, _) = parent.capture_quiesced().unwrap();
     let child = first.restore().unwrap();
     child
         .memory
-        .write_slice(&[0; PAGE], GuestAddress(PAGE as u64))
+        .write_slice(
+            &vec![0; host_page_size()],
+            GuestAddress(host_page_size() as u64),
+        )
         .unwrap();
     let (second, _) = child.capture_quiesced().unwrap();
     drop(parent);
@@ -1552,14 +1635,14 @@ fn unlinked_readonly_file_outlives_parents_and_generations() {
     assert_eq!(
         grandchild
             .memory
-            .read_obj::<u8>(GuestAddress(PAGE as u64))
+            .read_obj::<u8>(GuestAddress(host_page_size() as u64))
             .unwrap(),
         0
     );
     assert_eq!(
         grandchild
             .memory
-            .read_obj::<u8>(GuestAddress((LEN - PAGE) as u64))
+            .read_obj::<u8>(GuestAddress((len - host_page_size()) as u64))
             .unwrap(),
         0x73
     );
@@ -1567,15 +1650,15 @@ fn unlinked_readonly_file_outlives_parents_and_generations() {
 
 #[test]
 fn repeated_capture_reuses_previous_private_pages() {
-    let file = crate::builder::create_guest_ram_memfd(16 * PAGE).unwrap();
-    let image = Image::from_immutable_file(file, 16 * PAGE).unwrap();
+    let file = crate::builder::create_guest_ram_memfd(16 * host_page_size()).unwrap();
+    let image = Image::from_immutable_file(file, 16 * host_page_size()).unwrap();
     let mut instance = image.restore().unwrap();
     instance
         .memory
-        .write_slice(&[0x73; PAGE], GuestAddress(0))
+        .write_slice(&vec![0x73; host_page_size()], GuestAddress(0))
         .unwrap();
     let (first, copied) = instance.capture_quiesced().unwrap();
-    assert_eq!(copied, PAGE);
+    assert_eq!(copied, host_page_size());
     let address = instance.memory.get_host_address(GuestAddress(0)).unwrap();
     instance.rebase_quiesced(first.clone()).unwrap();
     assert_eq!(
@@ -1586,10 +1669,13 @@ fn repeated_capture_reuses_previous_private_pages() {
     assert_eq!(copied, 0);
     instance
         .memory
-        .write_slice(&[0x91; PAGE], GuestAddress(PAGE as u64))
+        .write_slice(
+            &vec![0x91; host_page_size()],
+            GuestAddress(host_page_size() as u64),
+        )
         .unwrap();
     let (second, copied) = instance.capture_quiesced().unwrap();
-    assert_eq!(copied, PAGE);
+    assert_eq!(copied, host_page_size());
     instance.rebase_quiesced(second.clone()).unwrap();
     let before = first.restore().unwrap();
     let after = second.restore().unwrap();
@@ -1597,7 +1683,7 @@ fn repeated_capture_reuses_previous_private_pages() {
     assert_eq!(
         before
             .memory
-            .read_obj::<u8>(GuestAddress(PAGE as u64))
+            .read_obj::<u8>(GuestAddress(host_page_size() as u64))
             .unwrap(),
         0
     );
@@ -1605,7 +1691,7 @@ fn repeated_capture_reuses_previous_private_pages() {
     assert_eq!(
         after
             .memory
-            .read_obj::<u8>(GuestAddress(PAGE as u64))
+            .read_obj::<u8>(GuestAddress(host_page_size() as u64))
             .unwrap(),
         0x91
     );
@@ -1613,10 +1699,10 @@ fn repeated_capture_reuses_previous_private_pages() {
 
 #[test]
 fn sixty_four_generations_match_full_memory_model() {
-    const LEN: usize = 128 * PAGE;
-    let file = crate::builder::create_guest_ram_memfd(LEN).unwrap();
-    let mut image = Image::from_immutable_file(file, LEN).unwrap();
-    let mut expected = vec![0; LEN];
+    let len: usize = 128 * host_page_size();
+    let file = crate::builder::create_guest_ram_memfd(len).unwrap();
+    let mut image = Image::from_immutable_file(file, len).unwrap();
+    let mut expected = vec![0; len];
     let mut seed = 0x713_4179_u64;
     for generation in 0..64_u8 {
         let mut instance = image.restore().unwrap();
@@ -1624,20 +1710,20 @@ fn sixty_four_generations_match_full_memory_model() {
             seed ^= seed << 13;
             seed ^= seed >> 7;
             seed ^= seed << 17;
-            let offset = (seed as usize % 128) * PAGE;
+            let offset = (seed as usize % 128) * host_page_size();
             let value = if generation % 3 == 0 { 0 } else { generation };
-            expected[offset..offset + PAGE].fill(value);
+            expected[offset..offset + host_page_size()].fill(value);
             instance
                 .memory
                 .write_slice(
-                    &expected[offset..offset + PAGE],
+                    &expected[offset..offset + host_page_size()],
                     GuestAddress(offset as u64),
                 )
                 .unwrap();
         }
         let (next, _) = instance.capture_quiesced().unwrap();
         instance.rebase_quiesced(next.clone()).unwrap();
-        let mut actual = vec![0; LEN];
+        let mut actual = vec![0; len];
         instance
             .memory
             .read_slice(&mut actual, GuestAddress(0))
@@ -1657,35 +1743,45 @@ fn sixty_four_generations_match_full_memory_model() {
 #[ignore = "8 GiB address-space test, not an 8 GiB resident application"]
 fn eight_gib_address_space_branches_without_full_backing_copy() {
     use std::time::Instant;
-    const LEN: usize = 8 * 1024 * 1024 * 1024;
-    let file = crate::builder::create_guest_ram_memfd(LEN).unwrap();
-    file.write_all_at(&[0x73; PAGE], (LEN - PAGE) as u64)
-        .unwrap();
-    let image = Image::from_immutable_file(file, LEN).unwrap();
+    let len: usize = 8 * 1024 * 1024 * 1024;
+    let file = crate::builder::create_guest_ram_memfd(len).unwrap();
+    file.write_all_at(
+        &vec![0x73; host_page_size()],
+        (len - host_page_size()) as u64,
+    )
+    .unwrap();
+    let image = Image::from_immutable_file(file, len).unwrap();
     let begin = Instant::now();
     let parent = image.restore().unwrap();
     let map_us = begin.elapsed().as_micros();
     parent
         .memory
-        .write_slice(&[0x42; PAGE], GuestAddress(0))
+        .write_slice(&vec![0x42; host_page_size()], GuestAddress(0))
         .unwrap();
     let begin = Instant::now();
     let (first, copied) = parent.capture_quiesced().unwrap();
     let capture_us = begin.elapsed().as_micros();
-    assert_eq!(copied, PAGE);
+    assert_eq!(copied, host_page_size());
     let child = first.restore().unwrap();
     child
         .memory
-        .write_slice(&[0x91; PAGE], GuestAddress(PAGE as u64))
+        .write_slice(
+            &vec![0x91; host_page_size()],
+            GuestAddress(host_page_size() as u64),
+        )
         .unwrap();
     let (second, nested_copied) = child.capture_quiesced().unwrap();
-    assert_eq!(nested_copied, PAGE);
+    assert_eq!(nested_copied, host_page_size());
     drop(parent);
     drop(child);
     drop(image);
     drop(first);
     let grandchild = second.restore().unwrap();
-    for (offset, value) in [(0, 0x42), (PAGE, 0x91), (LEN - PAGE, 0x73)] {
+    for (offset, value) in [
+        (0, 0x42),
+        (host_page_size(), 0x91),
+        (len - host_page_size(), 0x73),
+    ] {
         assert_eq!(
             grandchild
                 .memory
@@ -1695,60 +1791,71 @@ fn eight_gib_address_space_branches_without_full_backing_copy() {
         );
     }
     println!(
-        "layered_address_space bytes={LEN} map_us={map_us} capture_us={capture_us} copied={copied} nested_copied={nested_copied}"
+        "layered_address_space bytes={len} map_us={map_us} capture_us={capture_us} copied={copied} nested_copied={nested_copied}"
     );
 }
 
 #[test]
 fn nested_layers_preserve_modified_unread_and_zero_pages() {
-    const LEN: usize = 32 * 1024 * 1024;
-    let file = crate::builder::create_guest_ram_memfd(LEN).unwrap();
-    file.write_all_at(&[0x73; PAGE], (LEN - PAGE) as u64)
+    let len: usize = 32 * 1024 * 1024;
+    let file = crate::builder::create_guest_ram_memfd(len).unwrap();
+    file.write_all_at(
+        &vec![0x73; host_page_size()],
+        (len - host_page_size()) as u64,
+    )
+    .unwrap();
+    file.write_all_at(&vec![0x11; host_page_size()], host_page_size() as u64)
         .unwrap();
-    file.write_all_at(&[0x11; PAGE], PAGE as u64).unwrap();
-    let image = Image::from_immutable_file(file, LEN).unwrap();
+    let image = Image::from_immutable_file(file, len).unwrap();
     let parent = image.restore().unwrap();
     parent
         .memory
-        .write_slice(&[0x42; PAGE], GuestAddress(0))
+        .write_slice(&vec![0x42; host_page_size()], GuestAddress(0))
         .unwrap();
     let (first, copied) = parent.capture_quiesced().unwrap();
-    assert_eq!(copied, PAGE);
+    assert_eq!(copied, host_page_size());
     let child = first.restore().unwrap();
     let sibling = first.restore().unwrap();
     child
         .memory
-        .write_slice(&[0; PAGE], GuestAddress(PAGE as u64))
+        .write_slice(
+            &vec![0; host_page_size()],
+            GuestAddress(host_page_size() as u64),
+        )
         .unwrap();
     child
         .memory
-        .write_slice(&[0x91; PAGE], GuestAddress(0))
+        .write_slice(&vec![0x91; host_page_size()], GuestAddress(0))
         .unwrap();
     let (second, copied) = child.capture_quiesced().unwrap();
-    assert_eq!(copied, 2 * PAGE);
+    assert_eq!(copied, 2 * host_page_size());
     drop(parent);
     drop(child);
     drop(first);
     drop(image);
     let grandchild = second.restore().unwrap();
-    let mut bytes = [0; PAGE];
-    for (offset, value) in [(0, 0x91), (PAGE, 0), (LEN - PAGE, 0x73)] {
+    let mut bytes = vec![0; host_page_size()];
+    for (offset, value) in [
+        (0, 0x91),
+        (host_page_size(), 0),
+        (len - host_page_size(), 0x73),
+    ] {
         grandchild
             .memory
             .read_slice(&mut bytes, GuestAddress(offset as u64))
             .unwrap();
-        assert_eq!(bytes, [value; PAGE]);
+        assert_eq!(bytes, vec![value; host_page_size()]);
     }
     sibling
         .memory
         .read_slice(&mut bytes, GuestAddress(0))
         .unwrap();
-    assert_eq!(bytes, [0x42; PAGE]);
+    assert_eq!(bytes, vec![0x42; host_page_size()]);
     sibling
         .memory
-        .read_slice(&mut bytes, GuestAddress(PAGE as u64))
+        .read_slice(&mut bytes, GuestAddress(host_page_size() as u64))
         .unwrap();
-    assert_eq!(bytes, [0x11; PAGE]);
+    assert_eq!(bytes, vec![0x11; host_page_size()]);
     let (_, copied) = grandchild.capture_quiesced().unwrap();
     assert_eq!(copied, 0, "read-only faults must not become copied deltas");
 }
@@ -1786,7 +1893,7 @@ fn kvm_writes_are_preserved_in_nested_layers() {
                     rip: 0,
                     rflags: 2,
                     rax: value as u64,
-                    rbx: 0x4000 + id * PAGE as u64,
+                    rbx: 0x4000 + id * host_page_size() as u64,
                     ..Default::default()
                 })
                 .unwrap();
@@ -1801,11 +1908,11 @@ fn kvm_writes_are_preserved_in_nested_layers() {
     let first = image.restore().unwrap();
     run(&first, 0x5A);
     let (generation, copied) = first.capture_quiesced().unwrap();
-    assert_eq!(copied, 8 * PAGE);
+    assert_eq!(copied, 8 * host_page_size());
     let second = generation.restore().unwrap();
     run(&second, 0x91);
     let (nested, copied) = second.capture_quiesced().unwrap();
-    assert_eq!(copied, 8 * PAGE);
+    assert_eq!(copied, 8 * host_page_size());
     let third = nested.restore().unwrap();
     let sibling = generation.restore().unwrap();
     drop(image);
@@ -1814,7 +1921,7 @@ fn kvm_writes_are_preserved_in_nested_layers() {
     drop(generation);
     drop(nested);
     for id in 0..8 {
-        let address = GuestAddress(0x4000 + id * PAGE as u64);
+        let address = GuestAddress(0x4000 + id * host_page_size() as u64);
         assert_eq!(third.memory.read_obj::<u8>(address).unwrap(), 0x91);
         assert_eq!(sibling.memory.read_obj::<u8>(address).unwrap(), 0x5A);
     }
