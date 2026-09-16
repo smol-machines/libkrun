@@ -41,9 +41,19 @@ impl<T> PreparedSaves<T> {
     }
 
     pub(crate) fn status(&self, id: &str) -> Option<Status> {
+        self.status_for(Some(id))
+    }
+
+    /// Runtime-wide ownership lets a branch account for a checkpoint started
+    /// by another caller, without trusting a caller-maintained lease file.
+    pub(crate) fn active_status(&self) -> Option<Status> {
+        self.status_for(None)
+    }
+
+    fn status_for(&self, id: Option<&str>) -> Option<Status> {
         let entry = self.entry.lock().unwrap();
         let (current, state) = entry.as_ref()?;
-        if current != id {
+        if id.is_some_and(|id| current != id) {
             return None;
         }
         Some(match state {
@@ -137,17 +147,20 @@ mod tests {
             });
             running.recv_timeout(Duration::from_secs(5)).unwrap();
             let status = saves.status("first");
+            let active_status = saves.active_status();
             let second_refused = saves.reserve("second").is_none();
             let cancellation_refused = !saves.cancel("first");
             let duplicate_refused = saves.finish("first", |_| ()).is_none();
             release.send(()).unwrap();
             assert_eq!(worker.join().unwrap(), Some(8));
             assert_eq!(status, Some(Status::Finishing));
+            assert_eq!(active_status, Some(Status::Finishing));
             assert!(second_refused);
             assert!(cancellation_refused);
             assert!(duplicate_refused);
         });
         assert_eq!(saves.status("first"), None);
+        assert_eq!(saves.active_status(), None);
         assert!(saves.reserve("second").is_some());
     }
 
@@ -156,6 +169,7 @@ mod tests {
         let saves = PreparedSaves::new();
         let reservation = saves.reserve("first").unwrap();
         assert_eq!(saves.status("first"), Some(Status::Preparing));
+        assert_eq!(saves.active_status(), Some(Status::Preparing));
         assert!(!saves.cancel("first"));
         drop(reservation);
         assert_eq!(saves.status("first"), None);
@@ -163,6 +177,7 @@ mod tests {
         assert!(!saves.cancel("wrong"));
         assert!(saves.finish("wrong", |_| ()).is_none());
         assert_eq!(saves.status("next"), Some(Status::Ready));
+        assert_eq!(saves.active_status(), Some(Status::Ready));
         assert_eq!(saves.finish("next", Err::<(), _>), Some(Err(9)));
         assert_eq!(saves.status("next"), None);
     }

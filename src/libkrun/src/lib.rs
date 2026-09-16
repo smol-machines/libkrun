@@ -887,11 +887,13 @@ fn handle_cancel_save(dir: &str) -> String {
     any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
 ))]
 fn handle_save_status(dir: &str) -> String {
-    if dir.is_empty() {
-        return "ERR EINVAL snapshot dir required\n".to_string();
-    }
     // This reports retained RAM ownership, never artifact durability.
-    let state = match PREPARED_SAVES.status(dir) {
+    let status = if dir.is_empty() {
+        PREPARED_SAVES.active_status()
+    } else {
+        PREPARED_SAVES.status(dir)
+    };
+    let state = match status {
         Some(prepared_saves::Status::Preparing) => "preparing",
         Some(prepared_saves::Status::Ready) => "ready",
         Some(prepared_saves::Status::Finishing) => "finishing",
