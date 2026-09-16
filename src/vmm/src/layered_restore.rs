@@ -791,6 +791,70 @@ fn swapped_pages_are_not_discarded() {
 }
 
 #[test]
+fn concurrent_siblings_capture_independent_generations() {
+    use crate::snapshot::MemoryRegionDesc;
+    use std::sync::Barrier;
+    const PAGES: usize = 32;
+    const SIBLINGS: usize = 8;
+    let file = crate::builder::create_guest_ram_memfd(PAGES * PAGE).unwrap();
+    file.write_all_at(&vec![0x59; PAGES * PAGE], 0).unwrap();
+    let base = Generation::from_immutable_file(
+        &[MemoryRegionDesc {
+            gpa: 0,
+            len: (PAGES * PAGE) as u64,
+        }],
+        &file,
+    )
+    .unwrap();
+    drop(file);
+    let barrier = Arc::new(Barrier::new(SIBLINGS));
+    let children: Vec<_> = (0..SIBLINGS)
+        .map(|sibling| {
+            let mut generation = base.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                // Synchronize before fallible work. A failed assertion in one
+                // sibling must not strand the others at a later barrier.
+                barrier.wait();
+                let memory = generation.restore().unwrap();
+                let mut expected = vec![0x59; PAGES * PAGE];
+                for round in 0..4 {
+                    // Every sibling first reads untouched backing concurrently,
+                    // then modifies the same address with its own distinct bytes.
+                    let offset = round * PAGE;
+                    assert_eq!(
+                        memory.read_obj::<u8>(GuestAddress(offset as u64)).unwrap(),
+                        0x59
+                    );
+                    let value = (sibling * 4 + round) as u8;
+                    memory
+                        .write_slice(&vec![value; PAGE], GuestAddress(offset as u64))
+                        .unwrap();
+                    expected[offset..offset + PAGE].fill(value);
+                    let (next, copied) = generation.capture_quiesced(&memory).unwrap();
+                    assert_eq!(copied, PAGE);
+                    next.rebase_quiesced(&memory).unwrap();
+                    generation = next;
+                }
+                (generation, expected)
+            })
+        })
+        .collect();
+    drop(base);
+    let children: Vec<_> = children
+        .into_iter()
+        .map(|child| child.join().unwrap())
+        .collect();
+    // No original mapping or parent is alive. Each independently captured
+    // generation must still export its own state, including explicit zeros.
+    for (generation, expected) in children {
+        let mut actual = Vec::new();
+        generation.write_to(&mut actual).unwrap();
+        assert_eq!(actual, expected);
+    }
+}
+
+#[test]
 fn restore_keeps_preopened_descriptor_when_path_access_is_revoked() {
     use crate::snapshot::MemoryRegionDesc;
     use std::os::unix::fs::PermissionsExt;
