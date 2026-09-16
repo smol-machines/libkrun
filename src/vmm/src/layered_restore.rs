@@ -41,6 +41,26 @@ pub struct Generation {
 }
 
 impl Generation {
+    pub fn publish_manifest(
+        &self,
+        socket: &std::path::Path,
+    ) -> io::Result<(Vec<u8>, crate::retained_fds::RetainedFiles)> {
+        use std::os::unix::ffi::OsStrExt;
+        let mut bytes = self.encode_manifest()?;
+        let mut files = std::collections::BTreeMap::new();
+        for region in &self.regions {
+            for extent in &region.extents {
+                files.insert(extent.file.as_raw_fd(), extent.file.clone());
+            }
+        }
+        let (service, token) = crate::retained_fds::RetainedFiles::start(socket, files)?;
+        bytes[12..16].copy_from_slice(&1u32.to_le_bytes());
+        let path = socket.as_os_str().as_bytes();
+        bytes.extend_from_slice(&(path.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(path);
+        bytes.extend_from_slice(&token);
+        Ok((bytes, service))
+    }
     /// Encode references to this process's retained immutable descriptors.
     /// Keep this generation alive until importers acquire their own handles.
     pub fn encode_manifest(&self) -> io::Result<Vec<u8>> {
@@ -85,7 +105,8 @@ impl Generation {
             return Err(invalid("invalid layered RAM manifest magic"));
         }
         let pid = u32::from_le_bytes(take(&mut remaining)?);
-        if pid == 0 || pid > i32::MAX as u32 || take::<4>(&mut remaining)? != [0; 4] {
+        let transport = u32::from_le_bytes(take(&mut remaining)?);
+        if pid == 0 || pid > i32::MAX as u32 || transport > 1 {
             return Err(invalid("invalid layered RAM owner/header"));
         }
         let start = u64::from_le_bytes(take(&mut remaining)?);
@@ -114,13 +135,46 @@ impl Generation {
             }
             descriptions.push(RegionDescription { gpa, len, extents });
         }
+        let handoff = if transport == 1 {
+            use std::os::unix::ffi::OsStrExt;
+            let len = u16::from_le_bytes(take(&mut remaining)?) as usize;
+            if len == 0 || len > 100 {
+                return Err(invalid("invalid checkpoint handoff path length"));
+            }
+            let path = remaining
+                .get(..len)
+                .ok_or_else(|| invalid("truncated checkpoint handoff path"))?;
+            let path = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(path));
+            if !path.is_absolute() {
+                return Err(invalid("checkpoint handoff path must be absolute"));
+            }
+            remaining = &remaining[len..];
+            Some((path, take::<32>(&mut remaining)?))
+        } else {
+            None
+        };
         if !remaining.is_empty() {
             return Err(invalid("trailing layered RAM manifest data"));
         }
         if process_start_time(pid)? != start {
             return Err(invalid("layered RAM owner identity changed"));
         }
-        let generation = Self::from_descriptions(pid as i32, &descriptions)?;
+        let generation = if let Some((path, token)) = handoff {
+            let keys: Vec<_> = descriptions
+                .iter()
+                .flat_map(|region| region.extents.iter().map(|extent| extent.fd))
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let files = crate::retained_fds::receive(&path, &token, pid, &keys)?;
+            Self::from_descriptions_with_files(
+                pid as i32,
+                &descriptions,
+                files.into_iter().collect(),
+            )?
+        } else {
+            Self::from_descriptions(pid as i32, &descriptions)?
+        };
         if process_start_time(pid)? != start {
             return Err(invalid("layered RAM owner changed during import"));
         }
@@ -829,6 +883,50 @@ fn multi_region_import_capture_export_and_rebase() {
             .unwrap(),
         0x91
     );
+}
+
+#[test]
+fn manifest_handoff_retains_private_checkpoint_after_owner_drops() {
+    use crate::snapshot::MemoryRegionDesc;
+    use std::os::unix::fs::PermissionsExt;
+    let file = crate::builder::create_guest_ram_memfd(3 * PAGE).unwrap();
+    file.write_all_at(&[0x79; 3 * PAGE], 0).unwrap();
+    let readonly = File::open(format!("/proc/self/fd/{}", file.as_raw_fd())).unwrap();
+    file.set_permissions(std::fs::Permissions::from_mode(0o000))
+        .unwrap();
+    let base = Generation::from_immutable_file(
+        &[MemoryRegionDesc {
+            gpa: 0,
+            len: (3 * PAGE) as u64,
+        }],
+        &readonly,
+    )
+    .unwrap();
+    let parent = base.restore().unwrap();
+    parent
+        .write_slice(&[0; PAGE], GuestAddress(PAGE as u64))
+        .unwrap();
+    let (snapshot, copied) = base.capture_quiesced(&parent).unwrap();
+    assert_eq!(copied, PAGE);
+    let socket = std::env::temp_dir().join(format!("krun-generation-fds-{}", std::process::id()));
+    let (manifest, service) = snapshot.publish_manifest(&socket).unwrap();
+    let imported = Generation::decode_manifest(&manifest).unwrap();
+    drop(service);
+    drop(snapshot);
+    drop(base);
+    drop(parent);
+    drop(file);
+    drop(readonly);
+    let child = imported.restore().unwrap();
+    assert_eq!(child.read_obj::<u8>(GuestAddress(0)).unwrap(), 0x79);
+    assert_eq!(child.read_obj::<u8>(GuestAddress(PAGE as u64)).unwrap(), 0);
+    assert_eq!(
+        child
+            .read_obj::<u8>(GuestAddress((2 * PAGE) as u64))
+            .unwrap(),
+        0x79
+    );
+    assert!(Generation::decode_manifest(&manifest).is_err());
 }
 
 #[cfg(target_arch = "x86_64")]

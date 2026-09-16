@@ -1303,9 +1303,7 @@ fn handle_fork(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
         #[cfg(target_os = "linux")]
         vmm::ForkMemory::Layered(generation) => (
             generation.memory_regions().len(),
-            generation
-                .encode_manifest()
-                .and_then(|bytes| atomic_write_file(&dir.join("manifest.bin"), &bytes)),
+            publish_layered_manifest(vmm, &generation, dir),
         ),
     };
     if let Err(e) = written {
@@ -1417,10 +1415,7 @@ fn handle_fork_continue_inner(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str, demand_page
     match generation {
         #[cfg(target_os = "linux")]
         vmm::ForkContinueRamGeneration::Layered(generation) => {
-            if let Err(error) = generation
-                .encode_manifest()
-                .and_then(|bytes| atomic_write_file(&dir.join("manifest.bin"), &bytes))
-            {
+            if let Err(error) = publish_layered_manifest(vmm, &generation, dir) {
                 let _ = std::fs::remove_file(dir.join("checkpoint.bin"));
                 return format!(
                     "ERR EIO write layered manifest: {error}; source already resumed\n"
@@ -1462,6 +1457,22 @@ fn handle_fork_continue_inner(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str, demand_page
             )
         }
     }
+}
+
+#[cfg(all(fork_supported, target_os = "linux"))]
+fn publish_layered_manifest(
+    vmm: &Arc<Mutex<vmm::Vmm>>,
+    generation: &vmm::layered_restore::Generation,
+    dir: &std::path::Path,
+) -> std::io::Result<()> {
+    let (bytes, service) = generation.publish_manifest(&dir.join("f"))?;
+    let manifest = dir.join("manifest.bin");
+    atomic_write_file(&manifest, &bytes)?;
+    if let Err(error) = vmm.lock().unwrap().retain_layered_export(service) {
+        let _ = std::fs::remove_file(manifest);
+        return Err(error);
+    }
+    Ok(())
 }
 
 #[cfg(fork_supported)]

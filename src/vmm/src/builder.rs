@@ -1162,6 +1162,8 @@ pub fn build_microvm(
         #[cfg(target_os = "linux")]
         layered_ram: restore_layered_ram,
         #[cfg(target_os = "linux")]
+        layered_exports: Vec::new(),
+        #[cfg(target_os = "linux")]
         layered_device_regions: _shm_manager
             .regions()
             .iter()

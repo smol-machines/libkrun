@@ -24,6 +24,8 @@ pub mod generation_guardian;
 pub mod layered_restore;
 /// Resource store for configured microVM resources.
 pub mod resources;
+#[cfg(target_os = "linux")]
+pub mod retained_fds;
 /// Signal handling utilities.
 #[cfg(target_os = "linux")]
 pub mod signal_handler;
@@ -329,6 +331,8 @@ pub struct Vmm {
     #[cfg(target_os = "linux")]
     layered_device_regions: Vec<u64>,
     #[cfg(target_os = "linux")]
+    layered_exports: Vec<retained_fds::RetainedFiles>,
+    #[cfg(target_os = "linux")]
     ram_remap_failure: Option<String>,
     guest_memory: GuestMemoryMmap,
     arch_memory_info: ArchMemoryInfo,
@@ -427,6 +431,21 @@ fn has_memfd_backed_memory(descs: &[snapshot::MemfdRegionDesc]) -> bool {
 }
 
 impl Vmm {
+    #[cfg(target_os = "linux")]
+    pub fn retain_layered_export(
+        &mut self,
+        service: retained_fds::RetainedFiles,
+    ) -> std::io::Result<()> {
+        self.layered_exports
+            .retain(|service| !service.is_finished());
+        if self.layered_exports.len() >= 128 {
+            return Err(std::io::Error::other(
+                "too many retained RAM handoffs; remove unused branch generations",
+            ));
+        }
+        self.layered_exports.push(service);
+        Ok(())
+    }
     #[cfg(target_os = "linux")]
     fn capture_layered_ram(&mut self) -> Result<Option<layered_restore::Generation>> {
         let Some(current) = &self.layered_ram else {
