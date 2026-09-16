@@ -7,6 +7,9 @@ jobs:
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v4
+
+      - name: Test independent guest selection
+        run: python3 tests/test_guest_selection.py
       
       - name: Setup build environment
         uses: ./.github/actions/setup-build-env

@@ -5,6 +5,13 @@ The testing framework here allows you to write code to configure libkrun (using 
 The tests can be ran using `make test` (from the main libkrun directory).
 You can also run `./run.sh` inside the `test` directory. When using the `./run.sh` script you probably want specify the `PKG_CONFIG_PATH` enviroment variable, otherwise you will be testing the system wide installation of libkrun.
 
+Use `KRUN_TEST_FREEBSD=0 make test` for Linux guests only, without downloading
+or compiling FreeBSD assets. This also ignores cached FreeBSD assets and
+inherited FreeBSD kernel/ISO environment variables. Core CI uses this mode.
+Separate FreeBSD compatibility jobs use `KRUN_TEST_FREEBSD=1 make test` and
+fail if required assets are unavailable. The default `auto` retains the
+existing optional FreeBSD behavior for local runs.
+
 ## Running on macOS
 
 ### Prerequisites
@@ -86,4 +93,7 @@ With the sysroot/init assets built, `run.sh` (or `make test`) will automatically
 - Build `target/freebsd-test-rootfs.iso` from `init-freebsd` + the FreeBSD `guest-agent`
 - Set `KRUN_TEST_FREEBSD_KERNEL_PATH` and `KRUN_TEST_FREEBSD_ISO_PATH` for the runner
 
-FreeBSD tests are **skipped** (not failed) when the kernel or ISO are unavailable, so the test suite still passes without FreeBSD assets.
+In default `auto` mode, FreeBSD tests are **skipped** when the kernel or ISO
+are unavailable. Set `KRUN_TEST_FREEBSD=1` to require them instead, as the
+dedicated compatibility CI jobs do. A failure in those jobs does not cancel
+the independent Linux-guest jobs.
