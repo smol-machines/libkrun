@@ -791,6 +791,55 @@ fn swapped_pages_are_not_discarded() {
 }
 
 #[test]
+fn partial_remap_failure_keeps_complete_saved_generation_usable() {
+    use std::os::unix::fs::OpenOptionsExt;
+    let base_file = crate::builder::create_guest_ram_memfd(2 * PAGE).unwrap();
+    base_file.write_all_at(&[0x11; 2 * PAGE], 0).unwrap();
+    let base = Image::from_immutable_file(base_file, 2 * PAGE).unwrap();
+    let mut source = base.restore().unwrap();
+    source
+        .memory
+        .write_slice(&[0x22; PAGE], GuestAddress(0))
+        .unwrap();
+    let (saved, _) = source.capture_quiesced().unwrap();
+    assert_eq!(saved.extents.len(), 2);
+    let mut unavailable = saved.clone();
+    // O_PATH keeps a real, owned descriptor but cannot back mmap. The first
+    // extent installs normally; the second deterministically returns EBADF.
+    let path_only = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH)
+        .open(format!(
+            "/proc/self/fd/{}",
+            saved.extents[1].file.as_raw_fd()
+        ))
+        .unwrap();
+    unavailable.extents[1].file = Arc::new(path_only);
+    let error = source.rebase_quiesced(unavailable).unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+    // The first mapping really changed: it is now a clean file-backed view.
+    // Recapturing against `base` would omit that page, so callers must latch
+    // the failure instead of treating an already-paused VM as capture-ready.
+    let (_, copied) = source.capture_quiesced().unwrap();
+    assert_eq!(copied, 0);
+    drop(source);
+    let recovered = saved.restore().unwrap();
+    let mut bytes = [0; 2 * PAGE];
+    recovered
+        .memory
+        .read_slice(&mut bytes, GuestAddress(0))
+        .unwrap();
+    assert_eq!(&bytes[..PAGE], &[0x22; PAGE]);
+    assert_eq!(&bytes[PAGE..], &[0x11; PAGE]);
+    let ancestor = base.restore().unwrap();
+    ancestor
+        .memory
+        .read_slice(&mut bytes, GuestAddress(0))
+        .unwrap();
+    assert_eq!(bytes, [0x11; 2 * PAGE]);
+}
+
+#[test]
 fn fragmented_writes_then_dense_capture_preserve_ancestors() {
     use crate::snapshot::MemoryRegionDesc;
     const PAGES: usize = 4096;

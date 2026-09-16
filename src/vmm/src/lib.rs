@@ -430,7 +430,78 @@ fn has_memfd_backed_memory(descs: &[snapshot::MemfdRegionDesc]) -> bool {
     descs.iter().any(|desc| desc.fd >= 0)
 }
 
+#[cfg(target_os = "linux")]
+fn ensure_ram_mapping_valid(failure: Option<&str>) -> Result<()> {
+    match failure {
+        Some(error) => Err(Error::Snapshot(format!(
+            "cannot capture or resume after RAM remap failure: {error}; restore a saved checkpoint into a new machine"
+        ))),
+        None => Ok(()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn failed_ram_mapping_rejects_repeated_operations() {
+    assert!(ensure_ram_mapping_valid(None).is_ok());
+    for _ in 0..3 {
+        let error = ensure_ram_mapping_valid(Some("mapping allocation failed")).unwrap_err();
+        assert!(error.to_string().contains("cannot capture or resume"));
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+#[test]
+fn paused_vm_with_failed_ram_mapping_cannot_capture_or_rearm() {
+    let exit_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap();
+    let pio = PortIODeviceManager::new(
+        Arc::new(Mutex::new(devices::legacy::Cmos::new(4096, 0))),
+        Vec::new(),
+        exit_evt.try_clone().unwrap(),
+    )
+    .unwrap();
+    let mut mmio_base = arch::MMIO_MEM_START;
+    let mut vmm = Vmm {
+        demand_pager: None,
+        layered_ram: None,
+        layered_device_regions: Vec::new(),
+        layered_exports: Vec::new(),
+        ram_remap_failure: Some("partial mapping installation".into()),
+        guest_memory: GuestMemoryMmap::from_ranges(&[(vm_memory::GuestAddress(0), 4096)]).unwrap(),
+        arch_memory_info: ArchMemoryInfo::default(),
+        kernel_cmdline: KernelCmdline::new(arch::CMDLINE_MAX_SIZE),
+        vcpus_handles: Vec::new(),
+        run_state: VmmRunState::Paused,
+        paused_at: None,
+        devices_quiesced: true,
+        exit_evt,
+        vm: Vm::new(&kvm_ioctls::Kvm::new().unwrap()).unwrap(),
+        exit_observers: Vec::new(),
+        exit_code: Arc::new(AtomicI32::new(i32::MAX)),
+        #[cfg(feature = "blk")]
+        retained_generation_files: Vec::new(),
+        mmio_device_manager: MMIODeviceManager::new(
+            &mut mmio_base,
+            (arch::IRQ_BASE, arch::IRQ_MAX),
+        ),
+        balloon: None,
+        pio_device_manager: pio,
+    };
+    for _ in 0..3 {
+        assert!(vmm.pause().is_err());
+        assert!(vmm.capture_layered_ram().is_err());
+        assert!(vmm.resume().is_err());
+        vmm.rearm_devices();
+        assert!(vmm.devices_quiesced);
+        assert!(matches!(vmm.run_state, VmmRunState::Paused));
+    }
+}
+
 impl Vmm {
+    #[cfg(target_os = "linux")]
+    fn ensure_ram_mapping_valid(&self) -> Result<()> {
+        ensure_ram_mapping_valid(self.ram_remap_failure.as_deref())
+    }
     #[cfg(target_os = "linux")]
     pub fn retain_layered_export(
         &mut self,
@@ -448,6 +519,7 @@ impl Vmm {
     }
     #[cfg(target_os = "linux")]
     fn capture_layered_ram(&mut self) -> Result<Option<layered_restore::Generation>> {
+        self.ensure_ram_mapping_valid()?;
         let Some(current) = &self.layered_ram else {
             return Ok(None);
         };
@@ -458,6 +530,10 @@ impl Vmm {
             next.rebase_quiesced_excluding(&self.guest_memory, &self.layered_device_regions)
         {
             self.ram_remap_failure = Some(error.to_string());
+            // Keep the complete captured backing even if installation stopped
+            // partway through. Neither resume nor another capture may inspect
+            // the partially replaced mappings as a valid generation.
+            self.layered_ram = Some(next);
             return Err(Error::Snapshot(format!(
                 "install captured RAM generation: {error}; VM remains stopped"
             )));
@@ -645,6 +721,12 @@ impl Vmm {
 
     /// Re-arm device workers quiesced by [`Self::quiesce_devices`].
     pub fn rearm_devices(&mut self) {
+        // Capture error cleanup can call this before attempting resume. Keep
+        // device writers stopped too when RAM installation failed partway.
+        #[cfg(target_os = "linux")]
+        if self.ram_remap_failure.is_some() {
+            return;
+        }
         if self.devices_quiesced {
             self.mmio_device_manager.rearm_devices();
             self.devices_quiesced = false;
@@ -1557,6 +1639,8 @@ impl Vmm {
 
     /// Pause the microVM.
     pub fn pause(&mut self) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        self.ensure_ram_mapping_valid()?;
         match self.run_state {
             VmmRunState::Paused => Ok(()),
             VmmRunState::Running | VmmRunState::Resuming => {
@@ -1583,11 +1667,7 @@ impl Vmm {
     /// Resume the microVM.
     pub fn resume(&mut self) -> Result<()> {
         #[cfg(target_os = "linux")]
-        if let Some(error) = &self.ram_remap_failure {
-            return Err(Error::Snapshot(format!(
-                "cannot resume after RAM remap failure: {error}; restore the saved generation"
-            )));
-        }
+        self.ensure_ram_mapping_valid()?;
         match self.run_state {
             VmmRunState::Running => Ok(()),
             VmmRunState::Paused | VmmRunState::Pausing => {
