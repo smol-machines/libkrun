@@ -826,40 +826,16 @@ impl File {
         err
     }
 
-    /// Attempt to discard range by truncating the file.
-    ///
-    /// If the given range is at the end of the file, discard it by simply truncating the file.
-    /// Return `true` on success.
-    ///
-    /// If the range is not at the end of the file, i.e. another method of discarding is needed,
-    /// return `false`.
-    fn try_discard_by_truncate(&self, offset: u64, length: u64) -> io::Result<bool> {
-        // Prevent modifications to the file length
-        #[allow(clippy::readonly_write_lock)]
-        let file = self.file.write().unwrap();
-
-        let size = self.size.load(Ordering::Relaxed);
-        if offset >= size {
-            // Nothing to do
-            return Ok(true);
-        }
-
-        // If `offset + length` overflows, we can just assume it ends at `size`.  (Anything past
-        // `size is irrelevant anyway.)
-        let end = offset.checked_add(length).unwrap_or(size);
-        if end < size {
-            return Ok(false);
-        }
-
-        file.set_len(offset)?;
-        Ok(true)
-    }
-
     /// Ensure the given range reads back as zeroes, or return an error.
     async fn discard_to_zero(&self, offset: u64, length: u64) -> io::Result<()> {
-        if self.try_discard_by_truncate(offset, length)? {
+        // A raw disk's capacity is its file length. Truncating a discarded tail
+        // keeps this open instance's cached size but changes what a later
+        // restore or branch sees. Reclaim blocks without changing that length.
+        let size = self.size.load(Ordering::Relaxed);
+        if offset >= size || length == 0 {
             return Ok(());
         }
+        let length = length.min(size - offset);
 
         if self.discard_unsupported.load(Ordering::Relaxed) {
             Err(io::ErrorKind::Unsupported.into())

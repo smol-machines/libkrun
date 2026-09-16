@@ -972,4 +972,71 @@ mod overlay_tests {
 
         std::fs::remove_file(&overlay_path).ok();
     }
+
+    fn tail_discard_keeps_raw_capacity(zero: bool) {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let base = TempFile::new().unwrap();
+        let base_path = base.as_path().to_str().unwrap();
+        let size = 4 * 1024 * 1024;
+        base.as_file().set_len(size).unwrap();
+        let mut file = base.as_file();
+        file.write_all(b"keep").unwrap();
+        file.seek(SeekFrom::Start(size - 4)).unwrap();
+        file.write_all(b"tail").unwrap();
+        let (disk, _) = open_disk_format(
+            base_path,
+            ImageType::Raw,
+            true,
+            false,
+            false,
+            BlockIoEngine::Sync,
+            None,
+        )
+        .unwrap();
+        if zero {
+            disk.discard_to_zero(size / 2, size / 2).unwrap();
+        } else {
+            disk.discard_to_any(size / 2, size / 2).unwrap();
+        }
+        assert_eq!(disk.size(), size);
+        assert_eq!(
+            base.as_file().metadata().unwrap().len(),
+            size,
+            "discard must not change the capacity seen by the next branch"
+        );
+        let mut bytes = [0; 4];
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"keep");
+        file.seek(SeekFrom::Start(size - 4)).unwrap();
+        file.read_exact(&mut bytes).unwrap();
+        assert_eq!(bytes, [0; 4]);
+        drop(disk);
+        let overlay_path = format!("{base_path}.tail.qcow2");
+        create_overlay(&overlay_path, base_path, ImageType::Raw).unwrap();
+        let (overlay, _) = open_disk_format(
+            &overlay_path,
+            ImageType::Qcow2,
+            false,
+            false,
+            false,
+            BlockIoEngine::Sync,
+            None,
+        )
+        .unwrap();
+        assert_eq!(overlay.size(), size);
+        drop(overlay);
+        std::fs::remove_file(overlay_path).unwrap();
+    }
+
+    #[test]
+    fn raw_tail_discard_keeps_capacity_for_branching() {
+        tail_discard_keeps_raw_capacity(false);
+    }
+
+    #[test]
+    fn raw_tail_zeroing_keeps_capacity_for_branching() {
+        tail_discard_keeps_raw_capacity(true);
+    }
 }
