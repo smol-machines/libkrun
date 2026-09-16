@@ -80,7 +80,8 @@ jobs:
       
       - name: Install libkrunfw
         run: |
-          curl -fL --retry 3 -o /tmp/libkrunfw-x86_64.tgz "https://github.com/containers/libkrunfw/releases/download/$LIBKRUNFW_VERSION/libkrunfw-x86_64.tgz"
+          curl -fL --retry 3 -o /tmp/libkrunfw-x86_64.tgz "https://github.com/libkrun/libkrunfw/releases/download/$LIBKRUNFW_VERSION/libkrunfw-x86_64.tgz"
+          echo 'c169206b01c89fbe134f1728bf4f988702bc7f73b4cf73e6fdece447d6fceca1  /tmp/libkrunfw-x86_64.tgz' | sha256sum --check --strict
           mkdir tmp && tar xf /tmp/libkrunfw-x86_64.tgz -C tmp && sudo mv tmp/lib64/* /lib/x86_64-linux-gnu
       
       - name: Integration tests
@@ -164,7 +165,8 @@ jobs:
       
       - name: Install libkrunfw
         run: |
-          curl -fL --retry 3 -o /tmp/libkrunfw-aarch64.tgz "https://github.com/containers/libkrunfw/releases/download/$LIBKRUNFW_VERSION/libkrunfw-aarch64.tgz"
+          curl -fL --retry 3 -o /tmp/libkrunfw-aarch64.tgz "https://github.com/libkrun/libkrunfw/releases/download/$LIBKRUNFW_VERSION/libkrunfw-aarch64.tgz"
+          echo 'b04c9a5520a1ea52b5b35d87559566872246145961c4b6978034c9b9be54b89b  /tmp/libkrunfw-aarch64.tgz' | sha256sum --check --strict
           mkdir tmp && tar xf /tmp/libkrunfw-aarch64.tgz -C tmp && sudo mv tmp/lib64/* /lib/aarch64-linux-gnu
 
       - name: Clean up tests directory
