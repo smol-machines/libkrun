@@ -618,7 +618,7 @@ fn private_or_swapped(entry: u64) -> bool {
 impl Instance {
     // Requires stopped vCPUs AND devices. Keep the original host addresses so
     // KVM slots stay valid. If a mapping fails the caller must NOT resume;
-    // production integration needs explicit fail-closed/rollback handling.
+    // the VMM records that failure and refuses subsequent resume requests.
     fn rebase_quiesced(&mut self, image: Image) -> io::Result<()> {
         if image.len != self.image.len {
             return Err(io::Error::new(
@@ -651,8 +651,8 @@ impl Instance {
         Ok(())
     }
 
-    // Requires all writers to be quiesced. This is deliberately test-only until
-    // device mappings, admission accounting, capture and ABI ownership are wired.
+    // Requires all writers to be quiesced. The caller validates private RAM
+    // views and excludes device-owned mappings before scanning page state.
     fn capture_quiesced(&self) -> io::Result<(Image, usize)> {
         let pagemap = File::open("/proc/self/pagemap")?;
         let base = self
