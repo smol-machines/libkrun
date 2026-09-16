@@ -1,6 +1,10 @@
 name: Integration tests
 on: [pull_request]
 
+env:
+  # Use a release with published binaries; latest may be source-only.
+  LIBKRUNFW_VERSION: v5.5.0
+
 jobs:
   integration-tests-x86_64:
     name: Integration Tests (Linux x86_64)
@@ -75,15 +79,8 @@ jobs:
           sudo make install
       
       - name: Install libkrunfw
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Authenticate the API call so it is not throttled by GitHub's 60/hr
-          # anonymous rate limit, which resolves TAG to null and makes the asset
-          # download 404 with a 9-byte "Not Found" that tar then chokes on.
-          TAG=$(curl -sfL -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/containers/libkrunfw/releases/latest | jq -r .tag_name)
-          [ -n "$TAG" ] && [ "$TAG" != "null" ] || { echo "failed to resolve libkrunfw release tag"; exit 1; }
-          curl -fL --retry 3 -o /tmp/libkrunfw-x86_64.tgz "https://github.com/containers/libkrunfw/releases/download/$TAG/libkrunfw-x86_64.tgz"
+          curl -fL --retry 3 -o /tmp/libkrunfw-x86_64.tgz "https://github.com/containers/libkrunfw/releases/download/$LIBKRUNFW_VERSION/libkrunfw-x86_64.tgz"
           mkdir tmp && tar xf /tmp/libkrunfw-x86_64.tgz -C tmp && sudo mv tmp/lib64/* /lib/x86_64-linux-gnu
       
       - name: Integration tests
@@ -166,15 +163,8 @@ jobs:
           sudo make install
       
       - name: Install libkrunfw
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Authenticate the API call so it is not throttled by GitHub's 60/hr
-          # anonymous rate limit, which resolves TAG to null and makes the asset
-          # download 404 with a 9-byte "Not Found" that tar then chokes on.
-          TAG=$(curl -sfL -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/containers/libkrunfw/releases/latest | jq -r .tag_name)
-          [ -n "$TAG" ] && [ "$TAG" != "null" ] || { echo "failed to resolve libkrunfw release tag"; exit 1; }
-          curl -fL --retry 3 -o /tmp/libkrunfw-aarch64.tgz "https://github.com/containers/libkrunfw/releases/download/$TAG/libkrunfw-aarch64.tgz"
+          curl -fL --retry 3 -o /tmp/libkrunfw-aarch64.tgz "https://github.com/containers/libkrunfw/releases/download/$LIBKRUNFW_VERSION/libkrunfw-aarch64.tgz"
           mkdir tmp && tar xf /tmp/libkrunfw-aarch64.tgz -C tmp && sudo mv tmp/lib64/* /lib/aarch64-linux-gnu
 
       - name: Clean up tests directory
