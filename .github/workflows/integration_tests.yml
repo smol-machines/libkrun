@@ -19,7 +19,7 @@ jobs:
             freebsd: '1'
     env:
       KRUN_TEST_FREEBSD: ${{ matrix.freebsd }}
-      KRUN_TEST_BASE_DIR: ${{ runner.temp }}/libkrun-tests-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.freebsd }}
+      KRUN_TEST_BASE_DIR: /tmp/libkrun-tests-x86_64-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.freebsd }}
     steps:
       - uses: actions/checkout@v4
       
@@ -127,7 +127,7 @@ jobs:
             freebsd: '1'
     env:
       KRUN_TEST_FREEBSD: ${{ matrix.freebsd }}
-      KRUN_TEST_BASE_DIR: ${{ runner.temp }}/libkrun-tests-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.freebsd }}
+      KRUN_TEST_BASE_DIR: /tmp/libkrun-tests-aarch64-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.freebsd }}
     steps:
       - uses: actions/checkout@v4
       
