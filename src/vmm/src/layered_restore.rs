@@ -791,6 +791,146 @@ fn swapped_pages_are_not_discarded() {
 }
 
 #[test]
+#[ignore = "exhausts this process's VMA budget; run explicitly on an isolated QA host"]
+fn mapping_exhaustion_during_restore_preserves_existing_instances() {
+    let max_maps: usize = std::fs::read_to_string("/proc/sys/vm/max_map_count")
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        (1024..=2_000_000).contains(&max_maps),
+        "unexpected host limit; refuse an unbounded stress run"
+    );
+    let file = crate::builder::create_guest_ram_memfd(2 * PAGE).unwrap();
+    file.write_all_at(&[0x29; 2 * PAGE], 0).unwrap();
+    let base = Image::from_immutable_file(file, 2 * PAGE).unwrap();
+    let source = base.restore().unwrap();
+    source
+        .memory
+        .write_slice(&[0x61; PAGE], GuestAddress(0))
+        .unwrap();
+    // Reserve virtual addresses without allocating payload RAM. Alternating
+    // protection splits VMAs; the kernel's existing per-process limit stops
+    // this loop. No sysctl or other process's limits are changed.
+    let arena = MmapRegion::<()>::build(
+        None,
+        max_maps * 2 * PAGE,
+        libc::PROT_NONE,
+        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+    )
+    .unwrap();
+    let mut failure = None;
+    let mut splits = 0;
+    for index in 0..max_maps {
+        let rc = unsafe {
+            libc::mprotect(
+                arena.as_ptr().add(index * 2 * PAGE).cast(),
+                PAGE,
+                libc::PROT_READ,
+            )
+        };
+        if rc != 0 {
+            failure = Some(io::Error::last_os_error());
+            break;
+        }
+        splits += 1;
+    }
+    let result = base.restore();
+    // Release pressure before formatting, allocating verification buffers,
+    // or asserting. The RAII owner removes the entire split reservation.
+    drop(arena);
+    assert_eq!(failure.unwrap().raw_os_error(), Some(libc::ENOMEM));
+    assert!(
+        result.is_err(),
+        "restore unexpectedly succeeded at the mapping limit"
+    );
+    println!("host_max_maps={max_maps} successful_splits={splits}");
+    let mut actual = [0; 2 * PAGE];
+    source
+        .memory
+        .read_slice(&mut actual, GuestAddress(0))
+        .unwrap();
+    assert_eq!(&actual[..PAGE], &[0x61; PAGE]);
+    assert_eq!(&actual[PAGE..], &[0x29; PAGE]);
+    let (saved, copied) = source.capture_quiesced().unwrap();
+    assert_eq!(copied, PAGE);
+    saved
+        .restore()
+        .unwrap()
+        .memory
+        .read_slice(&mut actual, GuestAddress(0))
+        .unwrap();
+    assert_eq!(&actual[..PAGE], &[0x61; PAGE]);
+    assert_eq!(&actual[PAGE..], &[0x29; PAGE]);
+    base.restore()
+        .unwrap()
+        .memory
+        .read_slice(&mut actual, GuestAddress(0))
+        .unwrap();
+    assert_eq!(actual, [0x29; 2 * PAGE]);
+}
+
+#[test]
+#[ignore = "requires active host swap; run explicitly on an isolated QA host"]
+fn capture_reads_back_actual_swapped_private_pages() {
+    const SIZE: usize = 64 * 1024 * 1024;
+    let file = crate::builder::create_guest_ram_memfd(SIZE).unwrap();
+    let base = Image::from_immutable_file(file, SIZE).unwrap();
+    let source = base.restore().unwrap();
+    let address = source.memory.get_host_address(GuestAddress(0)).unwrap();
+    assert_eq!(
+        unsafe { libc::madvise(address.cast(), SIZE, libc::MADV_NOHUGEPAGE) },
+        0
+    );
+    source
+        .memory
+        .write_slice(&vec![0x57; SIZE], GuestAddress(0))
+        .unwrap();
+    let pagemap = File::open("/proc/self/pagemap").unwrap();
+    let mut entries = vec![0; SIZE / PAGE * 8];
+    assert_eq!(
+        unsafe { libc::madvise(address.cast(), SIZE, libc::MADV_PAGEOUT) },
+        0
+    );
+    let mut swapped = 0;
+    for _ in 0..40 {
+        pagemap
+            .read_exact_at(&mut entries, (address as u64 / PAGE as u64) * 8)
+            .unwrap();
+        swapped = entries
+            .chunks_exact(8)
+            .filter(|entry| u64::from_ne_bytes((*entry).try_into().unwrap()) & (1 << 62) != 0)
+            .count();
+        if swapped != 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        swapped > 0,
+        "no actual swapped pages observed; this is not swap coverage"
+    );
+    println!("actual_swapped_pages={swapped} total_pages={}", SIZE / PAGE);
+    let (saved, copied) = source.capture_quiesced().unwrap();
+    assert_eq!(copied, SIZE);
+    drop(source);
+    let restored = saved.restore().unwrap();
+    let mut actual = vec![0; SIZE];
+    restored
+        .memory
+        .read_slice(&mut actual, GuestAddress(0))
+        .unwrap();
+    assert!(actual.iter().all(|byte| *byte == 0x57));
+    let ancestor = base.restore().unwrap();
+    ancestor
+        .memory
+        .read_slice(&mut actual, GuestAddress(0))
+        .unwrap();
+    assert!(actual.iter().all(|byte| *byte == 0));
+}
+
+#[test]
 fn descriptor_pressure_before_capture_leaves_running_state_unchanged() {
     const CHILD: &str = "KRUN_LAYERED_FD_LIMIT_CHILD";
     if std::env::var_os(CHILD).is_none() {
