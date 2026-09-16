@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -220,6 +221,58 @@ impl Drop for RetainedFiles {
     }
 }
 
+fn connect_before(path: &Path, deadline: Instant) -> io::Result<UnixStream> {
+    let bytes = path.as_os_str().as_bytes();
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if bytes.is_empty() || bytes.contains(&0) || bytes.len() >= address.sun_path.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid checkpoint socket path",
+        ));
+    }
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (target, byte) in address.sun_path.iter_mut().zip(bytes) {
+        *target = *byte as libc::c_char;
+    }
+    loop {
+        remaining(deadline)?;
+        // A blocking AF_UNIX connect can wait indefinitely on a full backlog;
+        // socket read/write timeouts do not bound that wait. Linux returns
+        // EAGAIN for this case on a nonblocking socket, so retry within the
+        // same deadline that also covers the subsequent descriptor handoff.
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                0,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let stream = unsafe { UnixStream::from_raw_fd(fd) };
+        let rc = unsafe {
+            libc::connect(
+                fd,
+                (&address as *const libc::sockaddr_un).cast(),
+                (std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1)
+                    as libc::socklen_t,
+            )
+        };
+        if rc == 0 {
+            remaining(deadline)?;
+            stream.set_nonblocking(false)?;
+            return Ok(stream);
+        }
+        let error = io::Error::last_os_error();
+        drop(stream);
+        if !matches!(error.raw_os_error(), Some(libc::EAGAIN | libc::EINTR)) {
+            return Err(error);
+        }
+        thread::sleep(remaining(deadline)?.min(Duration::from_millis(5)));
+    }
+}
+
 pub fn receive(
     path: &Path,
     token: &[u8; TOKEN_LEN],
@@ -229,7 +282,8 @@ pub fn receive(
     if keys.is_empty() || keys.len() > 1024 {
         return Err(io::Error::other("invalid checkpoint descriptor count"));
     }
-    let mut stream = UnixStream::connect(path)?;
+    let deadline = Instant::now() + HANDOFF_DEADLINE;
+    let mut stream = connect_before(path, deadline)?;
     let credentials = peer(&stream)?;
     if credentials.pid as u32 != owner || credentials.uid != unsafe { libc::geteuid() } {
         return Err(io::Error::new(
@@ -237,8 +291,7 @@ pub fn receive(
             "checkpoint owner credentials mismatch",
         ));
     }
-    let deadline = Instant::now() + HANDOFF_DEADLINE;
-    stream.set_write_timeout(Some(TIMEOUT))?;
+    stream.set_write_timeout(Some(remaining(deadline)?))?;
     stream.write_all(token)?;
     let mut files = BTreeMap::new();
     for key in keys {
@@ -420,6 +473,30 @@ mod tests {
         assert!(service.is_finished());
         drop(service);
         assert_eq!(fs::read(&path).unwrap(), b"replacement");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn full_backlog_is_bounded_and_recovers_after_accept() {
+        let path = path("backlog");
+        let listener = UnixListener::bind(&path).unwrap();
+        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
+        let queued = connect_before(&path, Instant::now() + HANDOFF_DEADLINE).unwrap();
+        let start = Instant::now();
+        assert_eq!(
+            connect_before(&path, start + Duration::from_millis(100))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(start.elapsed() < Duration::from_secs(1));
+        let accepted = listener.accept().unwrap();
+        let next = connect_before(&path, Instant::now() + HANDOFF_DEADLINE).unwrap();
+        assert_ne!(
+            unsafe { libc::fcntl(next.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        drop((next, accepted, queued, listener));
         fs::remove_file(path).unwrap();
     }
 
