@@ -2449,6 +2449,26 @@ pub fn open_cow_memory_from_paths(descs: &[MemfdRegionDesc]) -> io::Result<Guest
 
 #[cfg(test)]
 mod tests {
+    // A parallel test runner's fork inherits other tests' writable mappings,
+    // which legitimately prevent sealing. Match the VMM's private address space.
+    #[cfg(target_os = "linux")]
+    fn run_with_private_address_space(name: &str) -> bool {
+        const CHILD: &str = "KRUN_PRIVATE_SNAPSHOT_TEST";
+        if std::env::var(CHILD).as_deref() == Ok(name) {
+            return false;
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("snapshot::tests::{name}"),
+                "--nocapture",
+            ])
+            .env(CHILD, name)
+            .status()
+            .unwrap();
+        assert!(status.success(), "isolated snapshot test failed: {name}");
+        true
+    }
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn deferred_sparse_stream_preserves_live_generations_after_disconnect() {
@@ -2836,6 +2856,11 @@ mod tests {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn deferred_durable_save_preserves_initial_and_later_generations() {
+        if run_with_private_address_space(
+            "deferred_durable_save_preserves_initial_and_later_generations",
+        ) {
+            return;
+        }
         use crate::builder::create_guest_ram_memfd;
 
         const PAGE: usize = 4096;
@@ -3464,6 +3489,11 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn rebased_parent_can_continue_without_mutating_fork_generation() {
+        if run_with_private_address_space(
+            "rebased_parent_can_continue_without_mutating_fork_generation",
+        ) {
+            return;
+        }
         use crate::builder::create_guest_ram_memfd;
         use std::os::unix::fs::FileExt;
         use vm_memory::FileOffset;
@@ -3683,6 +3713,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn readonly_restore_input_keeps_two_promotions_independent() {
+        if run_with_private_address_space("readonly_restore_input_keeps_two_promotions_independent")
+        {
+            return;
+        }
         use crate::builder::create_guest_ram_memfd;
         use std::os::{fd::AsRawFd, unix::fs::FileExt};
 
@@ -3728,6 +3762,11 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn sparse_memory_image_promotes_into_independent_fork_backing() {
+        if run_with_private_address_space(
+            "sparse_memory_image_promotes_into_independent_fork_backing",
+        ) {
+            return;
+        }
         use crate::builder::create_guest_ram_memfd;
         use std::os::unix::fs::FileExt;
 
