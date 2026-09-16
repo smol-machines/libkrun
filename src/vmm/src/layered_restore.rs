@@ -791,6 +791,67 @@ fn swapped_pages_are_not_discarded() {
 }
 
 #[test]
+fn fragmented_writes_then_dense_capture_preserve_ancestors() {
+    use crate::snapshot::MemoryRegionDesc;
+    const PAGES: usize = 4096;
+    let file = crate::builder::create_guest_ram_memfd(PAGES * PAGE).unwrap();
+    let mut generation = Generation::from_immutable_file(
+        &[MemoryRegionDesc {
+            gpa: 0,
+            len: (PAGES * PAGE) as u64,
+        }],
+        &file,
+    )
+    .unwrap();
+    let memory = generation.restore().unwrap();
+    let mut ancestors = Vec::new();
+    for round in 0..4 {
+        for page in (round..PAGES).step_by(4) {
+            memory
+                .write_slice(
+                    &[(round + 1) as u8; PAGE],
+                    GuestAddress((page * PAGE) as u64),
+                )
+                .unwrap();
+        }
+        let (next, copied) = generation.capture_quiesced(&memory).unwrap();
+        assert_eq!(copied, PAGES / 4 * PAGE);
+        next.rebase_quiesced(&memory).unwrap();
+        ancestors.push(next.clone());
+        generation = next;
+    }
+    assert_eq!(generation.regions[0].extents.len(), PAGES);
+    // A dense overwrite should collapse the fragmented index without changing
+    // any previously retained checkpoint, including untouched zero pages.
+    memory
+        .write_slice(&vec![0x71; PAGES * PAGE], GuestAddress(0))
+        .unwrap();
+    let (dense, copied) = generation.capture_quiesced(&memory).unwrap();
+    assert_eq!(copied, PAGES * PAGE);
+    assert_eq!(dense.regions[0].extents.len(), 1);
+    dense.rebase_quiesced(&memory).unwrap();
+    for (round, ancestor) in ancestors.into_iter().enumerate() {
+        let restored = ancestor.restore().unwrap();
+        for page in 0..PAGES {
+            let expected = if page % 4 <= round {
+                (page % 4 + 1) as u8
+            } else {
+                0
+            };
+            let mut actual = [0; PAGE];
+            restored
+                .read_slice(&mut actual, GuestAddress((page * PAGE) as u64))
+                .unwrap();
+            assert_eq!(actual, [expected; PAGE], "round={round} page={page}");
+        }
+    }
+    let restored = dense.restore().unwrap();
+    let mut actual = vec![0; PAGES * PAGE];
+    restored.read_slice(&mut actual, GuestAddress(0)).unwrap();
+    assert!(actual.iter().all(|byte| *byte == 0x71));
+}
+
+#[test]
 fn concurrent_siblings_capture_independent_generations() {
     use crate::snapshot::MemoryRegionDesc;
     use std::sync::Barrier;
