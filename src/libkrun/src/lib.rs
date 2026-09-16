@@ -520,8 +520,14 @@ struct PreparedSave {
     snapshot_supported,
     any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
 ))]
-static PREPARED_SAVES: Lazy<Mutex<HashMap<String, PreparedSave>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+mod prepared_saves;
+
+#[cfg(all(
+    snapshot_supported,
+    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
+))]
+static PREPARED_SAVES: prepared_saves::PreparedSaves<PreparedSave> =
+    prepared_saves::PreparedSaves::new();
 
 fn log_level_to_filter_str(level: u32) -> &'static str {
     match level {
@@ -781,9 +787,9 @@ fn handle_prepare_save(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
     if dir.is_empty() {
         return "ERR EINVAL snapshot dir required\n".to_string();
     }
-    if !PREPARED_SAVES.lock().unwrap().is_empty() {
+    let Some(preparation) = PREPARED_SAVES.reserve(dir) else {
         return "ERR EBUSY another durable save is still pending\n".to_string();
-    }
+    };
     let dir_path = std::path::PathBuf::from(dir);
     if let Err(error) = std::fs::create_dir(&dir_path) {
         return format!("ERR EIO create {}: {error}\n", dir_path.display());
@@ -804,10 +810,7 @@ fn handle_prepare_save(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
             return format!("ERR EIO capture VM: {message}\n");
         }
     };
-    PREPARED_SAVES
-        .lock()
-        .unwrap()
-        .insert(dir.to_string(), PreparedSave { checkpoint, memory });
+    preparation.publish(PreparedSave { checkpoint, memory });
     "OK prepared (paused)\n".to_string()
 }
 
@@ -816,23 +819,25 @@ fn handle_prepare_save(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
     any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
 ))]
 fn handle_finish_save(dir: &str) -> String {
-    let Some(prepared) = PREPARED_SAVES.lock().unwrap().remove(dir) else {
+    let dir_path = std::path::Path::new(dir);
+    let Some(result) = PREPARED_SAVES.finish(
+        dir,
+        |prepared| -> std::result::Result<(u64, usize), String> {
+            let memory_partial = dir_path.join("memory.bin.partial");
+            let mut memory = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&memory_partial)
+                .map_err(|error| format!("create memory image: {error}"))?;
+            let descs = prepared
+                .memory
+                .finish(&mut memory)
+                .map_err(|error| format!("serialize retained RAM generation: {error}"))?;
+            publish_portable_save(dir_path, Some(memory), prepared.checkpoint, &descs)
+        },
+    ) else {
         return "ERR ENOENT no prepared durable save\n".to_string();
     };
-    let dir_path = std::path::Path::new(dir);
-    let result = (|| -> std::result::Result<(u64, usize), String> {
-        let memory_partial = dir_path.join("memory.bin.partial");
-        let mut memory = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&memory_partial)
-            .map_err(|error| format!("create memory image: {error}"))?;
-        let descs = prepared
-            .memory
-            .finish(&mut memory)
-            .map_err(|error| format!("serialize retained RAM generation: {error}"))?;
-        publish_portable_save(dir_path, Some(memory), prepared.checkpoint, &descs)
-    })();
     match result {
         Ok((bytes, regions)) => format!("OK saved ({bytes} bytes, {regions} regions)\n"),
         Err(error) => {
@@ -847,16 +852,17 @@ fn handle_finish_save(dir: &str) -> String {
     any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
 ))]
 fn handle_finish_save_stream<W: Write>(dir: &str, stream: &mut W) -> String {
-    let Some(prepared) = PREPARED_SAVES.lock().unwrap().remove(dir) else {
+    let Some(result) = PREPARED_SAVES.finish(dir, |prepared| {
+        prepared
+            .memory
+            .finish_stream(stream)
+            .map_err(|error| format!("stream retained RAM: {error}"))
+            .and_then(|descs| {
+                publish_portable_save(std::path::Path::new(dir), None, prepared.checkpoint, &descs)
+            })
+    }) else {
         return "ERR ENOENT no prepared durable save\n".to_string();
     };
-    let result = prepared
-        .memory
-        .finish_stream(stream)
-        .map_err(|error| format!("stream retained RAM: {error}"))
-        .and_then(|descs| {
-            publish_portable_save(std::path::Path::new(dir), None, prepared.checkpoint, &descs)
-        });
     match result {
         Ok((bytes, regions)) => format!("OK saved ({bytes} bytes, {regions} regions)\n"),
         Err(error) => format!("ERR EIO {error}\n"),
@@ -868,15 +874,30 @@ fn handle_finish_save_stream<W: Write>(dir: &str, stream: &mut W) -> String {
     any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
 ))]
 fn handle_cancel_save(dir: &str) -> String {
-    let removed = PREPARED_SAVES.lock().unwrap().remove(dir);
-    match removed {
-        Some(save) => {
-            drop(save);
-            let _ = std::fs::remove_dir_all(dir);
-            "OK canceled\n".to_string()
-        }
-        None => "ERR ENOENT save is finishing or does not exist\n".to_string(),
+    if PREPARED_SAVES.cancel(dir) {
+        let _ = std::fs::remove_dir_all(dir);
+        "OK canceled\n".to_string()
+    } else {
+        "ERR ENOENT save is finishing or does not exist\n".to_string()
     }
+}
+
+#[cfg(all(
+    snapshot_supported,
+    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
+))]
+fn handle_save_status(dir: &str) -> String {
+    if dir.is_empty() {
+        return "ERR EINVAL snapshot dir required\n".to_string();
+    }
+    // This reports retained RAM ownership, never artifact durability.
+    let state = match PREPARED_SAVES.status(dir) {
+        Some(prepared_saves::Status::Preparing) => "preparing",
+        Some(prepared_saves::Status::Ready) => "ready",
+        Some(prepared_saves::Status::Finishing) => "finishing",
+        None => "memory_released",
+    };
+    format!("OK {state}\n")
 }
 
 /// Magic for the fork manifest ("SMOLFORK").
@@ -1640,6 +1661,11 @@ fn handle_control_stream<S: std::io::Read + std::io::Write + Send + 'static>(
                     any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
                 ))]
                 "CANCEL_SAVE" => handle_cancel_save(_arg),
+                #[cfg(all(
+                    snapshot_supported,
+                    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
+                ))]
+                "SAVE_STATUS" => handle_save_status(_arg),
                 // FORK <dir>: capture a fork checkpoint to <dir> (checkpoint.bin +
                 // manifest.bin) and leave this VM FROZEN as the CoW base. A clone
                 // process then boots from <dir> via krun_set_snapshot, mapping this
