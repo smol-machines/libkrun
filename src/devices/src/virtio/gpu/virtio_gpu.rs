@@ -63,6 +63,30 @@ fn virgl_fence_thread_enabled() -> bool {
     }
 }
 
+/// Round a guest blob mapping length up to the host page size.
+///
+/// `hv_vm_map` only accepts lengths that are a multiple of the host page size
+/// (16 KiB on Apple Silicon), but the guest kernel sizes blob resources in its
+/// own 4 KiB pages. A Venus driver asking for, say, a 131268-byte command ring
+/// yields a 135168-byte (33 guest page) resource, and mapping that is
+/// rejected -- which reaches the guest as a failed mmap and is reported by
+/// Venus as `VK_ERROR_OUT_OF_HOST_MEMORY` from `vkCreateInstance`.
+///
+/// The size cannot be rounded when the resource is created: a HOST3D blob
+/// names an allocation that already exists inside the renderer, and changing
+/// the size makes virglrenderer reject the export. Round at map time instead.
+/// The extra bytes are the tail padding of the blob's own host allocation,
+/// which the host page allocator already rounded the same way; the guest only
+/// ever addresses the range it asked for. Unmapping rounds identically so the
+/// two stay symmetric.
+#[cfg(target_os = "macos")]
+fn host_map_len(size: u64) -> u64 {
+    // SAFETY: sysconf with a valid name has no preconditions.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    let page = if page > 0 { page as u64 } else { 16384 };
+    size.div_ceil(page).saturating_mul(page)
+}
+
 fn sglist_to_rutabaga_iovecs(
     vecs: &[(GuestAddress, usize)],
     mem: &GuestMemoryMmap,
@@ -1656,7 +1680,8 @@ impl VirtioGpu {
 
         if let Ok(export) = self.rutabaga.export_blob(resource_id) {
             if export.handle_type == RUTABAGA_MEM_HANDLE_TYPE_APPLE {
-                let end = offset.checked_add(resource.size).ok_or(ErrUnspec)?;
+                let map_len = host_map_len(resource.size);
+                let end = offset.checked_add(map_len).ok_or(ErrUnspec)?;
                 if end > shm_region.size as u64 {
                     error!("mapping DOES NOT FIT");
                     return Err(ErrUnspec);
@@ -1664,8 +1689,8 @@ impl VirtioGpu {
 
                 let guest_addr = shm_region.guest_addr.checked_add(offset).ok_or(ErrUnspec)?;
                 debug!(
-                    "mapping: map_ptr={:x}, guest_addr={:x}, size={}",
-                    map_ptr, guest_addr, resource.size
+                    "mapping: map_ptr={:x}, guest_addr={:x}, size={} (host map len {})",
+                    map_ptr, guest_addr, resource.size, map_len
                 );
 
                 let (reply_sender, reply_receiver) = unbounded();
@@ -1674,7 +1699,7 @@ impl VirtioGpu {
                         reply_sender,
                         map_ptr,
                         guest_addr,
-                        resource.size,
+                        map_len,
                     ))
                     .unwrap();
                 if !reply_receiver.recv().unwrap() {
@@ -1750,9 +1775,12 @@ impl VirtioGpu {
         let shmem_offset = resource.shmem_offset.ok_or(ErrUnspec)?;
 
         let guest_addr = shm_region.guest_addr + shmem_offset;
+        // Must match the length `resource_map_blob` mapped, or the tail of the
+        // mapping is left behind in the guest's address space.
+        let map_len = host_map_len(resource.size);
         debug!(
-            "unmapping: guest_addr={:x}, size={}",
-            guest_addr, resource.size
+            "unmapping: guest_addr={:x}, size={} (host map len {})",
+            guest_addr, resource.size, map_len
         );
 
         let (reply_sender, reply_receiver) = unbounded();
@@ -1760,7 +1788,7 @@ impl VirtioGpu {
             .send(WorkerMessage::GpuRemoveMapping(
                 reply_sender,
                 guest_addr,
-                resource.size,
+                map_len,
             ))
             .unwrap();
         if !reply_receiver.recv().unwrap() {
@@ -1775,6 +1803,29 @@ impl VirtioGpu {
 #[cfg(test)]
 mod test {
     use crate::virtio::gpu::protocol::VIRTIO_GPU_MAX_SCANOUTS;
+
+    /// `hv_vm_map` rejects a length that is not a host-page multiple, so a
+    /// guest blob sized in 4 KiB guest pages has to be rounded before it is
+    /// mapped. Venus asking for a 131268-byte ring gives a 135168-byte
+    /// resource: 33 guest pages, but not a whole number of 16 KiB host pages.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_map_len_rounds_up_to_the_host_page() {
+        use super::host_map_len;
+
+        // SAFETY: sysconf with a valid name has no preconditions.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+        assert!(page > 0);
+
+        assert_eq!(host_map_len(0), 0);
+        assert_eq!(host_map_len(1), page);
+        assert_eq!(host_map_len(page), page);
+        assert_eq!(host_map_len(page + 1), 2 * page);
+        // The size from the reported failure, and one that already fits.
+        assert_eq!(host_map_len(135168) % page, 0);
+        assert!(host_map_len(135168) >= 135168);
+        assert_eq!(host_map_len(1048576), 1048576);
+    }
 
     #[test]
     fn test_virtio_gpu_associated_scanouts() {
