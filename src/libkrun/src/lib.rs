@@ -1516,6 +1516,18 @@ fn build_restore_ctx_with_memory(
     dir: &std::path::Path,
     readonly_memory: Option<&std::fs::File>,
 ) -> std::result::Result<vmm::builder::RestoreCtx, String> {
+    let layered_requested = cfg!(target_os = "linux")
+        && std::env::var_os("SMOLVM_LAYERED_RESTORE").is_some_and(|value| value == "1")
+        && std::env::var_os("SMOLVM_FORKABLE").is_some_and(|value| value == "1");
+    build_restore_ctx_with_memory_mode(dir, readonly_memory, layered_requested)
+}
+
+#[cfg(fork_supported)]
+fn build_restore_ctx_with_memory_mode(
+    dir: &std::path::Path,
+    readonly_memory: Option<&std::fs::File>,
+    _layered_requested: bool,
+) -> std::result::Result<vmm::builder::RestoreCtx, String> {
     let manifest_path = dir.join("manifest.bin");
     let manifest = std::fs::read(&manifest_path).map_err(|e| format!("manifest: {e}"))?;
     let magic_bytes = manifest
@@ -1561,9 +1573,12 @@ fn build_restore_ctx_with_memory(
                 .try_clone()
                 .map_err(|e| format!("duplicate memory input: {e}"))?
         } else {
+            // Layered restore keeps this descriptor as the immutable branch
+            // base. Never retain a writable capability for later handoff;
+            // legacy restore paths still require their writable mapping.
             std::fs::OpenOptions::new()
                 .read(true)
-                .write(true)
+                .write(!_layered_requested)
                 .open(&memory_path)
                 .map_err(|e| format!("memory: {e}"))?
         };
@@ -1578,10 +1593,7 @@ fn build_restore_ctx_with_memory(
             ));
         }
         #[cfg(target_os = "linux")]
-        let layered_ram = if std::env::var_os("SMOLVM_LAYERED_RESTORE")
-            .is_some_and(|value| value == "1")
-            && std::env::var_os("SMOLVM_FORKABLE").is_some_and(|value| value == "1")
-        {
+        let layered_ram = if _layered_requested {
             Some(
                 vmm::layered_restore::Generation::from_immutable_file(&descs, &memory_file)
                     .map_err(|error| format!("retain layered restore input: {error}"))?,
@@ -1995,6 +2007,39 @@ mod control_command_tests {
             write_checkpoint_stream_header(&mut output, b"cpu", &vec![0; 1024 * 1024 + 1]).is_err()
         );
         assert!(output.is_empty());
+    }
+
+    #[cfg(all(target_os = "linux", fork_supported))]
+    #[test]
+    fn direct_file_restore_can_publish_a_layered_branch() {
+        use vm_memory::{Bytes, GuestAddress};
+        let dir = std::env::temp_dir().join(format!(
+            "krun-direct-layered-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let descs = [vmm::snapshot::MemoryRegionDesc { gpa: 0, len: 4096 }];
+        std::fs::write(dir.join("manifest.bin"), encode_portable_manifest(&descs)).unwrap();
+        std::fs::write(dir.join("checkpoint.bin"), b"opaque device state").unwrap();
+        std::fs::write(dir.join("memory.bin"), [0x6a; 4096]).unwrap();
+        let result = (|| {
+            let restored = build_restore_ctx_with_memory_mode(&dir, None, true)
+                .map_err(std::io::Error::other)?;
+            let generation = restored.layered_ram.as_ref().unwrap();
+            let (manifest, service) = generation.publish_manifest(&dir.join("handoff.sock"))?;
+            let imported = vmm::layered_restore::Generation::decode_manifest(&manifest)?;
+            drop(service);
+            drop(restored);
+            let child = imported.restore()?;
+            assert_eq!(child.read_obj::<u8>(GuestAddress(0)).unwrap(), 0x6a);
+            Ok::<(), std::io::Error>(())
+        })();
+        std::fs::remove_dir_all(&dir).unwrap();
+        result.unwrap();
     }
 
     #[test]
