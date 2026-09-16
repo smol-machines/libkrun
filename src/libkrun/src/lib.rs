@@ -235,6 +235,8 @@ struct ContextConfig {
     snapshot_dir: Option<PathBuf>,
     #[cfg(target_os = "linux")]
     snapshot_memory: Option<std::fs::File>,
+    #[cfg(target_os = "linux")]
+    snapshot_memory_immutable: bool,
 }
 
 impl ContextConfig {
@@ -1508,16 +1510,17 @@ fn handle_rollback_fork(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
 fn build_restore_ctx(
     dir: &std::path::Path,
 ) -> std::result::Result<vmm::builder::RestoreCtx, String> {
-    build_restore_ctx_with_memory(dir, None)
+    build_restore_ctx_with_memory(dir, None, false)
 }
 
 #[cfg(fork_supported)]
 fn build_restore_ctx_with_memory(
     dir: &std::path::Path,
     readonly_memory: Option<&std::fs::File>,
+    immutable: bool,
 ) -> std::result::Result<vmm::builder::RestoreCtx, String> {
     let layered_requested = cfg!(target_os = "linux")
-        && std::env::var_os("SMOLVM_LAYERED_RESTORE").is_some_and(|value| value == "1")
+        && immutable
         && std::env::var_os("SMOLVM_FORKABLE").is_some_and(|value| value == "1");
     build_restore_ctx_with_memory_mode(dir, readonly_memory, layered_requested)
 }
@@ -4042,6 +4045,22 @@ pub unsafe extern "C" fn krun_set_snapshot(ctx_id: u32, c_snapshot_dir: *const c
 /// Supported only by Linux branchable restores, which create private memfds.
 #[unsafe(no_mangle)]
 pub extern "C" fn krun_set_snapshot_memory_fd(ctx_id: u32, fd: i32) -> i32 {
+    set_snapshot_memory_input(ctx_id, fd, false)
+}
+
+/// Provide read-only checkpoint RAM with explicit lifetime guarantees.
+/// Flag 1 opts into immutable backing shared by this VM and its descendants;
+/// the caller must not change or truncate that inode during their lifetime.
+/// Flag 0 preserves the original API's eager-copy behavior.
+#[unsafe(no_mangle)]
+pub extern "C" fn krun_set_snapshot_memory_fd2(ctx_id: u32, fd: i32, flags: u32) -> i32 {
+    if flags & !1 != 0 {
+        return -libc::EINVAL;
+    }
+    set_snapshot_memory_input(ctx_id, fd, flags == 1)
+}
+
+fn set_snapshot_memory_input(ctx_id: u32, fd: i32, immutable: bool) -> i32 {
     #[cfg(all(target_os = "linux", fork_supported))]
     {
         use std::os::fd::BorrowedFd;
@@ -4064,6 +4083,7 @@ pub extern "C" fn krun_set_snapshot_memory_fd(ctx_id: u32, fd: i32) -> i32 {
         match CTX_MAP.lock().unwrap().entry(ctx_id) {
             Entry::Occupied(mut config) => {
                 config.get_mut().snapshot_memory = Some(file);
+                config.get_mut().snapshot_memory_immutable = immutable;
                 KRUN_SUCCESS
             }
             Entry::Vacant(_) => -libc::ENOENT,
@@ -4071,7 +4091,7 @@ pub extern "C" fn krun_set_snapshot_memory_fd(ctx_id: u32, fd: i32) -> i32 {
     }
     #[cfg(not(all(target_os = "linux", fork_supported)))]
     {
-        let _ = (ctx_id, fd);
+        let _ = (ctx_id, fd, immutable);
         -libc::ENOTSUP
     }
 }
@@ -5315,8 +5335,11 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     let restore_ctx = match ctx_cfg.snapshot_dir.take() {
         Some(dir) => {
             #[cfg(target_os = "linux")]
-            let result =
-                build_restore_ctx_with_memory(&dir, ctx_cfg.snapshot_memory.take().as_ref());
+            let result = build_restore_ctx_with_memory(
+                &dir,
+                ctx_cfg.snapshot_memory.take().as_ref(),
+                ctx_cfg.snapshot_memory_immutable,
+            );
             #[cfg(not(target_os = "linux"))]
             let result = build_restore_ctx(&dir);
             match result {
@@ -5470,6 +5493,55 @@ fn krun_start_enter_nitro(ctx_id: u32) -> i32 {
 mod test_snapshot_memory_fd {
     use super::*;
     use std::os::fd::AsRawFd;
+
+    #[test]
+    fn immutable_input_is_explicit_per_context_and_legacy_resets_it() {
+        use std::os::unix::fs::FileExt;
+        let id = krun_create_ctx() as u32;
+        let other = krun_create_ctx() as u32;
+        let backing = utils::tempfile::TempFile::new().unwrap();
+        backing.as_file().write_all_at(&[0x37; 4096], 0).unwrap();
+        let input = std::fs::File::open(backing.as_path()).unwrap();
+        assert_eq!(krun_set_snapshot_memory_fd2(id, input.as_raw_fd(), 1), 0);
+        assert_eq!(krun_set_snapshot_memory_fd(other, input.as_raw_fd()), 0);
+        assert_eq!(
+            krun_set_snapshot_memory_fd2(id, input.as_raw_fd(), 2),
+            -libc::EINVAL
+        );
+        assert_eq!(krun_set_snapshot_memory_fd2(id, -1, 0), -libc::EBADF);
+        {
+            let contexts = CTX_MAP.lock().unwrap();
+            assert!(contexts.get(&id).unwrap().snapshot_memory_immutable);
+            assert!(!contexts.get(&other).unwrap().snapshot_memory_immutable);
+        }
+        // Legacy callers can explicitly replace the input and always recover
+        // their copy semantics, even after an earlier immutable opt-in.
+        assert_eq!(krun_set_snapshot_memory_fd(id, input.as_raw_fd()), 0);
+        assert!(
+            !CTX_MAP
+                .lock()
+                .unwrap()
+                .get(&id)
+                .unwrap()
+                .snapshot_memory_immutable
+        );
+        assert_eq!(krun_set_snapshot_memory_fd2(id, input.as_raw_fd(), 1), 0);
+        drop(input);
+        drop(backing);
+        {
+            let contexts = CTX_MAP.lock().unwrap();
+            let retained = contexts.get(&id).unwrap().snapshot_memory.as_ref().unwrap();
+            let mut bytes = [0; 4096];
+            retained.read_exact_at(&mut bytes, 0).unwrap();
+            assert_eq!(bytes, [0x37; 4096]);
+            assert_ne!(
+                unsafe { libc::fcntl(retained.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+                0
+            );
+        }
+        assert_eq!(krun_free_ctx(id), 0);
+        assert_eq!(krun_free_ctx(other), 0);
+    }
 
     #[test]
     fn readonly_descriptor_is_duplicated_and_validated() {
