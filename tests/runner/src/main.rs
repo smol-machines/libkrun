@@ -16,6 +16,32 @@ struct TestResult {
     log_path: Option<PathBuf>,
 }
 
+fn failure_count(results: &[TestResult]) -> usize {
+    results
+        .iter()
+        .filter(|r| matches!(r.outcome, TestOutcome::Fail(_) | TestOutcome::Timeout))
+        .count()
+}
+
+#[test]
+fn timeouts_count_as_failed_tests() {
+    let result = |outcome| TestResult {
+        name: "test".into(),
+        outcome,
+        log_path: None,
+    };
+    assert_eq!(failure_count(&[result(TestOutcome::Timeout)]), 1);
+    assert_eq!(
+        failure_count(&[
+            result(TestOutcome::Pass),
+            result(TestOutcome::Skip("unavailable")),
+            result(TestOutcome::Fail("failed".into())),
+            result(TestOutcome::Timeout),
+        ]),
+        2
+    );
+}
+
 fn get_test(name: &str) -> anyhow::Result<Box<dyn Test>> {
     let tests = test_cases();
     tests
@@ -380,10 +406,7 @@ fn run_tests(
         .iter()
         .filter(|r| matches!(r.outcome, TestOutcome::Pass))
         .count();
-    let num_fail = results
-        .iter()
-        .filter(|r| matches!(r.outcome, TestOutcome::Fail(_)))
-        .count();
+    let num_fail = failure_count(&results);
     let num_skip = results
         .iter()
         .filter(|r| matches!(r.outcome, TestOutcome::Skip(_)))
