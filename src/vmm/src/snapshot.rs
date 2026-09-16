@@ -114,7 +114,15 @@ fn stream_sparse_memory_files<W: Write>(
                 }
                 let offset = base + cursor + (page * PAGE) as u64;
                 let end = offset + bytes.len() as u64;
-                append_sparse_range(&mut ranges, offset, end);
+                // GNU sparse tar requires aligned intermediate data blocks.
+                // Include neighboring hole bytes rather than emitting an
+                // unrepresentable map at a partial region boundary.
+                let aligned_offset = offset - offset % 512;
+                let aligned_end = end
+                    .checked_add((512 - end % 512) % 512)
+                    .unwrap_or(logical)
+                    .min(logical);
+                append_sparse_range(&mut ranges, aligned_offset, aligned_end);
             }
             cursor += count as u64;
         }
@@ -158,9 +166,9 @@ fn stream_sparse_memory_files<W: Write>(
 fn append_sparse_range(ranges: &mut Vec<(u64, u64)>, offset: u64, end: u64) {
     let full = ranges.len() == 65536;
     if let Some((previous, length)) = ranges.last_mut()
-        && (*previous + *length == offset || full)
+        && (*previous + *length >= offset || full)
     {
-        *length = end - *previous;
+        *length = end.max(*previous + *length) - *previous;
     } else {
         ranges.push((offset, end - offset));
     }
@@ -2598,6 +2606,10 @@ mod tests {
                 assert_eq!((start, length), (logical, 0));
             } else {
                 assert!(length > 0);
+                assert_eq!(start % 512, 0);
+                if index + 2 < count {
+                    assert_eq!(length % 512, 0);
+                }
                 restored[start..start + length]
                     .copy_from_slice(&encoded[payload..payload + length]);
                 payload += length;
