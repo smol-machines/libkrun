@@ -1,5 +1,10 @@
 name: 'Setup Build Environment'
 description: 'Common setup for Rust builds with all required packages (Linux & macOS)'
+inputs:
+  freebsd:
+    description: 'Install toolchains for dedicated FreeBSD compatibility checks'
+    required: false
+    default: 'false'
 runs:
   using: 'composite'
   steps:
@@ -9,6 +14,11 @@ runs:
         rustup update stable
         rustup default stable
         rustup component add rustfmt clippy
+
+    - name: Install FreeBSD toolchains
+      if: inputs.freebsd == 'true'
+      shell: bash
+      run: |
         rustup target add x86_64-unknown-freebsd
         rustup toolchain install nightly
         rustup component add rust-src --toolchain nightly

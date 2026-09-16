@@ -20,6 +20,19 @@ jobs:
       - name: Build libkrun on macOS (with Linux init)
         run: make
 
+  cross-compile-macos-freebsd:
+    name: Cross-compilation (macOS -> FreeBSD)
+    runs-on: macos-latest
+    env:
+      DYLD_LIBRARY_PATH: /Library/Developer/CommandLineTools/usr/lib/
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup FreeBSD build environment
+        uses: ./.github/actions/setup-build-env
+        with:
+          freebsd: 'true'
+      - name: Install cross-compilation dependencies
+        run: brew install lld xz
       - name: Build FreeBSD init on macOS
         run: make BUILD_BSD_INIT=1 -- init/init-freebsd
 
@@ -31,6 +44,8 @@ jobs:
 
       - name: Setup build environment
         uses: ./.github/actions/setup-build-env
+        with:
+          freebsd: 'true'
 
       - name: Install cross-compilation dependencies
         run: |
@@ -48,6 +63,8 @@ jobs:
 
       - name: Setup build environment
         uses: ./.github/actions/setup-build-env
+        with:
+          freebsd: 'true'
 
       - name: Install cross-compilation dependencies
         run: |

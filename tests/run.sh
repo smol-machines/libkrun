@@ -10,6 +10,14 @@ OS=$(uname -s)
  # macOS uses the string "arm64" but Rust uses "aarch64"
 ARCH=$(uname -m | sed 's/^arm64$/aarch64/')
 
+# Core CI must not acquire FreeBSD assets, even on a reused runner. Dedicated
+# compatibility jobs require them; local runs retain optional auto-detection.
+case "${KRUN_TEST_FREEBSD:-auto}" in
+	0) unset KRUN_TEST_FREEBSD_KERNEL_PATH KRUN_TEST_FREEBSD_ISO_PATH ;;
+	1|auto) ;;
+	*) echo "ERROR: KRUN_TEST_FREEBSD must be 0, 1, or auto"; exit 1 ;;
+esac
+
 # Set the OS-specific library path from LIBKRUN_LIB_PATH.
 # On macOS, SIP strips DYLD_LIBRARY_PATH when executing scripts via a shebang,
 # so the Makefile passes it through this alternative variable instead.
@@ -51,6 +59,7 @@ fi
 export KRUN_TEST_GUEST_AGENT_PATH="target/$GUEST_TARGET/debug/guest-agent"
 
 # --- FreeBSD guest support ---
+if [ "${KRUN_TEST_FREEBSD:-auto}" != 0 ]; then
 FREEBSD_SYSROOT="../freebsd-sysroot"
 FREEBSD_INIT="../init/init-freebsd"
 
@@ -147,6 +156,14 @@ if [ -f "${FREEBSD_SYSROOT}/.sysroot_ready" ] && [ -f "${FREEBSD_INIT}" ]; then
 else
 	echo "FreeBSD sysroot or init/init-freebsd not found; FreeBSD tests will be skipped."
 	echo "(Run 'make' with BUILD_BSD_INIT=1 in the libkrun root to build FreeBSD assets.)"
+fi
+
+if [ "${KRUN_TEST_FREEBSD:-auto}" = 1 ]; then
+	if [ ! -f "${KRUN_TEST_FREEBSD_KERNEL_PATH}" ] || [ ! -f "${KRUN_TEST_FREEBSD_ISO_PATH}" ]; then
+		echo "ERROR: dedicated FreeBSD tests require a kernel and built rootfs ISO"
+		exit 1
+	fi
+fi
 fi
 
 # Build runner args: pass through all arguments

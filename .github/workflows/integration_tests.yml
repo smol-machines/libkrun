@@ -1,15 +1,32 @@
 name: Integration tests
 on: [pull_request]
 
+env:
+  # Use a release with published binaries; latest may be source-only.
+  LIBKRUNFW_VERSION: v5.5.0
+
 jobs:
   integration-tests-x86_64:
-    name: Integration Tests (Linux x86_64)
+    name: Integration Tests (${{ matrix.label }})
     runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Linux x86_64
+            freebsd: '0'
+          - label: Linux x86_64 + FreeBSD guest
+            freebsd: '1'
+    env:
+      KRUN_TEST_FREEBSD: ${{ matrix.freebsd }}
+      KRUN_TEST_BASE_DIR: /tmp/libkrun-tests-x86_64-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.freebsd }}
     steps:
       - uses: actions/checkout@v4
       
       - name: Setup build environment
         uses: ./.github/actions/setup-build-env
+        with:
+          freebsd: ${{ matrix.freebsd == '1' && 'true' || 'false' }}
       
       - name: Install cross-compilation dependencies
         run: |
@@ -20,12 +37,15 @@ jobs:
         run: rustup target add x86_64-unknown-linux-musl
       
       - name: Add FreeBSD x86_64 target
+        if: matrix.freebsd == '1'
         run: rustup target add x86_64-unknown-freebsd
       
       - name: Install FreeBSD test prerequisites
+        if: matrix.freebsd == '1'
         run: sudo apt-get install -y --no-install-recommends libarchive-tools
       
       - name: Build FreeBSD sysroot and init
+        if: matrix.freebsd == '1'
         run: make BUILD_BSD_INIT=1 -- init/init-freebsd
       
       - name: Install gvproxy
@@ -75,39 +95,46 @@ jobs:
           sudo make install
       
       - name: Install libkrunfw
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Authenticate the API call so it is not throttled by GitHub's 60/hr
-          # anonymous rate limit, which resolves TAG to null and makes the asset
-          # download 404 with a 9-byte "Not Found" that tar then chokes on.
-          TAG=$(curl -sfL -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/containers/libkrunfw/releases/latest | jq -r .tag_name)
-          [ -n "$TAG" ] && [ "$TAG" != "null" ] || { echo "failed to resolve libkrunfw release tag"; exit 1; }
-          curl -fL --retry 3 -o /tmp/libkrunfw-x86_64.tgz "https://github.com/containers/libkrunfw/releases/download/$TAG/libkrunfw-x86_64.tgz"
+          curl -fL --retry 3 -o /tmp/libkrunfw-x86_64.tgz "https://github.com/libkrun/libkrunfw/releases/download/$LIBKRUNFW_VERSION/libkrunfw-x86_64.tgz"
+          echo 'c169206b01c89fbe134f1728bf4f988702bc7f73b4cf73e6fdece447d6fceca1  /tmp/libkrunfw-x86_64.tgz' | sha256sum --check --strict
           mkdir tmp && tar xf /tmp/libkrunfw-x86_64.tgz -C tmp && sudo mv tmp/lib64/* /lib/x86_64-linux-gnu
       
       - name: Integration tests
-        run: KRUN_ENOMEM_WORKAROUND=1 KRUN_TEST_BASE_DIR=/tmp/libkrun-tests make test NET=1 BLK=1 IPERF_DURATION=3 TEST_FLAGS="--keep-all --github-summary"
+        run: KRUN_ENOMEM_WORKAROUND=1 make test NET=1 BLK=1 IPERF_DURATION=3 TEST_FLAGS="--keep-all --github-summary"
 
       - name: Upload test logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: test-logs-x86_64
+          name: test-logs-x86_64-freebsd-${{ matrix.freebsd }}
           path: |
-            /tmp/libkrun-tests/
-            !/tmp/libkrun-tests/**/guest-agent
-            !/tmp/libkrun-tests/**/rootfs
+            ${{ env.KRUN_TEST_BASE_DIR }}/
+            !${{ env.KRUN_TEST_BASE_DIR }}/**/guest-agent
+            !${{ env.KRUN_TEST_BASE_DIR }}/**/rootfs
           if-no-files-found: ignore
 
   integration-tests-aarch64:
-    name: Integration Tests (Linux aarch64)
+    name: Integration Tests (${{ matrix.label }})
     runs-on: self-hosted
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Linux aarch64
+            freebsd: '0'
+          - label: Linux aarch64 + FreeBSD guest
+            freebsd: '1'
+    env:
+      KRUN_TEST_FREEBSD: ${{ matrix.freebsd }}
+      KRUN_TEST_BASE_DIR: /tmp/libkrun-tests-aarch64-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.freebsd }}
     steps:
       - uses: actions/checkout@v4
       
       - name: Setup build environment
         uses: ./.github/actions/setup-build-env
+        with:
+          freebsd: ${{ matrix.freebsd == '1' && 'true' || 'false' }}
       
       - name: Install cross-compilation dependencies
         run: |
@@ -118,12 +145,15 @@ jobs:
         run: rustup target add aarch64-unknown-linux-musl
       
       - name: Install nightly toolchain with rust-src for FreeBSD aarch64
+        if: matrix.freebsd == '1'
         run: rustup +nightly-2026-01-25 component add rust-src
       
       - name: Install FreeBSD test prerequisites
+        if: matrix.freebsd == '1'
         run: sudo apt-get install -y --no-install-recommends libarchive-tools
       
       - name: Build FreeBSD sysroot and init
+        if: matrix.freebsd == '1'
         run: make BUILD_BSD_INIT=1 -- init/init-freebsd
       
       - name: Install gvproxy
@@ -166,30 +196,21 @@ jobs:
           sudo make install
       
       - name: Install libkrunfw
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Authenticate the API call so it is not throttled by GitHub's 60/hr
-          # anonymous rate limit, which resolves TAG to null and makes the asset
-          # download 404 with a 9-byte "Not Found" that tar then chokes on.
-          TAG=$(curl -sfL -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/containers/libkrunfw/releases/latest | jq -r .tag_name)
-          [ -n "$TAG" ] && [ "$TAG" != "null" ] || { echo "failed to resolve libkrunfw release tag"; exit 1; }
-          curl -fL --retry 3 -o /tmp/libkrunfw-aarch64.tgz "https://github.com/containers/libkrunfw/releases/download/$TAG/libkrunfw-aarch64.tgz"
+          curl -fL --retry 3 -o /tmp/libkrunfw-aarch64.tgz "https://github.com/libkrun/libkrunfw/releases/download/$LIBKRUNFW_VERSION/libkrunfw-aarch64.tgz"
+          echo 'b04c9a5520a1ea52b5b35d87559566872246145961c4b6978034c9b9be54b89b  /tmp/libkrunfw-aarch64.tgz' | sha256sum --check --strict
           mkdir tmp && tar xf /tmp/libkrunfw-aarch64.tgz -C tmp && sudo mv tmp/lib64/* /lib/aarch64-linux-gnu
 
-      - name: Clean up tests directory
-        run: rm -fr /tmp/libkrun-tests
-      
       - name: Integration tests
-        run: KRUN_ENOMEM_WORKAROUND=1 KRUN_NO_UNSHARE=1 KRUN_TEST_BASE_DIR=/tmp/libkrun-tests make test NET=1 BLK=1 IPERF_DURATION=3 TEST_FLAGS="--keep-all --github-summary"
+        run: KRUN_ENOMEM_WORKAROUND=1 KRUN_NO_UNSHARE=1 make test NET=1 BLK=1 IPERF_DURATION=3 TEST_FLAGS="--keep-all --github-summary"
 
       - name: Upload test logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: test-logs-aarch64
+          name: test-logs-aarch64-freebsd-${{ matrix.freebsd }}
           path: |
-            /tmp/libkrun-tests/
-            !/tmp/libkrun-tests/**/guest-agent
-            !/tmp/libkrun-tests/**/rootfs
+            ${{ env.KRUN_TEST_BASE_DIR }}/
+            !${{ env.KRUN_TEST_BASE_DIR }}/**/guest-agent
+            !${{ env.KRUN_TEST_BASE_DIR }}/**/rootfs
           if-no-files-found: ignore
