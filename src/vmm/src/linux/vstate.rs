@@ -3762,11 +3762,11 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn host_cache_descriptors_are_not_vcpu_state() {
-        let ccsidr = kvm_bindings::KVM_REG_ARM64 as u64
+        let ccsidr = kvm_bindings::KVM_REG_ARM64
             | kvm_bindings::KVM_REG_SIZE_U32
             | KVM_REG_ARM_DEMUX as u64
             | 3;
-        let system_register = kvm_bindings::KVM_REG_ARM64 as u64
+        let system_register = kvm_bindings::KVM_REG_ARM64
             | kvm_bindings::KVM_REG_SIZE_U64
             | kvm_bindings::KVM_REG_ARM64_SYSREG as u64;
 

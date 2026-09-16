@@ -936,8 +936,10 @@ fn capture_reads_back_actual_swapped_private_pages() {
             .read_exact_at(&mut entries, (address as u64 / host_page_size() as u64) * 8)
             .unwrap();
         swapped = entries
-            .chunks_exact(8)
-            .filter(|entry| u64::from_ne_bytes((*entry).try_into().unwrap()) & (1 << 62) != 0)
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .filter(|entry| u64::from_ne_bytes(**entry) & (1 << 62) != 0)
             .count();
         if swapped != 0 {
             break;
@@ -1924,5 +1926,102 @@ fn kvm_writes_are_preserved_in_nested_layers() {
         let address = GuestAddress(0x4000 + id * host_page_size() as u64);
         assert_eq!(third.memory.read_obj::<u8>(address).unwrap(), 0x91);
         assert_eq!(sibling.memory.read_obj::<u8>(address).unwrap(), 0x5A);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn arm_kvm_writes_are_preserved_in_nested_layers() {
+    use kvm_bindings::{
+        KVM_REG_ARM_CORE, KVM_REG_ARM64, KVM_REG_SIZE_U64, kvm_regs, kvm_userspace_memory_region,
+        kvm_vcpu_init, user_pt_regs,
+    };
+    use kvm_ioctls::{Kvm, VcpuExit};
+    use std::mem::{offset_of, size_of};
+
+    const LEN: usize = 2 * 1024 * 1024;
+    const CPUS: u64 = 2;
+    fn run(instance: &Instance, value: u8) {
+        let kvm = Kvm::new().unwrap();
+        let vm = kvm.create_vm().unwrap();
+        // SAFETY: the instance owns the reservation until all vCPUs and
+        // the VM descriptor are dropped, just as in the x86 KVM test.
+        unsafe {
+            vm.set_user_memory_region(kvm_userspace_memory_region {
+                slot: 0,
+                guest_phys_addr: 0,
+                memory_size: LEN as u64,
+                userspace_addr: instance.memory.get_host_address(GuestAddress(0)).unwrap() as u64,
+                flags: 0,
+            })
+        }
+        .unwrap();
+        let mut target = kvm_vcpu_init::default();
+        vm.get_preferred_target(&mut target).unwrap();
+        let core = KVM_REG_ARM64 | KVM_REG_SIZE_U64 | u64::from(KVM_REG_ARM_CORE);
+        let reg = |offset: usize| {
+            core | ((offset_of!(kvm_regs, regs) + offset) / size_of::<u32>()) as u64
+        };
+        // Initialize all vCPUs before running any of them; ARM KVM freezes
+        // parts of VM configuration on its first KVM_RUN.
+        let cpus: Vec<_> = (0..CPUS)
+            .map(|id| {
+                let cpu = vm.create_vcpu(id).unwrap();
+                cpu.vcpu_init(&target).unwrap();
+                for (offset, value) in [
+                    (offset_of!(user_pt_regs, pc), 0),
+                    (offset_of!(user_pt_regs, pstate), 0x3c5), // EL1h, interrupts masked.
+                    (
+                        offset_of!(user_pt_regs, regs),
+                        4 * host_page_size() as u64 + id * host_page_size() as u64,
+                    ),
+                    (
+                        offset_of!(user_pt_regs, regs) + size_of::<u64>(),
+                        u64::from(value),
+                    ),
+                    (
+                        offset_of!(user_pt_regs, regs) + 2 * size_of::<u64>(),
+                        LEN as u64,
+                    ),
+                ] {
+                    cpu.set_one_reg(reg(offset), &value.to_le_bytes()).unwrap();
+                }
+                cpu
+            })
+            .collect();
+        std::thread::scope(|scope| {
+            for mut cpu in cpus {
+                scope.spawn(move || match cpu.run().unwrap() {
+                    VcpuExit::MmioWrite(address, bytes) => {
+                        assert_eq!(address, LEN as u64);
+                        assert_eq!(bytes, &[value]);
+                    }
+                    exit => panic!("unexpected guest completion: {exit:?}"),
+                });
+            }
+        });
+    }
+
+    let file = crate::builder::create_guest_ram_memfd(LEN).unwrap();
+    // strb w1, [x0]; strb w1, [x2]. The first instruction modifies RAM;
+    // the second signals completion through an unmapped MMIO address.
+    file.write_all_at(&[0x01, 0x00, 0x00, 0x39, 0x41, 0x00, 0x00, 0x39], 0)
+        .unwrap();
+    let image = Image::from_immutable_file(file, LEN).unwrap();
+    let first = image.restore().unwrap();
+    run(&first, 0x5a);
+    let (generation, copied) = first.capture_quiesced().unwrap();
+    assert_eq!(copied, CPUS as usize * host_page_size());
+    let second = generation.restore().unwrap();
+    run(&second, 0x91);
+    let (nested, copied) = second.capture_quiesced().unwrap();
+    assert_eq!(copied, CPUS as usize * host_page_size());
+    let third = nested.restore().unwrap();
+    let sibling = generation.restore().unwrap();
+    drop((image, first, second, generation, nested));
+    for id in 0..CPUS {
+        let address = GuestAddress((4 + id) * host_page_size() as u64);
+        assert_eq!(third.memory.read_obj::<u8>(address).unwrap(), 0x91);
+        assert_eq!(sibling.memory.read_obj::<u8>(address).unwrap(), 0x5a);
     }
 }
