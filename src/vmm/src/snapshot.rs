@@ -86,17 +86,60 @@ fn stream_sparse_memory_files<W: Write>(
     sources: &[(&File, u64, u64)],
     output: &mut W,
 ) -> io::Result<()> {
+    stream_sparse_memory_files_with_seek(sources, output, next_memory_data_offset)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn next_memory_data_offset(file: &File, offset: u64) -> io::Result<Option<u64>> {
+    let offset =
+        i64::try_from(offset).map_err(|_| io::Error::other("RAM source offset exceeds off_t"))?;
+    loop {
+        // The generation owner retains this immutable file throughout discovery
+        // and emission. Payload reads use pread, never this shared seek cursor.
+        let data = unsafe { libc::lseek(file.as_raw_fd(), offset, libc::SEEK_DATA) };
+        if data >= offset {
+            return Ok(Some(data as u64));
+        }
+        if data >= 0 {
+            return Err(io::Error::other("RAM data extent moved backwards"));
+        }
+        let error = io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::ENXIO) => return Ok(None),
+            Some(libc::EINVAL | libc::ENOTSUP) => {
+                return Err(io::Error::new(io::ErrorKind::Unsupported, error));
+            }
+            _ => return Err(error),
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn stream_sparse_memory_files_with_seek<W: Write>(
+    sources: &[(&File, u64, u64)],
+    output: &mut W,
+    mut next_data: impl FnMut(&File, u64) -> io::Result<Option<u64>>,
+) -> io::Result<()> {
     use std::os::unix::fs::FileExt;
     const PAGE: usize = 4096;
     static ZERO: [u8; PAGE] = [0; PAGE];
-    let logical = sources.iter().try_fold(0_u64, |total, (_, start, len)| {
-        start
-            .checked_add(*len)
-            .ok_or_else(|| io::Error::other("RAM source offset overflow"))?;
-        total
-            .checked_add(*len)
-            .ok_or_else(|| io::Error::other("RAM stream length overflow"))
-    })?;
+    let logical = sources
+        .iter()
+        .try_fold(0_u64, |total, (file, start, len)| {
+            let end = start
+                .checked_add(*len)
+                .ok_or_else(|| io::Error::other("RAM source offset overflow"))?;
+            if end > file.metadata()?.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "RAM source is truncated",
+                ));
+            }
+            total
+                .checked_add(*len)
+                .ok_or_else(|| io::Error::other("RAM stream length overflow"))
+        })?;
     if logical == 0 {
         return Err(io::Error::other("empty RAM stream"));
     }
@@ -105,7 +148,25 @@ fn stream_sparse_memory_files<W: Write>(
     let mut base = 0;
     for (file, start, len) in sources {
         let mut cursor = 0;
+        let mut seek_supported = true;
         while cursor < *len {
+            if seek_supported {
+                match next_data(file, start + cursor) {
+                    Ok(Some(data)) if data < start + cursor => {
+                        return Err(io::Error::other("RAM data extent moved backwards"));
+                    }
+                    Ok(Some(data)) if data < start + len => {
+                        // Preserve the original region-relative page boundaries,
+                        // including a region starting partway through a host page.
+                        cursor = (data - start) / PAGE as u64 * PAGE as u64;
+                    }
+                    Ok(_) => break,
+                    Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+                        seek_supported = false;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
             let count = (*len - cursor).min(buffer.len() as u64) as usize;
             file.read_exact_at(&mut buffer[..count], start + cursor)?;
             for (page, bytes) in buffer[..count].chunks(PAGE).enumerate() {
@@ -2622,6 +2683,82 @@ mod tests {
         second.read_exact_at(&mut expected[16385..], 1024).unwrap();
         assert_eq!(restored, expected);
         assert!(encoded.len() < logical);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn sparse_stream_extent_scan_matches_full_scan() {
+        use std::os::unix::fs::FileExt;
+        let file = crate::builder::create_guest_ram_memfd(16 * 1024 * 1024).unwrap();
+        for offset in [4095, 1048575, 8 * 1048576 + 17, 16 * 1048576 - 7] {
+            file.write_all_at(b"payload", offset).unwrap();
+        }
+        for (start, len) in [(0, 16 * 1048576), (13, 15 * 1048576 + 9), (8192, 32768)] {
+            let sources = [(&file, start, len)];
+            let mut full = Vec::new();
+            let mut fallback_calls = 0;
+            super::stream_sparse_memory_files_with_seek(&sources, &mut full, |_, _| {
+                fallback_calls += 1;
+                Err(io::ErrorKind::Unsupported.into())
+            })
+            .unwrap();
+            assert_eq!(
+                fallback_calls, 1,
+                "unsupported seek must disable further probes"
+            );
+            let mut sparse = Vec::new();
+            super::stream_sparse_memory_files(&sources, &mut sparse).unwrap();
+            assert_eq!(sparse, full, "region {start}+{len}");
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn sparse_stream_skips_a_large_leading_hole() {
+        use std::os::unix::fs::FileExt;
+        let len = 4_u64 * 1024 * 1024 * 1024;
+        let file = crate::builder::create_guest_ram_memfd(len as usize).unwrap();
+        file.write_all_at(b"last", len - 4).unwrap();
+        let mut queried = Vec::new();
+        let mut encoded = Vec::new();
+        super::stream_sparse_memory_files_with_seek(
+            &[(&file, 0, len)],
+            &mut encoded,
+            |file, offset| {
+                queried.push(offset);
+                super::next_memory_data_offset(file, offset)
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            queried,
+            [0],
+            "discovery should jump directly to the final page"
+        );
+        assert!(encoded.ends_with(b"last"));
+        assert!(encoded.len() < 8192);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn sparse_stream_seek_errors_do_not_publish_a_header() {
+        let file = crate::builder::create_guest_ram_memfd(4096).unwrap();
+        for backwards in [false, true] {
+            let mut output = Vec::new();
+            let result = super::stream_sparse_memory_files_with_seek(
+                &[(&file, 1, 4095)],
+                &mut output,
+                |_, _| {
+                    if backwards {
+                        Ok(Some(0))
+                    } else {
+                        Err(io::Error::from_raw_os_error(libc::EIO))
+                    }
+                },
+            );
+            assert!(result.is_err());
+            assert!(output.is_empty());
+        }
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
