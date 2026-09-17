@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use std::ops::Range;
 
 mod device;
-pub use device::MemoryDevice;
+pub use device::{MemoryDevice, MemoryDeviceState};
 
 const ACK: u16 = 0;
 const NACK: u16 = 1;
@@ -17,7 +17,8 @@ const PLUGGED: u16 = 0;
 const UNPLUGGED: u16 = 1;
 const MIXED: u16 = 2;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryState {
     addr: u64,
     region_size: u64,
@@ -28,6 +29,33 @@ pub struct MemoryState {
 }
 
 impl MemoryState {
+    /// A restored device may only advertise usable memory that exists in the
+    /// restored address space, including currently unplugged blocks.
+    pub fn validate_backing(&self, memory: &vm_memory::GuestMemoryMmap) -> Result<(), String> {
+        use vm_memory::{GuestAddress, GuestMemory};
+        self.validate()?;
+        let len =
+            usize::try_from(self.usable_size).map_err(|_| "RAM backing exceeds host range")?;
+        if len != 0 && !memory.check_range(GuestAddress(self.addr), len) {
+            return Err("checkpoint is missing backing for the RAM device's usable range".into());
+        }
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        let mut geometry = Self::new(self.addr, self.region_size, self.block_size)?;
+        geometry.request_growth(self.requested_size, self.usable_size)?;
+        if self.plugged.len() as u64 > self.requested_size / self.block_size
+            || self
+                .plugged
+                .last()
+                .is_some_and(|block| *block >= self.usable_size / self.block_size)
+        {
+            return Err("checkpoint has invalid plugged RAM blocks".into());
+        }
+        Ok(())
+    }
+
     /// Reserve only a guest physical address aperture, not backing host RAM.
     pub fn new(addr: u64, region_size: u64, block_size: u64) -> Result<Self, String> {
         if !block_size.is_power_of_two()
@@ -169,6 +197,25 @@ mod tests {
         bytes[8..16].copy_from_slice(&addr.to_le_bytes());
         bytes[16..18].copy_from_slice(&count.to_le_bytes());
         bytes
+    }
+
+    #[test]
+    fn restored_memory_requires_backing_for_unplugged_usable_blocks_too() {
+        use vm_memory::{GuestAddress, GuestMemoryMmap};
+        let mut state = MemoryState::new(BASE, 0x10000, 0x1000).unwrap();
+        state.request_growth(0x1000, 0x3000).unwrap();
+        let missing = GuestMemoryMmap::<()>::from_ranges(&[
+            (GuestAddress(BASE), 0x1000),
+            (GuestAddress(BASE + 0x2000), 0x1000),
+        ])
+        .unwrap();
+        assert!(state.validate_backing(&missing).is_err());
+        let complete = GuestMemoryMmap::<()>::from_ranges(&[
+            (GuestAddress(BASE), 0x1000),
+            (GuestAddress(BASE + 0x1000), 0x2000),
+        ])
+        .unwrap();
+        state.validate_backing(&complete).unwrap();
     }
 
     #[test]
