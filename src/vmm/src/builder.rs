@@ -1188,6 +1188,8 @@ pub fn build_microvm(
         vcpus_handles: Vec::new(),
         #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
         prototype_cpu_topology,
+        #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+        cpu_growth_failure: None,
         run_state: super::VmmRunState::Paused,
         paused_at: None,
         devices_quiesced: false,

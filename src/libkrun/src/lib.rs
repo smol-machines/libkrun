@@ -1713,6 +1713,13 @@ fn handle_control_stream<S: std::io::Read + std::io::Write + Send + 'static>(
             let _arg = parts.next().map(str::trim).unwrap_or("");
             match verb.as_str() {
                 #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+                "PROTOTYPE_CPU_STATUS" => match vmm.lock().unwrap().prototype_cpu_status() {
+                    Ok((created, capacity)) => {
+                        format!("OK created {created} capacity {capacity}\n")
+                    }
+                    Err(error) => format!("ERR EIO {error}\n"),
+                },
+                #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
                 "PROTOTYPE_GROW_CPUS" => match _arg.parse::<u8>() {
                     Ok(count) => match vmm.lock().unwrap().prototype_grow_cpus(count) {
                         Ok(()) => format!("OK created {count} vCPUs; guest online required\n"),
