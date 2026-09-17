@@ -2714,6 +2714,58 @@ mod tests {
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
+    fn sparse_stream_dense_and_fragmented_sources_match_full_scan() {
+        use std::os::unix::fs::FileExt;
+        let len = 4 * 1024 * 1024;
+        for dense in [false, true] {
+            let file = crate::builder::create_guest_ram_memfd(len).unwrap();
+            for page in 0..len / 4096 {
+                if dense || page % 2 == 0 {
+                    file.write_all_at(&[0xa5; 4096], (page * 4096) as u64)
+                        .unwrap();
+                }
+            }
+            for start in [0, 1, 511, 4095, 4096, 8191] {
+                let sources = [(&file, start, len as u64 - start - 3)];
+                let mut full = Vec::new();
+                super::stream_sparse_memory_files_with_seek(&sources, &mut full, |_, _| {
+                    Err(io::ErrorKind::Unsupported.into())
+                })
+                .unwrap();
+                let mut actual = Vec::new();
+                super::stream_sparse_memory_files(&sources, &mut actual).unwrap();
+                assert_eq!(actual, full, "dense={dense} start={start}");
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn sparse_stream_late_unsupported_seek_keeps_prior_progress() {
+        use std::os::unix::fs::FileExt;
+        let len = 4 * 1024 * 1024;
+        let file = crate::builder::create_guest_ram_memfd(len).unwrap();
+        file.write_all_at(&vec![0xa5; len], 0).unwrap();
+        let sources = [(&file, 0, len as u64)];
+        let mut expected = Vec::new();
+        super::stream_sparse_memory_files(&sources, &mut expected).unwrap();
+        let mut actual = Vec::new();
+        let mut calls = 0;
+        super::stream_sparse_memory_files_with_seek(&sources, &mut actual, |_, offset| {
+            calls += 1;
+            if calls == 1 {
+                Ok(Some(offset))
+            } else {
+                Err(io::ErrorKind::Unsupported.into())
+            }
+        })
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(actual, expected);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
     fn sparse_stream_skips_a_large_leading_hole() {
         use std::os::unix::fs::FileExt;
         let len = 4_u64 * 1024 * 1024 * 1024;
