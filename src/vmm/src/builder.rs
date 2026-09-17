@@ -2737,6 +2737,7 @@ fn attach_fs_devices(
                 config.shared_dir.clone(),
                 exit_code.clone(),
                 config.read_only,
+                config.override_stat,
                 config.virtual_entries.clone(),
             )
             .unwrap(),
