@@ -1370,8 +1370,13 @@ impl DeferredMemorySave {
             DeferredLinuxGeneration::Copy(copy) => copy.finish()?,
             DeferredLinuxGeneration::Layered(generation) => {
                 let regions = generation.memory_regions();
-                write_memory_stream_header(output, &regions)?;
-                generation.write_to(output)?;
+                header(&regions, output)?;
+                if sparse {
+                    stream_sparse_memory_files(&generation.memory_sources(), output)?;
+                } else {
+                    write_memory_stream_header(output, &regions)?;
+                    generation.write_to(output)?;
+                }
                 return Ok(regions);
             }
         };

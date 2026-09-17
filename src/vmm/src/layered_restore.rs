@@ -481,6 +481,23 @@ impl Generation {
         Ok(())
     }
 
+    /// Borrow the complete logical image in portable region order. The
+    /// generation owns all immutable files until streaming has finished.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn memory_sources(&self) -> Vec<(&File, u64, u64)> {
+        self.regions
+            .iter()
+            .flat_map(|image| &image.extents)
+            .map(|extent| {
+                (
+                    extent.file.as_ref(),
+                    extent.offset,
+                    (extent.end - extent.start) as u64,
+                )
+            })
+            .collect()
+    }
+
     pub fn memory_regions(&self) -> Vec<crate::snapshot::MemoryRegionDesc> {
         self.regions
             .iter()
@@ -1434,6 +1451,85 @@ fn deferred_checkpoint_preserves_boundary_after_source_continues() {
     output.read_exact_at(&mut bytes, 0).unwrap();
     assert_eq!(bytes, expected);
     assert_eq!(source.read_obj::<u8>(GuestAddress(0)).unwrap(), 0x99);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn layered_sparse_checkpoint_keeps_header_and_complete_generation() {
+    use crate::snapshot::{DeferredMemorySave, MemoryRegionDesc};
+    use std::io::{Read, Write};
+
+    let page = host_page_size();
+    let file = crate::builder::create_guest_ram_memfd(4 * page).unwrap();
+    file.write_all_at(&vec![0x31; 4 * page], 0).unwrap();
+    let regions = [
+        MemoryRegionDesc {
+            gpa: 0,
+            len: (2 * page) as u64,
+        },
+        MemoryRegionDesc {
+            gpa: 1 << 32,
+            len: (2 * page) as u64,
+        },
+    ];
+    let base = Generation::from_immutable_file(&regions, &file).unwrap();
+    let source = base.restore().unwrap();
+    source
+        .write_slice(&vec![0; page], GuestAddress(page as u64))
+        .unwrap();
+    source
+        .write_slice(&vec![0x42; page], GuestAddress((1 << 32) + page as u64))
+        .unwrap();
+    let (saved, _) = base.capture_quiesced(&source).unwrap();
+    saved.rebase_quiesced(&source).unwrap();
+    source
+        .write_slice(&vec![0x99; page], GuestAddress(0))
+        .unwrap();
+    drop((file, base));
+
+    let mut expected = vec![0x31; 4 * page];
+    expected[page..2 * page].fill(0);
+    expected[3 * page..].fill(0x42);
+    let mut wire = Vec::new();
+    let mut headers = 0;
+    DeferredMemorySave::from_layered(saved.clone())
+        .finish_sparse_stream_with_header(&mut wire, |descs, out| {
+            headers += 1;
+            assert_eq!(descs.len(), 2);
+            assert_eq!(descs[1].gpa, 1 << 32);
+            out.write_all(b"outer")
+        })
+        .unwrap();
+    assert_eq!(headers, 1, "checkpoint metadata must precede RAM");
+    assert_eq!(&wire[..5], b"outer");
+    assert_eq!(&wire[5..13], b"SMOLRSP1");
+    assert_eq!(
+        u64::from_le_bytes(wire[13..21].try_into().unwrap()),
+        expected.len() as u64
+    );
+    let count = u32::from_le_bytes(wire[21..25].try_into().unwrap()) as usize;
+    let mut decoded = vec![0; expected.len()];
+    let mut payload = std::io::Cursor::new(&wire[25 + count * 16..]);
+    for index in 0..count {
+        let start = 25 + index * 16;
+        let offset = u64::from_le_bytes(wire[start..start + 8].try_into().unwrap()) as usize;
+        let len = u64::from_le_bytes(wire[start + 8..start + 16].try_into().unwrap()) as usize;
+        payload
+            .read_exact(&mut decoded[offset..offset + len])
+            .unwrap();
+    }
+    assert_eq!(payload.position() as usize, payload.get_ref().len());
+    assert_eq!(decoded, expected);
+    assert_eq!(source.read_obj::<u8>(GuestAddress(0)).unwrap(), 0x99);
+
+    let mut rejected = Vec::new();
+    let error = DeferredMemorySave::from_layered(saved)
+        .finish_sparse_stream_with_header(&mut rejected, |_, _| {
+            Err(io::ErrorKind::BrokenPipe.into())
+        })
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    assert!(rejected.is_empty());
 }
 
 #[test]
