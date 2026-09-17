@@ -75,6 +75,10 @@ impl MemoryDevice {
     pub fn restore_state(&mut self, state: &MemoryDeviceState) -> Result<(), String> {
         state.validate()?;
         if self.device.is_activated() {
+            if self.quiesced && self.save_state() == *state {
+                // Continuing a just-captured source needs no device mutation.
+                return Ok(());
+            }
             return Err("RAM device must be inactive before restoring its state".into());
         }
         if self.state.addr != state.memory.addr
