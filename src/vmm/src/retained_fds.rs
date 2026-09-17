@@ -6,7 +6,7 @@ use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -19,6 +19,29 @@ use std::time::{Duration, Instant};
 const TOKEN_LEN: usize = 32;
 const TIMEOUT: Duration = Duration::from_millis(500);
 const HANDOFF_DEADLINE: Duration = Duration::from_secs(2);
+
+// Linux pathname sockets have a short sockaddr_un limit, even when their
+// containing directory is otherwise valid. Resolve long paths through a pinned
+// directory descriptor in *this* process; no owner PID or foreign fd is exposed.
+// Keep the descriptor alive through bind/connect. The socket still lives at the
+// original path, with the same permissions, identity checks and peer validation.
+fn socket_address(path: &Path) -> io::Result<(PathBuf, Option<File>)> {
+    if path.as_os_str().len() <= 100 {
+        return Ok((path.to_path_buf(), None));
+    }
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "checkpoint socket has no filename",
+        )
+    })?;
+    let directory = File::options()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_DIRECTORY)
+        .open(path.parent().unwrap_or_else(|| Path::new(".")))?;
+    let address = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd())).join(name);
+    Ok((address, Some(directory)))
+}
 
 fn remaining(deadline: Instant) -> io::Result<Duration> {
     deadline
@@ -90,7 +113,7 @@ impl RetainedFiles {
         path: &Path,
         files: BTreeMap<i32, Arc<File>>,
     ) -> io::Result<(Self, [u8; TOKEN_LEN])> {
-        if files.is_empty() || files.len() > 1024 || path.as_os_str().len() > 100 {
+        if files.is_empty() || files.len() > 1024 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "invalid checkpoint handoff size or path",
@@ -119,7 +142,8 @@ impl RetainedFiles {
             }
             read += result as usize;
         }
-        let listener = UnixListener::bind(path)?;
+        let (address, _directory) = socket_address(path)?;
+        let listener = UnixListener::bind(address)?;
         let id = identity(path)?;
         let stop = Arc::new(AtomicBool::new(false));
         let mut service = Self {
@@ -222,7 +246,8 @@ impl Drop for RetainedFiles {
 }
 
 fn connect_before(path: &Path, deadline: Instant) -> io::Result<UnixStream> {
-    let bytes = path.as_os_str().as_bytes();
+    let (address_path, _directory) = socket_address(path)?;
+    let bytes = address_path.as_os_str().as_bytes();
     let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     if bytes.is_empty() || bytes.contains(&0) || bytes.len() >= address.sun_path.len() {
         return Err(io::Error::new(
@@ -411,6 +436,30 @@ mod tests {
         file.set_permissions(fs::Permissions::from_mode(0o000))
             .unwrap();
         readonly
+    }
+
+    #[test]
+    fn handoff_supports_deep_checkpoint_directories() {
+        let root = path("long-directory");
+        let directory = root.join("a".repeat(80)).join("b".repeat(80));
+        fs::create_dir_all(&directory).unwrap();
+        let socket = directory.join("f");
+        assert!(socket.as_os_str().len() > 108);
+        let result =
+            RetainedFiles::start(&socket, BTreeMap::from([(42, Arc::new(retained_file()))]));
+        if let Ok((service, token)) = result {
+            let files = receive(&socket, &token, std::process::id(), &[42]).unwrap();
+            let mut bytes = [0; 8];
+            files[&42].read_exact_at(&mut bytes, 0).unwrap();
+            assert_eq!(&bytes, b"retained");
+            assert_eq!(fs::metadata(&socket).unwrap().mode() & 0o777, 0o600);
+            drop(service);
+            assert!(!socket.exists());
+        } else {
+            fs::remove_dir_all(&root).unwrap();
+            panic!("long checkpoint directory refused: {:?}", result.err());
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

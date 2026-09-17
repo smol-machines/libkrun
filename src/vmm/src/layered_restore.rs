@@ -52,6 +52,9 @@ impl Generation {
         socket: &std::path::Path,
     ) -> io::Result<(Vec<u8>, crate::retained_fds::RetainedFiles)> {
         use std::os::unix::ffi::OsStrExt;
+        if !socket.is_absolute() || socket.as_os_str().len() >= libc::PATH_MAX as usize {
+            return Err(invalid("invalid checkpoint handoff path"));
+        }
         let mut bytes = self.encode_manifest()?;
         let mut files = std::collections::BTreeMap::new();
         for region in &self.regions {
@@ -144,7 +147,7 @@ impl Generation {
         let handoff = if transport == 1 {
             use std::os::unix::ffi::OsStrExt;
             let len = u16::from_le_bytes(take(&mut remaining)?) as usize;
-            if len == 0 || len > 100 {
+            if len == 0 || len >= libc::PATH_MAX as usize {
                 return Err(invalid("invalid checkpoint handoff path length"));
             }
             let path = remaining
@@ -1369,7 +1372,11 @@ fn manifest_handoff_retains_private_checkpoint_after_owner_drops() {
         .unwrap();
     let (snapshot, copied) = base.capture_quiesced(&parent).unwrap();
     assert_eq!(copied, host_page_size());
-    let socket = std::env::temp_dir().join(format!("krun-generation-fds-{}", std::process::id()));
+    let directory =
+        std::env::temp_dir().join(format!("krun-generation-fds-{}", std::process::id()));
+    let deep = directory.join("generation-".repeat(12));
+    std::fs::create_dir_all(&deep).unwrap();
+    let socket = deep.join("f");
     let (manifest, service) = snapshot.publish_manifest(&socket).unwrap();
     let imported = Generation::decode_manifest(&manifest).unwrap();
     drop(service);
@@ -1393,6 +1400,7 @@ fn manifest_handoff_retains_private_checkpoint_after_owner_drops() {
         0x79
     );
     assert!(Generation::decode_manifest(&manifest).is_err());
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[cfg(target_arch = "x86_64")]
