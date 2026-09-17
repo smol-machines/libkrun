@@ -331,3 +331,32 @@ impl VirtioDevice for Net {
         self.rearm_worker();
     }
 }
+
+#[cfg(test)]
+mod checkpoint_failure_probe {
+    use super::*;
+    use std::thread;
+
+    // Diagnostic of the current behavior, not the desired regression contract.
+    // No guest, backend socket, or network traffic is involved.
+    #[test]
+    fn failed_worker_loses_queue_state_without_rejecting_quiescence() {
+        let mut net = Net::new(
+            "checkpoint-probe".into(),
+            VirtioNetBackend::UnixstreamPath(PathBuf::from("unused-probe-socket")),
+            [0; 6],
+            0,
+        )
+        .unwrap();
+        net.worker_thread = Some(thread::spawn(|| panic!("simulated worker failure")));
+        net.quiesce_for_snapshot();
+        let saved = net.save_state();
+        assert!(net.worker_thread.is_none());
+        assert!(net.quiesced_worker.is_none());
+        assert!(saved.queue_rx.is_none() && saved.queue_tx.is_none());
+        // Retrying quiescence does not recover or report the lost worker.
+        net.quiesce_for_snapshot();
+        net.rearm_after_snapshot();
+        assert!(net.worker_thread.is_none());
+    }
+}
