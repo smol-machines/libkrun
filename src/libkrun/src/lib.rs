@@ -1712,6 +1712,8 @@ fn handle_control_stream<S: std::io::Read + std::io::Write + Send + 'static>(
             // be an unused-variable error under -D warnings.
             let _arg = parts.next().map(str::trim).unwrap_or("");
             match verb.as_str() {
+                #[cfg(feature = "blk")]
+                "GROW_DISK_CAPABILITIES" => "OK grow-disk-v1\n".to_string(),
                 // The privileged embedder must enforce exclusive disk ownership
                 // and serialize machine lifecycle operations before requesting growth.
                 #[cfg(feature = "blk")]
