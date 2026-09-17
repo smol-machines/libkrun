@@ -538,6 +538,17 @@ impl Vmm {
         self.layered_ram = Some(next.clone());
         Ok(Some(next))
     }
+    /// Increase a writable disk's capacity without stopping the guest.
+    ///
+    /// The embedder must hold its machine lifecycle lock and verify that the
+    /// disk is exclusively owned, not an immutable ancestor of another VM.
+    /// A failed durability barrier can leave the backing larger; retry growth
+    /// rather than attempting a destructive shrink to roll the operation back.
+    #[cfg(feature = "blk")]
+    pub fn grow_block_device(&mut self, id: &str, bytes: u64) -> std::result::Result<(), String> {
+        self.mmio_device_manager.grow_block_device(id, bytes)
+    }
+
     #[cfg(not(feature = "tee"))]
     pub(crate) fn set_balloon(&mut self, balloon: Arc<Mutex<devices::virtio::Balloon>>) {
         self.balloon = Some(balloon);
