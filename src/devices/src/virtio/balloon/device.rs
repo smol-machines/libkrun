@@ -612,3 +612,66 @@ mod stats_tests {
         assert_eq!(stats.mem_total, 777);
     }
 }
+
+#[cfg(test)]
+mod checkpoint_quiescence_tests {
+    use super::*;
+    use crate::legacy::DummyIrqChip;
+    use crate::virtio::queue::tests::VirtQueue;
+    #[cfg(unix)]
+    use std::os::fd::AsRawFd;
+    use std::sync::Arc;
+    use utils::epoll::{EpollEvent, EventSet};
+    #[cfg(windows)]
+    use utils::windows::AsRawFd;
+    use vm_memory::GuestAddress;
+
+    #[test]
+    fn a_pending_free_page_callback_cannot_advance_a_quiesced_snapshot() {
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        let rings: Vec<_> = (0..defs::NUM_QUEUES)
+            .map(|i| VirtQueue::new(GuestAddress(0x1000 + i as u64 * 0x1000), &memory, 8))
+            .collect();
+        let queues: Vec<_> = rings
+            .iter()
+            .map(|ring| {
+                DeviceQueue::new(
+                    ring.create_queue(),
+                    Arc::new(EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap()),
+                )
+            })
+            .collect();
+        let event = Arc::clone(&queues[FRQ_INDEX].event);
+        let mut balloon = Balloon::new().unwrap();
+        balloon
+            .activate(
+                memory.clone(),
+                InterruptTransport::new(DummyIrqChip::new().into(), "checkpoint test".into())
+                    .unwrap(),
+                queues,
+            )
+            .unwrap();
+        rings[FRQ_INDEX].dtable[0].addr.set(0x10000);
+        rings[FRQ_INDEX].dtable[0].len.set(4096);
+        rings[FRQ_INDEX].avail.ring[0].set(0);
+        rings[FRQ_INDEX].avail.idx.set(1);
+        event.write(1).unwrap();
+
+        // The control thread has quiesced devices and saved their indices.
+        // The event loop then delivers a notification already pending at pause.
+        balloon.quiesce_for_snapshot();
+        let boundary = balloon.save_state();
+        let used = rings[FRQ_INDEX].used.idx.get();
+        balloon.handle_frq_event(&EpollEvent::new(EventSet::IN, event.as_raw_fd() as u64));
+        assert_eq!(
+            balloon.save_state(),
+            boundary,
+            "queue metadata moved after quiescence"
+        );
+        assert_eq!(
+            rings[FRQ_INDEX].used.idx.get(),
+            used,
+            "guest used ring moved after quiescence"
+        );
+    }
+}
