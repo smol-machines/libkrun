@@ -134,6 +134,20 @@ impl ConsoleControl {
         &self.queue_evt
     }
 
+    pub(crate) fn snapshot_pending(&self) -> Vec<Vec<u8>> {
+        self.queue
+            .lock()
+            .expect("Poisoned lock")
+            .iter()
+            .map(|message| message.to_vec())
+            .collect()
+    }
+
+    pub(crate) fn restore_pending(&self, pending: &[Vec<u8>]) {
+        *self.queue.lock().expect("Poisoned lock") =
+            pending.iter().cloned().map(Payload::Bytes).collect();
+    }
+
     fn push_msg(&self, msg: VirtioConsoleControl) {
         let mut queue = self.queue.lock().expect("Poisoned lock");
         queue.push_back(Payload::ConsoleControl(msg));
