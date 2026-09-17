@@ -235,6 +235,8 @@ struct ContextConfig {
     snapshot_dir: Option<PathBuf>,
     #[cfg(target_os = "linux")]
     snapshot_memory: Option<std::fs::File>,
+    #[cfg(target_os = "linux")]
+    snapshot_memory_immutable: bool,
 }
 
 impl ContextConfig {
@@ -1283,7 +1285,7 @@ fn handle_fork(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
         return format!("ERR EIO create {}: {e}\n", dir.display());
     }
     // Capture + freeze (the VM stays paused as the CoW base).
-    let (checkpoint, descs) = match vmm.lock().unwrap().checkpoint_for_fork() {
+    let (checkpoint, memory) = match vmm.lock().unwrap().checkpoint_for_fork() {
         Ok(v) => v,
         Err(vmm::Error::ForkRequiresMemfd) => {
             return "ERR EINVAL no memfd-backed RAM (start the golden VM with SMOLVM_FORKABLE=1)\n"
@@ -1295,13 +1297,21 @@ fn handle_fork(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
         return rollback_failed_fork(vmm, dir, checkpoint, format!("write checkpoint: {e}"));
     }
     let pid = std::process::id() as i32;
-    if let Err(e) = write_fork_manifest(&dir.join("manifest.bin"), pid, &descs) {
+    let (regions, written) = match memory {
+        vmm::ForkMemory::Mapped(descs) => (
+            descs.len(),
+            write_fork_manifest(&dir.join("manifest.bin"), pid, &descs),
+        ),
+        #[cfg(target_os = "linux")]
+        vmm::ForkMemory::Layered(generation) => (
+            generation.memory_regions().len(),
+            publish_layered_manifest(vmm, &generation, dir),
+        ),
+    };
+    if let Err(e) = written {
         return rollback_failed_fork(vmm, dir, checkpoint, format!("write manifest: {e}"));
     }
-    format!(
-        "OK forked (frozen base, pid {pid}, {} regions)\n",
-        descs.len()
-    )
+    format!("OK forked (frozen base, pid {pid}, {} regions)\n", regions)
 }
 
 #[cfg(all(
@@ -1405,6 +1415,20 @@ fn handle_fork_continue_inner(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str, demand_page
         return format!("ERR EIO write checkpoint: {error}; source already resumed\n");
     }
     match generation {
+        #[cfg(target_os = "linux")]
+        vmm::ForkContinueRamGeneration::Layered(generation) => {
+            if let Err(error) = publish_layered_manifest(vmm, &generation, dir) {
+                let _ = std::fs::remove_file(dir.join("checkpoint.bin"));
+                return format!(
+                    "ERR EIO write layered manifest: {error}; source already resumed\n"
+                );
+            }
+            format!(
+                "OK forked generation (running source, layered RAM, {} regions, {} disks)\n",
+                generation.memory_regions().len(),
+                block_pivots.len()
+            )
+        }
         vmm::ForkContinueRamGeneration::Mapped(descs) => {
             let pid = std::process::id() as i32;
             if let Err(error) = write_fork_manifest(&dir.join("manifest.bin"), pid, &descs) {
@@ -1435,6 +1459,22 @@ fn handle_fork_continue_inner(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str, demand_page
             )
         }
     }
+}
+
+#[cfg(all(fork_supported, target_os = "linux"))]
+fn publish_layered_manifest(
+    vmm: &Arc<Mutex<vmm::Vmm>>,
+    generation: &vmm::layered_restore::Generation,
+    dir: &std::path::Path,
+) -> std::io::Result<()> {
+    let (bytes, service) = generation.publish_manifest(&dir.join("f"))?;
+    let manifest = dir.join("manifest.bin");
+    atomic_write_file(&manifest, &bytes)?;
+    if let Err(error) = vmm.lock().unwrap().retain_layered_export(service) {
+        let _ = std::fs::remove_file(manifest);
+        return Err(error);
+    }
+    Ok(())
 }
 
 #[cfg(fork_supported)]
@@ -1470,13 +1510,26 @@ fn handle_rollback_fork(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
 fn build_restore_ctx(
     dir: &std::path::Path,
 ) -> std::result::Result<vmm::builder::RestoreCtx, String> {
-    build_restore_ctx_with_memory(dir, None)
+    build_restore_ctx_with_memory(dir, None, false)
 }
 
 #[cfg(fork_supported)]
 fn build_restore_ctx_with_memory(
     dir: &std::path::Path,
     readonly_memory: Option<&std::fs::File>,
+    immutable: bool,
+) -> std::result::Result<vmm::builder::RestoreCtx, String> {
+    let layered_requested = cfg!(target_os = "linux")
+        && immutable
+        && std::env::var_os("SMOLVM_FORKABLE").is_some_and(|value| value == "1");
+    build_restore_ctx_with_memory_mode(dir, readonly_memory, layered_requested)
+}
+
+#[cfg(fork_supported)]
+fn build_restore_ctx_with_memory_mode(
+    dir: &std::path::Path,
+    readonly_memory: Option<&std::fs::File>,
+    _layered_requested: bool,
 ) -> std::result::Result<vmm::builder::RestoreCtx, String> {
     let manifest_path = dir.join("manifest.bin");
     let manifest = std::fs::read(&manifest_path).map_err(|e| format!("manifest: {e}"))?;
@@ -1486,6 +1539,25 @@ fn build_restore_ctx_with_memory(
     let magic = u64::from_le_bytes(magic_bytes.try_into().unwrap());
     if readonly_memory.is_some() && magic != PORTABLE_MANIFEST_MAGIC {
         return Err("read-only memory input requires a portable snapshot".into());
+    }
+    #[cfg(target_os = "linux")]
+    if magic_bytes == vmm::layered_restore::MANIFEST_MAGIC {
+        let generation = vmm::layered_restore::Generation::decode_manifest(&manifest)
+            .map_err(|error| format!("layered RAM manifest: {error}"))?;
+        let guest_memory = generation
+            .restore()
+            .map_err(|error| format!("map layered RAM: {error}"))?;
+        let count = generation.memory_regions().len();
+        let checkpoint = std::fs::read(dir.join("checkpoint.bin"))
+            .map_err(|error| format!("checkpoint: {error}"))?;
+        return Ok(vmm::builder::RestoreCtx {
+            demand_pager: None,
+            layered_ram: Some(generation),
+            guest_memory,
+            fork_backed_regions: vec![true; count],
+            checkpoint,
+            portable_clock: false,
+        });
     }
     if magic == PORTABLE_MANIFEST_MAGIC {
         let descs = decode_portable_manifest(&manifest).map_err(|e| format!("manifest: {e}"))?;
@@ -1504,9 +1576,12 @@ fn build_restore_ctx_with_memory(
                 .try_clone()
                 .map_err(|e| format!("duplicate memory input: {e}"))?
         } else {
+            // Layered restore keeps this descriptor as the immutable branch
+            // base. Never retain a writable capability for later handoff;
+            // legacy restore paths still require their writable mapping.
             std::fs::OpenOptions::new()
                 .read(true)
-                .write(true)
+                .write(!_layered_requested)
                 .open(&memory_path)
                 .map_err(|e| format!("memory: {e}"))?
         };
@@ -1521,8 +1596,20 @@ fn build_restore_ctx_with_memory(
             ));
         }
         #[cfg(target_os = "linux")]
-        let guest_memory = if std::env::var_os("SMOLVM_FORKABLE").is_some_and(|value| value == "1")
-        {
+        let layered_ram = if _layered_requested {
+            Some(
+                vmm::layered_restore::Generation::from_immutable_file(&descs, &memory_file)
+                    .map_err(|error| format!("retain layered restore input: {error}"))?,
+            )
+        } else {
+            None
+        };
+        #[cfg(target_os = "linux")]
+        let guest_memory = if let Some(generation) = &layered_ram {
+            generation
+                .restore()
+                .map_err(|error| format!("map layered restore input: {error}"))?
+        } else if std::env::var_os("SMOLVM_FORKABLE").is_some_and(|value| value == "1") {
             vmm::snapshot::map_guest_memory_file_forkable(&descs, &memory_file)
                 .map_err(|e| format!("promote portable guest memory: {e}"))?
         } else {
@@ -1544,6 +1631,8 @@ fn build_restore_ctx_with_memory(
         return Ok(vmm::builder::RestoreCtx {
             #[cfg(target_os = "linux")]
             demand_pager: None,
+            #[cfg(target_os = "linux")]
+            layered_ram,
             guest_memory,
             fork_backed_regions: vec![true; descs.len()],
             checkpoint,
@@ -1566,6 +1655,7 @@ fn build_restore_ctx_with_memory(
         .map_err(|error| format!("create demand-paged guest RAM: {error}"))?;
         return Ok(vmm::builder::RestoreCtx {
             demand_pager: Some(demand.pager),
+            layered_ram: None,
             guest_memory: demand.memory,
             // A leaf can keep these anonymous demand-paged mappings. An
             // explicitly forkable child must materialize them into fresh
@@ -1594,6 +1684,8 @@ fn build_restore_ctx_with_memory(
     Ok(vmm::builder::RestoreCtx {
         #[cfg(target_os = "linux")]
         demand_pager: None,
+        #[cfg(target_os = "linux")]
+        layered_ram: None,
         guest_memory,
         fork_backed_regions: descs
             .iter()
@@ -1918,6 +2010,39 @@ mod control_command_tests {
             write_checkpoint_stream_header(&mut output, b"cpu", &vec![0; 1024 * 1024 + 1]).is_err()
         );
         assert!(output.is_empty());
+    }
+
+    #[cfg(all(target_os = "linux", fork_supported))]
+    #[test]
+    fn direct_file_restore_can_publish_a_layered_branch() {
+        use vm_memory::{Bytes, GuestAddress};
+        let dir = std::env::temp_dir().join(format!(
+            "krun-direct-layered-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let descs = [vmm::snapshot::MemoryRegionDesc { gpa: 0, len: 4096 }];
+        std::fs::write(dir.join("manifest.bin"), encode_portable_manifest(&descs)).unwrap();
+        std::fs::write(dir.join("checkpoint.bin"), b"opaque device state").unwrap();
+        std::fs::write(dir.join("memory.bin"), [0x6a; 4096]).unwrap();
+        let result = (|| {
+            let restored = build_restore_ctx_with_memory_mode(&dir, None, true)
+                .map_err(std::io::Error::other)?;
+            let generation = restored.layered_ram.as_ref().unwrap();
+            let (manifest, service) = generation.publish_manifest(&dir.join("handoff.sock"))?;
+            let imported = vmm::layered_restore::Generation::decode_manifest(&manifest)?;
+            drop(service);
+            drop(restored);
+            let child = imported.restore()?;
+            assert_eq!(child.read_obj::<u8>(GuestAddress(0)).unwrap(), 0x6a);
+            Ok::<(), std::io::Error>(())
+        })();
+        std::fs::remove_dir_all(&dir).unwrap();
+        result.unwrap();
     }
 
     #[test]
@@ -3920,6 +4045,22 @@ pub unsafe extern "C" fn krun_set_snapshot(ctx_id: u32, c_snapshot_dir: *const c
 /// Supported only by Linux branchable restores, which create private memfds.
 #[unsafe(no_mangle)]
 pub extern "C" fn krun_set_snapshot_memory_fd(ctx_id: u32, fd: i32) -> i32 {
+    set_snapshot_memory_input(ctx_id, fd, false)
+}
+
+/// Provide read-only checkpoint RAM with explicit lifetime guarantees.
+/// Flag 1 opts into immutable backing shared by this VM and its descendants;
+/// the caller must not change or truncate that inode during their lifetime.
+/// Flag 0 preserves the original API's eager-copy behavior.
+#[unsafe(no_mangle)]
+pub extern "C" fn krun_set_snapshot_memory_fd2(ctx_id: u32, fd: i32, flags: u32) -> i32 {
+    if flags & !1 != 0 {
+        return -libc::EINVAL;
+    }
+    set_snapshot_memory_input(ctx_id, fd, flags == 1)
+}
+
+fn set_snapshot_memory_input(ctx_id: u32, fd: i32, immutable: bool) -> i32 {
     #[cfg(all(target_os = "linux", fork_supported))]
     {
         use std::os::fd::BorrowedFd;
@@ -3942,6 +4083,7 @@ pub extern "C" fn krun_set_snapshot_memory_fd(ctx_id: u32, fd: i32) -> i32 {
         match CTX_MAP.lock().unwrap().entry(ctx_id) {
             Entry::Occupied(mut config) => {
                 config.get_mut().snapshot_memory = Some(file);
+                config.get_mut().snapshot_memory_immutable = immutable;
                 KRUN_SUCCESS
             }
             Entry::Vacant(_) => -libc::ENOENT,
@@ -3949,7 +4091,7 @@ pub extern "C" fn krun_set_snapshot_memory_fd(ctx_id: u32, fd: i32) -> i32 {
     }
     #[cfg(not(all(target_os = "linux", fork_supported)))]
     {
-        let _ = (ctx_id, fd);
+        let _ = (ctx_id, fd, immutable);
         -libc::ENOTSUP
     }
 }
@@ -5193,8 +5335,11 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     let restore_ctx = match ctx_cfg.snapshot_dir.take() {
         Some(dir) => {
             #[cfg(target_os = "linux")]
-            let result =
-                build_restore_ctx_with_memory(&dir, ctx_cfg.snapshot_memory.take().as_ref());
+            let result = build_restore_ctx_with_memory(
+                &dir,
+                ctx_cfg.snapshot_memory.take().as_ref(),
+                ctx_cfg.snapshot_memory_immutable,
+            );
             #[cfg(not(target_os = "linux"))]
             let result = build_restore_ctx(&dir);
             match result {
@@ -5348,6 +5493,55 @@ fn krun_start_enter_nitro(ctx_id: u32) -> i32 {
 mod test_snapshot_memory_fd {
     use super::*;
     use std::os::fd::AsRawFd;
+
+    #[test]
+    fn immutable_input_is_explicit_per_context_and_legacy_resets_it() {
+        use std::os::unix::fs::FileExt;
+        let id = krun_create_ctx() as u32;
+        let other = krun_create_ctx() as u32;
+        let backing = utils::tempfile::TempFile::new().unwrap();
+        backing.as_file().write_all_at(&[0x37; 4096], 0).unwrap();
+        let input = std::fs::File::open(backing.as_path()).unwrap();
+        assert_eq!(krun_set_snapshot_memory_fd2(id, input.as_raw_fd(), 1), 0);
+        assert_eq!(krun_set_snapshot_memory_fd(other, input.as_raw_fd()), 0);
+        assert_eq!(
+            krun_set_snapshot_memory_fd2(id, input.as_raw_fd(), 2),
+            -libc::EINVAL
+        );
+        assert_eq!(krun_set_snapshot_memory_fd2(id, -1, 0), -libc::EBADF);
+        {
+            let contexts = CTX_MAP.lock().unwrap();
+            assert!(contexts.get(&id).unwrap().snapshot_memory_immutable);
+            assert!(!contexts.get(&other).unwrap().snapshot_memory_immutable);
+        }
+        // Legacy callers can explicitly replace the input and always recover
+        // their copy semantics, even after an earlier immutable opt-in.
+        assert_eq!(krun_set_snapshot_memory_fd(id, input.as_raw_fd()), 0);
+        assert!(
+            !CTX_MAP
+                .lock()
+                .unwrap()
+                .get(&id)
+                .unwrap()
+                .snapshot_memory_immutable
+        );
+        assert_eq!(krun_set_snapshot_memory_fd2(id, input.as_raw_fd(), 1), 0);
+        drop(input);
+        drop(backing);
+        {
+            let contexts = CTX_MAP.lock().unwrap();
+            let retained = contexts.get(&id).unwrap().snapshot_memory.as_ref().unwrap();
+            let mut bytes = [0; 4096];
+            retained.read_exact_at(&mut bytes, 0).unwrap();
+            assert_eq!(bytes, [0x37; 4096]);
+            assert_ne!(
+                unsafe { libc::fcntl(retained.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+                0
+            );
+        }
+        assert_eq!(krun_free_ctx(id), 0);
+        assert_eq!(krun_free_ctx(other), 0);
+    }
 
     #[test]
     fn readonly_descriptor_is_duplicated_and_validated() {

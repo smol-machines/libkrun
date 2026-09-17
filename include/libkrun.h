@@ -1058,6 +1058,22 @@ int32_t krun_set_control_socket(uint32_t ctx_id, const char *c_socket_path);
  */
 int32_t krun_set_snapshot_memory_fd(uint32_t ctx_id, int32_t fd);
 
+#define KRUN_SNAPSHOT_MEMORY_IMMUTABLE 1u
+
+/* Provide portable snapshot RAM with explicit backing lifetime guarantees.
+ * flags=0 preserves krun_set_snapshot_memory_fd's eager-copy behavior.
+ * KRUN_SNAPSHOT_MEMORY_IMMUTABLE enables lazy, private mappings for Linux
+ * branchable restore: only modified pages need new backing when branching.
+ * The caller MUST keep the underlying inode's bytes and length unchanged
+ * until this VM and every descendant referencing it have been destroyed.
+ * Closing the caller's fd or unlinking its pathname is safe: libkrun retains
+ * its own descriptors. Other writable descriptors must not modify the inode.
+ * O_RDONLY alone does not enforce this immutability contract.
+ * Unknown flags return -EINVAL. Descriptor/platform checks match the original
+ * API. This opt-in is per context and never changes another context's mode.
+ */
+int32_t krun_set_snapshot_memory_fd2(uint32_t ctx_id, int32_t fd, uint32_t flags);
+
 /**
  * Configures uid which is set right before the microVM is started.
  *
