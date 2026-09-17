@@ -945,6 +945,12 @@ impl Vmm {
     /// in vCPU-index order.
     #[cfg(snapshot_supported)]
     pub fn save_vcpu_states(&mut self) -> Result<Vec<vstate::VcpuState>> {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+        if let Some(error) = &self.cpu_growth_failure {
+            return Err(Error::VcpuSnapshot(format!(
+                "cannot checkpoint incomplete CPU growth: {error}"
+            )));
+        }
         if self.run_state != VmmRunState::Paused {
             return Err(Error::VcpuSnapshot(
                 "vCPUs must be paused before capturing state".to_string(),
