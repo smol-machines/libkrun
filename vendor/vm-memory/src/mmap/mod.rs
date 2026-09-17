@@ -528,6 +528,37 @@ mod tests {
     }
 
     #[test]
+    fn shared_growth_registration_failure_leaves_all_views_unchanged() {
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)])
+            .unwrap()
+            .with_shared_growth();
+        let device = memory.clone();
+        let region =
+            Arc::new(GuestRegionMmap::from_range(GuestAddress(0x2000), 0x1000, None).unwrap());
+        let failed = memory.append_shared_region_with(region.clone(), |_| {
+            assert!(device.find_region(GuestAddress(0x2000)).is_none());
+            Err(GuestRegionCollectionError::GrowthPoisoned)
+        });
+        assert!(failed.is_err());
+        assert_eq!(memory.num_regions(), 1);
+        assert_eq!(device.num_regions(), 1);
+        memory
+            .append_shared_region_with(region.clone(), |_| {
+                assert!(device.find_region(GuestAddress(0x2000)).is_none());
+                Ok::<_, GuestRegionCollectionError>(())
+            })
+            .unwrap();
+        assert!(device.find_region(GuestAddress(0x2000)).is_some());
+        let overlap = memory.append_shared_region_with(
+            region,
+            |_| -> Result<(), GuestRegionCollectionError> {
+                panic!("overlap must be rejected before registration");
+            },
+        );
+        assert!(overlap.is_err());
+    }
+
+    #[test]
     fn shared_growth_reaches_existing_device_views_without_moving_memory() {
         let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)])
             .unwrap()
