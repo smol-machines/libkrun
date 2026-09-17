@@ -706,6 +706,20 @@ pub fn build_microvm(
     )?;
     vmm_timing!("memory created");
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    let memory_growth = std::env::var("KRUN_PROTOTYPE_MEMORY_GROWTH").as_deref() == Ok("1");
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    let guest_memory = if memory_growth {
+        if restoring {
+            return Err(StartMicrovmError::GuestMemoryMmap(
+                "experimental RAM hot-add restore is not implemented yet".into(),
+            ));
+        }
+        guest_memory.with_shared_growth()
+    } else {
+        guest_memory
+    };
+
     let vcpu_config = vm_resources.vcpu_config();
     #[cfg(snapshot_supported)]
     if let Some(checkpoint) = &restore_checkpoint {
@@ -1232,6 +1246,8 @@ pub fn build_microvm(
         prototype_cpu_topology,
         #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
         cpu_growth_progress: Default::default(),
+        #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+        prototype_memory: None,
         run_state: super::VmmRunState::Paused,
         paused_at: None,
         devices_quiesced: false,
@@ -1258,6 +1274,35 @@ pub fn build_microvm(
     vmm_timing!("before device attach");
     #[cfg(not(feature = "tee"))]
     attach_balloon_device(&mut vmm, event_manager, intc.clone())?;
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    if memory_growth {
+        let alignment = 128u64 << 20;
+        let base = vmm
+            .guest_memory
+            .last_addr()
+            .raw_value()
+            .checked_add(alignment)
+            .map(|end| end & !(alignment - 1))
+            .ok_or_else(|| StartMicrovmError::GuestMemoryMmap("RAM aperture overflow".into()))?;
+        let state = devices::virtio::memory::MemoryState::new(base, 64u64 << 30, 2 << 20)
+            .map_err(StartMicrovmError::GuestMemoryMmap)?;
+        let device = Arc::new(Mutex::new(
+            devices::virtio::memory::MemoryDevice::new(state)
+                .map_err(|e| StartMicrovmError::GuestMemoryMmap(e.to_string()))?,
+        ));
+        event_manager
+            .add_subscriber(device.clone())
+            .map_err(StartMicrovmError::RegisterEvent)?;
+        attach_mmio_device(
+            &mut vmm,
+            "memory-growth".into(),
+            intc.clone(),
+            device.clone(),
+        )
+        .map_err(StartMicrovmError::RegisterBalloonDevice)?;
+        vmm.prototype_memory = Some(device);
+    }
     #[cfg(not(feature = "tee"))]
     {
         #[cfg(all(feature = "vhost-user", target_os = "linux"))]
