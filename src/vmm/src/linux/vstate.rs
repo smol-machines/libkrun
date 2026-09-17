@@ -1901,7 +1901,7 @@ impl VmState {
 }
 
 /// Encapsulates configuration parameters for the guest vCPUS.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq, Clone)]
 pub struct VcpuConfig {
     /// Number of guest VCPUs.
     pub vcpu_count: u8,
@@ -2248,6 +2248,20 @@ impl Vcpu {
                 .map_err(Error::SREGSConfiguration)?;
             arch::x86_64::interrupts::set_lint(&self.fd).map_err(Error::LocalIntConfiguration)?;
         }
+        Ok(())
+    }
+
+    /// Initialize a secondary CPU without rewriting the running guest's boot tables.
+    #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+    pub fn configure_hot_added_x86_64(
+        &mut self,
+        guest_mem: &GuestMemoryMmap,
+        config: &VcpuConfig,
+    ) -> Result<()> {
+        self.configure_x86_64(guest_mem, GuestAddress(0), config, false, false)?;
+        arch::x86_64::msr::setup_msrs(&self.fd).map_err(Error::MSRSConfiguration)?;
+        arch::x86_64::regs::setup_fpu(&self.fd).map_err(Error::FPUConfiguration)?;
+        arch::x86_64::interrupts::set_lint(&self.fd).map_err(Error::LocalIntConfiguration)?;
         Ok(())
     }
 
