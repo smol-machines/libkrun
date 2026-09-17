@@ -305,6 +305,7 @@ mod tests {
             None,
             Arc::new(AtomicI32::new(0)),
             false,
+            false,
             Vec::new(),
         )
         .unwrap();
