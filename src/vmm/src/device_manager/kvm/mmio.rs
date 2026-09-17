@@ -616,15 +616,29 @@ mod tests {
     #[allow(dead_code)]
     struct DummyDevice {
         dummy: u32,
+        snapshot_failed: bool,
+        quiesced: bool,
     }
 
     impl DummyDevice {
         pub fn new() -> Self {
-            DummyDevice { dummy: 0 }
+            DummyDevice {
+                dummy: 0,
+                snapshot_failed: false,
+                quiesced: false,
+            }
         }
     }
 
     impl devices::virtio::VirtioDevice for DummyDevice {
+        fn quiesce_for_snapshot(&mut self) {
+            self.quiesced = true;
+        }
+
+        fn snapshot_error(&self) -> Option<&str> {
+            (self.quiesced && self.snapshot_failed).then_some("test worker failed")
+        }
+
         fn avail_features(&self) -> u64 {
             0
         }
@@ -669,6 +683,25 @@ mod tests {
         fn is_activated(&self) -> bool {
             false
         }
+    }
+
+    #[test]
+    fn checkpoint_drains_every_device_before_reporting_failure() {
+        let mut manager = MMIODeviceManager::new(&mut 0xd000_0000, (arch::IRQ_BASE, arch::IRQ_MAX));
+        let failed = Arc::new(Mutex::new(DummyDevice::new()));
+        failed.lock().unwrap().snapshot_failed = true;
+        let healthy = Arc::new(Mutex::new(DummyDevice::new()));
+        manager.virtio_devices.push(failed.clone());
+        manager.virtio_devices.push(healthy.clone());
+        manager.quiesce_devices();
+        assert!(failed.lock().unwrap().quiesced);
+        assert!(healthy.lock().unwrap().quiesced);
+        assert_eq!(
+            manager.validate_snapshot_boundary().unwrap_err(),
+            "dummy: test worker failed"
+        );
+        manager.quiesce_devices();
+        assert!(manager.validate_snapshot_boundary().is_err());
     }
 
     #[test]
