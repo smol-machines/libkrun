@@ -74,7 +74,9 @@ pub struct Console {
     pub(crate) sigwinch_evt: EventFd,
 
     pub(crate) snapshot_quiesced: bool,
-    pub(crate) deferred_events: Vec<RawFd>,
+    // Indices in the notification list, not borrowed OS handles (which are
+    // pointers on Windows). The list stays fixed while quiesced; reset clears it.
+    pub(crate) deferred_events: Vec<usize>,
 
     config: VirtioConsoleConfig,
 }
@@ -682,6 +684,34 @@ mod checkpoint_boundary_tests {
         console.process(&event, &mut EventManager::new().unwrap());
         assert_eq!(ring.used.idx.get(), 1);
         assert!(console.ports[0].is_active());
+        console.reset();
+    }
+
+    #[test]
+    fn paused_notifications_replay_to_their_original_events() {
+        fn assert_send<T: Send>() {}
+        assert_send::<Console>();
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        let (mut console, _) = active_console(&memory);
+        console.quiesce_for_snapshot();
+        let mut manager = EventManager::new().unwrap();
+        // Exercise both a guest queue and the host control event at the end of
+        // the indexed notification list, in reverse order.
+        for control in [true, false] {
+            let notification = if control {
+                console.control.queue_evt()
+            } else {
+                console.queue_events[CONTROL_TXQ_INDEX].as_ref()
+            };
+            notification.write(1).unwrap();
+            let event = EpollEvent::new(EventSet::IN, notification.as_raw_fd() as u64);
+            console.process(&event, &mut manager);
+        }
+        assert_eq!(console.deferred_events.len(), 2);
+        console.rearm_after_snapshot();
+        assert_eq!(console.control.queue_evt().read().unwrap(), 1);
+        assert_eq!(console.queue_events[CONTROL_TXQ_INDEX].read().unwrap(), 1);
+        assert!(console.deferred_events.is_empty());
         console.reset();
     }
 
