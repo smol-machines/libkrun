@@ -8,6 +8,7 @@ use crate::format::builder::{
 use crate::format::drivers::FormatDriverInstance;
 use crate::format::gate::ImplicitOpenGate;
 use crate::format::{Format, PreallocateMode};
+use crate::sync_primitives::Mutex;
 use crate::{
     storage, DenyImplicitOpenGate, ShallowMapping, Storage, StorageExt, StorageOpenOptions,
 };
@@ -28,6 +29,10 @@ pub struct Raw<S: Storage + 'static> {
 
     /// Disk size, which is the file size when this object was created.
     size: AtomicU64,
+
+    /// Serialize growth so a smaller concurrent request cannot truncate a
+    /// larger successful one while capacity is being published.
+    resize_lock: Mutex<()>,
 }
 
 #[maybe_async]
@@ -54,6 +59,7 @@ impl<S: Storage + 'static> Raw<S> {
             inner,
             writable,
             size: size.into(),
+            resize_lock: Mutex::new(()),
         })
     }
 
@@ -72,6 +78,7 @@ impl<S: Storage + 'static> Raw<S> {
             inner,
             writable,
             size: size.into(),
+            resize_lock: Mutex::new(()),
         })
     }
 
@@ -230,13 +237,8 @@ impl<S: Storage + 'static> FormatDriverInstance for Raw<S> {
         new_size: u64,
         format_prealloc_mode: PreallocateMode,
     ) -> io::Result<()> {
-        if self
-            .size
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
-                (new_size > old).then_some(new_size)
-            })
-            .is_err()
-        {
+        let _guard = self.resize_lock.lock().await;
+        if new_size <= self.size.load(Ordering::Relaxed) {
             return Ok(()); // only grow, else do nothing
         }
 
@@ -248,23 +250,21 @@ impl<S: Storage + 'static> FormatDriverInstance for Raw<S> {
             PreallocateMode::FullAllocate => storage::PreallocateMode::Allocate,
             PreallocateMode::WriteData => storage::PreallocateMode::WriteData,
         };
-        self.inner.resize(new_size, storage_prealloc_mode).await
+        self.inner.resize(new_size, storage_prealloc_mode).await?;
+        self.size.store(new_size, Ordering::Relaxed);
+        Ok(())
     }
 
     async fn resize_shrink(&mut self, new_size: u64) -> io::Result<()> {
-        if self
-            .size
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
-                (new_size < old).then_some(new_size)
-            })
-            .is_err()
-        {
+        if new_size >= self.size.load(Ordering::Relaxed) {
             return Ok(()); // only shrink, else do nothing
         }
 
         self.inner
             .resize(new_size, storage::PreallocateMode::None)
-            .await
+            .await?;
+        self.size.store(new_size, Ordering::Relaxed);
+        Ok(())
     }
 }
 
