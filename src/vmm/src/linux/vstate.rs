@@ -2426,7 +2426,7 @@ impl Vcpu {
 
     #[allow(unused)]
     #[cfg(target_arch = "x86_64")]
-    fn restore_state(&self, state: VcpuState) -> Result<()> {
+    fn restore_state(&mut self, state: VcpuState) -> Result<()> {
         /*
          * Ordering requirements:
          *
@@ -2458,6 +2458,9 @@ impl Vcpu {
         self.fd
             .set_cpuid2(&state.cpuid)
             .map_err(Error::VcpuSetCpuid)?;
+        // Future checkpoints must describe the profile now installed in KVM,
+        // not the destination profile cached when this vCPU was constructed.
+        self.cpuid = state.cpuid;
         self.fd
             .set_mp_state(state.mp_state)
             .map_err(Error::VcpuSetMpState)?;
@@ -3615,6 +3618,35 @@ mod tests {
     // state, so we can drive SaveState/RestoreState over the event channel.
     // This exercises the real KVM GET ioctls (save_state) and SET ioctls
     // (restore_state) end-to-end through the new channel protocol.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn repeated_checkpoint_preserves_restored_cpuid() {
+        let (_vm, mut vcpu, _mem) = setup_vcpu(0x1000);
+        let mut state = vcpu.save_state().expect("capture initial CPU profile");
+        let brand = state
+            .cpuid
+            .as_mut_slice()
+            .iter_mut()
+            .find(|entry| entry.function == 0x8000_0002)
+            .expect("test host must expose the CPU brand leaf");
+        // Change only the diagnostic brand string, not execution features.
+        brand.eax ^= 1;
+        let expected_brand = brand.eax;
+        vcpu.restore_state(state).expect("restore CPU profile");
+        let installed = vcpu.fd.get_cpuid2(KVM_MAX_CPUID_ENTRIES).unwrap();
+        let brand_word = |cpuid: &CpuId| {
+            cpuid
+                .as_slice()
+                .iter()
+                .find(|entry| entry.function == 0x8000_0002)
+                .unwrap()
+                .eax
+        };
+        assert_eq!(brand_word(&installed), expected_brand);
+        let resaved = vcpu.save_state().expect("checkpoint restored CPU profile");
+        assert_eq!(brand_word(&resaved.cpuid), expected_brand);
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_vcpu_save_restore_state_roundtrip() {
