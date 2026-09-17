@@ -930,10 +930,11 @@ impl PassthroughFs {
     /// Replace the host inode's owner and mode with the recorded ones. Symlink
     /// inodes keep the host's: their proc link would resolve past them.
     fn override_stat(&self, fd: RawFd, st: &mut libc::stat64) {
-        if self.cfg.override_stat && (st.st_mode & libc::S_IFMT) != libc::S_IFLNK {
-            if let Some(recorded) = read_override(fd) {
-                apply_override(st, recorded);
-            }
+        if self.cfg.override_stat
+            && (st.st_mode & libc::S_IFMT) != libc::S_IFLNK
+            && let Some(recorded) = read_override(fd)
+        {
+            apply_override(st, recorded);
         }
     }
 
