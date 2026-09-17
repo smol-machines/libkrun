@@ -485,3 +485,47 @@ impl VmmExitObserver for Console {
         log::trace!("Console on_vmm_exit finished");
     }
 }
+
+#[cfg(test)]
+mod checkpoint_boundary_tests {
+    use super::*;
+    use crate::legacy::DummyIrqChip;
+    use crate::virtio::queue::tests::VirtQueue;
+    use polly::event_manager::{EventManager, Subscriber};
+    use utils::epoll::{EpollEvent, EventSet};
+    use vm_memory::GuestAddress;
+
+    #[test]
+    fn pending_control_reply_keeps_the_checkpoint_boundary() {
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        let mut console = Console::new(vec![PortDescription {
+            name: "checkpoint-test".into(), input: None, output: None, terminal: None,
+        }]).unwrap();
+        let rings: Vec<_> = (0..4).map(|index| {
+            VirtQueue::new(GuestAddress(0x1000 + index * 0x1000), &memory, 8)
+        }).collect();
+        let queues = rings.iter().map(|ring| DeviceQueue::new(
+            ring.create_queue(), Arc::new(EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap()),
+        )).collect();
+        console.activate(memory.clone(),
+            InterruptTransport::new(DummyIrqChip::new().into(), "checkpoint test".into()).unwrap(),
+            queues).unwrap();
+        let ring = &rings[CONTROL_RXQ_INDEX];
+        ring.dtable[0].addr.set(0x10000);
+        ring.dtable[0].len.set(64);
+        ring.dtable[0].flags.set(2);
+        ring.avail.ring[0].set(0);
+        ring.avail.idx.set(1);
+        memory.write_slice(&[0x55; 64], GuestAddress(0x10000)).unwrap();
+        console.control.port_add(0);
+        console.quiesce_for_snapshot();
+        let boundary = console.save_state();
+        let event = EpollEvent::new(EventSet::IN, console.control.queue_evt().as_raw_fd() as u64);
+        console.process(&event, &mut EventManager::new().unwrap());
+        assert_eq!(console.save_state(), boundary, "console control queue advanced after quiescence");
+        assert_eq!(ring.used.idx.get(), 0);
+        let mut contents = [0; 64];
+        memory.read_slice(&mut contents, GuestAddress(0x10000)).unwrap();
+        assert_eq!(contents, [0x55; 64]);
+    }
+}
