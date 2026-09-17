@@ -578,6 +578,19 @@ mod checkpoint_boundary_tests {
     }
 
     #[test]
+    fn checkpoint_rejects_a_lost_console_worker_queue() {
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        let (mut console, _rings) = active_console(&memory);
+        console.ports[0].inject_failed_tx_worker();
+        console.quiesce_for_snapshot();
+        assert!(console.snapshot_error().unwrap().contains("port 0"));
+        console.quiesce_for_snapshot();
+        assert!(console.snapshot_error().is_some());
+        console.reset();
+        assert!(console.snapshot_error().is_none());
+    }
+
+    #[test]
     fn pending_control_reply_keeps_the_checkpoint_boundary() {
         let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
         let (mut console, rings) = active_console(&memory);

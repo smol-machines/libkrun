@@ -297,6 +297,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn checkpoint_drains_all_failed_workers_and_remembers_failure() {
+        let mut fs = Fs::new(
+            "test".into(),
+            None,
+            Arc::new(AtomicI32::new(0)),
+            false,
+            Vec::new(),
+        )
+        .unwrap();
+        let joined = Arc::new(AtomicI32::new(0));
+        for _ in 0..2 {
+            let joined = joined.clone();
+            fs.worker_threads.push(std::thread::spawn(move || {
+                joined.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                panic!("simulated filesystem worker failure");
+            }));
+        }
+        fs.quiesce_for_snapshot();
+        assert_eq!(joined.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(fs.worker_threads.is_empty());
+        assert!(fs.snapshot_error().is_some());
+        fs.quiesce_for_snapshot();
+        fs.rearm_after_snapshot();
+        assert!(fs.snapshot_error().is_some());
+        fs.reset();
+        assert!(fs.snapshot_error().is_none());
+    }
+
+    #[test]
     fn advertises_two_request_queues() {
         let fs = Fs::new(
             "test".to_owned(),

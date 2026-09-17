@@ -948,7 +948,115 @@ impl VirtioDevice for Block {
 #[cfg(test)]
 mod overlay_tests {
     use super::*;
+    use imago::storage::drivers::CommonStorageHelper;
+    use std::fmt;
+    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
     use utils::tempfile::TempFile;
+
+    #[derive(Debug, Default)]
+    struct FailureControl {
+        operations: AtomicU8,
+        flushes: AtomicUsize,
+        syncs: AtomicUsize,
+    }
+
+    #[derive(Debug)]
+    struct FailingStorage {
+        control: Arc<FailureControl>,
+        helper: CommonStorageHelper,
+    }
+
+    impl fmt::Display for FailingStorage {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("checkpoint failure test storage")
+        }
+    }
+
+    impl Storage for FailingStorage {
+        fn size(&self) -> io::Result<u64> {
+            Ok(1024 * 1024)
+        }
+
+        async unsafe fn pure_readv(&self, _: IoVectorMut<'_>, _: u64) -> io::Result<()> {
+            Err(io::ErrorKind::Unsupported.into())
+        }
+
+        async unsafe fn pure_writev(&self, _: IoVector<'_>, _: u64) -> io::Result<()> {
+            Err(io::ErrorKind::Unsupported.into())
+        }
+
+        async fn flush(&self) -> io::Result<()> {
+            self.control.flushes.fetch_add(1, Ordering::SeqCst);
+            if self.control.operations.load(Ordering::SeqCst) & 1 != 0 {
+                Err(io::Error::other("injected storage flush failure"))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn sync(&self) -> io::Result<()> {
+            self.control.syncs.fetch_add(1, Ordering::SeqCst);
+            if self.control.operations.load(Ordering::SeqCst) & 2 != 0 {
+                Err(io::Error::other("injected storage sync failure"))
+            } else {
+                Ok(())
+            }
+        }
+
+        async unsafe fn invalidate_cache(&self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn get_storage_helper(&self) -> &CommonStorageHelper {
+            &self.helper
+        }
+    }
+
+    #[test]
+    fn checkpoint_rejects_storage_flush_and_sync_failures() {
+        for operations in [1, 2, 3] {
+            let base = TempFile::new().unwrap();
+            base.as_file().set_len(1024 * 1024).unwrap();
+            let mut block = Block::new(
+                "failure-test".into(),
+                None,
+                CacheType::Writeback,
+                base.as_path().to_str().unwrap().into(),
+                ImageType::Raw,
+                false,
+                false,
+                SyncMode::Full,
+                BlockIoEngine::Sync,
+                None,
+            )
+            .unwrap();
+            let control = Arc::new(FailureControl::default());
+            let storage: Box<dyn DynStorage> = Box::new(FailingStorage {
+                control: control.clone(),
+                helper: CommonStorageHelper::default(),
+            });
+            let raw = Raw::open_image_sync(storage, true).unwrap();
+            block.disk_image = Arc::new(DiskBackend::Sync(Mutex::new(
+                SyncFormatAccess::new(raw).unwrap(),
+            )));
+            control.operations.store(operations, Ordering::SeqCst);
+            block.quiesce_for_snapshot();
+            let error = block
+                .snapshot_error()
+                .expect("failed durability must reject checkpoint");
+            assert!(error.contains(if operations & 1 != 0 { "flush" } else { "sync" }));
+            assert_eq!(control.flushes.load(Ordering::SeqCst), 1);
+            assert_eq!(control.syncs.load(Ordering::SeqCst), 1);
+            // A later successful barrier cannot recover buffers lost by a
+            // failed operation; require explicit device recovery/reset.
+            control.operations.store(0, Ordering::SeqCst);
+            block.quiesce_for_snapshot();
+            assert!(block.snapshot_error().is_some());
+            block.reset();
+            block.quiesce_for_snapshot();
+            assert!(block.snapshot_error().is_none());
+        }
+    }
 
     #[test]
     fn create_overlay_over_raw_base() {

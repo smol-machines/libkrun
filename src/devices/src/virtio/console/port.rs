@@ -72,7 +72,8 @@ enum PortState {
 }
 
 /// Virtqueues reclaimed from a port's worker threads when it is stopped for a
-/// checkpoint. `rx`/`tx` are present only for the directions the port runs.
+/// checkpoint. Both directions must be present for an active port, including
+/// queues retained without a worker for disconnected input/output.
 #[derive(Default)]
 pub(crate) struct ReclaimedQueues {
     pub rx: Option<Queue>,
@@ -240,6 +241,20 @@ impl Port {
     /// True if this port currently has running worker threads.
     pub(crate) fn is_active(&self) -> bool {
         matches!(self.state, PortState::Active { .. })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_failed_tx_worker(&mut self) {
+        self.state = PortState::Active {
+            stopfd: utils::eventfd::EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
+            stop: Arc::new(AtomicBool::new(false)),
+            tx_thread: Some(std::thread::spawn(|| {
+                panic!("simulated console worker failure")
+            })),
+            rx_thread: None,
+            idle_rx: Some(Queue::new(16)),
+            idle_tx: None,
+        };
     }
 }
 
