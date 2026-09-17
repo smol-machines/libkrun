@@ -27,12 +27,13 @@ impl Console {
                 &self.sigwinch_evt,
                 self.control.queue_evt(),
             ])
-            .find(|fd| fd.as_raw_fd() == source);
-        if let Some(notification) = notification {
+            .enumerate()
+            .find(|(_, fd)| fd.as_raw_fd() == source);
+        if let Some((index, notification)) = notification {
             match notification.read() {
                 Ok(_) => {
-                    if !self.deferred_events.contains(&source) {
-                        self.deferred_events.push(source);
+                    if !self.deferred_events.contains(&index) {
+                        self.deferred_events.push(index);
                     }
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
@@ -45,7 +46,7 @@ impl Console {
     }
 
     pub(crate) fn replay_deferred_events(&mut self) {
-        for source in std::mem::take(&mut self.deferred_events) {
+        for index in std::mem::take(&mut self.deferred_events) {
             let notification = self
                 .queue_events
                 .iter()
@@ -55,7 +56,7 @@ impl Console {
                     &self.sigwinch_evt,
                     self.control.queue_evt(),
                 ])
-                .find(|fd| fd.as_raw_fd() == source);
+                .nth(index);
             if let Some(notification) = notification
                 && let Err(error) = notification.write(1)
             {
