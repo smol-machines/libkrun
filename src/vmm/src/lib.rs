@@ -15,6 +15,8 @@ extern crate log;
 
 /// Handles setup and initialization a `Vmm` object.
 pub mod builder;
+/// Checkpointed CPU discovery policy and live creation bookkeeping.
+pub mod cpu_growth;
 #[cfg(target_os = "linux")]
 pub mod demand_paging;
 pub(crate) mod device_manager;
@@ -250,6 +252,8 @@ pub struct VmCheckpoint {
     /// in this process; without this section a restored clone boots with an
     /// all-masked redirection table and device IRQs (e.g. vsock) never arrive.
     pub ioapic: Option<Vec<u8>>,
+    /// Guest discovery/CPUID policy for CPUs added after boot.
+    pub cpu_growth: Option<cpu_growth::CpuGrowthTopology>,
 }
 
 #[cfg(snapshot_supported)]
@@ -272,6 +276,9 @@ impl VmCheckpoint {
         put(&mut out, &self.devices.to_bytes().unwrap_or_default());
         // Userspace IRQ-chip section; empty means "none" (in-kernel chip).
         put(&mut out, self.ioapic.as_deref().unwrap_or(&[]));
+        if let Some(topology) = &self.cpu_growth {
+            put(&mut out, &topology.encode());
+        }
         out
     }
 
@@ -310,11 +317,23 @@ impl VmCheckpoint {
         } else {
             None
         };
+        let cpu_growth = if pos < bytes.len() {
+            Some(cpu_growth::CpuGrowthTopology::decode(
+                take(bytes, &mut pos)?,
+                n,
+            )?)
+        } else {
+            None
+        };
+        if pos != bytes.len() {
+            return Err("unexpected trailing checkpoint state".into());
+        }
         Ok(VmCheckpoint {
             vm_state,
             vcpu_states,
             devices,
             ioapic,
+            cpu_growth,
         })
     }
 }
@@ -342,7 +361,7 @@ pub struct Vmm {
     #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
     prototype_cpu_topology: Option<vstate::VcpuConfig>,
     #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
-    cpu_growth_failure: Option<String>,
+    cpu_growth_progress: cpu_growth::CpuGrowthProgress,
     run_state: VmmRunState,
     paused_at: Option<Instant>,
     devices_quiesced: bool,
@@ -542,24 +561,43 @@ impl Vmm {
         self.layered_ram = Some(next.clone());
         Ok(Some(next))
     }
+    #[cfg(snapshot_supported)]
+    fn validate_restore_cpus(&self, checkpoint: &VmCheckpoint) -> Result<()> {
+        if checkpoint.vcpu_states.len() != self.vcpus_handles.len()
+            || checkpoint.cpu_growth != self.snapshot_cpu_growth()
+        {
+            return Err(Error::VcpuSnapshot(
+                "checkpoint CPU count or growth topology differs from this VM; restore into a machine configured for that checkpoint".into(),
+            ));
+        }
+        #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+        self.cpu_growth_progress
+            .check()
+            .map_err(Error::VcpuSnapshot)?;
+        Ok(())
+    }
+
+    #[cfg(snapshot_supported)]
+    fn snapshot_cpu_growth(&self) -> Option<cpu_growth::CpuGrowthTopology> {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+        return self
+            .prototype_cpu_topology
+            .as_ref()
+            .map(|config| cpu_growth::CpuGrowthTopology {
+                capacity: config.vcpu_count,
+                ht_enabled: config.ht_enabled,
+                nested_enabled: config.nested_enabled,
+                cpu_template: config.cpu_template,
+            });
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee"))))]
+        None
+    }
     /// Experimental Linux/x86 CPU creation; guest onlining is separate.
     #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
     pub fn prototype_grow_cpus(&mut self, count: u8) -> std::result::Result<(), String> {
-        if let Some(error) = &self.cpu_growth_failure {
-            return Err(format!(
-                "previous CPU creation did not complete: {error}; cannot safely retry"
-            ));
-        }
+        self.cpu_growth_progress.check()?;
         let result = self.prototype_grow_cpus_inner(count);
-        if let Err(error) = &result {
-            // Set only after crossing the host-vCPU creation boundary. A
-            // rejected target or paused VM is safe to retry without poisoning.
-            if self.cpu_growth_failure.is_some() {
-                self.cpu_growth_failure = Some(error.clone());
-            }
-        } else {
-            self.cpu_growth_failure = None;
-        }
+        self.cpu_growth_progress.finish(&result);
         result
     }
 
@@ -577,7 +615,7 @@ impl Vmm {
             return Err("CPU target must grow within the advertised topology".into());
         }
         for id in self.vcpus_handles.len() as u8..count {
-            self.cpu_growth_failure = Some(format!("creating vCPU {id}"));
+            self.cpu_growth_progress.begin_creation(id);
             let mut vcpu = Vcpu::new_x86_64(
                 id,
                 self.vm.fd(),
@@ -611,9 +649,7 @@ impl Vmm {
     /// Host-created CPU count and capacity, not the guest-online count.
     #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
     pub fn prototype_cpu_status(&self) -> std::result::Result<(usize, u8), String> {
-        if let Some(error) = &self.cpu_growth_failure {
-            return Err(format!("CPU creation incomplete: {error}"));
-        }
+        self.cpu_growth_progress.check()?;
         self.prototype_cpu_topology
             .as_ref()
             .map(|config| (self.vcpus_handles.len(), config.vcpu_count))
@@ -767,6 +803,7 @@ impl Vmm {
         mut checkpoint: VmCheckpoint,
         portable_clock: bool,
     ) -> Result<()> {
+        self.validate_restore_cpus(&checkpoint)?;
         #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
         let _ = portable_clock;
         self.vm
@@ -940,11 +977,9 @@ impl Vmm {
     #[cfg(snapshot_supported)]
     pub fn save_vcpu_states(&mut self) -> Result<Vec<vstate::VcpuState>> {
         #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
-        if let Some(error) = &self.cpu_growth_failure {
-            return Err(Error::VcpuSnapshot(format!(
-                "cannot checkpoint incomplete CPU growth: {error}"
-            )));
-        }
+        self.cpu_growth_progress
+            .check()
+            .map_err(Error::VcpuSnapshot)?;
         if self.run_state != VmmRunState::Paused {
             return Err(Error::VcpuSnapshot(
                 "vCPUs must be paused before capturing state".to_string(),
@@ -1081,6 +1116,7 @@ impl Vmm {
                 vcpu_states,
                 devices,
                 ioapic,
+                cpu_growth: self.snapshot_cpu_growth(),
             },
             mem_descs,
         ))
@@ -1154,6 +1190,7 @@ impl Vmm {
                     vcpu_states,
                     devices,
                     ioapic,
+                    cpu_growth: self.snapshot_cpu_growth(),
                 },
                 memory,
             ))
@@ -1196,6 +1233,7 @@ impl Vmm {
                     vcpu_states,
                     devices,
                     ioapic,
+                    cpu_growth: self.snapshot_cpu_growth(),
                 },
                 mem_descs,
             ))
@@ -1225,6 +1263,7 @@ impl Vmm {
         mem_descs: &[snapshot::MemoryRegionDesc],
         mem_in: &mut R,
     ) -> Result<()> {
+        self.validate_restore_cpus(&checkpoint)?;
         // Devices must be in their not-yet-running, paused state.
         if self.run_state != VmmRunState::Paused {
             return Err(Error::Snapshot(
@@ -1285,6 +1324,7 @@ impl Vmm {
                 devices,
                 // Linux-only path; KVM's IOAPIC is in-kernel and rides vm_state.
                 ioapic: None,
+                cpu_growth: self.snapshot_cpu_growth(),
             },
             mem_clone,
         ))
@@ -1302,6 +1342,7 @@ impl Vmm {
         mut checkpoint: VmCheckpoint,
         mem_clone: &GuestMemoryMmap,
     ) -> Result<()> {
+        self.validate_restore_cpus(&checkpoint)?;
         if self.run_state != VmmRunState::Paused {
             return Err(Error::Snapshot(
                 "VM must be paused before restore".to_string(),
@@ -1365,6 +1406,7 @@ impl Vmm {
                 vcpu_states,
                 devices,
                 ioapic,
+                cpu_growth: self.snapshot_cpu_growth(),
             })
         })();
 
@@ -1480,6 +1522,7 @@ impl Vmm {
                     vcpu_states,
                     devices,
                     ioapic: None,
+                    cpu_growth: self.snapshot_cpu_growth(),
                 },
                 generation_copy,
                 generation_guardian,
@@ -1614,6 +1657,7 @@ impl Vmm {
                     vcpu_states,
                     devices,
                     ioapic: None,
+                    cpu_growth: self.snapshot_cpu_growth(),
                 },
                 generation_copy,
                 disk_rollback,
@@ -1686,6 +1730,7 @@ impl Vmm {
     /// device state before resuming; a plain resume can leave guest I/O wedged.
     #[cfg(fork_supported)]
     pub fn rollback_fork_checkpoint(&mut self, checkpoint: VmCheckpoint) -> Result<()> {
+        self.validate_restore_cpus(&checkpoint)?;
         if self.run_state != VmmRunState::Paused {
             return Err(Error::Snapshot(
                 "fork rollback requires a paused VM".to_string(),
@@ -1698,6 +1743,7 @@ impl Vmm {
             mut vcpu_states,
             devices,
             ioapic,
+            cpu_growth: _,
         } = checkpoint;
         let restore = (|| {
             self.vm.restore_state(&vm_state).map_err(Error::Vm)?;
