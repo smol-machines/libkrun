@@ -268,6 +268,22 @@ impl<R: GuestMemoryRegion> GuestRegionCollection<R> {
         &self,
         region: Arc<R>,
     ) -> std::result::Result<(), GuestRegionCollectionError> {
+        self.append_shared_region_with(region, |_| Ok(()))
+    }
+
+    /// Register a region and publish it to every shared view as one transaction.
+    /// Validation and allocation happen before `register` is called. If it
+    /// fails, the collection is unchanged; the callback must itself leave no
+    /// registration behind on failure. After success, publication cannot fail.
+    ///
+    /// The callback runs under the growth lock and must not reenter this map's
+    /// growth methods. It must not notify the guest to use the new region: that
+    /// notification belongs after this method returns successfully.
+    pub fn append_shared_region_with<E: From<GuestRegionCollectionError>>(
+        &self,
+        region: Arc<R>,
+        register: impl FnOnce(&R) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
         let growth = self
             .growth
             .as_ref()
@@ -283,13 +299,17 @@ impl<R: GuestMemoryRegion> GuestRegionCollection<R> {
             slot = &node.next;
         }
         if last.is_some_and(|last| last >= region.start_addr()) {
-            return Err(GuestRegionCollectionError::MemoryRegionOverlap);
+            return Err(GuestRegionCollectionError::MemoryRegionOverlap.into());
         }
-        slot.set(Box::new(AppendedRegion {
+        let node = Box::new(AppendedRegion {
             region,
             next: OnceLock::new(),
-        }))
-        .map_err(|_| GuestRegionCollectionError::MemoryRegionOverlap)
+        });
+        register(node.region.as_ref())?;
+        // The writer lock excludes every publisher, and `slot` was empty
+        // above. No fallible allocation or registration follows publication.
+        assert!(slot.set(node).is_ok());
+        Ok(())
     }
 
     /// Creates an empty `GuestMemoryMmap` instance.
