@@ -541,6 +541,20 @@ fn log_level_to_filter_str(level: u32) -> &'static str {
 }
 
 #[cfg(snapshot_supported)]
+fn checkpoint_failure_reply(
+    error: &str,
+    was_running: bool,
+    resume: impl FnOnce() -> std::result::Result<(), String>,
+) -> String {
+    if was_running && let Err(resume_error) = resume() {
+        return format!(
+            "ERR EIO checkpoint failed: {error}; source resume failed: {resume_error}\n"
+        );
+    }
+    format!("ERR EIO checkpoint failed: {error}\n")
+}
+
+#[cfg(snapshot_supported)]
 fn handle_checkpoint(vmm: &Arc<Mutex<vmm::Vmm>>, id: &str) -> String {
     if id.is_empty() {
         return "ERR EINVAL checkpoint id required\n".to_string();
@@ -551,16 +565,20 @@ fn handle_checkpoint(vmm: &Arc<Mutex<vmm::Vmm>>, id: &str) -> String {
     let mut memory = Vec::new();
     // End the capture lock before attempting rollback; a match on the lock
     // expression would otherwise retain that guard through its error arm.
-    let captured = vmm.lock().unwrap().checkpoint(&mut memory);
+    let (captured, was_running) = {
+        let mut machine = vmm.lock().unwrap();
+        let was_running = machine.run_state() == "running";
+        (machine.checkpoint(&mut memory), was_running)
+    };
     let (checkpoint, mem_descs) = match captured {
         Ok(v) => v,
         Err(error) => {
-            return match vmm.lock().unwrap().resume() {
-                Ok(()) => format!("ERR EIO checkpoint failed: {error}\n"),
-                Err(resume_error) => format!(
-                    "ERR EIO checkpoint failed: {error}; source resume failed: {resume_error}\n"
-                ),
-            };
+            return checkpoint_failure_reply(&error.to_string(), was_running, || {
+                vmm.lock()
+                    .unwrap()
+                    .resume()
+                    .map_err(|error| error.to_string())
+            });
         }
     };
     let bytes = memory.len();
@@ -1787,6 +1805,39 @@ mod control_command_tests {
                 panic!("failed preparation must not cancel another save");
             })
             .is_err()
+        );
+    }
+
+    #[cfg(snapshot_supported)]
+    #[test]
+    fn failed_checkpoint_preserves_paused_sources() {
+        let reply = checkpoint_failure_reply("storage unavailable", false, || {
+            panic!("an already-paused machine must not resume")
+        });
+        assert_eq!(reply, "ERR EIO checkpoint failed: storage unavailable\n");
+    }
+
+    #[cfg(snapshot_supported)]
+    #[test]
+    fn failed_checkpoint_resumes_running_sources_once() {
+        let attempts = std::cell::Cell::new(0);
+        let reply = checkpoint_failure_reply("storage unavailable", true, || {
+            attempts.set(attempts.get() + 1);
+            Ok(())
+        });
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(reply, "ERR EIO checkpoint failed: storage unavailable\n");
+    }
+
+    #[cfg(snapshot_supported)]
+    #[test]
+    fn failed_checkpoint_reports_both_capture_and_resume_errors() {
+        let reply = checkpoint_failure_reply("storage unavailable", true, || {
+            Err("vCPU unavailable".into())
+        });
+        assert_eq!(
+            reply,
+            "ERR EIO checkpoint failed: storage unavailable; source resume failed: vCPU unavailable\n"
         );
     }
 
