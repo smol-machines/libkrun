@@ -2090,10 +2090,12 @@ pub unsafe extern "C" fn krun_add_virtiofs3(
 /// chmod and mknod there). Lets an unprivileged host share an image tree with
 /// its exact owners, setuid bits and whiteouts. Always in effect on macOS and
 /// Windows; on Linux only with this flag.
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 pub const KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT: u32 = 1 << 0;
 
 #[allow(clippy::missing_safety_doc)]
 #[unsafe(no_mangle)]
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 pub unsafe extern "C" fn krun_add_virtiofs4(
     ctx_id: u32,
     c_tag: *const c_char,
