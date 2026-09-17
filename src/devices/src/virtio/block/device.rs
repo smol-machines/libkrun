@@ -1082,6 +1082,87 @@ mod overlay_tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn growing_overlay_does_not_expose_backing_data_or_change_siblings() {
+        use std::os::unix::fs::FileExt;
+
+        let base = TempFile::new().unwrap();
+        base.as_file().set_len(2 * 1024 * 1024).unwrap();
+        base.as_file()
+            .write_all_at(&[0xab; 512], 1024 * 1024)
+            .unwrap();
+        let base_path = base.as_path().to_str().unwrap();
+        let overlay = format!("{base_path}.small.qcow2");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let storage = ImagoFile::create_open(
+                StorageCreateOptions::new().filename(&overlay),
+            ).await.unwrap();
+            Qcow2::<Box<dyn DynStorage>, Arc<imago::FormatAccess<Box<dyn DynStorage>>>>::create_builder(
+                Box::new(storage),
+            )
+            .size(1024 * 1024)
+            .backing(base_path.to_string(), "raw".to_string())
+            .create().await.unwrap();
+        });
+        let mut block = Block::new(
+            "private-overlay".into(),
+            None,
+            CacheType::Writeback,
+            overlay.clone(),
+            ImageType::Qcow2,
+            false,
+            false,
+            SyncMode::Full,
+            BlockIoEngine::Sync,
+            None,
+        )
+        .unwrap();
+        block.grow(2 * 1024 * 1024).unwrap();
+        let mut data = [0xff; 512];
+        block
+            .disk_image
+            .readv(IoVectorMut::from(&mut data[..]), 1024 * 1024)
+            .unwrap();
+        assert_eq!(
+            data, [0; 512],
+            "new capacity must not reveal the longer backing"
+        );
+        block
+            .disk_image
+            .writev(IoVector::from(&[0xcd; 512][..]), 1024 * 1024)
+            .unwrap();
+        block.disk_image.flush().unwrap();
+        base.as_file()
+            .read_exact_at(&mut data, 1024 * 1024)
+            .unwrap();
+        assert_eq!(
+            data, [0xab; 512],
+            "other readers of the base must remain unchanged"
+        );
+        drop(block);
+        let (reopened, _) = open_disk_format(
+            &overlay,
+            ImageType::Qcow2,
+            false,
+            false,
+            false,
+            BlockIoEngine::Sync,
+            None,
+        )
+        .unwrap();
+        assert_eq!(reopened.size(), 2 * 1024 * 1024);
+        reopened
+            .readv(IoVectorMut::from(&mut data[..]), 1024 * 1024)
+            .unwrap();
+        assert_eq!(data, [0xcd; 512]);
+        drop(reopened);
+        std::fs::remove_file(overlay).unwrap();
+    }
+
     #[derive(Debug, Default)]
     struct FailureControl {
         operations: AtomicU8,
