@@ -73,6 +73,9 @@ pub struct Console {
     pub(crate) activate_evt: EventFd,
     pub(crate) sigwinch_evt: EventFd,
 
+    pub(crate) snapshot_quiesced: bool,
+    pub(crate) deferred_events: Vec<RawFd>,
+
     config: VirtioConsoleConfig,
 }
 
@@ -108,6 +111,8 @@ impl Console {
             sigwinch_evt: EventFd::new(utils::eventfd::EFD_NONBLOCK)
                 .map_err(super::ConsoleError::EventFd)?,
             device_state: DeviceState::Inactive,
+            snapshot_quiesced: false,
+            deferred_events: Vec::new(),
             config,
         })
     }
@@ -257,6 +262,11 @@ impl Console {
         }
 
         for port_id in ports_to_start {
+            // Restore activation may already have restarted this port before
+            // a pending guest PORT_OPEN message is consumed.
+            if self.ports[port_id].is_active() {
+                continue;
+            }
             log::trace!("Starting port io for port {port_id}");
             let rx_idx = port_id_to_queue_idx(QueueDirection::Rx, port_id);
             let tx_idx = port_id_to_queue_idx(QueueDirection::Tx, port_id);
@@ -300,6 +310,9 @@ pub struct ConsoleState {
     /// captured — a faithful snapshot must first quiesce the port threads so
     /// they release their queues (the device-level drain step).
     pub queues: Vec<Option<QueueState>>,
+    /// Control replies accepted by the host but not yet delivered to the guest.
+    #[serde(default)]
+    pub pending_control: Vec<Vec<u8>>,
 }
 
 impl Console {
@@ -308,6 +321,7 @@ impl Console {
         ConsoleState {
             acked_features: self.acked_features,
             activated: matches!(self.device_state, DeviceState::Activated(..)),
+            pending_control: self.control.snapshot_pending(),
             queues: self
                 .queues
                 .iter()
@@ -321,6 +335,7 @@ impl Console {
     /// memory + interrupt and starting port threads).
     pub fn restore_state(&mut self, state: &ConsoleState) -> Result<(), String> {
         self.acked_features = state.acked_features;
+        self.control.restore_pending(&state.pending_control);
         for (slot, snap) in self.queues.iter_mut().zip(state.queues.iter()) {
             if let (Some(dq), Some(qs)) = (slot.as_mut(), snap.as_ref()) {
                 dq.queue.restore_state(qs)?;
@@ -463,19 +478,42 @@ impl VirtioDevice for Console {
         self.queues.clear();
         self.queue_events.clear();
         self.device_state = DeviceState::Inactive;
+        self.snapshot_quiesced = false;
+        self.deferred_events.clear();
         true
     }
 
     fn quiesce_for_snapshot(&mut self) {
+        if self.snapshot_quiesced {
+            return;
+        }
+        self.snapshot_quiesced = true;
         self.quiesce_ports_for_snapshot();
     }
 
     fn rearm_after_snapshot(&mut self) {
+        if !self.snapshot_quiesced {
+            return;
+        }
+        self.snapshot_quiesced = false;
         self.start_ports_after_restore();
+        self.replay_deferred_events();
     }
 
     fn finish_restore_activation(&mut self) {
         self.start_ports_after_restore();
+        if self.is_activated() {
+            // Guest queue state survives restore, host eventfd counters do not.
+            for event in [
+                self.queue_events[CONTROL_RXQ_INDEX].as_ref(),
+                self.queue_events[CONTROL_TXQ_INDEX].as_ref(),
+                self.control.queue_evt(),
+            ] {
+                if let Err(error) = event.write(1) {
+                    error!("console: failed to notify restored control queue: {error}");
+                }
+            }
+        }
     }
 }
 
@@ -495,37 +533,195 @@ mod checkpoint_boundary_tests {
     use utils::epoll::{EpollEvent, EventSet};
     use vm_memory::GuestAddress;
 
+    fn active_console(memory: &GuestMemoryMmap) -> (Console, Vec<VirtQueue<'_>>) {
+        let mut console = Console::new(vec![PortDescription {
+            name: "checkpoint-test".into(),
+            input: None,
+            output: None,
+            terminal: None,
+        }])
+        .unwrap();
+        let rings: Vec<_> = (0..4)
+            .map(|index| VirtQueue::new(GuestAddress(0x1000 + index * 0x1000), memory, 8))
+            .collect();
+        let queues = rings
+            .iter()
+            .map(|ring| {
+                DeviceQueue::new(
+                    ring.create_queue(),
+                    Arc::new(EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap()),
+                )
+            })
+            .collect();
+        console
+            .activate(
+                memory.clone(),
+                InterruptTransport::new(DummyIrqChip::new().into(), "checkpoint test".into())
+                    .unwrap(),
+                queues,
+            )
+            .unwrap();
+        (console, rings)
+    }
+
     #[test]
     fn pending_control_reply_keeps_the_checkpoint_boundary() {
         let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
-        let mut console = Console::new(vec![PortDescription {
-            name: "checkpoint-test".into(), input: None, output: None, terminal: None,
-        }]).unwrap();
-        let rings: Vec<_> = (0..4).map(|index| {
-            VirtQueue::new(GuestAddress(0x1000 + index * 0x1000), &memory, 8)
-        }).collect();
-        let queues = rings.iter().map(|ring| DeviceQueue::new(
-            ring.create_queue(), Arc::new(EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap()),
-        )).collect();
-        console.activate(memory.clone(),
-            InterruptTransport::new(DummyIrqChip::new().into(), "checkpoint test".into()).unwrap(),
-            queues).unwrap();
+        let (mut console, rings) = active_console(&memory);
         let ring = &rings[CONTROL_RXQ_INDEX];
         ring.dtable[0].addr.set(0x10000);
         ring.dtable[0].len.set(64);
         ring.dtable[0].flags.set(2);
         ring.avail.ring[0].set(0);
         ring.avail.idx.set(1);
-        memory.write_slice(&[0x55; 64], GuestAddress(0x10000)).unwrap();
+        memory
+            .write_slice(&[0x55; 64], GuestAddress(0x10000))
+            .unwrap();
         console.control.port_add(0);
         console.quiesce_for_snapshot();
         let boundary = console.save_state();
         let event = EpollEvent::new(EventSet::IN, console.control.queue_evt().as_raw_fd() as u64);
         console.process(&event, &mut EventManager::new().unwrap());
-        assert_eq!(console.save_state(), boundary, "console control queue advanced after quiescence");
+        assert_eq!(
+            console.save_state(),
+            boundary,
+            "console control queue advanced after quiescence"
+        );
         assert_eq!(ring.used.idx.get(), 0);
         let mut contents = [0; 64];
-        memory.read_slice(&mut contents, GuestAddress(0x10000)).unwrap();
+        memory
+            .read_slice(&mut contents, GuestAddress(0x10000))
+            .unwrap();
         assert_eq!(contents, [0x55; 64]);
+        assert_eq!(
+            console.control.queue_evt().read().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        console.rearm_after_snapshot();
+        console.process(&event, &mut EventManager::new().unwrap());
+        assert_eq!(ring.used.idx.get(), 1);
+        assert!(console.control.snapshot_pending().is_empty());
+        console.rearm_after_snapshot();
+        assert_eq!(
+            console.control.queue_evt().read().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        console.reset();
+    }
+
+    #[test]
+    fn restored_reply_waits_for_the_guest_to_supply_a_buffer() {
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        let (mut source, _) = active_console(&memory);
+        source.control.port_add(0);
+        source.quiesce_for_snapshot();
+        let state = source.save_state();
+        let encoded = serde_json::to_vec(&state).unwrap();
+        let decoded: ConsoleState = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(state, decoded);
+
+        let (mut restored, rings) = active_console(&memory);
+        restored.restore_state(&decoded).unwrap();
+        restored.finish_restore_activation();
+        let mut manager = EventManager::new().unwrap();
+        let event = EpollEvent::new(
+            EventSet::IN,
+            restored.control.queue_evt().as_raw_fd() as u64,
+        );
+        restored.process(&event, &mut manager);
+        assert_eq!(restored.control.snapshot_pending(), state.pending_control);
+        let ring = &rings[CONTROL_RXQ_INDEX];
+        ring.dtable[0].addr.set(0x10000);
+        ring.dtable[0].len.set(64);
+        ring.dtable[0].flags.set(2);
+        ring.avail.ring[0].set(0);
+        ring.avail.idx.set(1);
+        let notification = &restored.queue_events[CONTROL_RXQ_INDEX];
+        notification.write(1).unwrap();
+        let event = EpollEvent::new(EventSet::IN, notification.as_raw_fd() as u64);
+        restored.process(&event, &mut manager);
+        assert_eq!(ring.used.idx.get(), 1);
+        let mut reply = vec![0; state.pending_control[0].len()];
+        memory
+            .read_slice(&mut reply, GuestAddress(0x10000))
+            .unwrap();
+        assert_eq!(reply, state.pending_control[0]);
+        assert!(restored.control.snapshot_pending().is_empty());
+        assert_eq!(source.control.snapshot_pending(), state.pending_control);
+        restored.reset();
+        source.reset();
+    }
+
+    #[test]
+    fn restored_port_open_does_not_start_an_active_port_twice() {
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        let (mut console, rings) = active_console(&memory);
+        let ring = &rings[CONTROL_TXQ_INDEX];
+        memory
+            .write_obj(
+                VirtioConsoleControl {
+                    id: 0,
+                    event: control_event::VIRTIO_CONSOLE_PORT_OPEN,
+                    value: 1,
+                },
+                GuestAddress(0x10000),
+            )
+            .unwrap();
+        ring.dtable[0].addr.set(0x10000);
+        ring.dtable[0]
+            .len
+            .set(size_of::<VirtioConsoleControl>() as u32);
+        ring.avail.ring[0].set(0);
+        ring.avail.idx.set(1);
+        console.finish_restore_activation();
+        assert!(console.ports[0].is_active());
+        let event = EpollEvent::new(
+            EventSet::IN,
+            console.queue_events[CONTROL_TXQ_INDEX].as_raw_fd() as u64,
+        );
+        console.process(&event, &mut EventManager::new().unwrap());
+        assert_eq!(ring.used.idx.get(), 1);
+        assert!(console.ports[0].is_active());
+        console.reset();
+    }
+
+    #[test]
+    fn repeated_paused_events_are_drained_and_replayed_once() {
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        let (mut console, _) = active_console(&memory);
+        console.quiesce_for_snapshot();
+        let boundary = console.save_state();
+        let mut manager = EventManager::new().unwrap();
+        for _ in 0..3 {
+            console.quiesce_for_snapshot();
+            console.queue_events[CONTROL_TXQ_INDEX].write(1).unwrap();
+            let event = EpollEvent::new(
+                EventSet::IN,
+                console.queue_events[CONTROL_TXQ_INDEX].as_raw_fd() as u64,
+            );
+            console.process(&event, &mut manager);
+            assert_eq!(console.save_state(), boundary);
+            assert_eq!(
+                console.queue_events[CONTROL_TXQ_INDEX]
+                    .read()
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            assert_eq!(console.deferred_events.len(), 1);
+        }
+        console.rearm_after_snapshot();
+        assert_eq!(console.queue_events[CONTROL_TXQ_INDEX].read().unwrap(), 1);
+        console.rearm_after_snapshot();
+        assert_eq!(
+            console.queue_events[CONTROL_TXQ_INDEX]
+                .read()
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        console.reset();
+        assert!(!console.snapshot_quiesced);
+        assert!(console.deferred_events.is_empty());
     }
 }

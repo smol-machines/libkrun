@@ -261,6 +261,7 @@ mod tests {
                     acked_features: 0xABCD,
                     activated: true,
                     queues: vec![Some(qs.clone()), None],
+                    pending_control: vec![vec![1, 2, 3, 4]],
                 }),
                 DeviceSnapshot::Vsock(VsockState {
                     cid: 7,
