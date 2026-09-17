@@ -16,6 +16,40 @@ use crate::virtio::{
 const FEATURES: u64 = (1 << 32) | (1 << 1); // VERSION_1, UNPLUGGED_INACCESSIBLE
 const QUEUES: [QueueConfig; 1] = [QueueConfig::new(128)];
 
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryDeviceState {
+    pub version: u8,
+    pub memory: MemoryState,
+    pub acked_features: u64,
+    pub queue: Option<crate::virtio::queue::QueueState>,
+}
+
+impl MemoryDeviceState {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.version != 1 || self.acked_features & !FEATURES != 0 {
+            return Err("unsupported RAM device checkpoint version or features".into());
+        }
+        self.memory.validate()?;
+        if let Some(state) = &self.queue {
+            if self.acked_features & (1 << 32) == 0
+                || !state.ready
+                || !state.size.is_power_of_two()
+                || !state.desc_table.is_multiple_of(16)
+                || !state.avail_ring.is_multiple_of(2)
+                || !state.used_ring.is_multiple_of(4)
+                || state.event_idx_enabled
+            {
+                return Err("invalid RAM checkpoint request queue or negotiation".into());
+            }
+            crate::virtio::Queue::new(QUEUES[0].size).restore_state(state)?;
+        } else if self.memory.plugged_size() != 0 {
+            return Err("plugged RAM checkpoint has no active request queue".into());
+        }
+        Ok(())
+    }
+}
+
 pub struct MemoryDevice {
     state: MemoryState,
     acked: u64,
@@ -26,6 +60,34 @@ pub struct MemoryDevice {
 }
 
 impl MemoryDevice {
+    /// Called at the quiesced vCPU/device boundary by snapshot aggregation.
+    pub fn save_state(&self) -> MemoryDeviceState {
+        MemoryDeviceState {
+            version: 1,
+            memory: self.state.clone(),
+            acked_features: self.acked,
+            queue: self.queues.first().map(|q| q.queue.save_state()),
+        }
+    }
+
+    /// Restore only before activation. Queue indices are installed by the
+    /// transport; do not replay already acknowledged guest plug requests.
+    pub fn restore_state(&mut self, state: &MemoryDeviceState) -> Result<(), String> {
+        state.validate()?;
+        if self.device.is_activated() {
+            return Err("RAM device must be inactive before restoring its state".into());
+        }
+        if self.state.addr != state.memory.addr
+            || self.state.region_size != state.memory.region_size
+            || self.state.block_size != state.memory.block_size
+        {
+            return Err("RAM device checkpoint aperture does not match the destination".into());
+        }
+        self.state = state.memory.clone();
+        self.acked = state.acked_features;
+        Ok(())
+    }
+
     pub fn new(state: MemoryState) -> std::io::Result<Self> {
         Ok(Self {
             state,
@@ -232,6 +294,7 @@ mod tests {
             let mut state = MemoryState::new(0x1_0000_0000, 1 << 30, 2 << 20).unwrap();
             state.request_growth(2 << 20, 2 << 20).unwrap();
             let mut device = MemoryDevice::new(state).unwrap();
+            device.set_acked_features(FEATURES);
             device
                 .activate(
                     memory.clone(),
@@ -261,6 +324,87 @@ mod tests {
             );
             device.process_queue();
             assert_eq!(ring.used.idx.get(), 1, "request processed twice");
+            device.quiesce_for_snapshot();
+            let snapshot = device.save_state();
+            snapshot.validate().unwrap();
+            for case in 0..6 {
+                let mut invalid = snapshot.clone();
+                let queue = invalid.queue.as_mut().unwrap();
+                match case {
+                    0 => queue.size = 0,
+                    1 => queue.size = 256,
+                    2 => queue.desc_table += 1,
+                    3 => queue.ready = false,
+                    4 => queue.event_idx_enabled = true,
+                    5 => invalid.acked_features = 0,
+                    _ => unreachable!(),
+                }
+                assert!(invalid.validate().is_err());
+            }
+            let aggregate = crate::virtio::persist::VmDevicesState {
+                devices: vec![crate::virtio::persist::DeviceSnapshot::Memory(
+                    snapshot.clone(),
+                )],
+            };
+            let decoded =
+                crate::virtio::persist::VmDevicesState::from_bytes(&aggregate.to_bytes().unwrap())
+                    .unwrap();
+            assert_eq!(decoded, aggregate);
+            let mut restored =
+                MemoryDevice::new(MemoryState::new(0x1_0000_0000, 1 << 30, 2 << 20).unwrap())
+                    .unwrap();
+            crate::virtio::persist::restore_device(&mut restored, &decoded.devices[0]).unwrap();
+            let mut queue = crate::virtio::Queue::new(128);
+            queue
+                .restore_state(snapshot.queue.as_ref().unwrap())
+                .unwrap();
+            restored
+                .activate(
+                    memory.clone(),
+                    InterruptTransport::new(
+                        DummyIrqChip::new().into(),
+                        "restored memory test".into(),
+                    )
+                    .unwrap(),
+                    vec![DeviceQueue::new(
+                        queue,
+                        Arc::new(EventFd::new(EFD_NONBLOCK).unwrap()),
+                    )],
+                )
+                .unwrap();
+            restored.process_queue();
+            assert_eq!(
+                ring.used.idx.get(),
+                1,
+                "restore replayed an acknowledged request"
+            );
+            assert_eq!(restored.plugged_size(), device.plugged_size());
+            assert!(
+                restored.restore_state(&snapshot).is_err(),
+                "active restore must not race queue processing"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_memory_checkpoint_does_not_change_destination() {
+        let state = MemoryState::new(0x1_0000_0000, 1 << 30, 2 << 20).unwrap();
+        let mut device = MemoryDevice::new(state).unwrap();
+        let original = device.save_state();
+        for case in 0..5 {
+            let mut bad = original.clone();
+            match case {
+                0 => bad.version = 2,
+                1 => bad.acked_features = 1 << 63,
+                2 => bad.memory.usable_size = (1 << 30) + 1,
+                3 => {
+                    bad.memory.plugged.insert(0);
+                }
+                4 => bad.memory.addr += 2 << 20,
+                _ => unreachable!(),
+            }
+            assert!(device.restore_state(&bad).is_err());
+            assert_eq!(device.save_state(), original);
         }
     }
 }
