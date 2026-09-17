@@ -364,6 +364,7 @@ pub struct Block {
     /// holds the virtqueue + disk so its state can be snapshotted/restored and
     /// the worker re-armed. `None` during normal running.
     quiesced_worker: Option<BlockWorker>,
+    snapshot_error: Option<String>,
 
     // Virtio fields.
     pub(crate) avail_features: u64,
@@ -610,6 +611,7 @@ impl Block {
             worker_thread: None,
             worker_stopfd: EventFd::new(EFD_NONBLOCK)?,
             quiesced_worker: None,
+            snapshot_error: None,
         })
     }
 
@@ -794,7 +796,10 @@ impl Block {
             let _ = self.worker_stopfd.write(1);
             match handle.join() {
                 Ok(worker) => self.quiesced_worker = Some(worker),
-                Err(e) => error!("block: error draining worker thread: {e:?}"),
+                Err(e) => {
+                    error!("block: error draining worker thread: {e:?}");
+                    self.snapshot_error = Some("block worker failed before checkpoint".into());
+                }
             }
         }
     }
@@ -904,6 +909,7 @@ impl VirtioDevice for Block {
         }
         // Drop any worker reclaimed for a snapshot too.
         self.quiesced_worker = None;
+        self.snapshot_error = None;
         self.device_state = DeviceState::Inactive;
         true
     }
@@ -917,13 +923,20 @@ impl VirtioDevice for Block {
         // this, but snapshot quiescence may retain the device or rotate it onto
         // a new writable layer without dropping it, so it must happen here too.
         if self.cache_type == CacheType::Writeback {
-            if self.disk_image.flush().is_err() {
-                error!("block: failed to flush before snapshot");
+            if let Err(error) = self.disk_image.flush() {
+                self.snapshot_error.get_or_insert_with(|| {
+                    format!("block flush failed before checkpoint: {error}")
+                });
             }
-            if self.disk_image.sync().is_err() {
-                error!("block: failed to sync before snapshot");
+            if let Err(error) = self.disk_image.sync() {
+                self.snapshot_error
+                    .get_or_insert_with(|| format!("block sync failed before checkpoint: {error}"));
             }
         }
+    }
+
+    fn snapshot_error(&self) -> Option<&str> {
+        self.snapshot_error.as_deref()
     }
 
     /// Re-arm the worker after a checkpoint/restore (resumes I/O).
@@ -935,7 +948,115 @@ impl VirtioDevice for Block {
 #[cfg(test)]
 mod overlay_tests {
     use super::*;
+    use imago::storage::drivers::CommonStorageHelper;
+    use std::fmt;
+    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
     use utils::tempfile::TempFile;
+
+    #[derive(Debug, Default)]
+    struct FailureControl {
+        operations: AtomicU8,
+        flushes: AtomicUsize,
+        syncs: AtomicUsize,
+    }
+
+    #[derive(Debug)]
+    struct FailingStorage {
+        control: Arc<FailureControl>,
+        helper: CommonStorageHelper,
+    }
+
+    impl fmt::Display for FailingStorage {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("checkpoint failure test storage")
+        }
+    }
+
+    impl Storage for FailingStorage {
+        fn size(&self) -> io::Result<u64> {
+            Ok(1024 * 1024)
+        }
+
+        async unsafe fn pure_readv(&self, _: IoVectorMut<'_>, _: u64) -> io::Result<()> {
+            Err(io::ErrorKind::Unsupported.into())
+        }
+
+        async unsafe fn pure_writev(&self, _: IoVector<'_>, _: u64) -> io::Result<()> {
+            Err(io::ErrorKind::Unsupported.into())
+        }
+
+        async fn flush(&self) -> io::Result<()> {
+            self.control.flushes.fetch_add(1, Ordering::SeqCst);
+            if self.control.operations.load(Ordering::SeqCst) & 1 != 0 {
+                Err(io::Error::other("injected storage flush failure"))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn sync(&self) -> io::Result<()> {
+            self.control.syncs.fetch_add(1, Ordering::SeqCst);
+            if self.control.operations.load(Ordering::SeqCst) & 2 != 0 {
+                Err(io::Error::other("injected storage sync failure"))
+            } else {
+                Ok(())
+            }
+        }
+
+        async unsafe fn invalidate_cache(&self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn get_storage_helper(&self) -> &CommonStorageHelper {
+            &self.helper
+        }
+    }
+
+    #[test]
+    fn checkpoint_rejects_storage_flush_and_sync_failures() {
+        for operations in [1, 2, 3] {
+            let base = TempFile::new().unwrap();
+            base.as_file().set_len(1024 * 1024).unwrap();
+            let mut block = Block::new(
+                "failure-test".into(),
+                None,
+                CacheType::Writeback,
+                base.as_path().to_str().unwrap().into(),
+                ImageType::Raw,
+                false,
+                false,
+                SyncMode::Full,
+                BlockIoEngine::Sync,
+                None,
+            )
+            .unwrap();
+            let control = Arc::new(FailureControl::default());
+            let storage: Box<dyn DynStorage> = Box::new(FailingStorage {
+                control: control.clone(),
+                helper: CommonStorageHelper::default(),
+            });
+            let raw = Raw::open_image_sync(storage, true).unwrap();
+            block.disk_image = Arc::new(DiskBackend::Sync(Mutex::new(
+                SyncFormatAccess::new(raw).unwrap(),
+            )));
+            control.operations.store(operations, Ordering::SeqCst);
+            block.quiesce_for_snapshot();
+            let error = block
+                .snapshot_error()
+                .expect("failed durability must reject checkpoint");
+            assert!(error.contains(if operations & 1 != 0 { "flush" } else { "sync" }));
+            assert_eq!(control.flushes.load(Ordering::SeqCst), 1);
+            assert_eq!(control.syncs.load(Ordering::SeqCst), 1);
+            // A later successful barrier cannot recover buffers lost by a
+            // failed operation; require explicit device recovery/reset.
+            control.operations.store(0, Ordering::SeqCst);
+            block.quiesce_for_snapshot();
+            assert!(block.snapshot_error().is_some());
+            block.reset();
+            block.quiesce_for_snapshot();
+            assert!(block.snapshot_error().is_none());
+        }
+    }
 
     #[test]
     fn create_overlay_over_raw_base() {

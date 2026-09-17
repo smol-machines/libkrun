@@ -74,6 +74,7 @@ pub struct Console {
     pub(crate) sigwinch_evt: EventFd,
 
     pub(crate) snapshot_quiesced: bool,
+    snapshot_error: Option<String>,
     // Indices in the notification list, not borrowed OS handles (which are
     // pointers on Windows). The list stays fixed while quiesced; reset clears it.
     pub(crate) deferred_events: Vec<usize>,
@@ -114,6 +115,7 @@ impl Console {
                 .map_err(super::ConsoleError::EventFd)?,
             device_state: DeviceState::Inactive,
             snapshot_quiesced: false,
+            snapshot_error: None,
             deferred_events: Vec::new(),
             config,
         })
@@ -357,6 +359,10 @@ impl Console {
                 continue;
             }
             let reclaimed = self.ports[port_id].shutdown_and_reclaim();
+            if reclaimed.rx.is_none() || reclaimed.tx.is_none() {
+                self.snapshot_error =
+                    Some(format!("console port {port_id} lost a checkpoint queue"));
+            }
             if let Some(q) = reclaimed.rx {
                 let idx = port_id_to_queue_idx(QueueDirection::Rx, port_id);
                 self.queues[idx] = Some(DeviceQueue::new(q, self.queue_events[idx].clone()));
@@ -481,6 +487,7 @@ impl VirtioDevice for Console {
         self.queue_events.clear();
         self.device_state = DeviceState::Inactive;
         self.snapshot_quiesced = false;
+        self.snapshot_error = None;
         self.deferred_events.clear();
         true
     }
@@ -491,6 +498,10 @@ impl VirtioDevice for Console {
         }
         self.snapshot_quiesced = true;
         self.quiesce_ports_for_snapshot();
+    }
+
+    fn snapshot_error(&self) -> Option<&str> {
+        self.snapshot_error.as_deref()
     }
 
     fn rearm_after_snapshot(&mut self) {
@@ -564,6 +575,19 @@ mod checkpoint_boundary_tests {
             )
             .unwrap();
         (console, rings)
+    }
+
+    #[test]
+    fn checkpoint_rejects_a_lost_console_worker_queue() {
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        let (mut console, _rings) = active_console(&memory);
+        console.ports[0].inject_failed_tx_worker();
+        console.quiesce_for_snapshot();
+        assert!(console.snapshot_error().unwrap().contains("port 0"));
+        console.quiesce_for_snapshot();
+        assert!(console.snapshot_error().is_some());
+        console.reset();
+        assert!(console.snapshot_error().is_none());
     }
 
     #[test]
