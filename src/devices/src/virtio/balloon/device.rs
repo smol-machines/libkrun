@@ -138,8 +138,8 @@ impl Balloon {
         defs::BALLOON_DEV_ID
     }
 
-    /// Capture runtime state for checkpoint/fork. vCPUs must be paused, so
-    /// the queues are at a clean boundary.
+    /// Capture runtime state for checkpoint/fork. Both vCPUs and device event
+    /// handling must be quiesced so the queues remain at a clean boundary.
     pub fn save_state(&self) -> BalloonState {
         BalloonState {
             acked_features: self.acked_features,

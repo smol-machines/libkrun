@@ -168,9 +168,12 @@ pub trait VirtioDevice: AsAny + Send {
     /// Quiesce the device to a clean boundary for a checkpoint/fork snapshot:
     /// devices that move their virtqueues into a worker thread (block, net)
     /// drain in-flight work and reclaim the queue so its indices can be
-    /// captured by `save_state`. Default: no-op (devices that keep their queues
-    /// in-struct, e.g. vsock). Paired with [`Self::rearm_after_snapshot`].
-    /// The vCPUs must already be paused when this is called.
+    /// captured by `save_state`. Devices serviced by the event loop must also
+    /// prevent callbacks from changing guest memory or queue state until
+    /// [`Self::rearm_after_snapshot`]. Keeping queues in-struct is not enough:
+    /// the event loop may run concurrently with checkpoint control requests.
+    /// The vCPUs must already be paused when this is called. The default no-op
+    /// is appropriate only when no asynchronous work can change the boundary.
     fn quiesce_for_snapshot(&mut self) {}
 
     /// Re-arm a device quiesced by [`Self::quiesce_for_snapshot`], resuming its
