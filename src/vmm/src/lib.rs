@@ -577,11 +577,14 @@ impl Vmm {
 
     /// Drain + reclaim worker-owned virtqueues (block/net) so their indices can
     /// be captured/restored at a clean boundary. vCPUs must be paused first.
-    pub fn quiesce_devices(&mut self) {
+    pub fn quiesce_devices(&mut self) -> Result<()> {
         if !self.devices_quiesced {
             self.mmio_device_manager.quiesce_devices();
             self.devices_quiesced = true;
         }
+        self.mmio_device_manager
+            .validate_snapshot_boundary()
+            .map_err(Error::Snapshot)
     }
 
     /// Re-arm device workers quiesced by [`Self::quiesce_devices`].
@@ -823,7 +826,7 @@ impl Vmm {
         // device workers so block/net virtqueue indices are captured at a clean
         // boundary (no in-flight I/O).
         self.pause()?;
-        self.quiesce_devices();
+        self.quiesce_devices()?;
         let vcpu_states = self.save_vcpu_states()?;
         let vm_state = self.vm.save_state().map_err(Error::Vm)?;
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -887,8 +890,8 @@ impl Vmm {
         generation_dir: &std::path::Path,
     ) -> Result<(VmCheckpoint, snapshot::DeferredMemorySave)> {
         self.pause()?;
-        self.quiesce_devices();
         let capture = (|| {
+            self.quiesce_devices()?;
             let vcpu_states = self.save_vcpu_states()?;
             let vm_state = self.vm.save_state().map_err(Error::Vm)?;
             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -931,8 +934,8 @@ impl Vmm {
         F: FnOnce(&GuestMemoryMmap) -> std::io::Result<Vec<snapshot::MemoryRegionDesc>>,
     {
         self.pause()?;
-        self.quiesce_devices();
         let capture = (|| {
+            self.quiesce_devices()?;
             let vcpu_states = self.save_vcpu_states()?;
             let vm_state = self.vm.save_state().map_err(Error::Vm)?;
             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -989,7 +992,7 @@ impl Vmm {
         }
         // Drain + reclaim worker-owned queues so restored indices can be applied
         // to them (and so they match the rewound guest rings).
-        self.quiesce_devices();
+        self.quiesce_devices()?;
         snapshot::read_guest_memory_into(&self.guest_memory, mem_descs, mem_in)
             .map_err(|e| Error::Snapshot(format!("guest-memory load: {e}")))?;
         self.vm
@@ -1027,7 +1030,7 @@ impl Vmm {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     pub fn checkpoint_cow(&mut self) -> Result<(VmCheckpoint, GuestMemoryMmap)> {
         self.pause()?;
-        self.quiesce_devices();
+        self.quiesce_devices()?;
         let vcpu_states = self.save_vcpu_states()?;
         let vm_state = self.vm.save_state().map_err(Error::Vm)?;
         let devices = self.snapshot_devices();
@@ -1063,7 +1066,7 @@ impl Vmm {
                 "VM must be paused before restore".to_string(),
             ));
         }
-        self.quiesce_devices();
+        self.quiesce_devices()?;
         snapshot::copy_guest_memory(mem_clone, &self.guest_memory)
             .map_err(|e| Error::Snapshot(format!("guest-memory restore copy: {e}")))?;
         self.vm
@@ -1097,8 +1100,8 @@ impl Vmm {
         }
 
         self.pause()?;
-        self.quiesce_devices();
         let checkpoint = (|| {
+            self.quiesce_devices()?;
             let vcpu_states = self.save_vcpu_states()?;
             let vm_state = self.vm.save_state().map_err(Error::Vm)?;
             let devices = self.snapshot_devices();
@@ -1155,8 +1158,8 @@ impl Vmm {
         };
 
         self.pause()?;
-        self.quiesce_devices();
         let capture = (|| {
+            self.quiesce_devices()?;
             let vcpu_states = self.save_vcpu_states()?;
             let vm_state = self.vm.save_state().map_err(Error::Vm)?;
             let devices = self.snapshot_devices();
@@ -1323,8 +1326,8 @@ impl Vmm {
         }
 
         self.pause()?;
-        self.quiesce_devices();
         let capture = (|| {
+            self.quiesce_devices()?;
             let vcpu_states = self.save_vcpu_states()?;
             let vm_state = self.vm.save_state().map_err(Error::Vm)?;
             let devices = self.snapshot_devices();

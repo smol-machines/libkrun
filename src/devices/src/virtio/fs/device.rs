@@ -58,6 +58,7 @@ pub struct Fs {
     /// hold the virtqueues so their indices can be captured for a checkpoint
     /// and re-armed afterwards.
     quiesced_workers: Vec<FsWorker>,
+    snapshot_error: Option<String>,
     /// FUSE server state restored from a checkpoint, consumed by the next
     /// `activate` to rebuild the worker's passthrough inode/handle maps.
     pending_fuse: Option<FuseServerState>,
@@ -186,6 +187,7 @@ impl Fs {
             worker_threads: Vec::new(),
             worker_stopfds: Vec::new(),
             quiesced_workers: Vec::new(),
+            snapshot_error: None,
             pending_fuse: None,
             exit_code,
             #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -273,7 +275,10 @@ impl Fs {
         for worker in self.worker_threads.drain(..) {
             match worker.join() {
                 Ok(w) => self.quiesced_workers.push(w),
-                Err(e) => error!("virtio_fs: error reclaiming worker: {e:?}"),
+                Err(e) => {
+                    error!("virtio_fs: error reclaiming worker: {e:?}");
+                    self.snapshot_error = Some("filesystem worker failed before checkpoint".into());
+                }
             }
         }
     }
@@ -441,12 +446,17 @@ impl VirtioDevice for Fs {
         }
         self.worker_stopfds.clear();
         self.quiesced_workers.clear();
+        self.snapshot_error = None;
         self.device_state = DeviceState::Inactive;
         true
     }
 
     fn quiesce_for_snapshot(&mut self) {
         self.quiesce_worker();
+    }
+
+    fn snapshot_error(&self) -> Option<&str> {
+        self.snapshot_error.as_deref()
     }
 
     fn rearm_after_snapshot(&mut self) {

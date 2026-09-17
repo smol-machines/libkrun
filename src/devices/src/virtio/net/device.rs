@@ -97,6 +97,7 @@ pub struct Net {
     /// rx/tx queues + backend so their state can be snapshotted/restored and the
     /// worker re-armed. `None` during normal running.
     quiesced_worker: Option<NetWorker>,
+    snapshot_error: Option<String>,
 }
 
 impl Net {
@@ -130,6 +131,7 @@ impl Net {
             worker_thread: None,
             worker_stopfd: EventFd::new(EFD_NONBLOCK).map_err(Error::EventFd)?,
             quiesced_worker: None,
+            snapshot_error: None,
         })
     }
 
@@ -201,7 +203,10 @@ impl Net {
             let _ = self.worker_stopfd.write(1);
             match handle.join() {
                 Ok(worker) => self.quiesced_worker = Some(worker),
-                Err(e) => error!("net: error draining worker thread: {e:?}"),
+                Err(e) => {
+                    error!("net: error draining worker thread: {e:?}");
+                    self.snapshot_error = Some("network worker failed before checkpoint".into());
+                }
             }
         }
     }
@@ -317,6 +322,7 @@ impl VirtioDevice for Net {
             }
         }
         self.quiesced_worker = None;
+        self.snapshot_error = None;
         self.device_state = DeviceState::Inactive;
         true
     }
@@ -324,6 +330,10 @@ impl VirtioDevice for Net {
     /// Quiesce for checkpoint/fork: drain + reclaim the worker's rx/tx queues.
     fn quiesce_for_snapshot(&mut self) {
         self.quiesce_worker();
+    }
+
+    fn snapshot_error(&self) -> Option<&str> {
+        self.snapshot_error.as_deref()
     }
 
     /// Re-arm the worker after checkpoint/restore (resumes packet processing).
@@ -337,10 +347,9 @@ mod checkpoint_failure_probe {
     use super::*;
     use std::thread;
 
-    // Diagnostic of the current behavior, not the desired regression contract.
     // No guest, backend socket, or network traffic is involved.
     #[test]
-    fn failed_worker_loses_queue_state_without_rejecting_quiescence() {
+    fn failed_worker_rejects_checkpoint_and_repeated_attempts() {
         let mut net = Net::new(
             "checkpoint-probe".into(),
             VirtioNetBackend::UnixstreamPath(PathBuf::from("unused-probe-socket")),
@@ -350,13 +359,17 @@ mod checkpoint_failure_probe {
         .unwrap();
         net.worker_thread = Some(thread::spawn(|| panic!("simulated worker failure")));
         net.quiesce_for_snapshot();
+        assert!(net.snapshot_error().is_some());
         let saved = net.save_state();
         assert!(net.worker_thread.is_none());
         assert!(net.quiesced_worker.is_none());
         assert!(saved.queue_rx.is_none() && saved.queue_tx.is_none());
-        // Retrying quiescence does not recover or report the lost worker.
+        // Retrying cannot mistake the missing worker for an inactive device.
         net.quiesce_for_snapshot();
         net.rearm_after_snapshot();
         assert!(net.worker_thread.is_none());
+        assert!(net.snapshot_error().is_some());
+        net.reset();
+        assert!(net.snapshot_error().is_none());
     }
 }

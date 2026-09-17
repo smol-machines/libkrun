@@ -149,6 +149,18 @@ impl MMIODeviceManager {
         }
     }
 
+    /// Validate only after all workers have stopped, including after a previous
+    /// failed attempt that left the devices quiesced.
+    pub fn validate_snapshot_boundary(&self) -> std::result::Result<(), String> {
+        for dev in &self.virtio_devices {
+            let guard = dev.lock().expect("poisoned virtio device lock");
+            if let Some(error) = guard.snapshot_error() {
+                return Err(format!("{}: {error}", guard.device_name()));
+            }
+        }
+        Ok(())
+    }
+
     /// Re-arm every virtio device quiesced by [`Self::quiesce_devices`].
     pub fn rearm_devices(&self) {
         for dev in &self.virtio_devices {

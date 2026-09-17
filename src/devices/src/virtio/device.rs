@@ -176,6 +176,13 @@ pub trait VirtioDevice: AsAny + Send {
     /// is appropriate only when no asynchronous work can change the boundary.
     fn quiesce_for_snapshot(&mut self) {}
 
+    /// Report a failure to establish a complete checkpoint boundary. Call only
+    /// after quiescing every device, so an error cannot leave other workers
+    /// running. A lost worker must remain an error on subsequent attempts.
+    fn snapshot_error(&self) -> Option<&str> {
+        None
+    }
+
     /// Re-arm a device quiesced by [`Self::quiesce_for_snapshot`], resuming its
     /// worker from the (possibly restored) virtqueue indices. Default: no-op.
     fn rearm_after_snapshot(&mut self) {}
