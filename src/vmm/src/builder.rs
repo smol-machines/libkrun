@@ -686,6 +686,12 @@ pub fn build_microvm(
         None => (None, None, false),
     };
 
+    #[cfg(snapshot_supported)]
+    let restore_checkpoint = restore_checkpoint
+        .map(|bytes| super::VmCheckpoint::deserialize(&bytes))
+        .transpose()
+        .map_err(StartMicrovmError::GuestMemoryMmap)?;
+
     let payload = choose_payload(vm_resources)?;
     vmm_timing!("payload selected");
 
@@ -701,8 +707,39 @@ pub fn build_microvm(
     vmm_timing!("memory created");
 
     let vcpu_config = vm_resources.vcpu_config();
+    #[cfg(snapshot_supported)]
+    if let Some(checkpoint) = &restore_checkpoint {
+        if checkpoint.vcpu_states.len() != usize::from(vcpu_config.vcpu_count) {
+            return Err(StartMicrovmError::GuestMemoryMmap(format!(
+                "checkpoint has {} CPUs but machine is configured for {}; reconcile resized CPU settings before restore",
+                checkpoint.vcpu_states.len(),
+                vcpu_config.vcpu_count
+            )));
+        }
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee"))))]
+        if checkpoint.cpu_growth.is_some() {
+            return Err(StartMicrovmError::GuestMemoryMmap(
+                "checkpoint CPU growth topology is unsupported on this platform".into(),
+            ));
+        }
+    }
     #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
-    let prototype_cpu_topology = if !restoring
+    let prototype_cpu_topology = if let Some(topology) = restore_checkpoint
+        .as_ref()
+        .and_then(|checkpoint| checkpoint.cpu_growth.as_ref())
+    {
+        if topology.capacity > 16 {
+            return Err(StartMicrovmError::GuestMemoryMmap(
+                "checkpoint CPU topology exceeds the current firmware limit".into(),
+            ));
+        }
+        Some(VcpuConfig {
+            vcpu_count: topology.capacity,
+            ht_enabled: topology.ht_enabled,
+            nested_enabled: topology.nested_enabled,
+            cpu_template: topology.cpu_template,
+        })
+    } else if !restoring
         && vcpu_config.vcpu_count <= 16
         && std::env::var("KRUN_PROTOTYPE_CPU_GROWTH").as_deref() == Ok("1")
     {
@@ -989,9 +1026,14 @@ pub fn build_microvm(
         let kernel_boot =
             !restoring && vm_resources.firmware_config.is_none() && !cfg!(feature = "tee");
 
+        let created_count = vcpu_config.vcpu_count;
+        let creation_config = &vcpu_config;
+        #[cfg(not(feature = "tee"))]
+        let creation_config = prototype_cpu_topology.as_ref().unwrap_or(creation_config);
         vcpus = create_vcpus_x86_64(
             &vm,
-            &vcpu_config,
+            creation_config,
+            created_count,
             &guest_memory,
             payload_config.entry_addr,
             &pio_device_manager.io_bus,
@@ -1189,7 +1231,7 @@ pub fn build_microvm(
         #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
         prototype_cpu_topology,
         #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
-        cpu_growth_failure: None,
+        cpu_growth_progress: Default::default(),
         run_state: super::VmmRunState::Paused,
         paused_at: None,
         devices_quiesced: false,
@@ -1394,14 +1436,12 @@ pub fn build_microvm(
                 .map_err(StartMicrovmError::Internal)?;
             vmm_timing!("vcpus running");
         }
-        Some(checkpoint_bytes) => {
+        Some(checkpoint) => {
             // Restore-into-a-fresh-clone: start vCPUs paused, apply the
             // checkpoint (VM + device re-activation + vCPU registers), then
             // resume so the clone runs from the checkpoint instruction.
             #[cfg(fork_supported)]
             {
-                let checkpoint = super::VmCheckpoint::deserialize(&checkpoint_bytes)
-                    .map_err(StartMicrovmError::GuestMemoryMmap)?;
                 vmm.start_vcpus_paused(vcpus)
                     .map_err(StartMicrovmError::Internal)?;
                 vmm.apply_restore(checkpoint, restore_portable_clock)
@@ -2589,6 +2629,7 @@ fn attach_legacy_devices(
 fn create_vcpus_x86_64(
     vm: &Vm,
     vcpu_config: &VcpuConfig,
+    created_count: u8,
     guest_mem: &GuestMemoryMmap,
     entry_addr: GuestAddress,
     io_bus: &devices::Bus,
@@ -2597,20 +2638,8 @@ fn create_vcpus_x86_64(
     pvh: bool,
     #[cfg(feature = "tee")] pm_sender: Sender<WorkerMessage>,
 ) -> super::Result<Vec<Vcpu>> {
-    let mut vcpus = Vec::with_capacity(vcpu_config.vcpu_count as usize);
-    for cpu_index in 0..vcpu_config.vcpu_count {
-        #[cfg(not(feature = "tee"))]
-        let topology = if std::env::var("KRUN_PROTOTYPE_CPU_GROWTH").as_deref() == Ok("1")
-            && vcpu_config.vcpu_count <= 16
-        {
-            let mut config = vcpu_config.clone();
-            config.vcpu_count = 16;
-            config
-        } else {
-            vcpu_config.clone()
-        };
-        #[cfg(not(feature = "tee"))]
-        let vcpu_config = &topology;
+    let mut vcpus = Vec::with_capacity(created_count as usize);
+    for cpu_index in 0..created_count {
         let mut vcpu = Vcpu::new_x86_64(
             cpu_index,
             vm.fd(),
@@ -3531,6 +3560,7 @@ pub mod tests {
         let vcpu_vec = create_vcpus_x86_64(
             &vm,
             &vcpu_config,
+            vcpu_count,
             &guest_memory,
             entry_addr,
             &bus,
