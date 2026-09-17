@@ -814,6 +814,24 @@ fn handle_prepare_save(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
     "OK prepared (paused)\n".to_string()
 }
 
+/// Until the paused-state reply is delivered, the caller cannot own cleanup.
+/// A failed prepare does not transfer that ownership in the first place.
+#[cfg(all(
+    snapshot_supported,
+    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
+))]
+fn write_prepared_save_reply(
+    stream: &mut impl Write,
+    response: &str,
+    recover: impl FnOnce(),
+) -> std::io::Result<()> {
+    let result = stream.write_all(response.as_bytes());
+    if result.is_err() && response == "OK prepared (paused)\n" {
+        recover();
+    }
+    result
+}
+
 #[cfg(all(
     snapshot_supported,
     any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
@@ -1622,7 +1640,23 @@ fn handle_control_stream<S: std::io::Read + std::io::Write + Send + 'static>(
                     snapshot_supported,
                     any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
                 ))]
-                "PREPARE_SAVE" => handle_prepare_save(vmm, _arg),
+                "PREPARE_SAVE" => {
+                    let response = handle_prepare_save(vmm, _arg);
+                    if let Err(error) = write_prepared_save_reply(&mut stream, &response, || {
+                        // The control listener is serial: no later command can
+                        // consume this preparation before reply delivery ends.
+                        if let Err(error) = vmm.lock().unwrap().resume() {
+                            error!("resume after disconnected checkpoint preparation: {error}");
+                        }
+                        let cancelled = handle_cancel_save(_arg);
+                        if !cancelled.starts_with("OK ") {
+                            error!("cancel disconnected checkpoint preparation: {cancelled}");
+                        }
+                    }) {
+                        warn!("deliver checkpoint preparation reply: {error}");
+                    }
+                    return;
+                }
                 #[cfg(all(
                     snapshot_supported,
                     any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
@@ -1700,6 +1734,51 @@ fn handle_control_stream<S: std::io::Read + std::io::Write + Send + 'static>(
 #[cfg(test)]
 mod control_command_tests {
     use super::*;
+
+    #[cfg(all(
+        snapshot_supported,
+        any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
+    ))]
+    #[test]
+    fn disconnected_prepared_reply_recovers_source_once() {
+        use std::net::Shutdown;
+        use std::os::unix::net::UnixStream;
+
+        let (mut server, client) = UnixStream::pair().unwrap();
+        client.shutdown(Shutdown::Read).unwrap();
+        let mut recoveries = 0;
+        let result = write_prepared_save_reply(&mut server, "OK prepared (paused)\n", || {
+            recoveries += 1;
+        });
+        assert!(result.is_err());
+        assert_eq!(recoveries, 1);
+    }
+
+    #[cfg(all(
+        snapshot_supported,
+        any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
+    ))]
+    #[test]
+    fn prepared_reply_preserves_success_and_failed_prepare_ownership() {
+        use std::net::Shutdown;
+        use std::os::unix::net::UnixStream;
+
+        let mut output = Vec::new();
+        write_prepared_save_reply(&mut output, "OK prepared (paused)\n", || {
+            panic!("delivered preparation belongs to the caller");
+        })
+        .unwrap();
+        assert_eq!(output, b"OK prepared (paused)\n");
+
+        let (mut server, client) = UnixStream::pair().unwrap();
+        client.shutdown(Shutdown::Read).unwrap();
+        assert!(
+            write_prepared_save_reply(&mut server, "ERR EBUSY another save is pending\n", || {
+                panic!("failed preparation must not cancel another save");
+            })
+            .is_err()
+        );
+    }
 
     #[test]
     fn last_error_is_thread_local_and_copied_as_c_string() {
