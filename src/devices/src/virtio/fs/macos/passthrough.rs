@@ -517,6 +517,9 @@ pub struct Config {
     ///
     /// The default value for this options is `false`.
     pub xattr: bool,
+    /// Accepted for API symmetry with the Linux server: this server always
+    /// presents ownership from the override xattr.
+    pub override_stat: bool,
 
     /// Optional file descriptor for /proc/self/fd. Callers can obtain a file descriptor and pass it
     /// here, so there's no need to open it in PassthroughFs::new(). This is specially useful for
@@ -544,6 +547,7 @@ impl Default for Config {
             writeback: false,
             root_dir: String::from("/"),
             xattr: true,
+            override_stat: false,
             proc_sfd_rawfd: None,
             export_fsid: 0,
             export_table: None,

@@ -2082,6 +2082,30 @@ pub unsafe extern "C" fn krun_add_virtiofs3(
     shm_size: u64,
     read_only: bool,
 ) -> i32 {
+    unsafe { krun_add_virtiofs4(ctx_id, c_tag, c_path, shm_size, read_only, 0) }
+}
+
+/// Serve ownership and mode from the `user.containers.override_stat` xattr
+/// on each file instead of the host inode (and record the guest's chown,
+/// chmod and mknod there). Lets an unprivileged host share an image tree with
+/// its exact owners, setuid bits and whiteouts. Always in effect on macOS and
+/// Windows; on Linux only with this flag.
+pub const KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT: u32 = 1 << 0;
+
+#[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn krun_add_virtiofs4(
+    ctx_id: u32,
+    c_tag: *const c_char,
+    c_path: *const c_char,
+    shm_size: u64,
+    read_only: bool,
+    flags: u32,
+) -> i32 {
+    if flags & !KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT != 0 {
+        return -libc::EINVAL;
+    }
+    let override_stat = flags & KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT != 0;
     unsafe {
         if c_tag.is_null() {
             return -libc::EINVAL;
@@ -2125,6 +2149,7 @@ pub unsafe extern "C" fn krun_add_virtiofs3(
                     shared_dir: path.map(|p| p.to_string()),
                     shm_size: shm,
                     read_only,
+                    override_stat,
                     virtual_entries,
                 });
             }
@@ -4209,6 +4234,7 @@ pub unsafe extern "C" fn krun_set_root_disk_remount(
                     // Default to a conservative 512 MB window.
                     shm_size: Some(1 << 29),
                     read_only: false,
+                    override_stat: false,
                     virtual_entries,
                 });
 

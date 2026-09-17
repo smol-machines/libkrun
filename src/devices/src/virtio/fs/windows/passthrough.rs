@@ -250,6 +250,9 @@ pub struct Config {
     ///
     /// The default value for this options is `false`.
     pub xattr: bool,
+    /// Accepted for API symmetry with the Linux server: this server always
+    /// presents ownership from the override xattr.
+    pub override_stat: bool,
 
     /// ID of this filesystem to uniquely identify exports.
     pub export_fsid: u64,
@@ -266,6 +269,7 @@ impl Default for Config {
             writeback: false,
             root_dir: String::from("C:\\"),
             xattr: true,
+            override_stat: false,
             export_fsid: 0,
             export_table: None,
         }

@@ -9,6 +9,9 @@ pub struct FsDeviceConfig {
     pub shared_dir: Option<String>,
     pub shm_size: Option<usize>,
     pub read_only: bool,
+    /// Serve ownership and mode from the `user.containers.override_stat`
+    /// xattr (see the passthrough `Config`).
+    pub override_stat: bool,
     #[cfg(not(feature = "aws-nitro"))]
     pub virtual_entries: Vec<VirtualDirEntry>,
 }

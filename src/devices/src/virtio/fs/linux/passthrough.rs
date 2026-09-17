@@ -339,6 +339,15 @@ pub struct Config {
     ///
     /// The default value for this options is `false`.
     pub xattr: bool,
+    /// Present ownership and mode from the `user.containers.override_stat`
+    /// xattr instead of the host inode, and record the guest's chown/chmod/
+    /// mknod there instead of applying them to the host. This is how an
+    /// unprivileged host (which cannot chown, set setuid bits or mknod) can
+    /// serve an image tree with its exact owners, setuid binaries and
+    /// overlayfs whiteouts: the extractor writes the xattr, this server
+    /// honors it. The macOS and Windows servers always do this; on Linux it
+    /// is opt-in per share.
+    pub override_stat: bool,
 
     /// Optional file descriptor for /proc/self/fd. Callers can obtain a file descriptor and pass it
     /// here, so there's no need to open it in PassthroughFs::new(). This is specially useful for
@@ -362,6 +371,7 @@ impl Default for Config {
             writeback: false,
             root_dir: String::from("/"),
             xattr: true,
+            override_stat: false,
             proc_sfd_rawfd: None,
             export_fsid: 0,
             export_table: None,
@@ -412,6 +422,95 @@ pub struct PassthroughFs {
 
 /// Some operations can only be performed on opened FDs without O_PATH, or on symlink paths.
 /// This enum encodes a fallback to handle those symlinks separately.
+/// The rootless-containers convention for virtual ownership: `uid:gid:0mode`
+/// in a user xattr, with `x` for "unchanged". Shared with the macOS and
+/// Windows servers so one extracted tree serves all three.
+const OVERRIDE_STAT_KEY: &[u8] = b"user.containers.override_stat\0";
+
+fn override_key() -> &'static CStr {
+    unsafe { CStr::from_bytes_with_nul_unchecked(OVERRIDE_STAT_KEY) }
+}
+
+fn override_key_name() -> &'static [u8] {
+    &OVERRIDE_STAT_KEY[..OVERRIDE_STAT_KEY.len() - 1]
+}
+
+fn override_item(item: &[u8], radix: u32) -> Option<u32> {
+    std::str::from_utf8(item)
+        .ok()
+        .and_then(|value| u32::from_str_radix(value, radix).ok())
+}
+
+fn parse_override(buf: &[u8]) -> (Option<u32>, Option<u32>, Option<u32>) {
+    let mut items = buf.split(|c| *c == b':');
+    let uid = items.next().and_then(|item| override_item(item, 10));
+    let gid = items.next().and_then(|item| override_item(item, 10));
+    let mode = items.next().and_then(|item| override_item(item, 8));
+    (uid, gid, mode)
+}
+
+/// The proc magic link for an `O_PATH` fd resolves to its inode, which is
+/// what lets the xattr be read without opening the file. It follows through
+/// a symlink inode to the target, so callers skip symlinks.
+fn proc_fd_path(fd: RawFd) -> io::Result<CString> {
+    CString::new(format!("/proc/self/fd/{fd}"))
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+fn read_override(fd: RawFd) -> Option<(Option<u32>, Option<u32>, Option<u32>)> {
+    let path = proc_fd_path(fd).ok()?;
+    let mut buf = [0u8; 64];
+    let res = unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            override_key().as_ptr(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    };
+    if res < 0 {
+        return None;
+    }
+    Some(parse_override(&buf[..res as usize]))
+}
+
+fn write_override(fd: RawFd, uid: u32, gid: u32, mode: u32) -> io::Result<()> {
+    let path = proc_fd_path(fd)?;
+    let value = format!("{uid}:{gid}:0{mode:o}");
+    let res = unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            override_key().as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+        )
+    };
+    if res < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn apply_override(
+    st: &mut libc::stat64,
+    (uid, gid, mode): (Option<u32>, Option<u32>, Option<u32>),
+) {
+    if let Some(uid) = uid {
+        st.st_uid = uid;
+    }
+    if let Some(gid) = gid {
+        st.st_gid = gid;
+    }
+    if let Some(mode) = mode {
+        if mode & libc::S_IFMT == 0 {
+            st.st_mode = (st.st_mode & libc::S_IFMT) | mode;
+        } else {
+            st.st_mode = mode;
+        }
+    }
+}
+
 enum FileOrLink {
     File(File),
     Link(CString),
@@ -828,6 +927,46 @@ impl PassthroughFs {
         Ok(unsafe { File::from_raw_fd(fd) })
     }
 
+    /// Replace the host inode's owner and mode with the recorded ones. Symlink
+    /// inodes keep the host's: their proc link would resolve past them.
+    fn override_stat(&self, fd: RawFd, st: &mut libc::stat64) {
+        if self.cfg.override_stat && (st.st_mode & libc::S_IFMT) != libc::S_IFLNK {
+            if let Some(recorded) = read_override(fd) {
+                apply_override(st, recorded);
+            }
+        }
+    }
+
+    /// Record the calling guest process as owner of an entry it just created
+    /// under `parent`, with the mode it asked for.
+    fn stamp_created(
+        &self,
+        parent_fd: RawFd,
+        name: &CStr,
+        ctx: &Context,
+        mode: u32,
+    ) -> io::Result<()> {
+        if !self.cfg.override_stat {
+            return Ok(());
+        }
+        let fd = unsafe {
+            libc::openat(
+                parent_fd,
+                name.as_ptr(),
+                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let file = unsafe { File::from_raw_fd(fd) };
+        let st = stat(&file)?;
+        if (st.st_mode & libc::S_IFMT) == libc::S_IFLNK {
+            return Ok(());
+        }
+        write_override(file.as_raw_fd(), ctx.uid, ctx.gid, mode)
+    }
+
     fn open_inode_or_path(&self, inode: Inode, flags: i32) -> io::Result<FileOrLink> {
         match self.open_inode(inode, flags) {
             Ok(a) => Ok(FileOrLink::File(a)),
@@ -1062,7 +1201,8 @@ impl PassthroughFs {
             .cloned()
             .ok_or_else(estale)?;
 
-        let st = stat(&data.file)?;
+        let mut st = stat(&data.file)?;
+        self.override_stat(data.file.as_raw_fd(), &mut st);
 
         Ok((st, self.cfg.attr_timeout))
     }
@@ -1090,6 +1230,11 @@ impl PassthroughFs {
         uid: libc::uid_t,
         gid: libc::gid_t,
     ) -> io::Result<(Option<ScopedUid>, Option<ScopedGid>)> {
+        // Ownership is virtual: every write lands as the server's own user and
+        // the guest's identity goes in the xattr instead.
+        if self.cfg.override_stat {
+            return Ok((None, None));
+        }
         // Change the gid first, since once we change the uid we lose the capability to change the gid.
         let scoped_gid = if gid == 0 || self.my_gid == Some(gid) {
             // Always allow "root" accesses even if we don't have root powers.
@@ -1235,7 +1380,8 @@ impl FileSystem for PassthroughFs {
         // Safe because we just opened this fd.
         let f = unsafe { File::from_raw_fd(fd) };
 
-        let (st, mnt_id) = statx(&f)?;
+        let (mut st, mnt_id) = statx(&f)?;
+        self.override_stat(f.as_raw_fd(), &mut st);
 
         let mut attr_flags: u32 = 0;
 
@@ -1355,6 +1501,7 @@ impl FileSystem for PassthroughFs {
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe { libc::mkdirat(data.file.as_raw_fd(), name.as_ptr(), mode & !umask) };
         if res == 0 {
+            self.stamp_created(data.file.as_raw_fd(), name, &ctx, (mode & !umask) & 0o7777)?;
             self.lookup(ctx, parent, name)
         } else {
             Err(io::Error::last_os_error())
@@ -1477,6 +1624,12 @@ impl FileSystem for PassthroughFs {
         // Safe because we just opened this fd.
         let file = RwLock::new(unsafe { File::from_raw_fd(fd) });
 
+        self.stamp_created(
+            data.file.as_raw_fd(),
+            name,
+            &ctx,
+            mode & !(umask & 0o777) & 0o7777,
+        )?;
         let entry = self.lookup(ctx, parent, name)?;
 
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
@@ -1584,7 +1737,7 @@ impl FileSystem for PassthroughFs {
         inode: Inode,
         attr: libc::stat64,
         handle: Option<Handle>,
-        valid: SetattrValid,
+        mut valid: SetattrValid,
     ) -> io::Result<(libc::stat64, Duration)> {
         let inode_data = self
             .inodes
@@ -1618,6 +1771,32 @@ impl FileSystem for PassthroughFs {
             Data::ProcPath(pathname)
         };
 
+        if self.cfg.override_stat
+            && valid.intersects(SetattrValid::MODE | SetattrValid::UID | SetattrValid::GID)
+        {
+            let fd = inode_data.file.as_raw_fd();
+            let host = stat(&inode_data.file)?;
+            if (host.st_mode & libc::S_IFMT) != libc::S_IFLNK {
+                let current = read_override(fd).unwrap_or((None, None, None));
+                let uid = if valid.contains(SetattrValid::UID) {
+                    attr.st_uid
+                } else {
+                    current.0.unwrap_or(host.st_uid)
+                };
+                let gid = if valid.contains(SetattrValid::GID) {
+                    attr.st_gid
+                } else {
+                    current.1.unwrap_or(host.st_gid)
+                };
+                let mode = if valid.contains(SetattrValid::MODE) {
+                    attr.st_mode & 0o7777
+                } else {
+                    current.2.unwrap_or(host.st_mode & 0o7777)
+                };
+                write_override(fd, uid, gid, mode)?;
+            }
+            valid.remove(SetattrValid::MODE | SetattrValid::UID | SetattrValid::GID);
+        }
         if valid.contains(SetattrValid::MODE) {
             // Safe because this doesn't modify any memory and we check the return value.
             let res = unsafe {
@@ -1789,18 +1968,38 @@ impl FileSystem for PassthroughFs {
             .ok_or_else(ebadf)?;
 
         // Safe because this doesn't modify any memory and we check the return value.
-        let res = unsafe {
-            libc::mknodat(
-                data.file.as_raw_fd(),
-                name.as_ptr(),
-                (mode & !umask) as libc::mode_t,
-                u64::from(rdev),
-            )
+        let res = if self.cfg.override_stat {
+            // The host cannot mknod; an empty file whose xattr says "char
+            // device 0:0" is what overlayfs whiteouts need, which is what
+            // guests create through here.
+            let fd = unsafe {
+                libc::openat(
+                    data.file.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
+                    0o600,
+                )
+            };
+            if fd >= 0 {
+                unsafe { libc::close(fd) };
+                0
+            } else {
+                -1
+            }
+        } else {
+            unsafe {
+                libc::mknodat(
+                    data.file.as_raw_fd(),
+                    name.as_ptr(),
+                    (mode & !umask) as libc::mode_t,
+                    u64::from(rdev),
+                )
+            }
         };
-
         if res < 0 {
             Err(io::Error::last_os_error())
         } else {
+            self.stamp_created(data.file.as_raw_fd(), name, &ctx, mode & !umask)?;
             self.lookup(ctx, parent, name)
         }
     }
@@ -1873,6 +2072,7 @@ impl FileSystem for PassthroughFs {
         let res =
             unsafe { libc::symlinkat(linkname.as_ptr(), data.file.as_raw_fd(), name.as_ptr()) };
         if res == 0 {
+            self.stamp_created(data.file.as_raw_fd(), name, &ctx, 0o777)?;
             self.lookup(ctx, parent, name)
         } else {
             Err(io::Error::last_os_error())
@@ -2072,6 +2272,9 @@ impl FileSystem for PassthroughFs {
         if !self.cfg.xattr {
             return Err(io::Error::from_raw_os_error(libc::ENOSYS));
         }
+        if self.cfg.override_stat && name.to_bytes() == override_key_name() {
+            return Err(io::Error::from_raw_os_error(libc::EPERM));
+        }
 
         // The f{set,get,remove,list}xattr functions don't work on an fd opened with `O_PATH` so we
         // need to get a new fd. This doesn't work for symlinks, so we use the l* family of
@@ -2119,6 +2322,9 @@ impl FileSystem for PassthroughFs {
     ) -> io::Result<GetxattrReply> {
         if !self.cfg.xattr {
             return Err(io::Error::from_raw_os_error(libc::ENOSYS));
+        }
+        if self.cfg.override_stat && name.to_bytes() == override_key_name() {
+            return Err(io::Error::from_raw_os_error(libc::ENODATA));
         }
 
         let mut buf = vec![0; size as usize];
@@ -2200,6 +2406,18 @@ impl FileSystem for PassthroughFs {
             Ok(ListxattrReply::Count(res as u32))
         } else {
             buf.resize(res as usize, 0);
+            let buf = if self.cfg.override_stat {
+                let mut kept = Vec::with_capacity(buf.len());
+                for name in buf.split(|b| *b == 0).filter(|n| !n.is_empty()) {
+                    if name != override_key_name() {
+                        kept.extend_from_slice(name);
+                        kept.push(0);
+                    }
+                }
+                kept
+            } else {
+                buf
+            };
             Ok(ListxattrReply::Names(buf))
         }
     }
@@ -2207,6 +2425,9 @@ impl FileSystem for PassthroughFs {
     fn removexattr(&self, _ctx: Context, inode: Inode, name: &CStr) -> io::Result<()> {
         if !self.cfg.xattr {
             return Err(io::Error::from_raw_os_error(libc::ENOSYS));
+        }
+        if self.cfg.override_stat && name.to_bytes() == override_key_name() {
+            return Err(io::Error::from_raw_os_error(libc::ENODATA));
         }
 
         // The f{set,get,remove,list}xattr functions don't work on an fd opened with `O_PATH` so we

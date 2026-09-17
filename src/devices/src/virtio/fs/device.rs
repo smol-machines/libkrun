@@ -158,6 +158,7 @@ impl Fs {
         shared_dir: Option<String>,
         exit_code: Arc<AtomicI32>,
         read_only: bool,
+        override_stat: bool,
         virtual_entries: Vec<VirtualDirEntry>,
     ) -> super::Result<Fs> {
         let avail_features = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_RING_F_EVENT_IDX);
@@ -169,6 +170,7 @@ impl Fs {
 
         let fs_cfg = shared_dir.map(|root_dir| passthrough::Config {
             root_dir,
+            override_stat,
             ..Default::default()
         });
 
@@ -297,6 +299,7 @@ mod tests {
             "test".to_owned(),
             None,
             Arc::new(AtomicI32::new(0)),
+            false,
             false,
             Vec::new(),
         )
