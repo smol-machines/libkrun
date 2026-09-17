@@ -24,6 +24,8 @@ pub(crate) mod device_manager;
 pub mod generation_guardian;
 #[cfg(target_os = "linux")]
 pub mod layered_restore;
+#[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+mod memory_growth;
 /// Resource store for configured microVM resources.
 pub mod resources;
 #[cfg(target_os = "linux")]
@@ -365,6 +367,8 @@ pub struct Vmm {
     prototype_cpu_topology: Option<vstate::VcpuConfig>,
     #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
     cpu_growth_progress: cpu_growth::CpuGrowthProgress,
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    prototype_memory: Option<Arc<Mutex<devices::virtio::memory::MemoryDevice>>>,
     run_state: VmmRunState,
     paused_at: Option<Instant>,
     devices_quiesced: bool,
@@ -984,6 +988,12 @@ impl Vmm {
     /// in vCPU-index order.
     #[cfg(snapshot_supported)]
     pub fn save_vcpu_states(&mut self) -> Result<Vec<vstate::VcpuState>> {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+        if self.prototype_memory.is_some() {
+            return Err(Error::VcpuSnapshot(
+                "experimental RAM hot-add checkpoint state is not implemented yet".into(),
+            ));
+        }
         #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
         self.cpu_growth_progress
             .check()
