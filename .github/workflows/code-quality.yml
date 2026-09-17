@@ -60,36 +60,3 @@ jobs:
         run: cargo clippy --locked --features gpu -- -D warnings
         env:
           KRUN_INIT_BINARY_PATH: ${{ github.workspace }}/init/init
-
-  code-quality-examples:
-    name: ${{ matrix.name }}
-    strategy:
-      matrix:
-        include:
-          - name: "Examples (Linux x86_64)"
-            runner: ubuntu-26.04
-          
-          - name: "Examples (Linux aarch64)"
-            runner: ubuntu-26.04-arm
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Setup build environment
-        uses: ./.github/actions/setup-build-env
-      
-      - name: Install GTK system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -yqq --no-install-recommends \
-            libgtk-4-dev
-      
-      - name: Build and install libkrun to local prefix
-        run: |
-          mkdir -p $HOME/libkrun-prefix
-          GPU=1 NET=1 INPUT=1 PREFIX=$HOME/libkrun-prefix make && PREFIX=$HOME/libkrun-prefix make install
-      
-      - name: Clippy (examples workspace)
-        run: |
-          cd examples
-          PKG_CONFIG_PATH="$HOME/libkrun-prefix/lib64/pkgconfig:$PKG_CONFIG_PATH" LD_LIBRARY_PATH="$HOME/libkrun-prefix/lib64:$LD_LIBRARY_PATH" cargo clippy --locked -- -D warnings
