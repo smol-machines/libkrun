@@ -915,6 +915,52 @@ fn handle_finish_save_stream<W: Write>(dir: &str, stream: &mut W) -> String {
     }
 }
 
+/// Metadata is a captured-state handoff, not a durable completion marker.
+/// The final reply follows successful RAM output and metadata persistence.
+#[cfg(all(snapshot_supported, target_os = "linux", target_arch = "x86_64"))]
+fn handle_finish_save_sparse<W: Write>(dir: &str, stream: &mut W) -> String {
+    let Some(result) = PREPARED_SAVES.finish(dir, |prepared| {
+        let state = prepared.checkpoint.serialize();
+        prepared
+            .memory
+            .finish_sparse_stream_with_header(stream, |descs, output| {
+                let layout = encode_portable_manifest(descs);
+                write_checkpoint_stream_header(output, &state, &layout)
+            })
+            .map_err(|error| format!("stream sparse retained RAM: {error}"))
+            .and_then(|descs| {
+                publish_portable_save(std::path::Path::new(dir), None, prepared.checkpoint, &descs)
+            })
+    }) else {
+        return "ERR ENOENT no prepared durable save\n".to_string();
+    };
+    match result {
+        Ok((bytes, regions)) => format!("OK saved ({bytes} bytes, {regions} regions)\n"),
+        Err(error) => format!("ERR EIO {error}\n"),
+    }
+}
+
+#[cfg(all(snapshot_supported, target_os = "linux", target_arch = "x86_64"))]
+fn write_checkpoint_stream_header(
+    output: &mut impl Write,
+    state: &[u8],
+    layout: &[u8],
+) -> std::io::Result<()> {
+    const MAX_STATE: usize = 16 * 1024 * 1024;
+    const MAX_LAYOUT: usize = 1024 * 1024;
+    if state.is_empty() || layout.is_empty() || state.len() > MAX_STATE || layout.len() > MAX_LAYOUT
+    {
+        return Err(std::io::Error::other(
+            "checkpoint stream metadata exceeds bounds",
+        ));
+    }
+    output.write_all(b"SMOLCKS1")?;
+    output.write_all(&(state.len() as u32).to_le_bytes())?;
+    output.write_all(&(layout.len() as u32).to_le_bytes())?;
+    output.write_all(state)?;
+    output.write_all(layout)
+}
+
 #[cfg(all(
     snapshot_supported,
     any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
@@ -1601,6 +1647,8 @@ fn handle_control_stream<S: std::io::Read + std::io::Write + Send + 'static>(
                     any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
                 ))]
                 "SAVE_CAPABILITIES" => "OK deferred-stream-v1\n".to_string(),
+                #[cfg(all(snapshot_supported, target_os = "linux", target_arch = "x86_64"))]
+                "SAVE_SPARSE_CAPABILITIES" => "OK sparse-stream-v1 ownership-v1\n".to_string(),
                 "PAUSE" => match vmm.lock().unwrap().pause() {
                     Ok(()) => "OK paused\n".to_string(),
                     Err(e) => format!("ERR EIO {e}\n"),
@@ -1689,20 +1737,30 @@ fn handle_control_stream<S: std::io::Read + std::io::Write + Send + 'static>(
                     snapshot_supported,
                     any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
                 ))]
-                "FINISH_SAVE" | "FINISH_SAVE_STREAM" => {
+                "FINISH_SAVE" | "FINISH_SAVE_STREAM" | "FINISH_SAVE_SPARSE" => {
                     // RAM persistence can take seconds for large resident
                     // guests. Keep the control listener available so a resumed
                     // source can fork, checkpoint again, or answer health
                     // probes while this caller waits for durable completion.
                     let dir = _arg.to_string();
                     let send_memory = verb == "FINISH_SAVE_STREAM";
+                    let sparse_memory = verb == "FINISH_SAVE_SPARSE";
                     let stream = Arc::new(Mutex::new(Some(stream)));
                     let worker_stream = Arc::clone(&stream);
                     let worker = std::thread::Builder::new()
                         .name("krun durable save".into())
                         .spawn(move || {
                             if let Some(mut stream) = worker_stream.lock().unwrap().take() {
-                                let response = if send_memory {
+                                let response = if sparse_memory {
+                                    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+                                    {
+                                        handle_finish_save_sparse(&dir, &mut stream)
+                                    }
+                                    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+                                    {
+                                        "ERR ENOTSUP sparse save is unavailable\n".to_string()
+                                    }
+                                } else if send_memory {
                                     handle_finish_save_stream(&dir, &mut stream)
                                 } else {
                                     handle_finish_save(&dir)
@@ -1839,6 +1897,27 @@ mod control_command_tests {
             reply,
             "ERR EIO checkpoint failed: storage unavailable; source resume failed: vCPU unavailable\n"
         );
+    }
+
+    #[cfg(all(snapshot_supported, target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn sparse_checkpoint_header_is_bounded_and_explicitly_framed() {
+        let mut output = Vec::new();
+        write_checkpoint_stream_header(&mut output, b"cpu", b"layout").unwrap();
+        assert_eq!(&output[..8], b"SMOLCKS1");
+        assert_eq!(u32::from_le_bytes(output[8..12].try_into().unwrap()), 3);
+        assert_eq!(u32::from_le_bytes(output[12..16].try_into().unwrap()), 6);
+        assert_eq!(&output[16..], b"cpulayout");
+        for (state, layout) in [(b"".as_slice(), b"layout".as_slice()), (b"cpu", b"")] {
+            let mut output = Vec::new();
+            assert!(write_checkpoint_stream_header(&mut output, state, layout).is_err());
+            assert!(output.is_empty());
+        }
+        let mut output = Vec::new();
+        assert!(
+            write_checkpoint_stream_header(&mut output, b"cpu", &vec![0; 1024 * 1024 + 1]).is_err()
+        );
+        assert!(output.is_empty());
     }
 
     #[test]

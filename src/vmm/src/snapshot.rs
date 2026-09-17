@@ -78,6 +78,163 @@ fn stream_memory_file<W: Write>(
     Ok(())
 }
 
+/// Stream immutable generation files without a temporary full memory image.
+/// The bounded map ends with an EOF sentinel; after excessive fragmentation
+/// its last range includes holes too, preserving bytes without growing memory.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn stream_sparse_memory_files<W: Write>(
+    sources: &[(&File, u64, u64)],
+    output: &mut W,
+) -> io::Result<()> {
+    stream_sparse_memory_files_with_seek(sources, output, next_memory_data_offset)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn next_memory_data_offset(file: &File, offset: u64) -> io::Result<Option<u64>> {
+    let offset =
+        i64::try_from(offset).map_err(|_| io::Error::other("RAM source offset exceeds off_t"))?;
+    loop {
+        // The generation owner retains this immutable file throughout discovery
+        // and emission. Payload reads use pread, never this shared seek cursor.
+        let data = unsafe { libc::lseek(file.as_raw_fd(), offset, libc::SEEK_DATA) };
+        if data >= offset {
+            return Ok(Some(data as u64));
+        }
+        if data >= 0 {
+            return Err(io::Error::other("RAM data extent moved backwards"));
+        }
+        let error = io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::ENXIO) => return Ok(None),
+            Some(libc::EINVAL | libc::ENOTSUP) => {
+                return Err(io::Error::new(io::ErrorKind::Unsupported, error));
+            }
+            _ => return Err(error),
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn stream_sparse_memory_files_with_seek<W: Write>(
+    sources: &[(&File, u64, u64)],
+    output: &mut W,
+    mut next_data: impl FnMut(&File, u64) -> io::Result<Option<u64>>,
+) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    const PAGE: usize = 4096;
+    static ZERO: [u8; PAGE] = [0; PAGE];
+    let logical = sources
+        .iter()
+        .try_fold(0_u64, |total, (file, start, len)| {
+            let end = start
+                .checked_add(*len)
+                .ok_or_else(|| io::Error::other("RAM source offset overflow"))?;
+            if end > file.metadata()?.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "RAM source is truncated",
+                ));
+            }
+            total
+                .checked_add(*len)
+                .ok_or_else(|| io::Error::other("RAM stream length overflow"))
+        })?;
+    if logical == 0 {
+        return Err(io::Error::other("empty RAM stream"));
+    }
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    let mut base = 0;
+    for (file, start, len) in sources {
+        let mut cursor = 0;
+        let mut seek_supported = true;
+        while cursor < *len {
+            if seek_supported {
+                match next_data(file, start + cursor) {
+                    Ok(Some(data)) if data < start + cursor => {
+                        return Err(io::Error::other("RAM data extent moved backwards"));
+                    }
+                    Ok(Some(data)) if data < start + len => {
+                        // Preserve the original region-relative page boundaries,
+                        // including a region starting partway through a host page.
+                        cursor = (data - start) / PAGE as u64 * PAGE as u64;
+                    }
+                    Ok(_) => break,
+                    Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+                        seek_supported = false;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            let count = (*len - cursor).min(buffer.len() as u64) as usize;
+            file.read_exact_at(&mut buffer[..count], start + cursor)?;
+            for (page, bytes) in buffer[..count].chunks(PAGE).enumerate() {
+                if bytes == &ZERO[..bytes.len()] {
+                    continue;
+                }
+                let offset = base + cursor + (page * PAGE) as u64;
+                let end = offset + bytes.len() as u64;
+                // GNU sparse tar requires aligned intermediate data blocks.
+                // Include neighboring hole bytes rather than emitting an
+                // unrepresentable map at a partial region boundary.
+                let aligned_offset = offset - offset % 512;
+                let aligned_end = end
+                    .checked_add((512 - end % 512) % 512)
+                    .unwrap_or(logical)
+                    .min(logical);
+                append_sparse_range(&mut ranges, aligned_offset, aligned_end);
+            }
+            cursor += count as u64;
+        }
+        base += len;
+    }
+    output.write_all(b"SMOLRSP1")?;
+    output.write_all(&logical.to_le_bytes())?;
+    output.write_all(&((ranges.len() + 1) as u32).to_le_bytes())?;
+    for &(offset, len) in &ranges {
+        output.write_all(&offset.to_le_bytes())?;
+        output.write_all(&len.to_le_bytes())?;
+    }
+    output.write_all(&logical.to_le_bytes())?;
+    output.write_all(&0_u64.to_le_bytes())?;
+    // Sources are held open by the generation owner throughout both passes.
+    // Only immutable generations may enter here: a changing source could make
+    // the sparse map omit bytes written after its scan.
+    let mut region = 0;
+    let mut region_base = 0;
+    for (mut offset, mut len) in ranges {
+        while len > 0 {
+            let (file, start, region_len) = sources[region];
+            if offset >= region_base + region_len {
+                region_base += region_len;
+                region += 1;
+                continue;
+            }
+            let count = len
+                .min(region_base + region_len - offset)
+                .min(buffer.len() as u64);
+            file.read_exact_at(&mut buffer[..count as usize], start + offset - region_base)?;
+            output.write_all(&buffer[..count as usize])?;
+            offset += count;
+            len -= count;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn append_sparse_range(ranges: &mut Vec<(u64, u64)>, offset: u64, end: u64) {
+    let full = ranges.len() == 65536;
+    if let Some((previous, length)) = ranges.last_mut()
+        && (*previous + *length >= offset || full)
+    {
+        *length = end.max(*previous + *length) - *previous;
+    } else {
+        ranges.push((offset, end - offset));
+    }
+}
+
 /// A file writer that preserves zero guest-memory pages as filesystem holes.
 ///
 /// Durable checkpoints have a fixed logical memory layout, so restore still
@@ -1175,6 +1332,32 @@ impl DeferredMemorySave {
     /// The wire format is `SMOLRAM1`, a little-endian u64 logical length, then
     /// exactly that many bytes in portable region order.
     pub fn finish_stream<W: Write>(self, output: &mut W) -> io::Result<Vec<MemoryRegionDesc>> {
+        self.finish_stream_mode(output, false, |_, _| Ok(()))
+    }
+
+    /// Produce a bounded sparse map and payload from immutable generation RAM.
+    pub fn finish_sparse_stream<W: Write>(
+        self,
+        output: &mut W,
+    ) -> io::Result<Vec<MemoryRegionDesc>> {
+        self.finish_stream_mode(output, true, |_, _| Ok(()))
+    }
+
+    /// Hand captured metadata to the consumer before RAM payload output.
+    pub fn finish_sparse_stream_with_header<W: Write>(
+        self,
+        output: &mut W,
+        header: impl FnOnce(&[MemoryRegionDesc], &mut W) -> io::Result<()>,
+    ) -> io::Result<Vec<MemoryRegionDesc>> {
+        self.finish_stream_mode(output, true, header)
+    }
+
+    fn finish_stream_mode<W: Write>(
+        self,
+        output: &mut W,
+        sparse: bool,
+        header: impl FnOnce(&[MemoryRegionDesc], &mut W) -> io::Result<()>,
+    ) -> io::Result<Vec<MemoryRegionDesc>> {
         let (descs, files) = match self.generation {
             DeferredLinuxGeneration::Stable { descs, files } => (descs, files),
             DeferredLinuxGeneration::Copy(copy) => copy.finish()?,
@@ -1191,9 +1374,19 @@ impl DeferredMemorySave {
                 len: d.len,
             })
             .collect();
-        write_memory_stream_header(output, &regions)?;
-        for (desc, file) in descs.iter().zip(&files) {
-            stream_memory_file(file, desc.offset, desc.len, output)?;
+        header(&regions, output)?;
+        if sparse {
+            let sources: Vec<_> = descs
+                .iter()
+                .zip(&files)
+                .map(|(d, f)| (f, d.offset, d.len))
+                .collect();
+            stream_sparse_memory_files(&sources, output)?;
+        } else {
+            write_memory_stream_header(output, &regions)?;
+            for (desc, file) in descs.iter().zip(&files) {
+                stream_memory_file(file, desc.offset, desc.len, output)?;
+            }
         }
         Ok(regions)
     }
@@ -2336,6 +2529,301 @@ pub fn open_cow_memory_from_paths(descs: &[MemfdRegionDesc]) -> io::Result<Guest
 
 #[cfg(test)]
 mod tests {
+    // A parallel test runner's fork inherits other tests' writable mappings,
+    // which legitimately prevent sealing. Match the VMM's private address space.
+    #[cfg(target_os = "linux")]
+    fn run_with_private_address_space(name: &str) -> bool {
+        const CHILD: &str = "KRUN_PRIVATE_SNAPSHOT_TEST";
+        if std::env::var(CHILD).as_deref() == Ok(name) {
+            return false;
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("snapshot::tests::{name}"),
+                "--nocapture",
+            ])
+            .env(CHILD, name)
+            .status()
+            .unwrap();
+        assert!(status.success(), "isolated snapshot test failed: {name}");
+        true
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn deferred_sparse_stream_preserves_live_generations_after_disconnect() {
+        const CHILD: &str = "KRUN_SPARSE_STREAM_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "snapshot::tests::deferred_sparse_stream_preserves_live_generations_after_disconnect"])
+                .env(CHILD, "1")
+                .status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        const SIZE: usize = 2 * 1024 * 1024;
+        let file = crate::builder::create_guest_ram_memfd(SIZE).unwrap();
+        let memory = GuestMemoryMmap::from_ranges_with_files([(
+            GuestAddress(0),
+            SIZE,
+            Some(FileOffset::new(file, 0)),
+        )])
+        .unwrap();
+        memory
+            .write_slice(&[0x31; 4096], GuestAddress(4096))
+            .unwrap();
+        let mut expected = 0x31;
+        for value in [0x42, 0x53, 0x64] {
+            let snapshot =
+                start_deferred_memory_save(&memory, std::path::Path::new("unused")).unwrap();
+            memory
+                .write_slice(&[value; 4096], GuestAddress(4096))
+                .unwrap();
+            let mut wire = Vec::new();
+            snapshot.finish_sparse_stream(&mut wire).unwrap();
+            assert_eq!(&wire[..8], b"SMOLRSP1");
+            assert_eq!(
+                u64::from_le_bytes(wire[8..16].try_into().unwrap()),
+                SIZE as u64
+            );
+            assert_eq!(u32::from_le_bytes(wire[16..20].try_into().unwrap()), 2);
+            assert_eq!(u64::from_le_bytes(wire[20..28].try_into().unwrap()), 4096);
+            assert_eq!(u64::from_le_bytes(wire[28..36].try_into().unwrap()), 4096);
+            assert_eq!(
+                u64::from_le_bytes(wire[36..44].try_into().unwrap()),
+                SIZE as u64
+            );
+            assert_eq!(u64::from_le_bytes(wire[44..52].try_into().unwrap()), 0);
+            assert_eq!(&wire[52..], &[expected; 4096]);
+            expected = value;
+        }
+        struct Disconnected;
+        impl Write for Disconnected {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let snapshot = start_deferred_memory_save(&memory, std::path::Path::new("unused")).unwrap();
+        assert_eq!(
+            snapshot
+                .finish_sparse_stream(&mut Disconnected)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        let next = start_deferred_memory_save(&memory, std::path::Path::new("unused")).unwrap();
+        let mut wire = Vec::new();
+        next.finish_sparse_stream(&mut wire).unwrap();
+        assert_eq!(&wire[52..], &[expected; 4096]);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn fragmented_sparse_maps_remain_bounded_without_losing_data_ranges() {
+        let mut ranges = Vec::new();
+        for page in 0..70000_u64 {
+            super::append_sparse_range(&mut ranges, page * 8192, page * 8192 + 4096);
+        }
+        assert_eq!(ranges.len(), 65536);
+        for page in 0..70000_u64 {
+            let (offset, length) = ranges[(page as usize).min(65535)];
+            assert!(offset <= page * 8192);
+            assert!(offset + length >= page * 8192 + 4096);
+        }
+        assert_eq!(
+            ranges.last().map(|(offset, len)| offset + len),
+            Some(69999 * 8192 + 4096)
+        );
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn sparse_stream_preserves_region_offsets_holes_and_partial_pages() {
+        use std::os::unix::fs::FileExt;
+        let first = crate::builder::create_guest_ram_memfd(32768).unwrap();
+        let second = crate::builder::create_guest_ram_memfd(32768).unwrap();
+        first.write_all_at(b"first", 4096 + 8190).unwrap();
+        second.write_all_at(b"second", 1024).unwrap();
+        second.write_all_at(b"last", 1024 + 8192 + 3).unwrap();
+        let sources = [(&first, 4096, 16385), (&second, 1024, 8200)];
+        let mut encoded = Vec::new();
+        super::stream_sparse_memory_files(&sources, &mut encoded).unwrap();
+        assert_eq!(&encoded[..8], b"SMOLRSP1");
+        let logical = u64::from_le_bytes(encoded[8..16].try_into().unwrap()) as usize;
+        assert_eq!(logical, 24585);
+        let count = u32::from_le_bytes(encoded[16..20].try_into().unwrap()) as usize;
+        let mut payload = 20 + 16 * count;
+        let mut restored = vec![0; logical];
+        let mut previous_end = 0;
+        for index in 0..count {
+            let map = &encoded[20 + 16 * index..20 + 16 * (index + 1)];
+            let start = u64::from_le_bytes(map[..8].try_into().unwrap()) as usize;
+            let length = u64::from_le_bytes(map[8..].try_into().unwrap()) as usize;
+            assert!(start >= previous_end);
+            if index + 1 == count {
+                assert_eq!((start, length), (logical, 0));
+            } else {
+                assert!(length > 0);
+                assert_eq!(start % 512, 0);
+                if index + 2 < count {
+                    assert_eq!(length % 512, 0);
+                }
+                restored[start..start + length]
+                    .copy_from_slice(&encoded[payload..payload + length]);
+                payload += length;
+                previous_end = start + length;
+            }
+        }
+        assert_eq!(payload, encoded.len());
+        let mut expected = vec![0; logical];
+        first.read_exact_at(&mut expected[..16385], 4096).unwrap();
+        second.read_exact_at(&mut expected[16385..], 1024).unwrap();
+        assert_eq!(restored, expected);
+        assert!(encoded.len() < logical);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn sparse_stream_extent_scan_matches_full_scan() {
+        use std::os::unix::fs::FileExt;
+        let file = crate::builder::create_guest_ram_memfd(16 * 1024 * 1024).unwrap();
+        for offset in [4095, 1048575, 8 * 1048576 + 17, 16 * 1048576 - 7] {
+            file.write_all_at(b"payload", offset).unwrap();
+        }
+        for (start, len) in [(0, 16 * 1048576), (13, 15 * 1048576 + 9), (8192, 32768)] {
+            let sources = [(&file, start, len)];
+            let mut full = Vec::new();
+            let mut fallback_calls = 0;
+            super::stream_sparse_memory_files_with_seek(&sources, &mut full, |_, _| {
+                fallback_calls += 1;
+                Err(io::ErrorKind::Unsupported.into())
+            })
+            .unwrap();
+            assert_eq!(
+                fallback_calls, 1,
+                "unsupported seek must disable further probes"
+            );
+            let mut sparse = Vec::new();
+            super::stream_sparse_memory_files(&sources, &mut sparse).unwrap();
+            assert_eq!(sparse, full, "region {start}+{len}");
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn sparse_stream_dense_and_fragmented_sources_match_full_scan() {
+        use std::os::unix::fs::FileExt;
+        let len = 4 * 1024 * 1024;
+        for dense in [false, true] {
+            let file = crate::builder::create_guest_ram_memfd(len).unwrap();
+            for page in 0..len / 4096 {
+                if dense || page % 2 == 0 {
+                    file.write_all_at(&[0xa5; 4096], (page * 4096) as u64)
+                        .unwrap();
+                }
+            }
+            for start in [0, 1, 511, 4095, 4096, 8191] {
+                let sources = [(&file, start, len as u64 - start - 3)];
+                let mut full = Vec::new();
+                super::stream_sparse_memory_files_with_seek(&sources, &mut full, |_, _| {
+                    Err(io::ErrorKind::Unsupported.into())
+                })
+                .unwrap();
+                let mut actual = Vec::new();
+                super::stream_sparse_memory_files(&sources, &mut actual).unwrap();
+                assert_eq!(actual, full, "dense={dense} start={start}");
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn sparse_stream_late_unsupported_seek_keeps_prior_progress() {
+        use std::os::unix::fs::FileExt;
+        let len = 4 * 1024 * 1024;
+        let file = crate::builder::create_guest_ram_memfd(len).unwrap();
+        file.write_all_at(&vec![0xa5; len], 0).unwrap();
+        let sources = [(&file, 0, len as u64)];
+        let mut expected = Vec::new();
+        super::stream_sparse_memory_files(&sources, &mut expected).unwrap();
+        let mut actual = Vec::new();
+        let mut calls = 0;
+        super::stream_sparse_memory_files_with_seek(&sources, &mut actual, |_, offset| {
+            calls += 1;
+            if calls == 1 {
+                Ok(Some(offset))
+            } else {
+                Err(io::ErrorKind::Unsupported.into())
+            }
+        })
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(actual, expected);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn sparse_stream_skips_a_large_leading_hole() {
+        use std::os::unix::fs::FileExt;
+        let len = 4_u64 * 1024 * 1024 * 1024;
+        let file = crate::builder::create_guest_ram_memfd(len as usize).unwrap();
+        file.write_all_at(b"last", len - 4).unwrap();
+        let mut queried = Vec::new();
+        let mut encoded = Vec::new();
+        super::stream_sparse_memory_files_with_seek(
+            &[(&file, 0, len)],
+            &mut encoded,
+            |file, offset| {
+                queried.push(offset);
+                super::next_memory_data_offset(file, offset)
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            queried,
+            [0],
+            "discovery should jump directly to the final page"
+        );
+        assert!(encoded.ends_with(b"last"));
+        assert!(encoded.len() < 8192);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn sparse_stream_seek_errors_do_not_publish_a_header() {
+        let file = crate::builder::create_guest_ram_memfd(4096).unwrap();
+        for backwards in [false, true] {
+            let mut output = Vec::new();
+            let result = super::stream_sparse_memory_files_with_seek(
+                &[(&file, 1, 4095)],
+                &mut output,
+                |_, _| {
+                    if backwards {
+                        Ok(Some(0))
+                    } else {
+                        Err(io::Error::from_raw_os_error(libc::EIO))
+                    }
+                },
+            );
+            assert!(result.is_err());
+            assert!(output.is_empty());
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn sparse_stream_rejects_bad_sources_before_publishing_a_header() {
+        let file = crate::builder::create_guest_ram_memfd(4096).unwrap();
+        for sources in [vec![], vec![(&file, u64::MAX, 1)], vec![(&file, 0, 8192)]] {
+            let mut encoded = Vec::new();
+            assert!(super::stream_sparse_memory_files(&sources, &mut encoded).is_err());
+            assert!(encoded.is_empty());
+        }
+    }
+
     use super::*;
     #[cfg(unix)]
     use std::fs::{self, OpenOptions};
@@ -2580,6 +3068,11 @@ mod tests {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn deferred_durable_save_preserves_initial_and_later_generations() {
+        if run_with_private_address_space(
+            "deferred_durable_save_preserves_initial_and_later_generations",
+        ) {
+            return;
+        }
         use crate::builder::create_guest_ram_memfd;
 
         const PAGE: usize = 4096;
@@ -3208,6 +3701,11 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn rebased_parent_can_continue_without_mutating_fork_generation() {
+        if run_with_private_address_space(
+            "rebased_parent_can_continue_without_mutating_fork_generation",
+        ) {
+            return;
+        }
         use crate::builder::create_guest_ram_memfd;
         use std::os::unix::fs::FileExt;
         use vm_memory::FileOffset;
@@ -3427,6 +3925,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn readonly_restore_input_keeps_two_promotions_independent() {
+        if run_with_private_address_space("readonly_restore_input_keeps_two_promotions_independent")
+        {
+            return;
+        }
         use crate::builder::create_guest_ram_memfd;
         use std::os::{fd::AsRawFd, unix::fs::FileExt};
 
@@ -3472,6 +3974,11 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn sparse_memory_image_promotes_into_independent_fork_backing() {
+        if run_with_private_address_space(
+            "sparse_memory_image_promotes_into_independent_fork_backing",
+        ) {
+            return;
+        }
         use crate::builder::create_guest_ram_memfd;
         use std::os::unix::fs::FileExt;
 
