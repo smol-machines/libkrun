@@ -549,9 +549,19 @@ fn handle_checkpoint(vmm: &Arc<Mutex<vmm::Vmm>>, id: &str) -> String {
     // state + an eager guest-RAM image (correct for rewind — see StashedCheckpoint).
     // The VM remains paused (workers re-armed) on success.
     let mut memory = Vec::new();
-    let (checkpoint, mem_descs) = match vmm.lock().unwrap().checkpoint(&mut memory) {
+    // End the capture lock before attempting rollback; a match on the lock
+    // expression would otherwise retain that guard through its error arm.
+    let captured = vmm.lock().unwrap().checkpoint(&mut memory);
+    let (checkpoint, mem_descs) = match captured {
         Ok(v) => v,
-        Err(e) => return format!("ERR EIO checkpoint failed: {e}\n"),
+        Err(error) => {
+            return match vmm.lock().unwrap().resume() {
+                Ok(()) => format!("ERR EIO checkpoint failed: {error}\n"),
+                Err(resume_error) => format!(
+                    "ERR EIO checkpoint failed: {error}; source resume failed: {resume_error}\n"
+                ),
+            };
+        }
     };
     let bytes = memory.len();
     CHECKPOINTS.lock().unwrap().insert(
