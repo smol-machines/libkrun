@@ -1,6 +1,10 @@
 name: Code Formatting
 on: [pull_request]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   formatting:
     name: clang-format + cargo fmt
@@ -11,8 +15,13 @@ jobs:
       - name: Test independent guest selection
         run: python3 tests/test_guest_selection.py
       
-      - name: Setup build environment
-        uses: ./.github/actions/setup-build-env
+      - name: Install formatting tools
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup component add rustfmt
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-format
       
       - name: C code formatting
         run: find init -iname '*.h' -o -iname '*.c' | xargs clang-format -n -Werror

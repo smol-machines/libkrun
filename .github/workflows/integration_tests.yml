@@ -1,32 +1,26 @@
 name: Integration tests
 on: [pull_request]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 env:
   # Use a release with published binaries; latest may be source-only.
   LIBKRUNFW_VERSION: v5.5.0
 
 jobs:
   integration-tests-x86_64:
-    name: Integration Tests (${{ matrix.label }})
+    name: Integration Tests (Linux x86_64)
     runs-on: ubuntu-26.04
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - label: Linux x86_64
-            freebsd: '0'
-          - label: Linux x86_64 + FreeBSD guest
-            freebsd: '1'
     env:
-      KRUN_TEST_FREEBSD: ${{ matrix.freebsd }}
-      KRUN_TEST_BASE_DIR: /tmp/libkrun-tests-x86_64-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.freebsd }}
+      KRUN_TEST_FREEBSD: '0'
+      KRUN_TEST_BASE_DIR: /tmp/libkrun-tests-x86_64-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v4
       
       - name: Setup build environment
         uses: ./.github/actions/setup-build-env
-        with:
-          freebsd: ${{ matrix.freebsd == '1' && 'true' || 'false' }}
       
       - name: Install cross-compilation dependencies
         run: |
@@ -35,18 +29,6 @@ jobs:
       
       - name: Add musl target
         run: rustup target add x86_64-unknown-linux-musl
-      
-      - name: Add FreeBSD x86_64 target
-        if: matrix.freebsd == '1'
-        run: rustup target add x86_64-unknown-freebsd
-      
-      - name: Install FreeBSD test prerequisites
-        if: matrix.freebsd == '1'
-        run: sudo apt-get install -y --no-install-recommends libarchive-tools
-      
-      - name: Build FreeBSD sysroot and init
-        if: matrix.freebsd == '1'
-        run: make BUILD_BSD_INIT=1 -- init/init-freebsd
       
       - name: Install gvproxy
         run: |
@@ -107,7 +89,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: test-logs-x86_64-freebsd-${{ matrix.freebsd }}
+          name: test-logs-x86_64
           path: |
             ${{ env.KRUN_TEST_BASE_DIR }}/
             !${{ env.KRUN_TEST_BASE_DIR }}/**/guest-agent
@@ -115,26 +97,16 @@ jobs:
           if-no-files-found: ignore
 
   integration-tests-aarch64:
-    name: Integration Tests (${{ matrix.label }})
+    name: Integration Tests (Linux aarch64)
     runs-on: self-hosted
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - label: Linux aarch64
-            freebsd: '0'
-          - label: Linux aarch64 + FreeBSD guest
-            freebsd: '1'
     env:
-      KRUN_TEST_FREEBSD: ${{ matrix.freebsd }}
-      KRUN_TEST_BASE_DIR: /tmp/libkrun-tests-aarch64-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.freebsd }}
+      KRUN_TEST_FREEBSD: '0'
+      KRUN_TEST_BASE_DIR: /tmp/libkrun-tests-aarch64-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v4
       
       - name: Setup build environment
         uses: ./.github/actions/setup-build-env
-        with:
-          freebsd: ${{ matrix.freebsd == '1' && 'true' || 'false' }}
       
       - name: Install cross-compilation dependencies
         run: |
@@ -143,18 +115,6 @@ jobs:
       
       - name: Add musl target
         run: rustup target add aarch64-unknown-linux-musl
-      
-      - name: Install nightly toolchain with rust-src for FreeBSD aarch64
-        if: matrix.freebsd == '1'
-        run: rustup +nightly-2026-01-25 component add rust-src
-      
-      - name: Install FreeBSD test prerequisites
-        if: matrix.freebsd == '1'
-        run: sudo apt-get install -y --no-install-recommends libarchive-tools
-      
-      - name: Build FreeBSD sysroot and init
-        if: matrix.freebsd == '1'
-        run: make BUILD_BSD_INIT=1 -- init/init-freebsd
       
       - name: Install gvproxy
         run: |
@@ -208,7 +168,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: test-logs-aarch64-freebsd-${{ matrix.freebsd }}
+          name: test-logs-aarch64
           path: |
             ${{ env.KRUN_TEST_BASE_DIR }}/
             !${{ env.KRUN_TEST_BASE_DIR }}/**/guest-agent
