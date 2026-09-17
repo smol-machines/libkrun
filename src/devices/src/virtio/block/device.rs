@@ -364,6 +364,7 @@ pub struct Block {
     /// holds the virtqueue + disk so its state can be snapshotted/restored and
     /// the worker re-armed. `None` during normal running.
     quiesced_worker: Option<BlockWorker>,
+    snapshot_error: Option<String>,
 
     // Virtio fields.
     pub(crate) avail_features: u64,
@@ -610,6 +611,7 @@ impl Block {
             worker_thread: None,
             worker_stopfd: EventFd::new(EFD_NONBLOCK)?,
             quiesced_worker: None,
+            snapshot_error: None,
         })
     }
 
@@ -794,7 +796,10 @@ impl Block {
             let _ = self.worker_stopfd.write(1);
             match handle.join() {
                 Ok(worker) => self.quiesced_worker = Some(worker),
-                Err(e) => error!("block: error draining worker thread: {e:?}"),
+                Err(e) => {
+                    error!("block: error draining worker thread: {e:?}");
+                    self.snapshot_error = Some("block worker failed before checkpoint".into());
+                }
             }
         }
     }
@@ -904,6 +909,7 @@ impl VirtioDevice for Block {
         }
         // Drop any worker reclaimed for a snapshot too.
         self.quiesced_worker = None;
+        self.snapshot_error = None;
         self.device_state = DeviceState::Inactive;
         true
     }
@@ -917,13 +923,20 @@ impl VirtioDevice for Block {
         // this, but snapshot quiescence may retain the device or rotate it onto
         // a new writable layer without dropping it, so it must happen here too.
         if self.cache_type == CacheType::Writeback {
-            if self.disk_image.flush().is_err() {
-                error!("block: failed to flush before snapshot");
+            if let Err(error) = self.disk_image.flush() {
+                self.snapshot_error.get_or_insert_with(|| {
+                    format!("block flush failed before checkpoint: {error}")
+                });
             }
-            if self.disk_image.sync().is_err() {
-                error!("block: failed to sync before snapshot");
+            if let Err(error) = self.disk_image.sync() {
+                self.snapshot_error
+                    .get_or_insert_with(|| format!("block sync failed before checkpoint: {error}"));
             }
         }
+    }
+
+    fn snapshot_error(&self) -> Option<&str> {
+        self.snapshot_error.as_deref()
     }
 
     /// Re-arm the worker after a checkpoint/restore (resumes I/O).
