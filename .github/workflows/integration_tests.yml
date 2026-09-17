@@ -1,6 +1,10 @@
 name: Integration tests
 on: [pull_request]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 env:
   # Use a release with published binaries; latest may be source-only.
   LIBKRUNFW_VERSION: v5.5.0
@@ -58,21 +62,25 @@ jobs:
         run: make test-prefix NET=1 BLK=1
       
       - name: Clippy (test_cases guest)
+        if: matrix.freebsd == '0'
         run: |
           cd tests
           cargo clippy --locked -p test_cases --features guest -- -D warnings
       
       - name: Clippy (test_cases host)
+        if: matrix.freebsd == '0'
         run: |
           cd tests
           PKG_CONFIG_PATH="$(realpath ../test-prefix/lib64/pkgconfig/)" LD_LIBRARY_PATH="$(realpath ../test-prefix/lib64/)" cargo clippy --locked -p test_cases --features host -- -D warnings
       
       - name: Clippy (runner)
+        if: matrix.freebsd == '0'
         run: |
           cd tests
           PKG_CONFIG_PATH="$(realpath ../test-prefix/lib64/pkgconfig/)" LD_LIBRARY_PATH="$(realpath ../test-prefix/lib64/)" cargo clippy --locked -p runner -- -D warnings
       
       - name: Clippy (guest-agent)
+        if: matrix.freebsd == '0'
         run: |
           cd tests
           cargo clippy --locked --target x86_64-unknown-linux-musl -p guest-agent -- -D warnings
@@ -166,21 +174,25 @@ jobs:
         run: make test-prefix NET=1 BLK=1
       
       - name: Clippy (test_cases guest)
+        if: matrix.freebsd == '0'
         run: |
           cd tests
           cargo clippy --locked -p test_cases --features guest -- -D warnings
       
       - name: Clippy (test_cases host)
+        if: matrix.freebsd == '0'
         run: |
           cd tests
           PKG_CONFIG_PATH="$(realpath ../test-prefix/lib64/pkgconfig/)" LD_LIBRARY_PATH="$(realpath ../test-prefix/lib64/)" cargo clippy --locked -p test_cases --features host -- -D warnings
       
       - name: Clippy (runner)
+        if: matrix.freebsd == '0'
         run: |
           cd tests
           PKG_CONFIG_PATH="$(realpath ../test-prefix/lib64/pkgconfig/)" LD_LIBRARY_PATH="$(realpath ../test-prefix/lib64/)" cargo clippy --locked -p runner -- -D warnings
       
       - name: Clippy (guest-agent)
+        if: matrix.freebsd == '0'
         run: |
           cd tests
           cargo clippy --locked --target aarch64-unknown-linux-musl -p guest-agent -- -D warnings

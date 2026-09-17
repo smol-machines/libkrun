@@ -1,6 +1,10 @@
 name: Code Quality
 on: [pull_request]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   code-quality-linux-x86_64:
     name: libkrun (Linux x86_64)
