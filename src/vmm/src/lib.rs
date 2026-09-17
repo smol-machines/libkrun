@@ -26,6 +26,8 @@ pub mod generation_guardian;
 pub mod layered_restore;
 #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
 mod memory_growth;
+/// Boot RAM geometry retained independently from added memory.
+pub mod memory_topology;
 /// Resource store for configured microVM resources.
 pub mod resources;
 #[cfg(target_os = "linux")]
@@ -259,6 +261,7 @@ pub struct VmCheckpoint {
     pub ioapic: Option<Vec<u8>>,
     /// Guest discovery/CPUID policy for CPUs added after boot.
     pub cpu_growth: Option<cpu_growth::CpuGrowthTopology>,
+    pub memory_growth: Option<memory_topology::MemoryGrowthTopology>,
 }
 
 #[cfg(snapshot_supported)]
@@ -281,7 +284,17 @@ impl VmCheckpoint {
         put(&mut out, &self.devices.to_bytes().unwrap_or_default());
         // Userspace IRQ-chip section; empty means "none" (in-kernel chip).
         put(&mut out, self.ioapic.as_deref().unwrap_or(&[]));
-        if let Some(topology) = &self.cpu_growth {
+        if self.cpu_growth.is_some() || self.memory_growth.is_some() {
+            put(
+                &mut out,
+                &self
+                    .cpu_growth
+                    .as_ref()
+                    .map(|t| t.encode().to_vec())
+                    .unwrap_or_default(),
+            );
+        }
+        if let Some(topology) = &self.memory_growth {
             put(&mut out, &topology.encode());
         }
         out
@@ -323,10 +336,19 @@ impl VmCheckpoint {
             None
         };
         let cpu_growth = if pos < bytes.len() {
-            Some(cpu_growth::CpuGrowthTopology::decode(
-                take(bytes, &mut pos)?,
-                n,
-            )?)
+            let section = take(bytes, &mut pos)?;
+            if section.is_empty() {
+                None
+            } else {
+                Some(cpu_growth::CpuGrowthTopology::decode(section, n)?)
+            }
+        } else {
+            None
+        };
+        let memory_growth = if pos < bytes.len() {
+            Some(memory_topology::MemoryGrowthTopology::decode(take(
+                bytes, &mut pos,
+            )?)?)
         } else {
             None
         };
@@ -339,6 +361,7 @@ impl VmCheckpoint {
             devices,
             ioapic,
             cpu_growth,
+            memory_growth,
         })
     }
 }
@@ -369,6 +392,8 @@ pub struct Vmm {
     cpu_growth_progress: cpu_growth::CpuGrowthProgress,
     #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
     prototype_memory: Option<Arc<Mutex<devices::virtio::memory::MemoryDevice>>>,
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    memory_growth_topology: Option<memory_topology::MemoryGrowthTopology>,
     run_state: VmmRunState,
     paused_at: Option<Instant>,
     devices_quiesced: bool,
@@ -575,6 +600,47 @@ impl Vmm {
     }
     #[cfg(snapshot_supported)]
     fn validate_restore_cpus(&self, checkpoint: &VmCheckpoint) -> Result<()> {
+        if checkpoint.memory_growth != self.snapshot_memory_growth() {
+            return Err(Error::VcpuSnapshot(
+                "checkpoint boot RAM topology differs; restore into a new machine".into(),
+            ));
+        }
+        #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+        if let Some(device) = &self.prototype_memory {
+            let states: Vec<_> = checkpoint
+                .devices
+                .devices
+                .iter()
+                .filter_map(|s| {
+                    if let devices::virtio::persist::DeviceSnapshot::Memory(s) = s {
+                        Some(s)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if states.len() != 1 {
+                return Err(Error::VcpuSnapshot(
+                    "checkpoint RAM device missing or duplicated".into(),
+                ));
+            }
+            let state = states[0];
+            state.validate().map_err(Error::VcpuSnapshot)?;
+            state
+                .memory
+                .validate_backing(&self.guest_memory)
+                .map_err(Error::VcpuSnapshot)?;
+            let device = device
+                .lock()
+                .map_err(|_| Error::VcpuSnapshot("RAM device poisoned".into()))?;
+            if devices::virtio::VirtioDevice::is_activated(&*device)
+                && device.save_state() != *state
+            {
+                return Err(Error::VcpuSnapshot(
+                    "live RAM device state differs; restore into a new machine".into(),
+                ));
+            }
+        }
         if checkpoint.vcpu_states.len() != self.vcpus_handles.len()
             || checkpoint.cpu_growth != self.snapshot_cpu_growth()
         {
@@ -601,6 +667,14 @@ impl Vmm {
                 nested_enabled: config.nested_enabled,
                 cpu_template: config.cpu_template,
             });
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee"))))]
+        None
+    }
+
+    #[cfg(snapshot_supported)]
+    fn snapshot_memory_growth(&self) -> Option<memory_topology::MemoryGrowthTopology> {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+        return self.memory_growth_topology.clone();
         #[cfg(not(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee"))))]
         None
     }
@@ -989,10 +1063,16 @@ impl Vmm {
     #[cfg(snapshot_supported)]
     pub fn save_vcpu_states(&mut self) -> Result<Vec<vstate::VcpuState>> {
         #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
-        if self.prototype_memory.is_some() {
-            return Err(Error::VcpuSnapshot(
-                "experimental RAM hot-add checkpoint state is not implemented yet".into(),
-            ));
+        if let Some(device) = &self.prototype_memory {
+            let state = device
+                .lock()
+                .map_err(|_| Error::VcpuSnapshot("RAM device poisoned".into()))?
+                .save_state();
+            state.validate().map_err(Error::VcpuSnapshot)?;
+            state
+                .memory
+                .validate_backing(&self.guest_memory)
+                .map_err(Error::VcpuSnapshot)?;
         }
         #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
         self.cpu_growth_progress
@@ -1135,6 +1215,7 @@ impl Vmm {
                 devices,
                 ioapic,
                 cpu_growth: self.snapshot_cpu_growth(),
+                memory_growth: self.snapshot_memory_growth(),
             },
             mem_descs,
         ))
@@ -1209,6 +1290,7 @@ impl Vmm {
                     devices,
                     ioapic,
                     cpu_growth: self.snapshot_cpu_growth(),
+                    memory_growth: self.snapshot_memory_growth(),
                 },
                 memory,
             ))
@@ -1252,6 +1334,7 @@ impl Vmm {
                     devices,
                     ioapic,
                     cpu_growth: self.snapshot_cpu_growth(),
+                    memory_growth: self.snapshot_memory_growth(),
                 },
                 mem_descs,
             ))
@@ -1343,6 +1426,7 @@ impl Vmm {
                 // Linux-only path; KVM's IOAPIC is in-kernel and rides vm_state.
                 ioapic: None,
                 cpu_growth: self.snapshot_cpu_growth(),
+                memory_growth: self.snapshot_memory_growth(),
             },
             mem_clone,
         ))
@@ -1425,6 +1509,7 @@ impl Vmm {
                 devices,
                 ioapic,
                 cpu_growth: self.snapshot_cpu_growth(),
+                memory_growth: self.snapshot_memory_growth(),
             })
         })();
 
@@ -1464,7 +1549,7 @@ impl Vmm {
         let needs_materialization = if layered {
             false
         } else if has_memfd_backing {
-            snapshot::guest_memory_backing_is_immutable(&self.guest_memory).map_err(|error| {
+            snapshot::guest_memory_has_private_backing(&self.guest_memory).map_err(|error| {
                 Error::Snapshot(format!("inspect guest RAM generation: {error}"))
             })?
         } else {
@@ -1474,6 +1559,15 @@ impl Vmm {
         self.pause()?;
         let capture = (|| {
             self.quiesce_devices()?;
+            if has_memfd_backing
+                && needs_materialization
+                && !snapshot::guest_memory_backing_is_immutable(&self.guest_memory)
+                    .map_err(|e| Error::Snapshot(format!("inspect added RAM: {e}")))?
+            {
+                snapshot::rebase_guest_memory_private(&self.guest_memory)
+                    .map_err(|e| Error::Snapshot(format!("freeze added RAM: {e}")))?;
+                self.mmio_device_manager.replay_fs_dax_maps();
+            }
             let vcpu_states = self.save_vcpu_states()?;
             let vm_state = self.vm.save_state().map_err(Error::Vm)?;
             let devices = self.snapshot_devices();
@@ -1541,6 +1635,7 @@ impl Vmm {
                     devices,
                     ioapic: None,
                     cpu_growth: self.snapshot_cpu_growth(),
+                    memory_growth: self.snapshot_memory_growth(),
                 },
                 generation_copy,
                 generation_guardian,
@@ -1676,6 +1771,7 @@ impl Vmm {
                     devices,
                     ioapic: None,
                     cpu_growth: self.snapshot_cpu_growth(),
+                    memory_growth: self.snapshot_memory_growth(),
                 },
                 generation_copy,
                 disk_rollback,
@@ -1762,6 +1858,7 @@ impl Vmm {
             devices,
             ioapic,
             cpu_growth: _,
+            memory_growth: _,
         } = checkpoint;
         let restore = (|| {
             self.vm.restore_state(&vm_state).map_err(Error::Vm)?;

@@ -695,25 +695,74 @@ pub fn build_microvm(
     let payload = choose_payload(vm_resources)?;
     vmm_timing!("payload selected");
 
-    let (guest_memory, arch_memory_info, mut _shm_manager, payload_config) = create_guest_memory(
-        vm_resources
-            .vm_config()
-            .mem_size_mib
-            .ok_or(StartMicrovmError::MissingMemSizeConfig)?,
-        vm_resources,
-        &payload,
-        restore_mem,
-    )?;
+    let configured_memory_mib = vm_resources
+        .vm_config()
+        .mem_size_mib
+        .ok_or(StartMicrovmError::MissingMemSizeConfig)?;
+    #[cfg(snapshot_supported)]
+    let boot_memory_mib = restore_checkpoint
+        .as_ref()
+        .and_then(|checkpoint| checkpoint.memory_growth.as_ref())
+        .map(|topology| usize::try_from(topology.boot_memory_mib))
+        .transpose()
+        .map_err(|_| StartMicrovmError::GuestMemoryMmap("boot RAM exceeds host range".into()))?
+        .unwrap_or(configured_memory_mib);
+    #[cfg(not(snapshot_supported))]
+    let boot_memory_mib = configured_memory_mib;
+    #[cfg(all(
+        snapshot_supported,
+        not(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))
+    ))]
+    if restore_checkpoint
+        .as_ref()
+        .is_some_and(|c| c.memory_growth.is_some())
+    {
+        return Err(StartMicrovmError::GuestMemoryMmap(
+            "RAM hot-add checkpoint is unsupported on this platform".into(),
+        ));
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    let restored_memory_device = if let Some(checkpoint) = &restore_checkpoint {
+        let states: Vec<_> = checkpoint
+            .devices
+            .devices
+            .iter()
+            .filter_map(|state| {
+                if let devices::virtio::persist::DeviceSnapshot::Memory(state) = state {
+                    Some(state)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if states.len() > 1 || checkpoint.memory_growth.is_some() != (states.len() == 1) {
+            return Err(StartMicrovmError::GuestMemoryMmap(
+                "RAM checkpoint topology/device mismatch".into(),
+            ));
+        }
+        if let Some(state) = states.first() {
+            state
+                .validate()
+                .map_err(StartMicrovmError::GuestMemoryMmap)?;
+        }
+        states.first().map(|state| (*state).clone())
+    } else {
+        None
+    };
+    let (guest_memory, arch_memory_info, mut _shm_manager, payload_config) =
+        create_guest_memory(boot_memory_mib, vm_resources, &payload, restore_mem)?;
     vmm_timing!("memory created");
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
-    let memory_growth = std::env::var("KRUN_PROTOTYPE_MEMORY_GROWTH").as_deref() == Ok("1");
+    let memory_growth = restored_memory_device.is_some()
+        || (!restoring && std::env::var("KRUN_PROTOTYPE_MEMORY_GROWTH").as_deref() == Ok("1"));
     #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
     let guest_memory = if memory_growth {
-        if restoring {
-            return Err(StartMicrovmError::GuestMemoryMmap(
-                "experimental RAM hot-add restore is not implemented yet".into(),
-            ));
+        if let Some(state) = &restored_memory_device {
+            state
+                .memory
+                .validate_backing(&guest_memory)
+                .map_err(StartMicrovmError::GuestMemoryMmap)?;
         }
         guest_memory.with_shared_growth()
     } else {
@@ -1248,6 +1297,12 @@ pub fn build_microvm(
         cpu_growth_progress: Default::default(),
         #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
         prototype_memory: None,
+        #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+        memory_growth_topology: memory_growth.then_some(
+            crate::memory_topology::MemoryGrowthTopology {
+                boot_memory_mib: boot_memory_mib as u64,
+            },
+        ),
         run_state: super::VmmRunState::Paused,
         paused_at: None,
         devices_quiesced: false,
@@ -1277,16 +1332,22 @@ pub fn build_microvm(
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
     if memory_growth {
-        let alignment = 128u64 << 20;
-        let base = vmm
-            .guest_memory
-            .last_addr()
-            .raw_value()
-            .checked_add(alignment)
-            .map(|end| end & !(alignment - 1))
-            .ok_or_else(|| StartMicrovmError::GuestMemoryMmap("RAM aperture overflow".into()))?;
-        let state = devices::virtio::memory::MemoryState::new(base, 64u64 << 30, 2 << 20)
-            .map_err(StartMicrovmError::GuestMemoryMmap)?;
+        let state = if let Some(state) = restored_memory_device {
+            state.memory
+        } else {
+            let alignment = 128u64 << 20;
+            let base = vmm
+                .guest_memory
+                .last_addr()
+                .raw_value()
+                .checked_add(alignment)
+                .map(|end| end & !(alignment - 1))
+                .ok_or_else(|| {
+                    StartMicrovmError::GuestMemoryMmap("RAM aperture overflow".into())
+                })?;
+            devices::virtio::memory::MemoryState::new(base, 64u64 << 30, 2 << 20)
+                .map_err(StartMicrovmError::GuestMemoryMmap)?
+        };
         let device = Arc::new(Mutex::new(
             devices::virtio::memory::MemoryDevice::new(state)
                 .map_err(|e| StartMicrovmError::GuestMemoryMmap(e.to_string()))?,
