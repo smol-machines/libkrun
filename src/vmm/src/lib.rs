@@ -339,6 +339,8 @@ pub struct Vmm {
     kernel_cmdline: KernelCmdline,
 
     vcpus_handles: Vec<VcpuHandle>,
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    prototype_cpu_topology: Option<vstate::VcpuConfig>,
     run_state: VmmRunState,
     paused_at: Option<Instant>,
     devices_quiesced: bool,
@@ -538,6 +540,51 @@ impl Vmm {
         self.layered_ram = Some(next.clone());
         Ok(Some(next))
     }
+    /// Experimental Linux/x86 CPU creation; guest onlining is separate.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    pub fn prototype_grow_cpus(&mut self, count: u8) -> std::result::Result<(), String> {
+        let config = self
+            .prototype_cpu_topology
+            .as_ref()
+            .ok_or("CPU growth prototype is not enabled for this VM")?
+            .clone();
+        if self.run_state != VmmRunState::Running || self.devices_quiesced {
+            return Err("CPU growth requires a running VM".into());
+        }
+        if usize::from(count) < self.vcpus_handles.len() || count > config.vcpu_count {
+            return Err("CPU target must grow within the advertised topology".into());
+        }
+        for id in self.vcpus_handles.len() as u8..count {
+            let mut vcpu = Vcpu::new_x86_64(
+                id,
+                self.vm.fd(),
+                self.vm.supported_cpuid().clone(),
+                self.vm.supported_msrs().clone(),
+                self.pio_device_manager.io_bus.clone(),
+                self.exit_evt
+                    .try_clone()
+                    .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+            vcpu.configure_hot_added_x86_64(&self.guest_memory, &config)
+                .map_err(|error| error.to_string())?;
+            vcpu.set_mmio_bus(self.mmio_device_manager.bus.clone());
+            let handle = vcpu.start_threaded().map_err(|error| error.to_string())?;
+            self.vcpus_handles.push(handle);
+            let handle = self.vcpus_handles.last().unwrap();
+            handle
+                .send_event(VcpuEvent::Resume { paused_ns: 0 })
+                .map_err(|error| error.to_string())?;
+            Self::wait_for_vcpu_response(
+                handle,
+                VcpuResponse::Resumed,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .map_err(|error| format!("new vCPU did not enter its run loop: {error:?}"))?;
+        }
+        Ok(())
+    }
+
     /// Increase a writable disk's capacity without stopping the guest.
     ///
     /// The embedder must hold its machine lifecycle lock and verify that the
@@ -1739,13 +1786,19 @@ impl Vmm {
                 self.kernel_cmdline.len() + 1
             };
 
+            let possible_cpus = vcpus.len() as u8;
+            #[cfg(all(target_os = "linux", not(feature = "tee")))]
+            let possible_cpus = self
+                .prototype_cpu_topology
+                .as_ref()
+                .map_or(possible_cpus, |config| config.vcpu_count);
             arch::x86_64::configure_system(
                 &self.guest_memory,
                 &self.arch_memory_info,
                 vm_memory::GuestAddress(arch::x86_64::layout::CMDLINE_START),
                 cmdline_len,
                 initrd,
-                vcpus.len() as u8,
+                possible_cpus,
                 _pvh,
             )
             .map_err(Error::ConfigureSystem)?;

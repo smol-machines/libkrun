@@ -701,6 +701,17 @@ pub fn build_microvm(
     vmm_timing!("memory created");
 
     let vcpu_config = vm_resources.vcpu_config();
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    let prototype_cpu_topology = if !restoring
+        && vcpu_config.vcpu_count <= 16
+        && std::env::var("KRUN_PROTOTYPE_CPU_GROWTH").as_deref() == Ok("1")
+    {
+        let mut topology = vcpu_config.clone();
+        topology.vcpu_count = 16;
+        Some(topology)
+    } else {
+        None
+    };
 
     // Clone the command-line so that a failed boot doesn't pollute the original.
     #[allow(unused_mut)]
@@ -1175,6 +1186,8 @@ pub fn build_microvm(
         arch_memory_info,
         kernel_cmdline,
         vcpus_handles: Vec::new(),
+        #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+        prototype_cpu_topology,
         run_state: super::VmmRunState::Paused,
         paused_at: None,
         devices_quiesced: false,
@@ -1308,6 +1321,12 @@ pub fn build_microvm(
         vmm.kernel_cmdline.insert_str("KRUN_DHCP=1")?;
     }
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    if !restoring && vmm.prototype_cpu_topology.is_some() {
+        // Kernel options must precede the epilog's `--` application separator.
+        vmm.kernel_cmdline
+            .insert_str(format!("maxcpus={}", vcpus.len()))?;
+    }
     if let Some(s) = &vm_resources.kernel_cmdline.epilog {
         vmm.kernel_cmdline.insert_str(s).unwrap();
     };
@@ -2578,6 +2597,18 @@ fn create_vcpus_x86_64(
 ) -> super::Result<Vec<Vcpu>> {
     let mut vcpus = Vec::with_capacity(vcpu_config.vcpu_count as usize);
     for cpu_index in 0..vcpu_config.vcpu_count {
+        #[cfg(not(feature = "tee"))]
+        let topology = if std::env::var("KRUN_PROTOTYPE_CPU_GROWTH").as_deref() == Ok("1")
+            && vcpu_config.vcpu_count <= 16
+        {
+            let mut config = vcpu_config.clone();
+            config.vcpu_count = 16;
+            config
+        } else {
+            vcpu_config.clone()
+        };
+        #[cfg(not(feature = "tee"))]
+        let vcpu_config = &topology;
         let mut vcpu = Vcpu::new_x86_64(
             cpu_index,
             vm.fd(),
