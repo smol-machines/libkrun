@@ -814,4 +814,50 @@ mod checkpoint_quiescence_tests {
         balloon.rearm_after_snapshot();
         assert_eq!(balloon.pages().0, 42);
     }
+
+    #[test]
+    fn every_supported_queue_defers_pending_work_until_resume() {
+        type QueueHandler = fn(&mut Balloon, &EpollEvent);
+        let handlers: [(usize, QueueHandler); 4] = [
+            (IFQ_INDEX, Balloon::handle_ifq_event),
+            (DFQ_INDEX, Balloon::handle_dfq_event),
+            (STQ_INDEX, Balloon::handle_stq_event),
+            (FRQ_INDEX, Balloon::handle_frq_event),
+        ];
+        for (index, handle) in handlers {
+            let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+            let (mut balloon, rings) = active_balloon(&memory);
+            let event = Arc::clone(&balloon.queues.as_ref().unwrap()[index].event);
+            // An inflate PFN points at a separate free page; the other queues
+            // only need a readable buffer to exercise their completion path.
+            memory.write_obj(0x18u32, GuestAddress(0x10000)).unwrap();
+            rings[index].dtable[0].addr.set(0x10000);
+            rings[index].dtable[0].len.set(4);
+            rings[index].avail.ring[0].set(0);
+            rings[index].avail.idx.set(1);
+            balloon.quiesce_for_snapshot();
+            let boundary = balloon.save_state();
+            let notification = EpollEvent::new(EventSet::IN, event.as_raw_fd() as u64);
+            // Multiple kicks coalesce while paused, without processing work or
+            // leaving an eventfd readable in a busy loop.
+            for _ in 0..2 {
+                event.write(1).unwrap();
+                handle(&mut balloon, &notification);
+                assert_eq!(balloon.save_state(), boundary, "queue {index}");
+                assert_eq!(rings[index].used.idx.get(), 0, "queue {index}");
+                assert_eq!(
+                    event.read().unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+            }
+            balloon.rearm_after_snapshot();
+            handle(&mut balloon, &notification);
+            if index == STQ_INDEX {
+                // Stats park their descriptor until a fresh sample is asked for.
+                assert_eq!(balloon.stats_pending_ack, Some(0));
+                assert!(balloon.request_stats_sample());
+            }
+            assert_eq!(rings[index].used.idx.get(), 1, "queue {index}");
+        }
+    }
 }
