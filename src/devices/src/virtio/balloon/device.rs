@@ -66,6 +66,10 @@ pub struct Balloon {
     pub(crate) activate_evt: EventFd,
     pub(crate) device_state: DeviceState,
     config: VirtioBalloonConfig,
+    snapshot_quiesced: bool,
+    deferred_events: u8,
+    deferred_stats_request: bool,
+    deferred_target_pages: Option<u32>,
     /// Most recent sample the guest published on the stats queue.
     stats: Option<BalloonStats>,
     /// The guest parks one buffer on the stats queue and only refills it after
@@ -120,6 +124,10 @@ impl Balloon {
                 .map_err(BalloonError::EventFd)?,
             device_state: DeviceState::Inactive,
             config: VirtioBalloonConfig::default(),
+            snapshot_quiesced: false,
+            deferred_events: 0,
+            deferred_stats_request: false,
+            deferred_target_pages: None,
             stats: None,
             stats_pending_ack: None,
             stats_last_request: None,
@@ -161,6 +169,10 @@ impl Balloon {
     /// interrupt; the guest driver in/deflates toward the target and updates
     /// `actual` in config space as it goes.
     pub fn set_target_pages(&mut self, pages: u32) {
+        if self.snapshot_quiesced {
+            self.deferred_target_pages = Some(pages);
+            return;
+        }
         self.config.num_pages = pages;
         if let DeviceState::Activated(_, ref interrupt) = self.device_state {
             interrupt.signal_config_change();
@@ -268,6 +280,10 @@ impl Balloon {
     /// Ack the parked stats buffer, which is what makes the guest publish a
     /// fresh sample. Returns true if a request was actually issued.
     fn request_stats_sample(&mut self) -> bool {
+        if self.snapshot_quiesced {
+            self.deferred_stats_request = true;
+            return false;
+        }
         let Some(index) = self.stats_pending_ack.take() else {
             return false;
         };
@@ -435,6 +451,41 @@ fn release_guest_range(mem: &GuestMemoryMmap, gpa: u64, len: u64) {
 }
 
 impl VirtioDevice for Balloon {
+    fn quiesce_for_snapshot(&mut self) {
+        if self.snapshot_quiesced {
+            return;
+        }
+        // A parked stats descriptor is host-only state. Return it before
+        // freezing so a restored device does not lose the outstanding ack.
+        if self.request_stats_sample() {
+            self.device_state.signal_used_queue();
+        }
+        self.snapshot_quiesced = true;
+    }
+
+    fn rearm_after_snapshot(&mut self) {
+        if !self.snapshot_quiesced {
+            return;
+        }
+        self.snapshot_quiesced = false;
+        let pending = std::mem::take(&mut self.deferred_events);
+        self.notify_pending_queues(pending);
+        if let Some(pages) = self.deferred_target_pages.take() {
+            self.set_target_pages(pages);
+        }
+        if std::mem::take(&mut self.deferred_stats_request) && self.request_stats_sample() {
+            self.device_state.signal_used_queue();
+        }
+    }
+
+    fn finish_restore_activation(&mut self) {
+        // Eventfd notifications do not survive a portable restore. The saved
+        // available ring can still contain reports awaiting acknowledgment.
+        self.notify_pending_queues(
+            (1 << IFQ_INDEX) | (1 << DFQ_INDEX) | (1 << STQ_INDEX) | (1 << FRQ_INDEX),
+        );
+    }
+
     fn avail_features(&self) -> u64 {
         self.avail_features
     }
@@ -515,6 +566,30 @@ impl VirtioDevice for Balloon {
 
     fn is_activated(&self) -> bool {
         self.device_state.is_activated()
+    }
+}
+
+impl Balloon {
+    pub(crate) fn defer_queue_event(&mut self, index: usize) -> bool {
+        if self.snapshot_quiesced {
+            self.deferred_events |= 1 << index;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn notify_pending_queues(&self, pending: u8) {
+        if let Some(queues) = &self.queues {
+            for (index, queue) in queues.iter().enumerate() {
+                if pending & (1 << index) != 0
+                    && queue.queue.ready
+                    && let Err(error) = queue.event.write(1)
+                {
+                    error!("balloon: failed to rearm queue {index}: {error}");
+                }
+            }
+        }
     }
 }
 
@@ -626,11 +701,9 @@ mod checkpoint_quiescence_tests {
     use utils::windows::AsRawFd;
     use vm_memory::GuestAddress;
 
-    #[test]
-    fn a_pending_free_page_callback_cannot_advance_a_quiesced_snapshot() {
-        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+    fn active_balloon(memory: &GuestMemoryMmap) -> (Balloon, Vec<VirtQueue<'_>>) {
         let rings: Vec<_> = (0..defs::NUM_QUEUES)
-            .map(|i| VirtQueue::new(GuestAddress(0x1000 + i as u64 * 0x1000), &memory, 8))
+            .map(|i| VirtQueue::new(GuestAddress(0x1000 + i as u64 * 0x1000), memory, 8))
             .collect();
         let queues: Vec<_> = rings
             .iter()
@@ -641,7 +714,6 @@ mod checkpoint_quiescence_tests {
                 )
             })
             .collect();
-        let event = Arc::clone(&queues[FRQ_INDEX].event);
         let mut balloon = Balloon::new().unwrap();
         balloon
             .activate(
@@ -651,6 +723,14 @@ mod checkpoint_quiescence_tests {
                 queues,
             )
             .unwrap();
+        (balloon, rings)
+    }
+
+    #[test]
+    fn a_pending_free_page_callback_cannot_advance_a_quiesced_snapshot() {
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        let (mut balloon, rings) = active_balloon(&memory);
+        let event = Arc::clone(&balloon.queues.as_ref().unwrap()[FRQ_INDEX].event);
         rings[FRQ_INDEX].dtable[0].addr.set(0x10000);
         rings[FRQ_INDEX].dtable[0].len.set(4096);
         rings[FRQ_INDEX].avail.ring[0].set(0);
@@ -673,5 +753,65 @@ mod checkpoint_quiescence_tests {
             used,
             "guest used ring moved after quiescence"
         );
+        assert_eq!(
+            event.read().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "a deferred notification must not leave the event loop spinning"
+        );
+        balloon.rearm_after_snapshot();
+        balloon.handle_frq_event(&EpollEvent::new(EventSet::IN, event.as_raw_fd() as u64));
+        assert_eq!(
+            rings[FRQ_INDEX].used.idx.get(),
+            1,
+            "deferred report must complete after resume"
+        );
+        balloon.rearm_after_snapshot();
+        assert_eq!(
+            event.read().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "rearming twice must not duplicate the notification"
+        );
+    }
+
+    #[test]
+    fn paused_stats_and_target_requests_do_not_change_the_boundary() {
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        let (mut balloon, rings) = active_balloon(&memory);
+        // A stats buffer was consumed and parked before the checkpoint.
+        balloon.stats_pending_ack = Some(0);
+        balloon.quiesce_for_snapshot();
+        assert!(balloon.stats_pending_ack.is_none());
+        assert_eq!(rings[STQ_INDEX].used.idx.get(), 1);
+        let boundary = balloon.save_state();
+        balloon.set_target_pages(123);
+        balloon.take_stats();
+        balloon.quiesce_for_snapshot();
+        assert_eq!(balloon.save_state(), boundary);
+        balloon.rearm_after_snapshot();
+        assert_eq!(balloon.pages().0, 123);
+    }
+
+    #[test]
+    fn restored_pending_reports_receive_a_fresh_notification() {
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        let (mut balloon, rings) = active_balloon(&memory);
+        let event = Arc::clone(&balloon.queues.as_ref().unwrap()[FRQ_INDEX].event);
+        rings[FRQ_INDEX].dtable[0].addr.set(0x10000);
+        rings[FRQ_INDEX].dtable[0].len.set(4096);
+        rings[FRQ_INDEX].avail.ring[0].set(0);
+        rings[FRQ_INDEX].avail.idx.set(1);
+        balloon.finish_restore_activation();
+        balloon.handle_frq_event(&EpollEvent::new(EventSet::IN, event.as_raw_fd() as u64));
+        assert_eq!(rings[FRQ_INDEX].used.idx.get(), 1);
+    }
+
+    #[test]
+    fn inactive_balloon_can_be_quiesced_and_rearmed() {
+        let mut balloon = Balloon::new().unwrap();
+        balloon.quiesce_for_snapshot();
+        balloon.set_target_pages(42);
+        balloon.take_stats();
+        balloon.rearm_after_snapshot();
+        assert_eq!(balloon.pages().0, 42);
     }
 }
