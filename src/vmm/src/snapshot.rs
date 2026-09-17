@@ -1051,6 +1051,9 @@ pub fn rebase_guest_memory_private(parent: &GuestMemoryMmap) -> io::Result<()> {
     // until the MAP_FIXED replacement immediately below.
     for backing in &backings {
         let seals = unsafe { libc::fcntl(backing.fd, libc::F_GET_SEALS) };
+        if seals & libc::F_SEAL_WRITE != 0 {
+            continue;
+        }
         if seals & libc::F_SEAL_FUTURE_WRITE == 0 {
             let result =
                 unsafe { libc::fcntl(backing.fd, libc::F_ADD_SEALS, libc::F_SEAL_FUTURE_WRITE) };
@@ -1061,6 +1064,15 @@ pub fn rebase_guest_memory_private(parent: &GuestMemoryMmap) -> io::Result<()> {
     }
 
     for backing in &backings {
+        // An already sealed backing is an older generation. Its live mapping
+        // can contain newer private writes; remapping it would discard them.
+        let seals = unsafe { libc::fcntl(backing.fd, libc::F_GET_SEALS) };
+        if seals < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if seals & libc::F_SEAL_WRITE != 0 {
+            continue;
+        }
         let mapped = unsafe {
             libc::mmap(
                 backing.host_address,
@@ -1133,6 +1145,24 @@ pub fn guest_memory_backing_is_immutable(parent: &GuestMemoryMmap) -> io::Result
         ));
     }
     Ok(true)
+}
+
+/// Whether any region can contain private writes over an older generation.
+/// After live RAM growth a source can have both old private and new shared
+/// regions; testing whether *all* backings are sealed loses that distinction.
+#[cfg(target_os = "linux")]
+pub fn guest_memory_has_private_backing(parent: &GuestMemoryMmap) -> io::Result<bool> {
+    let mut private = false;
+    for region in parent.iter() {
+        if let Some(offset) = region.file_offset() {
+            let seals = unsafe { libc::fcntl(offset.file().as_raw_fd(), libc::F_GET_SEALS) };
+            if seals < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            private |= seals & libc::F_SEAL_WRITE != 0;
+        }
+    }
+    Ok(private)
 }
 
 /// An exact RAM generation being materialized by a short-lived fork child.
@@ -1317,10 +1347,13 @@ pub fn start_deferred_memory_save(
     // Reject anonymous regions before changing any mappings. Portable capture
     // falls back to the established synchronous SAVE path for this shape.
     let _ = stable_memfd_generation(parent)?;
-    let generation = if guest_memory_backing_is_immutable(parent)? {
+    let has_private = guest_memory_has_private_backing(parent)?;
+    // Freeze newly added shared regions too before a fork worker is allowed
+    // to read them. Existing private views must retain all their live writes.
+    rebase_guest_memory_private(parent)?;
+    let generation = if has_private {
         DeferredLinuxGeneration::Copy(start_fork_generation_copy(parent)?)
     } else {
-        rebase_guest_memory_private(parent)?;
         let (descs, files) = stable_memfd_generation(parent)?;
         DeferredLinuxGeneration::Stable { descs, files }
     };
@@ -2579,6 +2612,59 @@ mod tests {
         assert!(status.success(), "isolated snapshot test failed: {name}");
         true
     }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn deferred_save_preserves_private_ram_after_live_growth() {
+        use std::sync::Arc;
+        use vm_memory::GuestRegionMmap;
+        if run_with_private_address_space("deferred_save_preserves_private_ram_after_live_growth") {
+            return;
+        }
+        let initial = crate::builder::create_guest_ram_memfd(4096).unwrap();
+        let memory = GuestMemoryMmap::from_ranges_with_files([(
+            GuestAddress(0),
+            4096,
+            Some(FileOffset::new(initial, 0)),
+        )])
+        .unwrap()
+        .with_shared_growth();
+        memory.write_obj(1u8, GuestAddress(0)).unwrap();
+        let first = start_deferred_memory_save(&memory, std::path::Path::new("unused")).unwrap();
+        first.finish_stream(&mut Vec::new()).unwrap();
+        memory.write_obj(2u8, GuestAddress(0)).unwrap();
+        let added = crate::builder::create_guest_ram_memfd(4096).unwrap();
+        memory
+            .append_shared_region(Arc::new(
+                GuestRegionMmap::from_range(
+                    GuestAddress(4096),
+                    4096,
+                    Some(FileOffset::new(added, 0)),
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+        memory.write_obj(3u8, GuestAddress(4096)).unwrap();
+        let second = start_deferred_memory_save(&memory, std::path::Path::new("unused")).unwrap();
+        assert_eq!(
+            memory.read_obj::<u8>(GuestAddress(0)).unwrap(),
+            2,
+            "capture reset private RAM to the old generation"
+        );
+        memory.write_obj(4u8, GuestAddress(0)).unwrap();
+        memory.write_obj(5u8, GuestAddress(4096)).unwrap();
+        let mut wire = Vec::new();
+        second.finish_stream(&mut wire).unwrap();
+        assert_eq!(&wire[..8], b"SMOLRAM1");
+        assert_eq!(wire[16], 2);
+        assert_eq!(
+            wire[16 + 4096],
+            3,
+            "new shared RAM changed after the capture boundary"
+        );
+        assert_eq!(memory.read_obj::<u8>(GuestAddress(0)).unwrap(), 4);
+        assert_eq!(memory.read_obj::<u8>(GuestAddress(4096)).unwrap(), 5);
+    }
+
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn deferred_sparse_stream_preserves_live_generations_after_disconnect() {
