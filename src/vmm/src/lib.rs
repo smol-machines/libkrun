@@ -344,6 +344,8 @@ pub struct Vmm {
     vcpus_handles: Vec<VcpuHandle>,
     #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
     prototype_cpu_topology: Option<vstate::VcpuConfig>,
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    cpu_growth_failure: Option<String>,
     run_state: VmmRunState,
     paused_at: Option<Instant>,
     devices_quiesced: bool,
@@ -549,6 +551,26 @@ impl Vmm {
     /// Experimental Linux/x86 CPU creation; guest onlining is separate.
     #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
     pub fn prototype_grow_cpus(&mut self, count: u8) -> std::result::Result<(), String> {
+        if let Some(error) = &self.cpu_growth_failure {
+            return Err(format!(
+                "previous CPU creation did not complete: {error}; cannot safely retry"
+            ));
+        }
+        let result = self.prototype_grow_cpus_inner(count);
+        if let Err(error) = &result {
+            // Set only after crossing the host-vCPU creation boundary. A
+            // rejected target or paused VM is safe to retry without poisoning.
+            if self.cpu_growth_failure.is_some() {
+                self.cpu_growth_failure = Some(error.clone());
+            }
+        } else {
+            self.cpu_growth_failure = None;
+        }
+        result
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    fn prototype_grow_cpus_inner(&mut self, count: u8) -> std::result::Result<(), String> {
         let config = self
             .prototype_cpu_topology
             .as_ref()
@@ -561,6 +583,7 @@ impl Vmm {
             return Err("CPU target must grow within the advertised topology".into());
         }
         for id in self.vcpus_handles.len() as u8..count {
+            self.cpu_growth_failure = Some(format!("creating vCPU {id}"));
             let mut vcpu = Vcpu::new_x86_64(
                 id,
                 self.vm.fd(),
@@ -589,6 +612,18 @@ impl Vmm {
             .map_err(|error| format!("new vCPU did not enter its run loop: {error:?}"))?;
         }
         Ok(())
+    }
+
+    /// Host-created CPU count and capacity, not the guest-online count.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    pub fn prototype_cpu_status(&self) -> std::result::Result<(usize, u8), String> {
+        if let Some(error) = &self.cpu_growth_failure {
+            return Err(format!("CPU creation incomplete: {error}"));
+        }
+        self.prototype_cpu_topology
+            .as_ref()
+            .map(|config| (self.vcpus_handles.len(), config.vcpu_count))
+            .ok_or_else(|| "CPU growth prototype is not enabled for this VM".into())
     }
 
     /// Increase a writable disk's capacity without stopping the guest.
