@@ -42,6 +42,7 @@ fn emit_snapshot_cfgs() {
     println!("cargo:rustc-check-cfg=cfg(snapshot_supported)");
     println!("cargo:rustc-check-cfg=cfg(deferred_stream_supported)");
     println!("cargo:rustc-check-cfg=cfg(fork_supported)");
+    println!("cargo:rustc-check-cfg=cfg(fork_continue_supported)");
     let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let linux_x86 = os == "linux" && arch == "x86_64";
@@ -59,5 +60,9 @@ fn emit_snapshot_cfgs() {
     }
     if linux_x86 || linux_arm || macos_arm || windows_x86 {
         println!("cargo:rustc-cfg=fork_supported");
+    }
+    // Mirrors vmm: resuming the source after a branch needs retained CoW RAM.
+    if linux_x86 || linux_arm || macos_arm {
+        println!("cargo:rustc-cfg=fork_continue_supported");
     }
 }

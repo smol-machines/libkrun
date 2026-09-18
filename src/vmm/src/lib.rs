@@ -54,10 +54,7 @@ use std::fmt::{Display, Formatter};
 use std::io;
 // Named only by the fork-continue generation writer, which lives on
 // linux-x86_64 and macOS.
-#[cfg(all(
-    feature = "blk",
-    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
-))]
+#[cfg(all(feature = "blk", fork_continue_supported))]
 use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
@@ -352,7 +349,7 @@ pub struct Vmm {
     /// Fresh memfds owned by the latest asynchronously materialized running
     /// generation. Existing clones retain their own mapping references when a
     /// newer generation replaces these handles.
-    #[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "blk"))]
+    #[cfg(all(target_os = "linux", fork_continue_supported, feature = "blk"))]
     retained_generation_files: Vec<std::fs::File>,
 
     // Guest VM devices.
@@ -390,10 +387,7 @@ pub enum ForkMemory {
 // Only fork-continue publishes this marker, and that exists on linux-x86_64
 // and macOS; deferring RAM to a stream (which aarch64 Linux now does) has no
 // generation directory to commit.
-#[cfg(all(
-    feature = "blk",
-    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
-))]
+#[cfg(all(feature = "blk", fork_continue_supported))]
 fn publish_generation_commit_marker(path: &std::path::Path) -> io::Result<()> {
     if path.exists() {
         return Err(io::Error::new(
@@ -1295,7 +1289,7 @@ impl Vmm {
     /// Every replacement disk is pre-opened before the first block worker is
     /// changed. If RAM generation capture fails, all disks are rolled back
     /// before the source resumes.
-    #[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "blk"))]
+    #[cfg(all(target_os = "linux", fork_continue_supported, feature = "blk"))]
     pub fn checkpoint_for_fork_continue(
         &mut self,
         block_pivots: &[(String, String)],

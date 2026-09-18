@@ -1181,7 +1181,7 @@ pub fn build_microvm(
         exit_evt,
         exit_observers: Vec::new(),
         exit_code: exit_code.clone(),
-        #[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "blk"))]
+        #[cfg(all(target_os = "linux", fork_continue_supported, feature = "blk"))]
         retained_generation_files: Vec::new(),
         vm,
         mmio_device_manager,
