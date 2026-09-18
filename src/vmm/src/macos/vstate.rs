@@ -456,9 +456,7 @@ impl Vcpu {
             })
             .map_err(Error::VcpuSpawn)?;
 
-        let hvf_vcpuid = init_tls_receiver
-            .recv()
-            .expect("Error waiting for TLS initialization.");
+        let hvf_vcpuid = init_tls_receiver.recv().map_err(|_| Error::VcpuEvent)?;
 
         Ok(VcpuHandle::new(
             event_sender,
