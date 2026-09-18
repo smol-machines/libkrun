@@ -7,7 +7,7 @@ use crate::{
     GuestUsize, MemoryRegionAddress, ReadVolatile, VolatileSlice, WriteVolatile,
 };
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Represents a continuous region of guest physical memory.
 ///
@@ -181,6 +181,24 @@ pub enum GuestRegionCollectionError {
     /// The provided memory regions haven't been sorted.
     #[error("The provided memory regions haven't been sorted")]
     UnsortedMemoryRegions,
+    /// Shared append-only growth has not been enabled for this collection.
+    #[error("Shared memory growth is not enabled")]
+    GrowthNotEnabled,
+    /// A previous writer failed while publishing a memory region.
+    #[error("Shared memory growth lock is poisoned")]
+    GrowthPoisoned,
+}
+
+#[derive(Debug)]
+struct AppendedRegion<R> {
+    region: Arc<R>,
+    next: OnceLock<Box<AppendedRegion<R>>>,
+}
+
+#[derive(Debug)]
+struct SharedGrowth<R> {
+    head: OnceLock<Box<AppendedRegion<R>>>,
+    writer: Mutex<()>,
 }
 
 /// [`GuestMemory`](trait.GuestMemory.html) implementation based on a homogeneous collection
@@ -190,12 +208,14 @@ pub enum GuestRegionCollectionError {
 #[derive(Debug)]
 pub struct GuestRegionCollection<R> {
     regions: Vec<Arc<R>>,
+    growth: Option<Arc<SharedGrowth<R>>>,
 }
 
 impl<R> Default for GuestRegionCollection<R> {
     fn default() -> Self {
         Self {
             regions: Vec::new(),
+            growth: None,
         }
     }
 }
@@ -204,11 +224,94 @@ impl<R> Clone for GuestRegionCollection<R> {
     fn clone(&self) -> Self {
         GuestRegionCollection {
             regions: self.regions.iter().map(Arc::clone).collect(),
+            growth: self.growth.clone(),
         }
     }
 }
 
 impl<R: GuestMemoryRegion> GuestRegionCollection<R> {
+    /// Enable shared, append-only growth before cloning this map into devices.
+    /// Existing regions never move or disappear, so borrowed slices remain
+    /// valid. Later clones observe appended regions without a stale map cache.
+    ///
+    /// The caller must serialize whole-map operations (snapshotting, hypervisor
+    /// registration) against append. This is not a coherent multi-call snapshot.
+    pub fn with_shared_growth(mut self) -> Self {
+        if self.growth.is_none() {
+            self.growth = Some(Arc::new(SharedGrowth {
+                head: OnceLock::new(),
+                writer: Mutex::new(()),
+            }));
+        }
+        self
+    }
+
+    fn appended_regions(&self) -> impl Iterator<Item = &Arc<R>> {
+        let first = self
+            .growth
+            .as_ref()
+            .and_then(|growth| growth.head.get())
+            .map(Box::as_ref);
+        std::iter::successors(first, |node| node.next.get().map(Box::as_ref))
+            .map(|node| &node.region)
+    }
+
+    fn all_regions(&self) -> impl Iterator<Item = &Arc<R>> {
+        self.regions.iter().chain(self.appended_regions())
+    }
+
+    /// Publish one region above every existing GPA range to all shared views.
+    /// The hypervisor mapping must already be ready before publication and the
+    /// guest must not be told to use the memory until publication completes.
+    /// Rejects overlap and insertion below the current highest region.
+    pub fn append_shared_region(
+        &self,
+        region: Arc<R>,
+    ) -> std::result::Result<(), GuestRegionCollectionError> {
+        self.append_shared_region_with(region, |_| Ok(()))
+    }
+
+    /// Register a region and publish it to every shared view as one transaction.
+    /// Validation and allocation happen before `register` is called. If it
+    /// fails, the collection is unchanged; the callback must itself leave no
+    /// registration behind on failure. After success, publication cannot fail.
+    ///
+    /// The callback runs under the growth lock and must not reenter this map's
+    /// growth methods. It must not notify the guest to use the new region: that
+    /// notification belongs after this method returns successfully.
+    pub fn append_shared_region_with<E: From<GuestRegionCollectionError>>(
+        &self,
+        region: Arc<R>,
+        register: impl FnOnce(&R) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        let growth = self
+            .growth
+            .as_ref()
+            .ok_or(GuestRegionCollectionError::GrowthNotEnabled)?;
+        let _writer = growth
+            .writer
+            .lock()
+            .map_err(|_| GuestRegionCollectionError::GrowthPoisoned)?;
+        let mut slot = &growth.head;
+        let mut last = self.regions.last().map(|region| region.last_addr());
+        while let Some(node) = slot.get() {
+            last = Some(node.region.last_addr());
+            slot = &node.next;
+        }
+        if last.is_some_and(|last| last >= region.start_addr()) {
+            return Err(GuestRegionCollectionError::MemoryRegionOverlap.into());
+        }
+        let node = Box::new(AppendedRegion {
+            region,
+            next: OnceLock::new(),
+        });
+        register(node.region.as_ref())?;
+        // The writer lock excludes every publisher, and `slot` was empty
+        // above. No fallible allocation or registration follows publication.
+        assert!(slot.set(node).is_ok());
+        Ok(())
+    }
+
     /// Creates an empty `GuestMemoryMmap` instance.
     pub fn new() -> Self {
         Self::default()
@@ -259,7 +362,10 @@ impl<R: GuestMemoryRegion> GuestRegionCollection<R> {
             }
         }
 
-        Ok(Self { regions })
+        Ok(Self {
+            regions,
+            growth: None,
+        })
     }
 
     /// Insert a region into the `GuestMemoryMmap` object and return a new `GuestMemoryMmap`.
@@ -270,7 +376,7 @@ impl<R: GuestMemoryRegion> GuestRegionCollection<R> {
         &self,
         region: Arc<R>,
     ) -> std::result::Result<GuestRegionCollection<R>, GuestRegionCollectionError> {
-        let mut regions = self.regions.clone();
+        let mut regions: Vec<_> = self.all_regions().cloned().collect();
         regions.push(region);
         regions.sort_by_key(|x| x.start_addr());
 
@@ -288,11 +394,17 @@ impl<R: GuestMemoryRegion> GuestRegionCollection<R> {
         base: GuestAddress,
         size: GuestUsize,
     ) -> std::result::Result<(GuestRegionCollection<R>, Arc<R>), GuestRegionCollectionError> {
-        if let Ok(region_index) = self.regions.binary_search_by_key(&base, |x| x.start_addr()) {
-            if self.regions.get(region_index).unwrap().len() == size {
-                let mut regions = self.regions.clone();
+        let mut regions: Vec<_> = self.all_regions().cloned().collect();
+        if let Ok(region_index) = regions.binary_search_by_key(&base, |x| x.start_addr()) {
+            if regions.get(region_index).unwrap().len() == size {
                 let region = regions.remove(region_index);
-                return Ok((Self { regions }, region));
+                return Ok((
+                    Self {
+                        regions,
+                        growth: None,
+                    },
+                    region,
+                ));
             }
         }
 
@@ -304,7 +416,7 @@ impl<R: GuestMemoryRegion> GuestMemory for GuestRegionCollection<R> {
     type R = R;
 
     fn num_regions(&self) -> usize {
-        self.regions.len()
+        self.regions.len() + self.appended_regions().count()
     }
 
     fn find_region(&self, addr: GuestAddress) -> Option<&R> {
@@ -314,11 +426,15 @@ impl<R: GuestMemoryRegion> GuestMemory for GuestRegionCollection<R> {
             Err(x) if (x > 0 && addr <= self.regions[x - 1].last_addr()) => Some(x - 1),
             _ => None,
         };
-        index.map(|x| self.regions[x].as_ref())
+        index.map(|x| self.regions[x].as_ref()).or_else(|| {
+            self.appended_regions()
+                .find(|region| region.start_addr() <= addr && addr <= region.last_addr())
+                .map(AsRef::as_ref)
+        })
     }
 
     fn iter(&self) -> impl Iterator<Item = &Self::R> {
-        self.regions.iter().map(AsRef::as_ref)
+        self.all_regions().map(AsRef::as_ref)
     }
 }
 

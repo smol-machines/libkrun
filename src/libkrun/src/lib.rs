@@ -1724,6 +1724,36 @@ fn handle_control_stream<S: std::io::Read + std::io::Write + Send + 'static>(
             // be an unused-variable error under -D warnings.
             let _arg = parts.next().map(str::trim).unwrap_or("");
             match verb.as_str() {
+                #[cfg(all(
+                    target_os = "linux",
+                    any(target_arch = "x86_64", target_arch = "aarch64"),
+                    not(feature = "tee")
+                ))]
+                "PROTOTYPE_GROW_MEMORY" => match _arg.parse::<u64>() {
+                    Ok(mib) => match vmm.lock().unwrap().prototype_grow_memory(mib) {
+                        Ok(()) => "OK RAM registered; guest onlining pending\n".into(),
+                        Err(error) => format!("ERR EIO {error}\n"),
+                    },
+                    Err(_) => "ERR EINVAL expected additional MiB\n".into(),
+                },
+                #[cfg(all(
+                    target_os = "linux",
+                    any(target_arch = "x86_64", target_arch = "aarch64"),
+                    not(feature = "tee")
+                ))]
+                "PROTOTYPE_MEMORY_STATUS" => match vmm.lock().unwrap().prototype_memory_status() {
+                    Ok((mapped, plugged)) => format!("OK mapped {mapped} plugged {plugged}\n"),
+                    Err(error) => format!("ERR EIO {error}\n"),
+                },
+                #[cfg(all(
+                    target_os = "linux",
+                    any(target_arch = "x86_64", target_arch = "aarch64"),
+                    not(feature = "tee")
+                ))]
+                "PROTOTYPE_MEMORY_INFO" => match vmm.lock().unwrap().prototype_memory_info() {
+                    Ok(info) => info,
+                    Err(error) => format!("ERR EIO {error}\n"),
+                },
                 #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
                 "PROTOTYPE_CPU_STATUS" => match vmm.lock().unwrap().prototype_cpu_status() {
                     Ok((created, capacity)) => {
@@ -2385,6 +2415,40 @@ pub extern "C" fn krun_set_vm_config(ctx_id: u32, num_vcpus: u8, ram_mib: u32) -
         Entry::Vacant(_) => return -libc::ENOENT,
     }
 
+    KRUN_SUCCESS
+}
+
+/// Configure live resource growth before boot; existing checkpoints retain
+/// their captured device topology regardless of these fresh-boot settings.
+#[unsafe(no_mangle)]
+pub extern "C" fn krun_set_live_resize(ctx_id: u32, flags: u32) -> i32 {
+    if flags & !3 != 0 {
+        return -libc::EINVAL;
+    }
+    if flags & 1 != 0
+        && !cfg!(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            not(feature = "tee")
+        ))
+    {
+        return -libc::ENOTSUP;
+    }
+    if flags & 2 != 0
+        && !cfg!(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64"),
+            not(feature = "tee")
+        ))
+    {
+        return -libc::ENOTSUP;
+    }
+    let mut contexts = CTX_MAP.lock().unwrap();
+    let Some(context) = contexts.get_mut(&ctx_id) else {
+        return -libc::ENOENT;
+    };
+    context.vmr.live_cpu_growth = flags & 1 != 0;
+    context.vmr.live_memory_growth = flags & 2 != 0;
     KRUN_SUCCESS
 }
 
@@ -5508,6 +5572,66 @@ fn krun_start_enter_nitro(ctx_id: u32) -> i32 {
 
             -libc::EINVAL
         }
+    }
+}
+
+#[cfg(test)]
+mod test_live_resize_config {
+    use super::*;
+
+    #[test]
+    fn live_resize_is_explicit_per_context_and_validated() {
+        let first = krun_create_ctx();
+        let second = krun_create_ctx();
+        assert!(first >= 0 && second >= 0);
+        let (first, second) = (first as u32, second as u32);
+        assert_eq!(krun_set_live_resize(first, 4), -libc::EINVAL);
+        assert_eq!(krun_set_live_resize(u32::MAX, 0), -libc::ENOENT);
+        let supported = cfg!(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            not(feature = "tee")
+        ));
+        assert_eq!(
+            krun_set_live_resize(first, 3),
+            if supported { 0 } else { -libc::ENOTSUP }
+        );
+        {
+            let contexts = CTX_MAP.lock().unwrap();
+            assert_eq!(contexts[&first].vmr.live_cpu_growth, supported);
+            assert_eq!(contexts[&first].vmr.live_memory_growth, supported);
+            assert!(!contexts[&second].vmr.live_cpu_growth);
+            assert!(!contexts[&second].vmr.live_memory_growth);
+        }
+        let memory_supported = cfg!(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64"),
+            not(feature = "tee")
+        ));
+        assert_eq!(
+            krun_set_live_resize(first, 2),
+            if memory_supported { 0 } else { -libc::ENOTSUP }
+        );
+        {
+            let contexts = CTX_MAP.lock().unwrap();
+            assert!(!contexts[&first].vmr.live_cpu_growth);
+            assert_eq!(contexts[&first].vmr.live_memory_growth, memory_supported);
+            assert!(!contexts[&second].vmr.live_memory_growth);
+        }
+        if memory_supported && !supported {
+            assert_eq!(krun_set_live_resize(first, 3), -libc::ENOTSUP);
+            let contexts = CTX_MAP.lock().unwrap();
+            assert!(!contexts[&first].vmr.live_cpu_growth);
+            assert!(contexts[&first].vmr.live_memory_growth);
+        }
+        assert_eq!(krun_set_live_resize(first, 0), 0);
+        {
+            let contexts = CTX_MAP.lock().unwrap();
+            assert!(!contexts[&first].vmr.live_cpu_growth);
+            assert!(!contexts[&first].vmr.live_memory_growth);
+        }
+        assert_eq!(krun_free_ctx(first), 0);
+        assert_eq!(krun_free_ctx(second), 0);
     }
 }
 

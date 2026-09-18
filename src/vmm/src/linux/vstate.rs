@@ -25,6 +25,8 @@ use std::os::unix::io::RawFd;
 #[cfg(target_arch = "x86_64")]
 use std::env;
 use std::result;
+#[cfg(not(feature = "tee"))]
+use std::sync::Arc;
 #[cfg(not(test))]
 use std::sync::Barrier;
 use std::sync::atomic::{Ordering, fence};
@@ -115,6 +117,8 @@ pub enum Error {
     FPUConfiguration(arch::x86_64::regs::Error),
     /// Invalid guest memory configuration.
     GuestMemoryMmap(GuestMemoryError),
+    /// A live RAM region could not be published to device memory views.
+    SharedMemoryGrowth(vm_memory::GuestRegionCollectionError),
     #[cfg(target_arch = "x86_64")]
     /// Retrieving supported guest MSRs fails.
     GuestMSRs(arch::x86_64::msr::Error),
@@ -332,6 +336,7 @@ impl Display for Error {
             CpuId(e) => write!(f, "Cpuid error: {e:?}"),
             CreateGuestMemfd(e) => write!(f, "Unable to create KVM guest_memfd: {e:?}"),
             GuestMemoryMmap(e) => write!(f, "Guest memory error: {e:?}"),
+            SharedMemoryGrowth(e) => write!(f, "Live memory map error: {e}"),
             #[cfg(target_arch = "x86_64")]
             GuestMSRs(e) => write!(f, "Retrieving supported guest MSRs fails: {e:?}"),
             HTNotInitialized => write!(f, "Hyperthreading flag is not initialized"),
@@ -513,6 +518,12 @@ impl Display for Error {
             #[cfg(feature = "tee")]
             InvalidTee => write!(f, "TEE selected is not currently supported"),
         }
+    }
+}
+
+impl From<vm_memory::GuestRegionCollectionError> for Error {
+    fn from(error: vm_memory::GuestRegionCollectionError) -> Self {
+        Self::SharedMemoryGrowth(error)
     }
 }
 
@@ -805,6 +816,30 @@ impl Vm {
             .map_err(Error::VmSetup)?;
 
         Ok(())
+    }
+
+    /// Register new RAM before publishing it to existing device views.
+    /// The caller must hold the VMM lifecycle lock and notify the guest only
+    /// after success. The shared map owns the mapping for KVM's lifetime.
+    #[cfg(not(feature = "tee"))]
+    pub fn append_guest_memory(
+        &mut self,
+        guest_mem: &GuestMemoryMmap,
+        region: Arc<GuestRegionMmap>,
+        kvm_max_memslots: usize,
+    ) -> Result<()> {
+        if self.next_mem_slot as usize >= kvm_max_memslots {
+            return Err(Error::NotEnoughMemorySlots);
+        }
+        guest_mem.append_shared_region_with(region, |region| {
+            self.create_guest_physical_memory_slot(
+                region.as_ptr() as u64,
+                region.start_addr().raw_value(),
+                region,
+            )?;
+            self.next_mem_slot += 1;
+            Ok(())
+        })
     }
 
     pub fn guest_memfd_get(&self, gpa: u64) -> Option<(RawFd, u64)> {
@@ -3449,6 +3484,68 @@ mod tests {
         ])
         .unwrap();
         assert!(vm.memory_init(&gm, kvm_context.max_memslots()).is_err());
+    }
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
+    fn test_live_memory_registration_is_transactional() {
+        let kvm = KvmContext::new().unwrap();
+        let mut vm = Vm::new(kvm.fd()).unwrap();
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)])
+            .unwrap()
+            .with_shared_growth();
+        vm.memory_init(&memory, kvm.max_memslots()).unwrap();
+        let device = memory.clone();
+        let region =
+            || Arc::new(GuestRegionMmap::from_range(GuestAddress(0x2000), 0x1000, None).unwrap());
+        // Slot exhaustion must not publish a region or consume a slot.
+        assert!(vm.append_guest_memory(&memory, region(), 1).is_err());
+        assert_eq!(vm.next_mem_slot, 1);
+        assert_eq!(device.num_regions(), 1);
+        // A misaligned GPA reaches KVM, which rejects it; views stay intact.
+        let invalid =
+            Arc::new(GuestRegionMmap::from_range(GuestAddress(0x2001), 0x1000, None).unwrap());
+        assert!(
+            vm.append_guest_memory(&memory, invalid, kvm.max_memslots())
+                .is_err()
+        );
+        assert_eq!(vm.next_mem_slot, 1);
+        assert_eq!(device.num_regions(), 1);
+        vm.append_guest_memory(&memory, region(), kvm.max_memslots())
+            .unwrap();
+        assert_eq!(vm.next_mem_slot, 2);
+        assert_eq!(device.num_regions(), 2);
+        assert!(
+            vm.append_guest_memory(&memory, region(), kvm.max_memslots())
+                .is_err()
+        );
+        assert_eq!(vm.next_mem_slot, 2);
+        assert_eq!(device.num_regions(), 2);
+        #[cfg(target_arch = "x86_64")]
+        {
+            use vm_memory::Bytes;
+
+            // Real-mode guest writes into the newly registered RAM, then
+            // halts. An existing device view must see that same write.
+            memory
+                .write_slice(&[0xc6, 0x06, 0x00, 0x20, 0x5a, 0xf4], GuestAddress(0))
+                .unwrap();
+            let mut cpu = vm.fd().create_vcpu(0).unwrap();
+            let mut sregs = cpu.get_sregs().unwrap();
+            sregs.cs.base = 0;
+            sregs.cs.selector = 0;
+            sregs.ds.base = 0;
+            sregs.ds.selector = 0;
+            cpu.set_sregs(&sregs).unwrap();
+            cpu.set_regs(&kvm_regs {
+                rip: 0,
+                rflags: 2,
+                ..Default::default()
+            })
+            .unwrap();
+            assert!(matches!(cpu.run().unwrap(), VcpuExit::Hlt));
+            assert_eq!(device.read_obj::<u8>(GuestAddress(0x2000)).unwrap(), 0x5a);
+        }
     }
 
     #[cfg(target_arch = "x86_64")]

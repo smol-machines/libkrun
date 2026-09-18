@@ -28,6 +28,8 @@ pub mod gpu;
 #[cfg(feature = "input")]
 pub mod input;
 pub mod linux_errno;
+#[cfg(all(target_os = "linux", not(feature = "tee")))]
+pub mod memory;
 mod mmio;
 #[cfg(feature = "net")]
 pub mod net;
