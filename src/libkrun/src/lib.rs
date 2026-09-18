@@ -2384,6 +2384,31 @@ pub extern "C" fn krun_set_vm_config(ctx_id: u32, num_vcpus: u8, ram_mib: u32) -
     KRUN_SUCCESS
 }
 
+/// Configure live resource growth before boot; existing checkpoints retain
+/// their captured device topology regardless of these fresh-boot settings.
+#[unsafe(no_mangle)]
+pub extern "C" fn krun_set_live_resize(ctx_id: u32, flags: u32) -> i32 {
+    if flags & !3 != 0 {
+        return -libc::EINVAL;
+    }
+    if flags != 0
+        && !cfg!(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            not(feature = "tee")
+        ))
+    {
+        return -libc::ENOTSUP;
+    }
+    let mut contexts = CTX_MAP.lock().unwrap();
+    let Some(context) = contexts.get_mut(&ctx_id) else {
+        return -libc::ENOENT;
+    };
+    context.vmr.live_cpu_growth = flags & 1 != 0;
+    context.vmr.live_memory_growth = flags & 2 != 0;
+    KRUN_SUCCESS
+}
+
 /// Select a stable virtual CPU contract for live migration.
 ///
 /// This is deliberately explicit instead of changing libkrun's host-feature
@@ -5504,6 +5529,45 @@ fn krun_start_enter_nitro(ctx_id: u32) -> i32 {
 
             -libc::EINVAL
         }
+    }
+}
+
+#[cfg(test)]
+mod test_live_resize_config {
+    use super::*;
+
+    #[test]
+    fn live_resize_is_explicit_per_context_and_validated() {
+        let first = krun_create_ctx();
+        let second = krun_create_ctx();
+        assert!(first >= 0 && second >= 0);
+        let (first, second) = (first as u32, second as u32);
+        assert_eq!(krun_set_live_resize(first, 4), -libc::EINVAL);
+        assert_eq!(krun_set_live_resize(u32::MAX, 0), -libc::ENOENT);
+        let supported = cfg!(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            not(feature = "tee")
+        ));
+        assert_eq!(
+            krun_set_live_resize(first, 3),
+            if supported { 0 } else { -libc::ENOTSUP }
+        );
+        {
+            let contexts = CTX_MAP.lock().unwrap();
+            assert_eq!(contexts[&first].vmr.live_cpu_growth, supported);
+            assert_eq!(contexts[&first].vmr.live_memory_growth, supported);
+            assert!(!contexts[&second].vmr.live_cpu_growth);
+            assert!(!contexts[&second].vmr.live_memory_growth);
+        }
+        assert_eq!(krun_set_live_resize(first, 0), 0);
+        {
+            let contexts = CTX_MAP.lock().unwrap();
+            assert!(!contexts[&first].vmr.live_cpu_growth);
+            assert!(!contexts[&first].vmr.live_memory_growth);
+        }
+        assert_eq!(krun_free_ctx(first), 0);
+        assert_eq!(krun_free_ctx(second), 0);
     }
 }
 

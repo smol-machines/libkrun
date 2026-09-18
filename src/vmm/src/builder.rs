@@ -754,8 +754,8 @@ pub fn build_microvm(
     vmm_timing!("memory created");
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
-    let memory_growth = restored_memory_device.is_some()
-        || (!restoring && std::env::var("KRUN_PROTOTYPE_MEMORY_GROWTH").as_deref() == Ok("1"));
+    let memory_growth =
+        restored_memory_device.is_some() || (!restoring && vm_resources.live_memory_growth);
     #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
     let guest_memory = if memory_growth {
         if let Some(state) = &restored_memory_device {
@@ -770,6 +770,11 @@ pub fn build_microvm(
     };
 
     let vcpu_config = vm_resources.vcpu_config();
+    if !restoring && vm_resources.live_cpu_growth && vcpu_config.vcpu_count > 16 {
+        return Err(StartMicrovmError::GuestMemoryMmap(
+            "live CPU growth supports boot configurations of at most 16 CPUs".into(),
+        ));
+    }
     #[cfg(snapshot_supported)]
     if let Some(checkpoint) = &restore_checkpoint {
         if checkpoint.vcpu_states.len() != usize::from(vcpu_config.vcpu_count) {
@@ -802,10 +807,7 @@ pub fn build_microvm(
             nested_enabled: topology.nested_enabled,
             cpu_template: topology.cpu_template,
         })
-    } else if !restoring
-        && vcpu_config.vcpu_count <= 16
-        && std::env::var("KRUN_PROTOTYPE_CPU_GROWTH").as_deref() == Ok("1")
-    {
+    } else if !restoring && vcpu_config.vcpu_count <= 16 && vm_resources.live_cpu_growth {
         let mut topology = vcpu_config.clone();
         topology.vcpu_count = 16;
         Some(topology)
