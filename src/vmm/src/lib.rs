@@ -1973,6 +1973,16 @@ impl Vmm {
 
     /// Pause the microVM.
     pub fn pause(&mut self) -> Result<()> {
+        // Reject before entering Pausing: the generic partial-pause recovery
+        // sends Resume to every CPU, including one still waiting for CPU_ON.
+        #[cfg(target_os = "macos")]
+        if self.mac_cpu_error.is_some()
+            || self.vcpus_handles.iter().any(|handle| !handle.boot_ready())
+        {
+            return Err(Error::VcpuSnapshot(
+                "CPU onlining is incomplete; retry the resize before checkpointing".into(),
+            ));
+        }
         #[cfg(target_os = "linux")]
         self.ensure_ram_mapping_valid()?;
         match self.run_state {
