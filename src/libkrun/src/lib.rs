@@ -1713,7 +1713,7 @@ fn handle_control_stream<S: std::io::Read + std::io::Write + Send + 'static>(
             let _arg = parts.next().map(str::trim).unwrap_or("");
             match verb.as_str() {
                 #[cfg(all(
-                    target_os = "linux",
+                    any(target_os = "linux", target_os = "macos"),
                     any(target_arch = "x86_64", target_arch = "aarch64"),
                     not(feature = "tee")
                 ))]
@@ -1725,7 +1725,7 @@ fn handle_control_stream<S: std::io::Read + std::io::Write + Send + 'static>(
                     Err(_) => "ERR EINVAL expected additional MiB\n".into(),
                 },
                 #[cfg(all(
-                    target_os = "linux",
+                    any(target_os = "linux", target_os = "macos"),
                     any(target_arch = "x86_64", target_arch = "aarch64"),
                     not(feature = "tee")
                 ))]
@@ -1734,7 +1734,7 @@ fn handle_control_stream<S: std::io::Read + std::io::Write + Send + 'static>(
                     Err(error) => format!("ERR EIO {error}\n"),
                 },
                 #[cfg(all(
-                    target_os = "linux",
+                    any(target_os = "linux", target_os = "macos"),
                     any(target_arch = "x86_64", target_arch = "aarch64"),
                     not(feature = "tee")
                 ))]
@@ -2414,7 +2414,7 @@ pub extern "C" fn krun_set_live_resize(ctx_id: u32, flags: u32) -> i32 {
     }
     if flags & 2 != 0
         && !cfg!(all(
-            target_os = "linux",
+            any(target_os = "linux", target_os = "macos"),
             any(target_arch = "x86_64", target_arch = "aarch64"),
             not(feature = "tee")
         ))
@@ -5582,7 +5582,7 @@ mod test_live_resize_config {
             assert!(!contexts[&second].vmr.live_memory_growth);
         }
         let memory_supported = cfg!(all(
-            target_os = "linux",
+            any(target_os = "linux", target_os = "macos"),
             any(target_arch = "x86_64", target_arch = "aarch64"),
             not(feature = "tee")
         ));

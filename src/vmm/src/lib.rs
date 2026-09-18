@@ -25,7 +25,7 @@ pub mod generation_guardian;
 #[cfg(target_os = "linux")]
 pub mod layered_restore;
 #[cfg(all(
-    target_os = "linux",
+    any(target_os = "linux", target_os = "macos"),
     any(target_arch = "x86_64", target_arch = "aarch64"),
     not(feature = "tee")
 ))]
@@ -392,13 +392,13 @@ pub struct Vmm {
     #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
     cpu_growth_progress: cpu_growth::CpuGrowthProgress,
     #[cfg(all(
-        target_os = "linux",
+        any(target_os = "linux", target_os = "macos"),
         any(target_arch = "x86_64", target_arch = "aarch64"),
         not(feature = "tee")
     ))]
     prototype_memory: Option<Arc<Mutex<devices::virtio::memory::MemoryDevice>>>,
     #[cfg(all(
-        target_os = "linux",
+        any(target_os = "linux", target_os = "macos"),
         any(target_arch = "x86_64", target_arch = "aarch64"),
         not(feature = "tee")
     ))]
@@ -614,7 +614,7 @@ impl Vmm {
             ));
         }
         #[cfg(all(
-            target_os = "linux",
+            any(target_os = "linux", target_os = "macos"),
             any(target_arch = "x86_64", target_arch = "aarch64"),
             not(feature = "tee")
         ))]
@@ -686,13 +686,13 @@ impl Vmm {
     #[cfg(snapshot_supported)]
     fn snapshot_memory_growth(&self) -> Option<memory_topology::MemoryGrowthTopology> {
         #[cfg(all(
-            target_os = "linux",
+            any(target_os = "linux", target_os = "macos"),
             any(target_arch = "x86_64", target_arch = "aarch64"),
             not(feature = "tee")
         ))]
         return self.memory_growth_topology.clone();
         #[cfg(not(all(
-            target_os = "linux",
+            any(target_os = "linux", target_os = "macos"),
             any(target_arch = "x86_64", target_arch = "aarch64"),
             not(feature = "tee")
         )))]
@@ -1083,7 +1083,7 @@ impl Vmm {
     #[cfg(snapshot_supported)]
     pub fn save_vcpu_states(&mut self) -> Result<Vec<vstate::VcpuState>> {
         #[cfg(all(
-            target_os = "linux",
+            any(target_os = "linux", target_os = "macos"),
             any(target_arch = "x86_64", target_arch = "aarch64"),
             not(feature = "tee")
         ))]
