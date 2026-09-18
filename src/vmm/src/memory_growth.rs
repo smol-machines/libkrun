@@ -1,5 +1,4 @@
-//! Experimental Linux RAM growth. Guest checkpoint support is intentionally
-//! refused until memory-device state and appended-region restore are wired.
+//! Experimental Linux RAM growth with checkpointed boot layout and device state.
 
 use std::sync::Arc;
 use vm_memory::{FileOffset, GuestAddress, GuestRegionMmap};
@@ -57,5 +56,26 @@ impl Vmm {
             .lock()
             .map_err(|_| "RAM device lock poisoned")?;
         Ok((device.geometry().1, device.plugged_size()))
+    }
+
+    /// Report original boot layout separately from live added RAM, so callers
+    /// can reconcile an interrupted resize without trusting a stale VM record.
+    pub fn prototype_memory_info(&self) -> Result<String, String> {
+        let boot = self
+            .memory_growth_topology
+            .as_ref()
+            .ok_or("RAM hot-add topology is unavailable")?
+            .boot_memory_mib;
+        let device = self
+            .prototype_memory
+            .as_ref()
+            .ok_or("RAM hot-add prototype is not enabled")?
+            .lock()
+            .map_err(|_| "RAM device lock poisoned")?;
+        let (base, mapped, capacity) = device.geometry();
+        let plugged = device.plugged_size();
+        Ok(format!(
+            "OK boot_mib {boot} base {base} mapped {mapped} plugged {plugged} capacity {capacity}\n"
+        ))
     }
 }
