@@ -1287,7 +1287,11 @@ fn handle_fork(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
     format!("OK forked (frozen base, pid {pid}, {} regions)\n", regions)
 }
 
-#[cfg(all(fork_supported, deferred_stream_supported, feature = "blk"))]
+#[cfg(all(
+    fork_supported,
+    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos"),
+    feature = "blk"
+))]
 fn read_fork_block_pivots(dir: &std::path::Path) -> std::io::Result<Vec<(String, String)>> {
     let contents = std::fs::read_to_string(dir.join("block-pivots.tsv"))?;
     let mut pivots = Vec::new();
@@ -1318,7 +1322,11 @@ fn read_fork_block_pivots(dir: &std::path::Path) -> std::io::Result<Vec<(String,
 
 /// Create an immutable RAM + disk generation while the same source VMM
 /// continues on private writable layers.
-#[cfg(all(fork_supported, deferred_stream_supported, feature = "blk"))]
+#[cfg(all(
+    fork_supported,
+    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos"),
+    feature = "blk"
+))]
 fn handle_fork_continue(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
     handle_fork_continue_inner(vmm, dir, false)
 }
@@ -1336,7 +1344,11 @@ fn handle_fork_continue_paged(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
     handle_fork_continue_inner(vmm, dir, true)
 }
 
-#[cfg(all(fork_supported, deferred_stream_supported, feature = "blk"))]
+#[cfg(all(
+    fork_supported,
+    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos"),
+    feature = "blk"
+))]
 fn handle_fork_continue_inner(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str, demand_paged: bool) -> String {
     #[cfg(target_os = "macos")]
     let _ = demand_paged;
@@ -1831,7 +1843,11 @@ fn handle_control_stream<S: std::io::Read + std::io::Write + Send + 'static>(
                 // (SMOLVM_FORKABLE=1).
                 #[cfg(fork_supported)]
                 "FORK" => handle_fork(vmm, _arg),
-                #[cfg(all(fork_supported, deferred_stream_supported, feature = "blk"))]
+                #[cfg(all(
+                    fork_supported,
+                    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos"),
+                    feature = "blk"
+                ))]
                 "FORK_CONTINUE" => handle_fork_continue(vmm, _arg),
                 #[cfg(all(
                     fork_supported,
@@ -1855,7 +1871,10 @@ fn handle_control_stream<S: std::io::Read + std::io::Write + Send + 'static>(
 mod control_command_tests {
     use super::*;
 
-    #[cfg(all(snapshot_supported, deferred_stream_supported))]
+    #[cfg(all(
+        snapshot_supported,
+        any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
+    ))]
     #[test]
     fn disconnected_prepared_reply_recovers_source_once() {
         use std::net::Shutdown;
@@ -1871,7 +1890,10 @@ mod control_command_tests {
         assert_eq!(recoveries, 1);
     }
 
-    #[cfg(all(snapshot_supported, deferred_stream_supported))]
+    #[cfg(all(
+        snapshot_supported,
+        any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
+    ))]
     #[test]
     fn prepared_reply_preserves_success_and_failed_prepare_ownership() {
         use std::net::Shutdown;
