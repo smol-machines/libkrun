@@ -785,7 +785,8 @@ pub fn build_microvm(
         guest_memory
     };
 
-    let vcpu_config = vm_resources.vcpu_config();
+    #[allow(unused_mut)]
+    let mut vcpu_config = vm_resources.vcpu_config();
     if !restoring && vm_resources.live_cpu_growth && vcpu_config.vcpu_count > 16 {
         return Err(StartMicrovmError::GuestMemoryMmap(
             "live CPU growth supports boot configurations of at most 16 CPUs".into(),
@@ -793,6 +794,12 @@ pub fn build_microvm(
     }
     #[cfg(snapshot_supported)]
     if let Some(checkpoint) = &restore_checkpoint {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+        if let Some(topology) = &checkpoint.cpu_growth {
+            vcpu_config.vcpu_count = topology
+                .restored_slot_count(vcpu_config.vcpu_count, checkpoint.vcpu_states.len())
+                .map_err(StartMicrovmError::GuestMemoryMmap)?;
+        }
         if checkpoint.vcpu_states.len() != usize::from(vcpu_config.vcpu_count) {
             return Err(StartMicrovmError::GuestMemoryMmap(format!(
                 "checkpoint has {} CPUs but machine is configured for {}; reconcile resized CPU settings before restore",
