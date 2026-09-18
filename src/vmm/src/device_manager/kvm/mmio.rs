@@ -20,14 +20,14 @@ use kvm_ioctls::{IoEventAddress, VmFd};
 #[cfg(target_arch = "aarch64")]
 use utils::eventfd::EventFd;
 
-#[cfg(all(feature = "blk", target_arch = "x86_64"))]
+#[cfg(all(feature = "blk", fork_continue_supported))]
 pub(crate) struct BlockPivotSpec {
     pub id: String,
     pub path: String,
     pub format: devices::virtio::block::ImageType,
 }
 
-#[cfg(all(feature = "blk", target_arch = "x86_64"))]
+#[cfg(all(feature = "blk", fork_continue_supported))]
 pub(crate) struct BlockPivotsRollback {
     pivots: Vec<(
         Arc<Mutex<dyn devices::virtio::VirtioDevice>>,
@@ -428,7 +428,7 @@ impl MMIODeviceManager {
     ///
     /// Gated like [`Self::pivot_block_devices`]: the live-fork path that remaps
     /// guest RAM is only built for those targets, and it is the only caller.
-    #[cfg(all(feature = "blk", target_arch = "x86_64"))]
+    #[cfg(all(feature = "blk", fork_continue_supported))]
     pub(crate) fn replay_fs_dax_maps(&self) {
         // A confidential-guest build has no virtio-fs device at all, so there is
         // no window to repair.
@@ -446,7 +446,7 @@ impl MMIODeviceManager {
     /// All images are opened and validated before the first device changes.
     /// The returned old backings stay live until the caller either drops the
     /// token after committing the RAM generation or explicitly rolls back.
-    #[cfg(all(feature = "blk", target_arch = "x86_64"))]
+    #[cfg(all(feature = "blk", fork_continue_supported))]
     pub(crate) fn pivot_block_devices(
         &self,
         specs: &[BlockPivotSpec],
@@ -506,7 +506,7 @@ impl MMIODeviceManager {
         Ok(BlockPivotsRollback { pivots: applied })
     }
 
-    #[cfg(all(feature = "blk", target_arch = "x86_64"))]
+    #[cfg(all(feature = "blk", fork_continue_supported))]
     pub(crate) fn rollback_block_pivots(
         &self,
         rollback: BlockPivotsRollback,
