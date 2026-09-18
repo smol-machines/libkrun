@@ -2839,7 +2839,22 @@ impl Vcpu {
         {
             let ret = unsafe { libc::ioctl(self.fd.as_raw_fd(), KVM_KVMCLOCK_CTRL) };
             if ret < 0 {
-                return Err(Error::VcpuKvmClockCtrl(io::Error::last_os_error()));
+                let error = io::Error::last_os_error();
+                // CPU hot-unplug disables the per-CPU pvclock MSR. KVM's
+                // kvm_set_guest_paused then returns EINVAL because there is
+                // no active pvclock page to mark. This is not a clock failure:
+                // the guest registers its clock again when it onlines the CPU.
+                // Do not broadly ignore EINVAL: verify that the enable bit is
+                // actually clear, and fail closed on an unreadable MSR.
+                if error.raw_os_error() == Some(libc::EINVAL) {
+                    let mut msrs = Msrs::new(1).unwrap();
+                    msrs.as_mut_slice()[0].index = 0x4b56_4d01; // MSR_KVM_SYSTEM_TIME_NEW
+                    let read = self.fd.get_msrs(&mut msrs).map_err(Error::VcpuGetMsrs)?;
+                    if read == 1 && msrs.as_slice()[0].data & 1 == 0 {
+                        return Ok(());
+                    }
+                }
+                return Err(Error::VcpuKvmClockCtrl(error));
             }
         }
 
@@ -3388,6 +3403,20 @@ mod tests {
     use std::sync::{Arc, Barrier};
 
     use super::*;
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn resume_cpu_with_disabled_pvclock() {
+        let (_vm, vcpu, _memory) = setup_vcpu(0x10000);
+        // A fresh vCPU has the same disabled clock registration as an
+        // offlined CPU. A nonzero pause must not terminate its thread.
+        assert!(unsafe { libc::ioctl(vcpu.fd.as_raw_fd(), KVM_KVMCLOCK_CTRL) } < 0);
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::EINVAL)
+        );
+        vcpu.adjust_guest_clock_after_pause(1_000_000).unwrap();
+    }
     #[cfg(target_arch = "aarch64")]
     use crate::builder::Payload;
     #[cfg(target_arch = "aarch64")]
