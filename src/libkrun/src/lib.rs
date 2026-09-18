@@ -509,25 +509,16 @@ static CHECKPOINTS: Lazy<Mutex<HashMap<String, StashedCheckpoint>>> =
 /// A durable checkpoint whose CPU/device boundary and immutable RAM generation
 /// have been captured, but whose process-independent memory image is still
 /// being serialized after the source resumes.
-#[cfg(all(
-    snapshot_supported,
-    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
-))]
+#[cfg(all(snapshot_supported, deferred_stream_supported))]
 struct PreparedSave {
     checkpoint: vmm::VmCheckpoint,
     memory: vmm::snapshot::DeferredMemorySave,
 }
 
-#[cfg(all(
-    snapshot_supported,
-    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
-))]
+#[cfg(all(snapshot_supported, deferred_stream_supported))]
 mod prepared_saves;
 
-#[cfg(all(
-    snapshot_supported,
-    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
-))]
+#[cfg(all(snapshot_supported, deferred_stream_supported))]
 static PREPARED_SAVES: prepared_saves::PreparedSaves<PreparedSave> =
     prepared_saves::PreparedSaves::new();
 
@@ -809,10 +800,7 @@ fn handle_save(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
 /// Capture a durable CPU/device/RAM boundary without serializing RAM while the
 /// source is paused. The caller stages disk state, resumes the VM, and then
 /// sends `FINISH_SAVE` to write the retained generation.
-#[cfg(all(
-    snapshot_supported,
-    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
-))]
+#[cfg(all(snapshot_supported, deferred_stream_supported))]
 fn handle_prepare_save(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
     if dir.is_empty() {
         return "ERR EINVAL snapshot dir required\n".to_string();
@@ -846,10 +834,7 @@ fn handle_prepare_save(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
 
 /// Until the paused-state reply is delivered, the caller cannot own cleanup.
 /// A failed prepare does not transfer that ownership in the first place.
-#[cfg(all(
-    snapshot_supported,
-    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
-))]
+#[cfg(all(snapshot_supported, deferred_stream_supported))]
 fn write_prepared_save_reply(
     stream: &mut impl Write,
     response: &str,
@@ -862,10 +847,7 @@ fn write_prepared_save_reply(
     result
 }
 
-#[cfg(all(
-    snapshot_supported,
-    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
-))]
+#[cfg(all(snapshot_supported, deferred_stream_supported))]
 fn handle_finish_save(dir: &str) -> String {
     let dir_path = std::path::Path::new(dir);
     let Some(result) = PREPARED_SAVES.finish(
@@ -895,10 +877,7 @@ fn handle_finish_save(dir: &str) -> String {
     }
 }
 
-#[cfg(all(
-    snapshot_supported,
-    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
-))]
+#[cfg(all(snapshot_supported, deferred_stream_supported))]
 fn handle_finish_save_stream<W: Write>(dir: &str, stream: &mut W) -> String {
     let Some(result) = PREPARED_SAVES.finish(dir, |prepared| {
         prepared
@@ -963,10 +942,7 @@ fn write_checkpoint_stream_header(
     output.write_all(layout)
 }
 
-#[cfg(all(
-    snapshot_supported,
-    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
-))]
+#[cfg(all(snapshot_supported, deferred_stream_supported))]
 fn handle_cancel_save(dir: &str) -> String {
     if PREPARED_SAVES.cancel(dir) {
         let _ = std::fs::remove_dir_all(dir);
@@ -976,10 +952,7 @@ fn handle_cancel_save(dir: &str) -> String {
     }
 }
 
-#[cfg(all(
-    snapshot_supported,
-    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
-))]
+#[cfg(all(snapshot_supported, deferred_stream_supported))]
 fn handle_save_status(dir: &str) -> String {
     if dir.is_empty() {
         return "ERR EINVAL snapshot dir required\n".to_string();
@@ -1314,11 +1287,7 @@ fn handle_fork(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
     format!("OK forked (frozen base, pid {pid}, {} regions)\n", regions)
 }
 
-#[cfg(all(
-    fork_supported,
-    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos"),
-    feature = "blk"
-))]
+#[cfg(all(fork_supported, deferred_stream_supported, feature = "blk"))]
 fn read_fork_block_pivots(dir: &std::path::Path) -> std::io::Result<Vec<(String, String)>> {
     let contents = std::fs::read_to_string(dir.join("block-pivots.tsv"))?;
     let mut pivots = Vec::new();
@@ -1349,11 +1318,7 @@ fn read_fork_block_pivots(dir: &std::path::Path) -> std::io::Result<Vec<(String,
 
 /// Create an immutable RAM + disk generation while the same source VMM
 /// continues on private writable layers.
-#[cfg(all(
-    fork_supported,
-    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos"),
-    feature = "blk"
-))]
+#[cfg(all(fork_supported, deferred_stream_supported, feature = "blk"))]
 fn handle_fork_continue(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
     handle_fork_continue_inner(vmm, dir, false)
 }
@@ -1371,11 +1336,7 @@ fn handle_fork_continue_paged(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
     handle_fork_continue_inner(vmm, dir, true)
 }
 
-#[cfg(all(
-    fork_supported,
-    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos"),
-    feature = "blk"
-))]
+#[cfg(all(fork_supported, deferred_stream_supported, feature = "blk"))]
 fn handle_fork_continue_inner(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str, demand_paged: bool) -> String {
     #[cfg(target_os = "macos")]
     let _ = demand_paged;
@@ -1734,10 +1695,7 @@ fn handle_control_stream<S: std::io::Read + std::io::Write + Send + 'static>(
             // be an unused-variable error under -D warnings.
             let _arg = parts.next().map(str::trim).unwrap_or("");
             match verb.as_str() {
-                #[cfg(all(
-                    snapshot_supported,
-                    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
-                ))]
+                #[cfg(all(snapshot_supported, deferred_stream_supported))]
                 "SAVE_CAPABILITIES" => "OK deferred-stream-v1\n".to_string(),
                 #[cfg(all(snapshot_supported, target_os = "linux", target_arch = "x86_64"))]
                 "SAVE_SPARSE_CAPABILITIES" => "OK sparse-stream-v1 ownership-v1\n".to_string(),
@@ -1804,10 +1762,7 @@ fn handle_control_stream<S: std::io::Read + std::io::Write + Send + 'static>(
                 // leaves the VM paused only for caller-side disk staging.
                 // After RESUME, FINISH_SAVE persists that retained generation;
                 // CANCEL_SAVE releases it after a caller-side failure.
-                #[cfg(all(
-                    snapshot_supported,
-                    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
-                ))]
+                #[cfg(all(snapshot_supported, deferred_stream_supported))]
                 "PREPARE_SAVE" => {
                     let response = handle_prepare_save(vmm, _arg);
                     if let Err(error) = write_prepared_save_reply(&mut stream, &response, || {
@@ -1825,10 +1780,7 @@ fn handle_control_stream<S: std::io::Read + std::io::Write + Send + 'static>(
                     }
                     return;
                 }
-                #[cfg(all(
-                    snapshot_supported,
-                    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
-                ))]
+                #[cfg(all(snapshot_supported, deferred_stream_supported))]
                 "FINISH_SAVE" | "FINISH_SAVE_STREAM" | "FINISH_SAVE_SPARSE" => {
                     // RAM persistence can take seconds for large resident
                     // guests. Keep the control listener available so a resumed
@@ -1868,15 +1820,9 @@ fn handle_control_stream<S: std::io::Read + std::io::Write + Send + 'static>(
                     }
                     return;
                 }
-                #[cfg(all(
-                    snapshot_supported,
-                    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
-                ))]
+                #[cfg(all(snapshot_supported, deferred_stream_supported))]
                 "CANCEL_SAVE" => handle_cancel_save(_arg),
-                #[cfg(all(
-                    snapshot_supported,
-                    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
-                ))]
+                #[cfg(all(snapshot_supported, deferred_stream_supported))]
                 "SAVE_STATUS" => handle_save_status(_arg),
                 // FORK <dir>: capture a fork checkpoint to <dir> (checkpoint.bin +
                 // manifest.bin) and leave this VM FROZEN as the CoW base. A clone
@@ -1885,11 +1831,7 @@ fn handle_control_stream<S: std::io::Read + std::io::Write + Send + 'static>(
                 // (SMOLVM_FORKABLE=1).
                 #[cfg(fork_supported)]
                 "FORK" => handle_fork(vmm, _arg),
-                #[cfg(all(
-                    fork_supported,
-                    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos"),
-                    feature = "blk"
-                ))]
+                #[cfg(all(fork_supported, deferred_stream_supported, feature = "blk"))]
                 "FORK_CONTINUE" => handle_fork_continue(vmm, _arg),
                 #[cfg(all(
                     fork_supported,
@@ -1913,10 +1855,7 @@ fn handle_control_stream<S: std::io::Read + std::io::Write + Send + 'static>(
 mod control_command_tests {
     use super::*;
 
-    #[cfg(all(
-        snapshot_supported,
-        any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
-    ))]
+    #[cfg(all(snapshot_supported, deferred_stream_supported))]
     #[test]
     fn disconnected_prepared_reply_recovers_source_once() {
         use std::net::Shutdown;
@@ -1932,10 +1871,7 @@ mod control_command_tests {
         assert_eq!(recoveries, 1);
     }
 
-    #[cfg(all(
-        snapshot_supported,
-        any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
-    ))]
+    #[cfg(all(snapshot_supported, deferred_stream_supported))]
     #[test]
     fn prepared_reply_preserves_success_and_failed_prepare_ownership() {
         use std::net::Shutdown;

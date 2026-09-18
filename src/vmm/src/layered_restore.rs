@@ -486,7 +486,6 @@ impl Generation {
 
     /// Borrow the complete logical image in portable region order. The
     /// generation owns all immutable files until streaming has finished.
-    #[cfg(target_arch = "x86_64")]
     pub(crate) fn memory_sources(&self) -> Vec<(&File, u64, u64)> {
         self.regions
             .iter()

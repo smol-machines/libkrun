@@ -52,10 +52,7 @@ use windows::vstate;
 
 use std::fmt::{Display, Formatter};
 use std::io;
-#[cfg(all(
-    feature = "blk",
-    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
-))]
+#[cfg(all(feature = "blk", deferred_stream_supported))]
 use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
@@ -367,10 +364,7 @@ pub struct Vmm {
 }
 
 /// RAM ownership returned by a fork-and-continue capture.
-#[cfg(all(
-    feature = "blk",
-    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
-))]
+#[cfg(all(feature = "blk", deferred_stream_supported))]
 pub enum ForkContinueRamGeneration {
     /// A directly CoW-mappable immutable RAM generation.
     Mapped(Vec<snapshot::MemfdRegionDesc>),
@@ -388,10 +382,7 @@ pub enum ForkMemory {
     Layered(layered_restore::Generation),
 }
 
-#[cfg(all(
-    feature = "blk",
-    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
-))]
+#[cfg(all(feature = "blk", deferred_stream_supported))]
 fn publish_generation_commit_marker(path: &std::path::Path) -> io::Result<()> {
     if path.exists() {
         return Err(io::Error::new(
@@ -1019,10 +1010,7 @@ impl Vmm {
     /// generation, leaving the VM paused only so the caller can snapshot its
     /// disks at the same boundary. Durable RAM serialization is deferred until
     /// after the caller resumes the source.
-    #[cfg(all(
-        snapshot_supported,
-        any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
-    ))]
+    #[cfg(all(snapshot_supported, deferred_stream_supported))]
     pub fn checkpoint_frozen_deferred_sparse(
         &mut self,
         generation_dir: &std::path::Path,
