@@ -24,6 +24,7 @@ use hvf::{HvfVcpu, HvfVm, VcpuExit, Vcpus};
 use utils::eventfd::EventFd;
 use vm_memory::{
     Address, GuestAddress, GuestMemory, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion,
+    GuestRegionCollectionError, GuestRegionMmap,
 };
 
 /// Errors associated with the wrappers over KVM ioctls.
@@ -31,6 +32,7 @@ use vm_memory::{
 pub enum Error {
     /// Invalid guest memory configuration.
     GuestMemoryMmap(GuestMemoryError),
+    SharedMemoryGrowth(GuestRegionCollectionError),
     /// The number of configured slots is bigger than the maximum reported by KVM.
     NotEnoughMemorySlots,
     /// Error configuring the general purpose aarch64 registers.
@@ -69,6 +71,7 @@ impl Display for Error {
 
         match self {
             GuestMemoryMmap(e) => write!(f, "Guest memory error: {e:?}"),
+            SharedMemoryGrowth(e) => write!(f, "Guest memory growth error: {e:?}"),
             VcpuCountNotInitialized => write!(f, "vCPU count is not initialized"),
             VmSetup(e) => write!(f, "Cannot configure the microvm: {e:?}"),
             VcpuRun => write!(f, "Cannot run the VCPUs"),
@@ -95,6 +98,12 @@ impl Display for Error {
 }
 
 pub type Result<T> = result::Result<T, Error>;
+
+impl From<GuestRegionCollectionError> for Error {
+    fn from(error: GuestRegionCollectionError) -> Self {
+        Self::SharedMemoryGrowth(error)
+    }
+}
 
 /// A wrapper around creating and using a VM.
 pub struct Vm {
@@ -181,6 +190,25 @@ impl Vm {
         }
 
         Ok(())
+    }
+
+    /// Register added RAM before publishing it to every device's shared view.
+    /// The caller serializes topology changes and notifies the guest only after
+    /// success; the shared map retains ownership for the HVF mapping's lifetime.
+    pub fn append_guest_memory(
+        &mut self,
+        guest_mem: &GuestMemoryMmap,
+        region: Arc<GuestRegionMmap>,
+    ) -> Result<()> {
+        guest_mem.append_shared_region_with(region, |region| {
+            self.hvf_vm
+                .map_memory(
+                    region.as_ptr() as u64,
+                    region.start_addr().raw_value(),
+                    region.len(),
+                )
+                .map_err(Error::SetUserMemoryRegion)
+        })
     }
 
     pub fn add_mapping(
@@ -867,7 +895,7 @@ mod tests {
     use super::*;
     use arch::aarch64::layout::DRAM_MEM_START_EFI;
     use devices::legacy::VcpuList;
-    use vm_memory::{GuestAddress, GuestMemoryMmap};
+    use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
     // Auxiliary function being used throughout the tests.
     // Does NOT create a real HVF VM — Vcpu::new_aarch64 and most vcpu methods
@@ -898,7 +926,37 @@ mod tests {
             0x20_0000, // 2 MB
         )])
         .unwrap();
+        let gm = gm.with_shared_growth();
+        let device_view = gm.clone();
         vm.memory_init(&gm).expect("memory_init failed");
+        let added = Arc::new(
+            GuestRegionMmap::from_range(
+                GuestAddress(DRAM_MEM_START_EFI + 0x40_0000),
+                0x20_0000,
+                None,
+            )
+            .unwrap(),
+        );
+        vm.append_guest_memory(&gm, added.clone()).unwrap();
+        let address = added.start_addr();
+        gm.write_slice(b"grown", address).unwrap();
+        let mut bytes = [0; 5];
+        device_view.read_slice(&mut bytes, address).unwrap();
+        assert_eq!(&bytes, b"grown");
+        assert_eq!(device_view.num_regions(), 2);
+        assert!(vm.append_guest_memory(&gm, added).is_err());
+        // HVF must reject the unaligned GPA without publishing a device view
+        // of memory the guest cannot access.
+        let invalid = Arc::new(
+            GuestRegionMmap::from_range(
+                GuestAddress(DRAM_MEM_START_EFI + 0x80_0001),
+                0x20_0000,
+                None,
+            )
+            .unwrap(),
+        );
+        assert!(vm.append_guest_memory(&gm, invalid).is_err());
+        assert_eq!(device_view.num_regions(), 2);
     }
 
     #[test]

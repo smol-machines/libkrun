@@ -1,9 +1,11 @@
-//! Experimental Linux RAM growth with checkpointed boot layout and device state.
+//! RAM growth with checkpointed boot layout and device state.
 
 use std::sync::Arc;
 use vm_memory::{FileOffset, GuestAddress, GuestRegionMmap};
 
-use crate::{Vmm, VmmRunState, builder, vstate};
+#[cfg(target_os = "linux")]
+use crate::vstate;
+use crate::{Vmm, VmmRunState, builder};
 
 impl Vmm {
     /// Grow the hot-add area (MiB in addition to initial boot RAM).
@@ -28,6 +30,7 @@ impl Vmm {
         if target != mapped {
             let size =
                 usize::try_from(target - mapped).map_err(|_| "RAM size exceeds host range")?;
+            #[cfg(target_os = "linux")]
             let (next_generation, region) = if let Some(generation) = &self.layered_ram {
                 let (next, region) = generation
                     .with_zero_region(base + mapped, size)
@@ -45,14 +48,30 @@ impl Vmm {
                 );
                 (None, region)
             };
-            let context =
-                vstate::KvmContext::new().map_err(|e| format!("KVM capability check: {e}"))?;
-            self.vm
-                .append_guest_memory(&self.guest_memory, region, context.max_memslots())
-                .map_err(|e| format!("register added RAM: {e}"))?;
-            if let Some(generation) = next_generation {
-                self.layered_ram = Some(generation);
+            #[cfg(target_os = "macos")]
+            let region = Arc::new(
+                GuestRegionMmap::from_range(
+                    GuestAddress(base + mapped),
+                    size,
+                    Some(FileOffset::new(builder::create_guest_ram_memfd(size)?, 0)),
+                )
+                .map_err(|error| format!("map added RAM: {error}"))?,
+            );
+            #[cfg(target_os = "linux")]
+            {
+                let context =
+                    vstate::KvmContext::new().map_err(|e| format!("KVM capability check: {e}"))?;
+                self.vm
+                    .append_guest_memory(&self.guest_memory, region, context.max_memslots())
+                    .map_err(|e| format!("register added RAM: {e}"))?;
+                if let Some(generation) = next_generation {
+                    self.layered_ram = Some(generation);
+                }
             }
+            #[cfg(target_os = "macos")]
+            self.vm
+                .append_guest_memory(&self.guest_memory, region)
+                .map_err(|error| format!("register added RAM: {error}"))?;
         }
         // Geometry commits before notification; a notification failure can be
         // retried without registering overlapping slots or forgetting backing.

@@ -719,7 +719,7 @@ pub fn build_microvm(
     #[cfg(all(
         snapshot_supported,
         not(all(
-            target_os = "linux",
+            any(target_os = "linux", target_os = "macos"),
             any(target_arch = "x86_64", target_arch = "aarch64"),
             not(feature = "tee")
         ))
@@ -733,7 +733,7 @@ pub fn build_microvm(
         ));
     }
     #[cfg(all(
-        target_os = "linux",
+        any(target_os = "linux", target_os = "macos"),
         any(target_arch = "x86_64", target_arch = "aarch64"),
         not(feature = "tee")
     ))]
@@ -769,14 +769,14 @@ pub fn build_microvm(
     vmm_timing!("memory created");
 
     #[cfg(all(
-        target_os = "linux",
+        any(target_os = "linux", target_os = "macos"),
         any(target_arch = "x86_64", target_arch = "aarch64"),
         not(feature = "tee")
     ))]
     let memory_growth =
         restored_memory_device.is_some() || (!restoring && vm_resources.live_memory_growth);
     #[cfg(all(
-        target_os = "linux",
+        any(target_os = "linux", target_os = "macos"),
         any(target_arch = "x86_64", target_arch = "aarch64"),
         not(feature = "tee")
     ))]
@@ -1321,13 +1321,13 @@ pub fn build_microvm(
         #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
         cpu_growth_progress: Default::default(),
         #[cfg(all(
-            target_os = "linux",
+            any(target_os = "linux", target_os = "macos"),
             any(target_arch = "x86_64", target_arch = "aarch64"),
             not(feature = "tee")
         ))]
         prototype_memory: None,
         #[cfg(all(
-            target_os = "linux",
+            any(target_os = "linux", target_os = "macos"),
             any(target_arch = "x86_64", target_arch = "aarch64"),
             not(feature = "tee")
         ))]
@@ -1368,7 +1368,7 @@ pub fn build_microvm(
     attach_balloon_device(&mut vmm, event_manager, intc.clone())?;
 
     #[cfg(all(
-        target_os = "linux",
+        any(target_os = "linux", target_os = "macos"),
         any(target_arch = "x86_64", target_arch = "aarch64"),
         not(feature = "tee")
     ))]
