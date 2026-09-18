@@ -458,6 +458,8 @@ mod tests {
 
     fn default_vm_resources() -> VmResources {
         VmResources {
+            live_cpu_growth: false,
+            live_memory_growth: false,
             vm_config: VmConfig::default(),
             firmware_config: None,
             kernel_cmdline: default_kernel_cmdline(),
