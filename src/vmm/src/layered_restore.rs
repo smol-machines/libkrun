@@ -47,6 +47,53 @@ pub struct Generation {
 }
 
 impl Generation {
+    /// Prepare hot-added RAM without changing this generation or existing views.
+    /// The caller publishes the returned generation only after KVM accepts the
+    /// new region. Private writes can then be captured exactly like restored RAM.
+    #[cfg(any(test, all(target_arch = "x86_64", not(feature = "tee"))))]
+    pub(crate) fn with_zero_region(
+        &self,
+        gpa: u64,
+        len: usize,
+    ) -> io::Result<(Self, Arc<GuestRegionMmap>)> {
+        let end = gpa
+            .checked_add(len as u64)
+            .ok_or_else(|| invalid("RAM address overflow"))?;
+        if self.regions.len() >= 256
+            || len == 0
+            || !len.is_multiple_of(host_page_size())
+            || !gpa.is_multiple_of(host_page_size() as u64)
+            || self
+                .regions
+                .iter()
+                .any(|region| gpa < region.gpa + region.len as u64 && end > region.gpa)
+        {
+            return Err(invalid("invalid or overlapping added RAM region"));
+        }
+        let file = crate::builder::create_guest_ram_memfd(len).map_err(io::Error::other)?;
+        let seals =
+            libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, seals) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let added = Self::from_immutable_file(
+            &[crate::snapshot::MemoryRegionDesc {
+                gpa,
+                len: len as u64,
+            }],
+            &file,
+        )?;
+        let memory = added.restore()?;
+        let (_, region) = memory
+            .remove_region(GuestAddress(gpa), len as u64)
+            .map_err(|error| io::Error::other(format!("select added RAM: {error:?}")))?;
+        let mut next = self.clone();
+        next.regions.extend(added.regions);
+        next.regions.sort_by_key(|region| region.gpa);
+        next.check_limits()?;
+        Ok((next, region))
+    }
+
     pub fn publish_manifest(
         &self,
         socket: &std::path::Path,
@@ -1342,6 +1389,82 @@ fn multi_region_import_capture_export_and_rebase() {
             .unwrap(),
         0x91
     );
+}
+
+#[test]
+fn grown_layered_ram_captures_private_writes_and_keeps_siblings_independent() {
+    let page = host_page_size();
+    let file = crate::builder::create_guest_ram_memfd(page).unwrap();
+    file.write_all_at(&vec![0x11; page], 0).unwrap();
+    let base = Generation::from_immutable_file(
+        &[crate::snapshot::MemoryRegionDesc {
+            gpa: 0,
+            len: page as u64,
+        }],
+        &file,
+    )
+    .unwrap();
+    let memory = base.restore().unwrap().with_shared_growth();
+    let added_gpa = 1 << 32;
+    let (grown, added) = base.with_zero_region(added_gpa, 2 * page).unwrap();
+    memory
+        .append_shared_region_with(
+            added,
+            |_| Ok::<_, vm_memory::GuestRegionCollectionError>(()),
+        )
+        .unwrap();
+    assert_eq!(memory.read_obj::<u8>(GuestAddress(added_gpa)).unwrap(), 0);
+    // The old metadata reproduces the pre-integration failure deterministically.
+    assert!(base.capture_quiesced(&memory).is_err());
+    memory
+        .write_slice(&vec![0x72; page], GuestAddress(added_gpa))
+        .unwrap();
+    memory
+        .write_slice(&vec![0x33; page], GuestAddress(0))
+        .unwrap();
+    let (captured, copied) = grown.capture_quiesced(&memory).unwrap();
+    assert_eq!(copied, 2 * page);
+    captured.rebase_quiesced(&memory).unwrap();
+    let child = captured.restore().unwrap();
+    memory
+        .write_slice(&vec![0x49; page], GuestAddress(added_gpa))
+        .unwrap();
+    child
+        .write_slice(&vec![0x56; page], GuestAddress(added_gpa + page as u64))
+        .unwrap();
+    let (parent_next, _) = captured.capture_quiesced(&memory).unwrap();
+    let (child_next, _) = captured.capture_quiesced(&child).unwrap();
+    drop(memory);
+    drop(child);
+    drop(captured);
+    let parent = parent_next.restore().unwrap();
+    let child = child_next.restore().unwrap();
+    assert_eq!(
+        parent.read_obj::<u8>(GuestAddress(added_gpa)).unwrap(),
+        0x49
+    );
+    assert_eq!(
+        parent
+            .read_obj::<u8>(GuestAddress(added_gpa + page as u64))
+            .unwrap(),
+        0
+    );
+    assert_eq!(child.read_obj::<u8>(GuestAddress(added_gpa)).unwrap(), 0x72);
+    assert_eq!(
+        child
+            .read_obj::<u8>(GuestAddress(added_gpa + page as u64))
+            .unwrap(),
+        0x56
+    );
+    assert_eq!(
+        base.restore()
+            .unwrap()
+            .read_obj::<u8>(GuestAddress(0))
+            .unwrap(),
+        0x11
+    );
+    assert!(grown.with_zero_region(added_gpa, page).is_err());
+    assert!(grown.with_zero_region(1, page).is_err());
 }
 
 #[test]
