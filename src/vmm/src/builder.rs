@@ -2854,7 +2854,7 @@ fn create_vcpus_aarch64(
     nested_enabled: bool,
 ) -> super::Result<Vec<Vcpu>> {
     let mut vcpus = Vec::with_capacity(vcpu_config.vcpu_count as usize);
-    let mut boot_senders: HashMap<u64, Sender<u64>> = HashMap::new();
+    let mut boot_senders: HashMap<u64, Sender<crate::vstate::CpuBootRequest>> = HashMap::new();
 
     for cpu_index in 0..vcpu_config.vcpu_count {
         let (boot_sender, boot_receiver) = if cpu_index != 0 {
@@ -2883,7 +2883,11 @@ fn create_vcpus_aarch64(
         vcpus.push(vcpu);
     }
 
-    vcpus[0].set_boot_senders(boot_senders);
+    // Hot-onlining may execute PSCI CPU_ON on any already-online CPU, not
+    // necessarily the boot CPU that started the initial SMP bring-up.
+    for vcpu in &mut vcpus {
+        vcpu.set_boot_senders(boot_senders.clone());
+    }
 
     Ok(vcpus)
 }

@@ -256,12 +256,19 @@ pub struct VcpuConfig {
 // Using this for easier explicit type-casting to help IDEs interpret the code.
 type VcpuCell = Cell<Option<*const Vcpu>>;
 
+/// PSCI CPU_ON supplies both the entry PC and the secondary CPU's x0 value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CpuBootRequest {
+    pub entry: u64,
+    pub context_id: u64,
+}
+
 /// A wrapper around creating and using a kvm-based VCPU.
 pub struct Vcpu {
     id: u8,
     boot_entry_addr: u64,
-    boot_receiver: Option<Receiver<u64>>,
-    boot_senders: Option<HashMap<u64, Sender<u64>>>,
+    boot_receiver: Option<Receiver<CpuBootRequest>>,
+    boot_senders: Option<HashMap<u64, Sender<CpuBootRequest>>>,
     fdt_addr: u64,
     mmio_bus: Option<devices::Bus>,
     #[cfg_attr(all(test, target_arch = "aarch64"), allow(unused))]
@@ -357,7 +364,7 @@ impl Vcpu {
     pub fn new_aarch64(
         id: u8,
         boot_entry_addr: GuestAddress,
-        boot_receiver: Option<Receiver<u64>>,
+        boot_receiver: Option<Receiver<CpuBootRequest>>,
         exit_evt: EventFd,
         vcpu_list: Arc<VcpuList>,
         nested_enabled: bool,
@@ -405,8 +412,15 @@ impl Vcpu {
         self.mmio_bus = Some(mmio_bus);
     }
 
-    pub fn set_boot_senders(&mut self, boot_senders: HashMap<u64, Sender<u64>>) {
+    pub fn set_boot_senders(&mut self, boot_senders: HashMap<u64, Sender<CpuBootRequest>>) {
         self.boot_senders = Some(boot_senders);
+    }
+
+    fn deliver_cpu_on(&self, mpidr: u64, request: CpuBootRequest) -> bool {
+        self.boot_senders
+            .as_ref()
+            .and_then(|senders| senders.get(&mpidr))
+            .is_some_and(|sender| sender.send(request).is_ok())
     }
 
     /// Configures an aarch64 specific vcpu.
@@ -467,12 +481,8 @@ impl Vcpu {
                 }
                 VcpuExit::CpuOn(mpidr, entry, context_id) => {
                     debug!("CpuOn: mpidr=0x{mpidr:x} entry=0x{entry:x} context_id={context_id}");
-                    if let Some(boot_senders) = &self.boot_senders {
-                        if let Some(sender) = boot_senders.get(&mpidr) {
-                            sender.send(entry).unwrap()
-                        }
-                    } else {
-                        error!("CpuOn request coming from an unexpected vCPU={}", self.id);
+                    if !self.deliver_cpu_on(mpidr, CpuBootRequest { entry, context_id }) {
+                        error!("CpuOn target {mpidr:#x} unavailable from vCPU={}", self.id);
                     }
                     Ok(VcpuEmulation::Handled)
                 }
@@ -549,13 +559,16 @@ impl Vcpu {
         // register state — so do NOT block on `boot_receiver` (no `CpuOn` will be
         // sent here, and the orchestrator drives restore over the event channel).
         // set_initial_state's entry_addr is overwritten by the restore anyway.
-        let entry_addr = match &self.boot_receiver {
+        let boot = match &self.boot_receiver {
             Some(boot_receiver) if !self.start_paused => boot_receiver.recv().unwrap(),
-            _ => self.boot_entry_addr,
+            _ => CpuBootRequest {
+                entry: self.boot_entry_addr,
+                context_id: self.fdt_addr,
+            },
         };
 
         hvf_vcpu
-            .set_initial_state(entry_addr, self.fdt_addr)
+            .set_initial_state(boot.entry, boot.context_id)
             .unwrap_or_else(|_| panic!("Can't set HVF vCPU {hvf_vcpuid} initial state"));
 
         // Restore-into-a-clone: hold here in the paused event loop (handling the
@@ -914,6 +927,23 @@ mod tests {
         assert!(vcpu.mmio_bus.is_none());
         vcpu.set_mmio_bus(devices::Bus::new());
         assert!(vcpu.mmio_bus.is_some());
+    }
+
+    #[test]
+    fn secondary_can_forward_cpu_on_with_context() {
+        let (mut vcpu, _) = setup_vcpu(0x1000);
+        assert_eq!(vcpu.id, 1);
+        let (sender, receiver) = unbounded();
+        vcpu.set_boot_senders(HashMap::from([(2, sender)]));
+        let request = CpuBootRequest {
+            entry: 0x8000,
+            context_id: 0x1234,
+        };
+        assert!(vcpu.deliver_cpu_on(2, request));
+        assert_eq!(receiver.try_recv().unwrap(), request);
+        assert!(!vcpu.deliver_cpu_on(3, request));
+        drop(receiver);
+        assert!(!vcpu.deliver_cpu_on(2, request));
     }
 
     #[test]
