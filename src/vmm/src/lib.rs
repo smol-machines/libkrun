@@ -481,6 +481,8 @@ fn paused_vm_with_failed_ram_mapping_cannot_capture_or_rearm() {
     .unwrap();
     let mut mmio_base = arch::MMIO_MEM_START;
     let mut vmm = Vmm {
+        prototype_cpu_topology: None,
+        cpu_growth_progress: cpu_growth::CpuGrowthProgress::default(),
         demand_pager: None,
         layered_ram: None,
         layered_device_regions: Vec::new(),
