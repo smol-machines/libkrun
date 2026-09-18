@@ -11,6 +11,7 @@ use std::fmt::{Display, Formatter};
 use std::io;
 use std::result;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -294,6 +295,7 @@ pub struct Vcpu {
     /// register state before the guest executes (the KVM analogue is starting
     /// the vCPU in its paused state machine).
     start_paused: bool,
+    boot_ready: Arc<AtomicBool>,
 }
 
 impl Vcpu {
@@ -388,6 +390,7 @@ impl Vcpu {
             vcpu_list,
             nested_enabled,
             start_paused: false,
+            boot_ready: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -441,6 +444,7 @@ impl Vcpu {
         let response_receiver = self.response_receiver.take().unwrap();
         let (init_tls_sender, init_tls_receiver) = unbounded();
         let vcpu_list = self.vcpu_list.clone();
+        let boot_ready = self.boot_ready.clone();
 
         let vcpu_thread = thread::Builder::new()
             .name(format!("fc_vcpu {}", self.cpu_index()))
@@ -462,6 +466,7 @@ impl Vcpu {
             hvf_vcpuid,
             vcpu_list,
             vcpu_thread,
+            boot_ready,
         ))
     }
 
@@ -570,6 +575,7 @@ impl Vcpu {
         hvf_vcpu
             .set_initial_state(boot.entry, boot.context_id)
             .unwrap_or_else(|_| panic!("Can't set HVF vCPU {hvf_vcpuid} initial state"));
+        self.boot_ready.store(true, Ordering::Release);
 
         // Restore-into-a-clone: hold here in the paused event loop (handling the
         // orchestrator's RestoreState) until a Resume arrives, so the saved
@@ -846,6 +852,7 @@ pub enum VcpuResponse {
 
 /// Wrapper over Vcpu that hides the underlying interactions with the Vcpu thread.
 pub struct VcpuHandle {
+    boot_ready: Arc<AtomicBool>,
     event_sender: Sender<VcpuEvent>,
     response_receiver: Receiver<VcpuResponse>,
     hvf_vcpuid: u64,
@@ -863,8 +870,10 @@ impl VcpuHandle {
         hvf_vcpuid: u64,
         vcpu_list: Arc<VcpuList>,
         vcpu_thread: thread::JoinHandle<()>,
+        boot_ready: Arc<AtomicBool>,
     ) -> Self {
         Self {
+            boot_ready,
             event_sender,
             response_receiver,
             hvf_vcpuid,
@@ -881,6 +890,10 @@ impl VcpuHandle {
         hvf::vcpu_request_exit(self.hvf_vcpuid).map_err(Error::VcpuRequestExit)?;
         self.vcpu_list.wake(self.hvf_vcpuid);
         Ok(())
+    }
+
+    pub fn boot_ready(&self) -> bool {
+        self.boot_ready.load(Ordering::Acquire)
     }
 
     pub fn response_receiver(&self) -> &Receiver<VcpuResponse> {
