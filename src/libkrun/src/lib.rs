@@ -1726,6 +1726,11 @@ fn handle_control_stream<S: std::io::Read + std::io::Write + Send + 'static>(
                     Err(error) => format!("ERR EIO {error}\n"),
                 },
                 #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+                "PROTOTYPE_MEMORY_INFO" => match vmm.lock().unwrap().prototype_memory_info() {
+                    Ok(info) => info,
+                    Err(error) => format!("ERR EIO {error}\n"),
+                },
+                #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
                 "PROTOTYPE_CPU_STATUS" => match vmm.lock().unwrap().prototype_cpu_status() {
                     Ok((created, capacity)) => {
                         format!("OK created {created} capacity {capacity}\n")
