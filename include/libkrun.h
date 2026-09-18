@@ -82,7 +82,8 @@ int32_t krun_set_vm_config(uint32_t ctx_id, uint8_t num_vcpus, uint32_t ram_mib)
 #define KRUN_LIVE_RESIZE_CPU    (1U << 0)
 #define KRUN_LIVE_RESIZE_MEMORY (1U << 1)
 /* Configure fresh-boot CPU/RAM growth; zero disables both (the default).
- * Supported on non-TEE Linux x86_64 with a hotplug-capable guest kernel.
+ * CPU and RAM growth support non-TEE Linux x86_64 and macOS aarch64;
+ * Linux aarch64 supports RAM growth. Requires a hotplug-capable guest kernel.
  * CPU growth reserves topology for up to 16 CPUs; memory growth uses virtio-mem.
  * Restores preserve captured topology, not these fresh-boot settings.
  * Unknown bits return -EINVAL; unsupported nonzero flags return -ENOTSUP.
