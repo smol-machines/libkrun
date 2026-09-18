@@ -28,20 +28,31 @@ impl Vmm {
         if target != mapped {
             let size =
                 usize::try_from(target - mapped).map_err(|_| "RAM size exceeds host range")?;
-            let backing = builder::create_guest_ram_memfd(size)?;
-            let region = Arc::new(
-                GuestRegionMmap::from_range(
-                    GuestAddress(base + mapped),
-                    size,
-                    Some(FileOffset::new(backing, 0)),
-                )
-                .map_err(|e| format!("map added RAM: {e}"))?,
-            );
+            let (next_generation, region) = if let Some(generation) = &self.layered_ram {
+                let (next, region) = generation
+                    .with_zero_region(base + mapped, size)
+                    .map_err(|error| format!("prepare added RAM generation: {error}"))?;
+                (Some(next), region)
+            } else {
+                let backing = builder::create_guest_ram_memfd(size)?;
+                let region = Arc::new(
+                    GuestRegionMmap::from_range(
+                        GuestAddress(base + mapped),
+                        size,
+                        Some(FileOffset::new(backing, 0)),
+                    )
+                    .map_err(|e| format!("map added RAM: {e}"))?,
+                );
+                (None, region)
+            };
             let context =
                 vstate::KvmContext::new().map_err(|e| format!("KVM capability check: {e}"))?;
             self.vm
                 .append_guest_memory(&self.guest_memory, region, context.max_memslots())
                 .map_err(|e| format!("register added RAM: {e}"))?;
+            if let Some(generation) = next_generation {
+                self.layered_ram = Some(generation);
+            }
         }
         // Geometry commits before notification; a notification failure can be
         // retried without registering overlapping slots or forgetting backing.
