@@ -50,7 +50,13 @@ impl Generation {
     /// Prepare hot-added RAM without changing this generation or existing views.
     /// The caller publishes the returned generation only after KVM accepts the
     /// new region. Private writes can then be captured exactly like restored RAM.
-    #[cfg(any(test, all(target_arch = "x86_64", not(feature = "tee"))))]
+    #[cfg(any(
+        test,
+        all(
+            any(target_arch = "x86_64", target_arch = "aarch64"),
+            not(feature = "tee")
+        )
+    ))]
     pub(crate) fn with_zero_region(
         &self,
         gpa: u64,
