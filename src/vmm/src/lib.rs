@@ -24,7 +24,11 @@ pub(crate) mod device_manager;
 pub mod generation_guardian;
 #[cfg(target_os = "linux")]
 pub mod layered_restore;
-#[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    not(feature = "tee")
+))]
 mod memory_growth;
 /// Boot RAM geometry retained independently from added memory.
 pub mod memory_topology;
@@ -387,9 +391,17 @@ pub struct Vmm {
     prototype_cpu_topology: Option<vstate::VcpuConfig>,
     #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
     cpu_growth_progress: cpu_growth::CpuGrowthProgress,
-    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        not(feature = "tee")
+    ))]
     prototype_memory: Option<Arc<Mutex<devices::virtio::memory::MemoryDevice>>>,
-    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        not(feature = "tee")
+    ))]
     memory_growth_topology: Option<memory_topology::MemoryGrowthTopology>,
     run_state: VmmRunState,
     paused_at: Option<Instant>,
@@ -601,7 +613,11 @@ impl Vmm {
                 "checkpoint boot RAM topology differs; restore into a new machine".into(),
             ));
         }
-        #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64"),
+            not(feature = "tee")
+        ))]
         if let Some(device) = &self.prototype_memory {
             let states: Vec<_> = checkpoint
                 .devices
@@ -669,9 +685,17 @@ impl Vmm {
 
     #[cfg(snapshot_supported)]
     fn snapshot_memory_growth(&self) -> Option<memory_topology::MemoryGrowthTopology> {
-        #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64"),
+            not(feature = "tee")
+        ))]
         return self.memory_growth_topology.clone();
-        #[cfg(not(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee"))))]
+        #[cfg(not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64"),
+            not(feature = "tee")
+        )))]
         None
     }
     /// Experimental Linux/x86 CPU creation; guest onlining is separate.
@@ -1058,7 +1082,11 @@ impl Vmm {
     /// in vCPU-index order.
     #[cfg(snapshot_supported)]
     pub fn save_vcpu_states(&mut self) -> Result<Vec<vstate::VcpuState>> {
-        #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64"),
+            not(feature = "tee")
+        ))]
         if let Some(device) = &self.prototype_memory {
             let state = device
                 .lock()
