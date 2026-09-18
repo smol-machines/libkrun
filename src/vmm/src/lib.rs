@@ -52,7 +52,12 @@ use windows::vstate;
 
 use std::fmt::{Display, Formatter};
 use std::io;
-#[cfg(all(feature = "blk", deferred_stream_supported))]
+// Named only by the fork-continue generation writer, which lives on
+// linux-x86_64 and macOS.
+#[cfg(all(
+    feature = "blk",
+    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
+))]
 use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
@@ -382,7 +387,13 @@ pub enum ForkMemory {
     Layered(layered_restore::Generation),
 }
 
-#[cfg(all(feature = "blk", deferred_stream_supported))]
+// Only fork-continue publishes this marker, and that exists on linux-x86_64
+// and macOS; deferring RAM to a stream (which aarch64 Linux now does) has no
+// generation directory to commit.
+#[cfg(all(
+    feature = "blk",
+    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
+))]
 fn publish_generation_commit_marker(path: &std::path::Path) -> io::Result<()> {
     if path.exists() {
         return Err(io::Error::new(
