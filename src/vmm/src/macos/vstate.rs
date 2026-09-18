@@ -244,7 +244,7 @@ impl Vm {
 }
 
 /// Encapsulates configuration parameters for the guest vCPUS.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq, Clone)]
 pub struct VcpuConfig {
     /// Number of guest VCPUs.
     pub vcpu_count: u8,
