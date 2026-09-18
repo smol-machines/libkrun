@@ -390,6 +390,12 @@ pub struct Vmm {
     kernel_cmdline: KernelCmdline,
 
     vcpus_handles: Vec<VcpuHandle>,
+    #[cfg(target_os = "macos")]
+    mac_cpu_topology: Option<cpu_growth::CpuGrowthTopology>,
+    #[cfg(target_os = "macos")]
+    mac_pending_vcpus: Vec<Vcpu>,
+    #[cfg(target_os = "macos")]
+    mac_cpu_error: Option<String>,
     #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
     prototype_cpu_topology: Option<vstate::VcpuConfig>,
     #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
@@ -675,6 +681,8 @@ impl Vmm {
 
     #[cfg(snapshot_supported)]
     fn snapshot_cpu_growth(&self) -> Option<cpu_growth::CpuGrowthTopology> {
+        #[cfg(target_os = "macos")]
+        return self.mac_cpu_topology.clone();
         #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
         return self
             .prototype_cpu_topology
@@ -685,8 +693,49 @@ impl Vmm {
                 nested_enabled: config.nested_enabled,
                 cpu_template: config.cpu_template,
             });
-        #[cfg(not(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee"))))]
+        #[cfg(not(any(
+            target_os = "macos",
+            all(target_os = "linux", target_arch = "x86_64", not(feature = "tee"))
+        )))]
         None
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn prototype_cpu_status(&self) -> std::result::Result<(usize, u8), String> {
+        if let Some(error) = &self.mac_cpu_error {
+            return Err(format!(
+                "CPU creation incomplete: {error}; cannot safely retry or checkpoint"
+            ));
+        }
+        self.mac_cpu_topology
+            .as_ref()
+            .map(|topology| (self.vcpus_handles.len(), topology.capacity))
+            .ok_or_else(|| "CPU growth was not enabled at boot".into())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn prototype_grow_cpus(&mut self, count: u8) -> std::result::Result<(), String> {
+        let (created, capacity) = self.prototype_cpu_status()?;
+        if self.run_state != VmmRunState::Running || self.devices_quiesced {
+            return Err("CPU growth requires a running VM".into());
+        }
+        if usize::from(count) < created || count > capacity {
+            return Err("CPU target must grow within the advertised topology".into());
+        }
+        while self.vcpus_handles.len() < usize::from(count) {
+            // The possible-CPU topology and boot channels already exist.
+            // Starting the thread does not run it: PSCI CPU_ON from guest
+            // onlining supplies the entry PC and wakes it afterwards.
+            let mut vcpu = self.mac_pending_vcpus.remove(0);
+            vcpu.set_mmio_bus(self.mmio_device_manager.bus.clone());
+            let handle = vcpu.start_threaded().map_err(|error| {
+                let message = error.to_string();
+                self.mac_cpu_error = Some(message.clone());
+                message
+            })?;
+            self.vcpus_handles.push(handle);
+        }
+        Ok(())
     }
 
     #[cfg(snapshot_supported)]
@@ -1049,6 +1098,14 @@ impl Vmm {
 
     /// Sends a pause command to the vcpus.
     pub fn pause_vcpus(&mut self) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        if self.mac_cpu_error.is_some()
+            || self.vcpus_handles.iter().any(|handle| !handle.boot_ready())
+        {
+            return Err(Error::VcpuSnapshot(
+                "CPU onlining is incomplete; retry the resize before checkpointing".into(),
+            ));
+        }
         for handle in self.vcpus_handles.iter() {
             handle
                 .send_event(VcpuEvent::Pause)
