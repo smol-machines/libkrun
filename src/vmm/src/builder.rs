@@ -711,7 +711,11 @@ pub fn build_microvm(
     let boot_memory_mib = configured_memory_mib;
     #[cfg(all(
         snapshot_supported,
-        not(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))
+        not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64"),
+            not(feature = "tee")
+        ))
     ))]
     if restore_checkpoint
         .as_ref()
@@ -721,7 +725,11 @@ pub fn build_microvm(
             "RAM hot-add checkpoint is unsupported on this platform".into(),
         ));
     }
-    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        not(feature = "tee")
+    ))]
     let restored_memory_device = if let Some(checkpoint) = &restore_checkpoint {
         let states: Vec<_> = checkpoint
             .devices
@@ -753,10 +761,18 @@ pub fn build_microvm(
         create_guest_memory(boot_memory_mib, vm_resources, &payload, restore_mem)?;
     vmm_timing!("memory created");
 
-    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        not(feature = "tee")
+    ))]
     let memory_growth =
         restored_memory_device.is_some() || (!restoring && vm_resources.live_memory_growth);
-    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        not(feature = "tee")
+    ))]
     let guest_memory = if memory_growth {
         if let Some(state) = &restored_memory_device {
             state
@@ -1297,9 +1313,17 @@ pub fn build_microvm(
         prototype_cpu_topology,
         #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
         cpu_growth_progress: Default::default(),
-        #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64"),
+            not(feature = "tee")
+        ))]
         prototype_memory: None,
-        #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64"),
+            not(feature = "tee")
+        ))]
         memory_growth_topology: memory_growth.then_some(
             crate::memory_topology::MemoryGrowthTopology {
                 boot_memory_mib: boot_memory_mib as u64,
@@ -1332,7 +1356,11 @@ pub fn build_microvm(
     #[cfg(not(feature = "tee"))]
     attach_balloon_device(&mut vmm, event_manager, intc.clone())?;
 
-    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        not(feature = "tee")
+    ))]
     if memory_growth {
         let state = if let Some(state) = restored_memory_device {
             state.memory
