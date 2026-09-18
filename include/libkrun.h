@@ -79,6 +79,16 @@ int32_t krun_free_ctx(uint32_t ctx_id);
  */
 int32_t krun_set_vm_config(uint32_t ctx_id, uint8_t num_vcpus, uint32_t ram_mib);
 
+#define KRUN_LIVE_RESIZE_CPU    (1U << 0)
+#define KRUN_LIVE_RESIZE_MEMORY (1U << 1)
+/* Configure fresh-boot CPU/RAM growth; zero disables both (the default).
+ * Supported on non-TEE Linux x86_64 with a hotplug-capable guest kernel.
+ * CPU growth reserves topology for up to 16 CPUs; memory growth uses virtio-mem.
+ * Restores preserve captured topology, not these fresh-boot settings.
+ * Unknown bits return -EINVAL; unsupported nonzero flags return -ENOTSUP.
+ */
+int32_t krun_set_live_resize(uint32_t ctx_id, uint32_t flags);
+
 /* Stable Intel CPU baseline used by migratable live checkpoints. */
 #define KRUN_CPU_TEMPLATE_PORTABLE_V1 1
 
