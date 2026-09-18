@@ -52,6 +52,8 @@ use windows::vstate;
 
 use std::fmt::{Display, Formatter};
 use std::io;
+// Named only by the fork-continue generation writer, which lives on
+// linux-x86_64 and macOS.
 #[cfg(all(
     feature = "blk",
     any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
@@ -367,10 +369,7 @@ pub struct Vmm {
 }
 
 /// RAM ownership returned by a fork-and-continue capture.
-#[cfg(all(
-    feature = "blk",
-    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
-))]
+#[cfg(all(feature = "blk", deferred_stream_supported))]
 pub enum ForkContinueRamGeneration {
     /// A directly CoW-mappable immutable RAM generation.
     Mapped(Vec<snapshot::MemfdRegionDesc>),
@@ -388,6 +387,9 @@ pub enum ForkMemory {
     Layered(layered_restore::Generation),
 }
 
+// Only fork-continue publishes this marker, and that exists on linux-x86_64
+// and macOS; deferring RAM to a stream (which aarch64 Linux now does) has no
+// generation directory to commit.
 #[cfg(all(
     feature = "blk",
     any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
@@ -1019,10 +1021,7 @@ impl Vmm {
     /// generation, leaving the VM paused only so the caller can snapshot its
     /// disks at the same boundary. Durable RAM serialization is deferred until
     /// after the caller resumes the source.
-    #[cfg(all(
-        snapshot_supported,
-        any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
-    ))]
+    #[cfg(all(snapshot_supported, deferred_stream_supported))]
     pub fn checkpoint_frozen_deferred_sparse(
         &mut self,
         generation_dir: &std::path::Path,

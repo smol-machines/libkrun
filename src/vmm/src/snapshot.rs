@@ -46,7 +46,7 @@ pub struct MemoryRegionDesc {
     pub len: u64,
 }
 
-#[cfg(any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos"))]
+#[cfg(deferred_stream_supported)]
 fn write_memory_stream_header<W: Write>(
     output: &mut W,
     regions: &[MemoryRegionDesc],
@@ -59,7 +59,7 @@ fn write_memory_stream_header<W: Write>(
     output.write_all(&len.to_le_bytes())
 }
 
-#[cfg(any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos"))]
+#[cfg(deferred_stream_supported)]
 fn stream_memory_file<W: Write>(
     file: &File,
     mut offset: u64,
@@ -81,7 +81,7 @@ fn stream_memory_file<W: Write>(
 /// Stream immutable generation files without a temporary full memory image.
 /// The bounded map ends with an EOF sentinel; after excessive fragmentation
 /// its last range includes holes too, preserving bytes without growing memory.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(target_os = "linux")]
 fn stream_sparse_memory_files<W: Write>(
     sources: &[(&File, u64, u64)],
     output: &mut W,
@@ -89,7 +89,7 @@ fn stream_sparse_memory_files<W: Write>(
     stream_sparse_memory_files_with_seek(sources, output, next_memory_data_offset)
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(target_os = "linux")]
 fn next_memory_data_offset(file: &File, offset: u64) -> io::Result<Option<u64>> {
     let offset =
         i64::try_from(offset).map_err(|_| io::Error::other("RAM source offset exceeds off_t"))?;
@@ -115,7 +115,7 @@ fn next_memory_data_offset(file: &File, offset: u64) -> io::Result<Option<u64>> 
     }
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(target_os = "linux")]
 fn stream_sparse_memory_files_with_seek<W: Write>(
     sources: &[(&File, u64, u64)],
     output: &mut W,
@@ -223,7 +223,7 @@ fn stream_sparse_memory_files_with_seek<W: Write>(
     Ok(())
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(target_os = "linux")]
 fn append_sparse_range(ranges: &mut Vec<(u64, u64)>, offset: u64, end: u64) {
     let full = ranges.len() == 65536;
     if let Some((previous, length)) = ranges.last_mut()
@@ -1142,7 +1142,7 @@ pub fn guest_memory_backing_is_immutable(parent: &GuestMemoryMmap) -> io::Result
 /// only async-signal-safe syscalls to copy bytes into fresh memfds. The parent
 /// can resume immediately, then wait for [`Self::finish`] without extending the
 /// guest-visible pause.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(target_os = "linux")]
 pub struct ForkGenerationCopy {
     child_pid: libc::pid_t,
     status_fd: libc::c_int,
@@ -1151,7 +1151,7 @@ pub struct ForkGenerationCopy {
     finished: bool,
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(target_os = "linux")]
 impl ForkGenerationCopy {
     pub fn finish(mut self) -> io::Result<(Vec<MemfdRegionDesc>, Vec<File>)> {
         let mut child_errno = 0_i32;
@@ -1221,7 +1221,7 @@ impl ForkGenerationCopy {
     }
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(target_os = "linux")]
 impl Drop for ForkGenerationCopy {
     fn drop(&mut self) {
         if self.status_fd >= 0 {
@@ -1240,12 +1240,12 @@ impl Drop for ForkGenerationCopy {
 
 /// A point-in-time Linux guest-RAM generation retained independently from the
 /// source while a durable checkpoint is written after the VM resumes.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(target_os = "linux")]
 pub struct DeferredMemorySave {
     generation: DeferredLinuxGeneration,
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(target_os = "linux")]
 enum DeferredLinuxGeneration {
     Stable {
         descs: Vec<MemfdRegionDesc>,
@@ -1255,7 +1255,7 @@ enum DeferredLinuxGeneration {
     Layered(crate::layered_restore::Generation),
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(target_os = "linux")]
 fn stable_memfd_generation(
     parent: &GuestMemoryMmap,
 ) -> io::Result<(Vec<MemfdRegionDesc>, Vec<File>)> {
@@ -1309,7 +1309,7 @@ fn stable_memfd_generation(
 /// An initial memfd generation is sealed and the source is remapped privately.
 /// Later generations use the existing syscall-only fork worker so source
 /// writes after resume cannot alter the retained point-in-time view.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(target_os = "linux")]
 pub fn start_deferred_memory_save(
     parent: &GuestMemoryMmap,
     _generation_dir: &std::path::Path,
@@ -1327,7 +1327,7 @@ pub fn start_deferred_memory_save(
     Ok(DeferredMemorySave { generation })
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(target_os = "linux")]
 impl DeferredMemorySave {
     pub(crate) fn from_layered(generation: crate::layered_restore::Generation) -> Self {
         Self {
@@ -1460,7 +1460,7 @@ impl DeferredMemorySave {
 
 /// Begin materializing the source's current private RAM into a fresh immutable
 /// generation. Call only at a fully quiesced snapshot boundary.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(target_os = "linux")]
 pub fn start_fork_generation_copy(parent: &GuestMemoryMmap) -> io::Result<ForkGenerationCopy> {
     struct CopyRegion {
         source: *const u8,
@@ -1522,7 +1522,15 @@ pub fn start_fork_generation_copy(parent: &GuestMemoryMmap) -> io::Result<ForkGe
     // Bypass pthread_atfork handlers: this multithreaded VMM deliberately uses
     // a syscall-only child, so inherited allocator/library locks are never
     // touched. Registered atfork callbacks would add unrelated deadlock risk.
+    // aarch64 Linux has no `fork` syscall at all; `clone` with SIGCHLD and no
+    // new stack is the same operation, and keeps the property this relies on:
+    // no libc wrapper, so no registered atfork handler runs.
+    #[cfg(target_arch = "x86_64")]
     let child_pid = unsafe { libc::syscall(libc::SYS_fork) as libc::pid_t };
+    #[cfg(not(target_arch = "x86_64"))]
+    let child_pid = unsafe {
+        libc::syscall(libc::SYS_clone, libc::SIGCHLD as libc::c_ulong, 0, 0, 0, 0) as libc::pid_t
+    };
     if child_pid < 0 {
         let error = io::Error::last_os_error();
         unsafe {
