@@ -916,9 +916,21 @@ impl PassthroughFs {
         let ihandle = self.inode_to_handle(inode, true)?;
         let fd = match ihandle {
             InodeHandle::Path(c_path) => unsafe {
+                // The volfs path names one specific inode. If that inode is a
+                // symlink, following it opens the link's target — and a guest
+                // can point a symlink it created inside the share anywhere on
+                // the host, so a traversal here would read or write an arbitrary
+                // host file outside the shared tree. Force `O_NOFOLLOW` so the
+                // kernel refuses a symlink atomically (`ELOOP`) at open time;
+                // it has no effect on a regular file or directory, which is all
+                // a well-behaved guest ever opens (a symlink node is reached by
+                // `readlink`, never `open`). This matches the Linux backend,
+                // whose `O_PATH` anchor makes the same open fail with `ELOOP`.
+                // (Unlike Linux, the macOS volfs path is direct rather than a
+                // `/proc/self/fd` magic link, so it must not be followed.)
                 libc::open(
                     c_path.as_ptr(),
-                    (flags | libc::O_CLOEXEC) & (!libc::O_NOFOLLOW) & (!libc::O_EXLOCK),
+                    (flags | libc::O_CLOEXEC | libc::O_NOFOLLOW) & (!libc::O_EXLOCK),
                 )
             },
             // Check if we have recently unlinked the inode and kept open a file descriptor to it.
