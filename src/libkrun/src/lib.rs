@@ -1725,7 +1725,7 @@ fn handle_control_stream<S: std::io::Read + std::io::Write + Send + 'static>(
             let _arg = parts.next().map(str::trim).unwrap_or("");
             match verb.as_str() {
                 #[cfg(all(
-                    target_os = "linux",
+                    any(target_os = "linux", target_os = "macos"),
                     any(target_arch = "x86_64", target_arch = "aarch64"),
                     not(feature = "tee")
                 ))]
@@ -1737,7 +1737,7 @@ fn handle_control_stream<S: std::io::Read + std::io::Write + Send + 'static>(
                     Err(_) => "ERR EINVAL expected additional MiB\n".into(),
                 },
                 #[cfg(all(
-                    target_os = "linux",
+                    any(target_os = "linux", target_os = "macos"),
                     any(target_arch = "x86_64", target_arch = "aarch64"),
                     not(feature = "tee")
                 ))]
@@ -1746,7 +1746,7 @@ fn handle_control_stream<S: std::io::Read + std::io::Write + Send + 'static>(
                     Err(error) => format!("ERR EIO {error}\n"),
                 },
                 #[cfg(all(
-                    target_os = "linux",
+                    any(target_os = "linux", target_os = "macos"),
                     any(target_arch = "x86_64", target_arch = "aarch64"),
                     not(feature = "tee")
                 ))]
@@ -1754,14 +1754,26 @@ fn handle_control_stream<S: std::io::Read + std::io::Write + Send + 'static>(
                     Ok(info) => info,
                     Err(error) => format!("ERR EIO {error}\n"),
                 },
-                #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+                #[cfg(all(
+                    any(
+                        all(target_os = "linux", target_arch = "x86_64"),
+                        all(target_os = "macos", target_arch = "aarch64")
+                    ),
+                    not(feature = "tee")
+                ))]
                 "PROTOTYPE_CPU_STATUS" => match vmm.lock().unwrap().prototype_cpu_status() {
                     Ok((created, capacity)) => {
                         format!("OK created {created} capacity {capacity}\n")
                     }
                     Err(error) => format!("ERR EIO {error}\n"),
                 },
-                #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+                #[cfg(all(
+                    any(
+                        all(target_os = "linux", target_arch = "x86_64"),
+                        all(target_os = "macos", target_arch = "aarch64")
+                    ),
+                    not(feature = "tee")
+                ))]
                 "PROTOTYPE_GROW_CPUS" => match _arg.parse::<u8>() {
                     Ok(count) => match vmm.lock().unwrap().prototype_grow_cpus(count) {
                         Ok(()) => format!("OK created {count} vCPUs; guest online required\n"),
@@ -2427,8 +2439,10 @@ pub extern "C" fn krun_set_live_resize(ctx_id: u32, flags: u32) -> i32 {
     }
     if flags & 1 != 0
         && !cfg!(all(
-            target_os = "linux",
-            target_arch = "x86_64",
+            any(
+                all(target_os = "linux", target_arch = "x86_64"),
+                all(target_os = "macos", target_arch = "aarch64")
+            ),
             not(feature = "tee")
         ))
     {
@@ -2436,7 +2450,7 @@ pub extern "C" fn krun_set_live_resize(ctx_id: u32, flags: u32) -> i32 {
     }
     if flags & 2 != 0
         && !cfg!(all(
-            target_os = "linux",
+            any(target_os = "linux", target_os = "macos"),
             any(target_arch = "x86_64", target_arch = "aarch64"),
             not(feature = "tee")
         ))
@@ -5588,8 +5602,10 @@ mod test_live_resize_config {
         assert_eq!(krun_set_live_resize(first, 4), -libc::EINVAL);
         assert_eq!(krun_set_live_resize(u32::MAX, 0), -libc::ENOENT);
         let supported = cfg!(all(
-            target_os = "linux",
-            target_arch = "x86_64",
+            any(
+                all(target_os = "linux", target_arch = "x86_64"),
+                all(target_os = "macos", target_arch = "aarch64")
+            ),
             not(feature = "tee")
         ));
         assert_eq!(
@@ -5604,7 +5620,7 @@ mod test_live_resize_config {
             assert!(!contexts[&second].vmr.live_memory_growth);
         }
         let memory_supported = cfg!(all(
-            target_os = "linux",
+            any(target_os = "linux", target_os = "macos"),
             any(target_arch = "x86_64", target_arch = "aarch64"),
             not(feature = "tee")
         ));
