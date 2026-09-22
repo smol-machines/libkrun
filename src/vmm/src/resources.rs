@@ -175,6 +175,10 @@ pub enum VsockConfig {
 /// held in the Vmm.
 #[derive(Default)]
 pub struct VmResources {
+    /// Reserve guest topology for adding CPUs after boot (Linux x86_64).
+    pub live_cpu_growth: bool,
+    /// Attach virtio-mem for adding RAM after boot (Linux x86_64).
+    pub live_memory_growth: bool,
     /// The vCpu and memory configuration for this microVM.
     vm_config: VmConfig,
     /// The firmware to be loaded into the microVM.
@@ -454,6 +458,8 @@ mod tests {
 
     fn default_vm_resources() -> VmResources {
         VmResources {
+            live_cpu_growth: false,
+            live_memory_growth: false,
             vm_config: VmConfig::default(),
             firmware_config: None,
             kernel_cmdline: default_kernel_cmdline(),

@@ -226,6 +226,7 @@ mod tests {
     use crate::{Bytes, GuestMemory, GuestMemoryError};
 
     use std::io::Write;
+    use std::sync::Arc;
     #[cfg(feature = "rawfd")]
     use std::{fs::File, path::Path};
     use vmm_sys_util::tempfile::TempFile;
@@ -524,6 +525,118 @@ mod tests {
             assert_eq!(gm.read(buf, GuestAddress(0xffc)).unwrap(), 5);
             assert_eq!(buf, sample_buf);
         }
+    }
+
+    #[test]
+    fn shared_growth_registration_failure_leaves_all_views_unchanged() {
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)])
+            .unwrap()
+            .with_shared_growth();
+        let device = memory.clone();
+        let region =
+            Arc::new(GuestRegionMmap::from_range(GuestAddress(0x2000), 0x1000, None).unwrap());
+        let failed = memory.append_shared_region_with(region.clone(), |_| {
+            assert!(device.find_region(GuestAddress(0x2000)).is_none());
+            Err(GuestRegionCollectionError::GrowthPoisoned)
+        });
+        assert!(failed.is_err());
+        assert_eq!(memory.num_regions(), 1);
+        assert_eq!(device.num_regions(), 1);
+        memory
+            .append_shared_region_with(region.clone(), |_| {
+                assert!(device.find_region(GuestAddress(0x2000)).is_none());
+                Ok::<_, GuestRegionCollectionError>(())
+            })
+            .unwrap();
+        assert!(device.find_region(GuestAddress(0x2000)).is_some());
+        let overlap = memory.append_shared_region_with(
+            region,
+            |_| -> Result<(), GuestRegionCollectionError> {
+                panic!("overlap must be rejected before registration");
+            },
+        );
+        assert!(overlap.is_err());
+    }
+
+    #[test]
+    fn shared_growth_reaches_existing_device_views_without_moving_memory() {
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)])
+            .unwrap()
+            .with_shared_growth();
+        let device = memory.clone();
+        let borrowed = device.get_slice(GuestAddress(0), 4).unwrap();
+        borrowed.get_ref::<u32>(0).unwrap().store(0x12345678);
+        let added =
+            Arc::new(GuestRegionMmap::from_range(GuestAddress(0x2000), 0x1000, None).unwrap());
+        memory.append_shared_region(added).unwrap();
+        assert_eq!(device.num_regions(), 2);
+        assert_eq!(borrowed.get_ref::<u32>(0).unwrap().load(), 0x12345678);
+        memory
+            .write_obj(0xabcdef01u32, GuestAddress(0x2000))
+            .unwrap();
+        assert_eq!(
+            device.read_obj::<u32>(GuestAddress(0x2000)).unwrap(),
+            0xabcdef01
+        );
+        assert_eq!(
+            device
+                .iter()
+                .map(|region| region.start_addr().raw_value())
+                .collect::<Vec<_>>(),
+            vec![0, 0x2000]
+        );
+    }
+
+    #[test]
+    fn shared_growth_is_opt_in_and_rejected_appends_do_not_change_views() {
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let region =
+            || Arc::new(GuestRegionMmap::from_range(GuestAddress(0x2000), 0x1000, None).unwrap());
+        assert!(memory.append_shared_region(region()).is_err());
+        let old_static_view = memory.clone();
+        let memory = memory.with_shared_growth();
+        let device = memory.clone();
+        memory.append_shared_region(region()).unwrap();
+        assert!(memory.append_shared_region(region()).is_err());
+        assert_eq!(device.num_regions(), 2);
+        assert_eq!(old_static_view.num_regions(), 1);
+        let frozen = memory
+            .insert_region(Arc::new(
+                GuestRegionMmap::from_range(GuestAddress(0x6000), 0x1000, None).unwrap(),
+            ))
+            .unwrap();
+        memory
+            .append_shared_region(Arc::new(
+                GuestRegionMmap::from_range(GuestAddress(0x4000), 0x1000, None).unwrap(),
+            ))
+            .unwrap();
+        assert!(frozen.find_region(GuestAddress(0x2000)).is_some());
+        assert!(frozen.find_region(GuestAddress(0x4000)).is_none());
+        let (removed, _) = memory.remove_region(GuestAddress(0x2000), 0x1000).unwrap();
+        assert!(removed.find_region(GuestAddress(0x2000)).is_none());
+        assert!(device.find_region(GuestAddress(0x2000)).is_some());
+    }
+
+    #[test]
+    fn concurrent_shared_growth_allows_only_one_overlapping_publication() {
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)])
+            .unwrap()
+            .with_shared_growth();
+        let barrier = std::sync::Barrier::new(2);
+        let wins = std::thread::scope(|scope| {
+            let run = || {
+                let region = Arc::new(
+                    GuestRegionMmap::from_range(GuestAddress(0x2000), 0x1000, None).unwrap(),
+                );
+                barrier.wait();
+                memory.append_shared_region(region).is_ok()
+            };
+            let first = scope.spawn(run);
+            let second = scope.spawn(run);
+            usize::from(first.join().unwrap()) + usize::from(second.join().unwrap())
+        });
+        assert_eq!(wins, 1);
+        assert_eq!(memory.num_regions(), 2);
     }
 
     #[test]
