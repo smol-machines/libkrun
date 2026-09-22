@@ -63,6 +63,7 @@ pub struct Vsock {
 
 impl Vsock {
     /// Create a new virtio-vsock device with the given VM CID.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         cid: u64,
         host_port_map: Option<HashMap<u16, u16>>,
