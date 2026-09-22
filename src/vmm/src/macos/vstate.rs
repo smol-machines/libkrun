@@ -11,6 +11,7 @@ use std::fmt::{Display, Formatter};
 use std::io;
 use std::result;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -24,6 +25,7 @@ use hvf::{HvfVcpu, HvfVm, VcpuExit, Vcpus};
 use utils::eventfd::EventFd;
 use vm_memory::{
     Address, GuestAddress, GuestMemory, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion,
+    GuestRegionCollectionError, GuestRegionMmap,
 };
 
 /// Errors associated with the wrappers over KVM ioctls.
@@ -31,6 +33,7 @@ use vm_memory::{
 pub enum Error {
     /// Invalid guest memory configuration.
     GuestMemoryMmap(GuestMemoryError),
+    SharedMemoryGrowth(GuestRegionCollectionError),
     /// The number of configured slots is bigger than the maximum reported by KVM.
     NotEnoughMemorySlots,
     /// Error configuring the general purpose aarch64 registers.
@@ -69,6 +72,7 @@ impl Display for Error {
 
         match self {
             GuestMemoryMmap(e) => write!(f, "Guest memory error: {e:?}"),
+            SharedMemoryGrowth(e) => write!(f, "Guest memory growth error: {e:?}"),
             VcpuCountNotInitialized => write!(f, "vCPU count is not initialized"),
             VmSetup(e) => write!(f, "Cannot configure the microvm: {e:?}"),
             VcpuRun => write!(f, "Cannot run the VCPUs"),
@@ -95,6 +99,12 @@ impl Display for Error {
 }
 
 pub type Result<T> = result::Result<T, Error>;
+
+impl From<GuestRegionCollectionError> for Error {
+    fn from(error: GuestRegionCollectionError) -> Self {
+        Self::SharedMemoryGrowth(error)
+    }
+}
 
 /// A wrapper around creating and using a VM.
 pub struct Vm {
@@ -183,6 +193,25 @@ impl Vm {
         Ok(())
     }
 
+    /// Register added RAM before publishing it to every device's shared view.
+    /// The caller serializes topology changes and notifies the guest only after
+    /// success; the shared map retains ownership for the HVF mapping's lifetime.
+    pub fn append_guest_memory(
+        &mut self,
+        guest_mem: &GuestMemoryMmap,
+        region: Arc<GuestRegionMmap>,
+    ) -> Result<()> {
+        guest_mem.append_shared_region_with(region, |region| {
+            self.hvf_vm
+                .map_memory(
+                    region.as_ptr() as u64,
+                    region.start_addr().raw_value(),
+                    region.len(),
+                )
+                .map_err(Error::SetUserMemoryRegion)
+        })
+    }
+
     pub fn add_mapping(
         &self,
         reply_sender: Sender<bool>,
@@ -215,7 +244,7 @@ impl Vm {
 }
 
 /// Encapsulates configuration parameters for the guest vCPUS.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq, Clone)]
 pub struct VcpuConfig {
     /// Number of guest VCPUs.
     pub vcpu_count: u8,
@@ -228,12 +257,19 @@ pub struct VcpuConfig {
 // Using this for easier explicit type-casting to help IDEs interpret the code.
 type VcpuCell = Cell<Option<*const Vcpu>>;
 
+/// PSCI CPU_ON supplies both the entry PC and the secondary CPU's x0 value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CpuBootRequest {
+    pub entry: u64,
+    pub context_id: u64,
+}
+
 /// A wrapper around creating and using a kvm-based VCPU.
 pub struct Vcpu {
     id: u8,
     boot_entry_addr: u64,
-    boot_receiver: Option<Receiver<u64>>,
-    boot_senders: Option<HashMap<u64, Sender<u64>>>,
+    boot_receiver: Option<Receiver<CpuBootRequest>>,
+    boot_senders: Option<HashMap<u64, Sender<CpuBootRequest>>>,
     fdt_addr: u64,
     mmio_bus: Option<devices::Bus>,
     #[cfg_attr(all(test, target_arch = "aarch64"), allow(unused))]
@@ -259,6 +295,7 @@ pub struct Vcpu {
     /// register state before the guest executes (the KVM analogue is starting
     /// the vCPU in its paused state machine).
     start_paused: bool,
+    boot_ready: Arc<AtomicBool>,
 }
 
 impl Vcpu {
@@ -329,7 +366,7 @@ impl Vcpu {
     pub fn new_aarch64(
         id: u8,
         boot_entry_addr: GuestAddress,
-        boot_receiver: Option<Receiver<u64>>,
+        boot_receiver: Option<Receiver<CpuBootRequest>>,
         exit_evt: EventFd,
         vcpu_list: Arc<VcpuList>,
         nested_enabled: bool,
@@ -353,6 +390,7 @@ impl Vcpu {
             vcpu_list,
             nested_enabled,
             start_paused: false,
+            boot_ready: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -377,8 +415,15 @@ impl Vcpu {
         self.mmio_bus = Some(mmio_bus);
     }
 
-    pub fn set_boot_senders(&mut self, boot_senders: HashMap<u64, Sender<u64>>) {
+    pub fn set_boot_senders(&mut self, boot_senders: HashMap<u64, Sender<CpuBootRequest>>) {
         self.boot_senders = Some(boot_senders);
+    }
+
+    fn deliver_cpu_on(&self, mpidr: u64, request: CpuBootRequest) -> bool {
+        self.boot_senders
+            .as_ref()
+            .and_then(|senders| senders.get(&mpidr))
+            .is_some_and(|sender| sender.send(request).is_ok())
     }
 
     /// Configures an aarch64 specific vcpu.
@@ -399,6 +444,7 @@ impl Vcpu {
         let response_receiver = self.response_receiver.take().unwrap();
         let (init_tls_sender, init_tls_receiver) = unbounded();
         let vcpu_list = self.vcpu_list.clone();
+        let boot_ready = self.boot_ready.clone();
 
         let vcpu_thread = thread::Builder::new()
             .name(format!("fc_vcpu {}", self.cpu_index()))
@@ -410,9 +456,7 @@ impl Vcpu {
             })
             .map_err(Error::VcpuSpawn)?;
 
-        let hvf_vcpuid = init_tls_receiver
-            .recv()
-            .expect("Error waiting for TLS initialization.");
+        let hvf_vcpuid = init_tls_receiver.recv().map_err(|_| Error::VcpuEvent)?;
 
         Ok(VcpuHandle::new(
             event_sender,
@@ -420,6 +464,7 @@ impl Vcpu {
             hvf_vcpuid,
             vcpu_list,
             vcpu_thread,
+            boot_ready,
         ))
     }
 
@@ -439,12 +484,8 @@ impl Vcpu {
                 }
                 VcpuExit::CpuOn(mpidr, entry, context_id) => {
                     debug!("CpuOn: mpidr=0x{mpidr:x} entry=0x{entry:x} context_id={context_id}");
-                    if let Some(boot_senders) = &self.boot_senders {
-                        if let Some(sender) = boot_senders.get(&mpidr) {
-                            sender.send(entry).unwrap()
-                        }
-                    } else {
-                        error!("CpuOn request coming from an unexpected vCPU={}", self.id);
+                    if !self.deliver_cpu_on(mpidr, CpuBootRequest { entry, context_id }) {
+                        error!("CpuOn target {mpidr:#x} unavailable from vCPU={}", self.id);
                     }
                     Ok(VcpuEmulation::Handled)
                 }
@@ -521,14 +562,18 @@ impl Vcpu {
         // register state — so do NOT block on `boot_receiver` (no `CpuOn` will be
         // sent here, and the orchestrator drives restore over the event channel).
         // set_initial_state's entry_addr is overwritten by the restore anyway.
-        let entry_addr = match &self.boot_receiver {
+        let boot = match &self.boot_receiver {
             Some(boot_receiver) if !self.start_paused => boot_receiver.recv().unwrap(),
-            _ => self.boot_entry_addr,
+            _ => CpuBootRequest {
+                entry: self.boot_entry_addr,
+                context_id: self.fdt_addr,
+            },
         };
 
         hvf_vcpu
-            .set_initial_state(entry_addr, self.fdt_addr)
+            .set_initial_state(boot.entry, boot.context_id)
             .unwrap_or_else(|_| panic!("Can't set HVF vCPU {hvf_vcpuid} initial state"));
+        self.boot_ready.store(true, Ordering::Release);
 
         // Restore-into-a-clone: hold here in the paused event loop (handling the
         // orchestrator's RestoreState) until a Resume arrives, so the saved
@@ -805,6 +850,7 @@ pub enum VcpuResponse {
 
 /// Wrapper over Vcpu that hides the underlying interactions with the Vcpu thread.
 pub struct VcpuHandle {
+    boot_ready: Arc<AtomicBool>,
     event_sender: Sender<VcpuEvent>,
     response_receiver: Receiver<VcpuResponse>,
     hvf_vcpuid: u64,
@@ -822,8 +868,10 @@ impl VcpuHandle {
         hvf_vcpuid: u64,
         vcpu_list: Arc<VcpuList>,
         vcpu_thread: thread::JoinHandle<()>,
+        boot_ready: Arc<AtomicBool>,
     ) -> Self {
         Self {
+            boot_ready,
             event_sender,
             response_receiver,
             hvf_vcpuid,
@@ -840,6 +888,10 @@ impl VcpuHandle {
         hvf::vcpu_request_exit(self.hvf_vcpuid).map_err(Error::VcpuRequestExit)?;
         self.vcpu_list.wake(self.hvf_vcpuid);
         Ok(())
+    }
+
+    pub fn boot_ready(&self) -> bool {
+        self.boot_ready.load(Ordering::Acquire)
     }
 
     pub fn response_receiver(&self) -> &Receiver<VcpuResponse> {
@@ -867,7 +919,7 @@ mod tests {
     use super::*;
     use arch::aarch64::layout::DRAM_MEM_START_EFI;
     use devices::legacy::VcpuList;
-    use vm_memory::{GuestAddress, GuestMemoryMmap};
+    use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
     // Auxiliary function being used throughout the tests.
     // Does NOT create a real HVF VM — Vcpu::new_aarch64 and most vcpu methods
@@ -889,6 +941,23 @@ mod tests {
     }
 
     #[test]
+    fn secondary_can_forward_cpu_on_with_context() {
+        let (mut vcpu, _) = setup_vcpu(0x1000);
+        assert_eq!(vcpu.id, 1);
+        let (sender, receiver) = unbounded();
+        vcpu.set_boot_senders(HashMap::from([(2, sender)]));
+        let request = CpuBootRequest {
+            entry: 0x8000,
+            context_id: 0x1234,
+        };
+        assert!(vcpu.deliver_cpu_on(2, request));
+        assert_eq!(receiver.try_recv().unwrap(), request);
+        assert!(!vcpu.deliver_cpu_on(3, request));
+        drop(receiver);
+        assert!(!vcpu.deliver_cpu_on(2, request));
+    }
+
+    #[test]
     fn test_vm_memory_init() {
         let mut vm = Vm::new(false).expect("Cannot create new vm");
 
@@ -898,7 +967,37 @@ mod tests {
             0x20_0000, // 2 MB
         )])
         .unwrap();
+        let gm = gm.with_shared_growth();
+        let device_view = gm.clone();
         vm.memory_init(&gm).expect("memory_init failed");
+        let added = Arc::new(
+            GuestRegionMmap::from_range(
+                GuestAddress(DRAM_MEM_START_EFI + 0x40_0000),
+                0x20_0000,
+                None,
+            )
+            .unwrap(),
+        );
+        vm.append_guest_memory(&gm, added.clone()).unwrap();
+        let address = added.start_addr();
+        gm.write_slice(b"grown", address).unwrap();
+        let mut bytes = [0; 5];
+        device_view.read_slice(&mut bytes, address).unwrap();
+        assert_eq!(&bytes, b"grown");
+        assert_eq!(device_view.num_regions(), 2);
+        assert!(vm.append_guest_memory(&gm, added).is_err());
+        // HVF must reject the unaligned GPA without publishing a device view
+        // of memory the guest cannot access.
+        let invalid = Arc::new(
+            GuestRegionMmap::from_range(
+                GuestAddress(DRAM_MEM_START_EFI + 0x80_0001),
+                0x20_0000,
+                None,
+            )
+            .unwrap(),
+        );
+        assert!(vm.append_guest_memory(&gm, invalid).is_err());
+        assert_eq!(device_view.num_regions(), 2);
     }
 
     #[test]

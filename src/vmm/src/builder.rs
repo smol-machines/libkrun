@@ -712,7 +712,7 @@ pub fn build_microvm(
     #[cfg(all(
         snapshot_supported,
         not(all(
-            target_os = "linux",
+            any(target_os = "linux", target_os = "macos"),
             any(target_arch = "x86_64", target_arch = "aarch64"),
             not(feature = "tee")
         ))
@@ -726,7 +726,7 @@ pub fn build_microvm(
         ));
     }
     #[cfg(all(
-        target_os = "linux",
+        any(target_os = "linux", target_os = "macos"),
         any(target_arch = "x86_64", target_arch = "aarch64"),
         not(feature = "tee")
     ))]
@@ -762,14 +762,14 @@ pub fn build_microvm(
     vmm_timing!("memory created");
 
     #[cfg(all(
-        target_os = "linux",
+        any(target_os = "linux", target_os = "macos"),
         any(target_arch = "x86_64", target_arch = "aarch64"),
         not(feature = "tee")
     ))]
     let memory_growth =
         restored_memory_device.is_some() || (!restoring && vm_resources.live_memory_growth);
     #[cfg(all(
-        target_os = "linux",
+        any(target_os = "linux", target_os = "macos"),
         any(target_arch = "x86_64", target_arch = "aarch64"),
         not(feature = "tee")
     ))]
@@ -800,7 +800,10 @@ pub fn build_microvm(
                 vcpu_config.vcpu_count
             )));
         }
-        #[cfg(not(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee"))))]
+        #[cfg(not(any(
+            target_os = "macos",
+            all(target_os = "linux", target_arch = "x86_64", not(feature = "tee"))
+        )))]
         if checkpoint.cpu_growth.is_some() {
             return Err(StartMicrovmError::GuestMemoryMmap(
                 "checkpoint CPU growth topology is unsupported on this platform".into(),
@@ -832,6 +835,32 @@ pub fn build_microvm(
     };
 
     // Clone the command-line so that a failed boot doesn't pollute the original.
+    #[cfg(target_os = "macos")]
+    let mac_cpu_topology = if let Some(topology) = restore_checkpoint
+        .as_ref()
+        .and_then(|checkpoint| checkpoint.cpu_growth.clone())
+    {
+        if topology.capacity > 16
+            || topology.ht_enabled
+            || topology.cpu_template.is_some()
+            || topology.nested_enabled != vm_resources.nested_enabled
+        {
+            return Err(StartMicrovmError::GuestMemoryMmap(
+                "checkpoint Mac CPU growth topology is incompatible".into(),
+            ));
+        }
+        Some(topology)
+    } else if !restoring && vm_resources.live_cpu_growth {
+        Some(crate::cpu_growth::CpuGrowthTopology {
+            capacity: 16,
+            ht_enabled: false,
+            nested_enabled: vm_resources.nested_enabled,
+            cpu_template: None,
+        })
+    } else {
+        None
+    };
+
     #[allow(unused_mut)]
     let mut kernel_cmdline = Cmdline::new(arch::CMDLINE_MAX_SIZE);
     if let Some(cmdline) = payload_config.kernel_cmdline {
@@ -1072,11 +1101,14 @@ pub fn build_microvm(
 
     #[cfg(target_os = "macos")]
     let vcpu_list = {
-        let cpu_count = vm_resources.vm_config().vcpu_count.unwrap();
+        let cpu_count = mac_cpu_topology
+            .as_ref()
+            .map_or(vcpu_config.vcpu_count, |topology| topology.capacity);
         Arc::new(VcpuList::new(cpu_count as u64))
     };
 
-    let vcpus;
+    #[allow(unused_mut)]
+    let mut vcpus;
     let intc: IrqChip;
     // For x86_64 we need to create the interrupt controller before calling `KVM_CREATE_VCPUS`
     // while on aarch64 we need to do it the other way around.
@@ -1218,10 +1250,14 @@ pub fn build_microvm(
 
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     {
+        let mut capacity_config = vcpu_config.clone();
+        capacity_config.vcpu_count = mac_cpu_topology
+            .as_ref()
+            .map_or(vcpu_config.vcpu_count, |topology| topology.capacity);
         intc = {
             // If the system supports the in-kernel GIC, use it. Otherwise, fall back to the
             // userspace implementation.
-            let gic = match HvfGicV3::new(vm_resources.vm_config().vcpu_count.unwrap() as u64) {
+            let gic = match HvfGicV3::new(capacity_config.vcpu_count as u64) {
                 Ok(hvfgic) => IrqChipDevice::new(Box::new(hvfgic)),
                 Err(_) => IrqChipDevice::new(Box::new(GicV3::new(vcpu_list.clone()))),
             };
@@ -1230,7 +1266,7 @@ pub fn build_microvm(
 
         vcpus = create_vcpus_aarch64(
             &vm,
-            &vcpu_config,
+            &capacity_config,
             &arch_memory_info,
             payload_config.entry_addr,
             &exit_evt,
@@ -1309,18 +1345,24 @@ pub fn build_microvm(
         arch_memory_info,
         kernel_cmdline,
         vcpus_handles: Vec::new(),
+        #[cfg(target_os = "macos")]
+        mac_cpu_topology,
+        #[cfg(target_os = "macos")]
+        mac_pending_vcpus: Vec::new(),
+        #[cfg(target_os = "macos")]
+        mac_cpu_error: None,
         #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
         prototype_cpu_topology,
         #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
         cpu_growth_progress: Default::default(),
         #[cfg(all(
-            target_os = "linux",
+            any(target_os = "linux", target_os = "macos"),
             any(target_arch = "x86_64", target_arch = "aarch64"),
             not(feature = "tee")
         ))]
         prototype_memory: None,
         #[cfg(all(
-            target_os = "linux",
+            any(target_os = "linux", target_os = "macos"),
             any(target_arch = "x86_64", target_arch = "aarch64"),
             not(feature = "tee")
         ))]
@@ -1357,7 +1399,7 @@ pub fn build_microvm(
     attach_balloon_device(&mut vmm, event_manager, intc.clone())?;
 
     #[cfg(all(
-        target_os = "linux",
+        any(target_os = "linux", target_os = "macos"),
         any(target_arch = "x86_64", target_arch = "aarch64"),
         not(feature = "tee")
     ))]
@@ -1507,6 +1549,11 @@ pub fn build_microvm(
         vmm.kernel_cmdline
             .insert_str(format!("maxcpus={}", vcpus.len()))?;
     }
+    #[cfg(target_os = "macos")]
+    if !restoring && vmm.mac_cpu_topology.is_some() {
+        vmm.kernel_cmdline
+            .insert_str(format!("maxcpus={}", vcpu_config.vcpu_count))?;
+    }
     if let Some(s) = &vm_resources.kernel_cmdline.epilog {
         vmm.kernel_cmdline.insert_str(s).unwrap();
     };
@@ -1566,6 +1613,10 @@ pub fn build_microvm(
         println!("Starting TEE/microVM.");
     }
 
+    #[cfg(target_os = "macos")]
+    {
+        vmm.mac_pending_vcpus = vcpus.split_off(usize::from(vcpu_config.vcpu_count));
+    }
     match restore_checkpoint {
         None => {
             vmm.start_vcpus(vcpus)
@@ -2854,7 +2905,7 @@ fn create_vcpus_aarch64(
     nested_enabled: bool,
 ) -> super::Result<Vec<Vcpu>> {
     let mut vcpus = Vec::with_capacity(vcpu_config.vcpu_count as usize);
-    let mut boot_senders: HashMap<u64, Sender<u64>> = HashMap::new();
+    let mut boot_senders: HashMap<u64, Sender<crate::vstate::CpuBootRequest>> = HashMap::new();
 
     for cpu_index in 0..vcpu_config.vcpu_count {
         let (boot_sender, boot_receiver) = if cpu_index != 0 {
@@ -2883,7 +2934,11 @@ fn create_vcpus_aarch64(
         vcpus.push(vcpu);
     }
 
-    vcpus[0].set_boot_senders(boot_senders);
+    // Hot-onlining may execute PSCI CPU_ON on any already-online CPU, not
+    // necessarily the boot CPU that started the initial SMP bring-up.
+    for vcpu in &mut vcpus {
+        vcpu.set_boot_senders(boot_senders.clone());
+    }
 
     Ok(vcpus)
 }

@@ -11,7 +11,7 @@
 //! unaware of snapshots, and devices without a Persist impl yet (balloon, rng,
 //! fs, gpu, snd, input) are simply skipped.
 
-#[cfg(all(target_os = "linux", not(feature = "tee")))]
+#[cfg(all(any(target_os = "linux", target_os = "macos"), not(feature = "tee")))]
 use crate::virtio::memory::{MemoryDevice, MemoryDeviceState};
 #[cfg(not(feature = "tee"))]
 use crate::virtio::{Balloon, BalloonState};
@@ -49,7 +49,7 @@ pub enum DeviceSnapshot {
     Balloon(BalloonState),
     #[cfg(feature = "gpu")]
     Gpu(GpuState),
-    #[cfg(all(target_os = "linux", not(feature = "tee")))]
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), not(feature = "tee")))]
     Memory(MemoryDeviceState),
 }
 
@@ -59,7 +59,7 @@ impl DeviceSnapshot {
     pub fn device_type(&self) -> u32 {
         use crate::virtio::*;
         match self {
-            #[cfg(all(target_os = "linux", not(feature = "tee")))]
+            #[cfg(all(any(target_os = "linux", target_os = "macos"), not(feature = "tee")))]
             DeviceSnapshot::Memory(_) => 24,
             DeviceSnapshot::Console(_) => TYPE_CONSOLE,
             #[cfg(not(target_os = "windows"))]
@@ -82,7 +82,7 @@ impl DeviceSnapshot {
     /// Negotiated feature bits to restore before re-activation.
     pub fn acked_features(&self) -> u64 {
         match self {
-            #[cfg(all(target_os = "linux", not(feature = "tee")))]
+            #[cfg(all(any(target_os = "linux", target_os = "macos"), not(feature = "tee")))]
             DeviceSnapshot::Memory(s) => s.acked_features,
             DeviceSnapshot::Console(s) => s.acked_features,
             #[cfg(not(target_os = "windows"))]
@@ -106,7 +106,7 @@ impl DeviceSnapshot {
     /// transport's queues on re-activation.
     pub fn queue_states(&self) -> Vec<Option<crate::virtio::queue::QueueState>> {
         match self {
-            #[cfg(all(target_os = "linux", not(feature = "tee")))]
+            #[cfg(all(any(target_os = "linux", target_os = "macos"), not(feature = "tee")))]
             DeviceSnapshot::Memory(s) => vec![s.queue.clone()],
             DeviceSnapshot::Console(s) => s.queues.clone(),
             #[cfg(not(target_os = "windows"))]
@@ -152,7 +152,7 @@ impl VmDevicesState {
 /// device types without a snapshot impl yet.
 pub fn snapshot_device(dev: &dyn VirtioDevice) -> Option<DeviceSnapshot> {
     let any = dev.as_any();
-    #[cfg(all(target_os = "linux", not(feature = "tee")))]
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), not(feature = "tee")))]
     if let Some(d) = any.downcast_ref::<MemoryDevice>() {
         return Some(DeviceSnapshot::Memory(d.save_state()));
     }
@@ -195,7 +195,7 @@ pub fn snapshot_device(dev: &dyn VirtioDevice) -> Option<DeviceSnapshot> {
 pub fn restore_device(dev: &mut dyn VirtioDevice, snap: &DeviceSnapshot) -> Result<(), String> {
     let any = dev.as_mut_any();
     match snap {
-        #[cfg(all(target_os = "linux", not(feature = "tee")))]
+        #[cfg(all(any(target_os = "linux", target_os = "macos"), not(feature = "tee")))]
         DeviceSnapshot::Memory(s) => any
             .downcast_mut::<MemoryDevice>()
             .ok_or_else(|| "snapshot/device mismatch: expected MemoryDevice".to_string())?
