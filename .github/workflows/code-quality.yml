@@ -6,6 +6,23 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  check-windows:
+    name: libkrun (Windows cross)
+    runs-on: ubuntu-22.04
+    env:
+      CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu,x86_64-unknown-linux-musl
+      - name: Install cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64 musl-tools clang libclang-dev
+      - name: Check the Windows block and network backend
+        run: cargo check --locked --target x86_64-pc-windows-gnu -p libkrun --features blk,net
+
   code-quality-linux-x86_64:
     name: libkrun (Linux x86_64)
     runs-on: ubuntu-26.04

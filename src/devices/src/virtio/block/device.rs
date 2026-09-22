@@ -156,6 +156,16 @@ impl DiskBackend {
         }
     }
 
+    fn grow(&self, bytes: u64) -> io::Result<()> {
+        let access = match self {
+            Self::Sync(access) | Self::AsyncRaw { access, .. } => access,
+        };
+        let access = access.lock().unwrap();
+        access.resize_grow(bytes, imago::format::PreallocateMode::Zero)?;
+        access.flush()?;
+        access.sync()
+    }
+
     pub(crate) fn write_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
         match self {
             Self::Sync(access) => access.lock().unwrap().write_zeroes(offset, length),
@@ -620,6 +630,43 @@ impl Block {
         &self.id
     }
 
+    /// Grow an exclusively owned writable disk and notify the guest driver.
+    /// The caller must serialize this with snapshots and backing-layer pivots,
+    /// and must never use it on an immutable ancestor of another machine.
+    /// Filesystem growth inside the guest is a separate, subsequent operation.
+    pub fn grow(&mut self, bytes: u64) -> io::Result<()> {
+        let current = self.config.capacity * SECTOR_SIZE;
+        if bytes < current || !bytes.is_multiple_of(SECTOR_SIZE) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "disk growth must be sector-aligned and cannot shrink",
+            ));
+        }
+        if self.avail_features & (1u64 << VIRTIO_BLK_F_RO) != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "cannot grow a read-only disk",
+            ));
+        }
+        if self.quiesced_worker.is_some() || self.snapshot_error.is_some() {
+            return Err(io::Error::other(
+                "cannot grow a disk during snapshot preparation or recovery",
+            ));
+        }
+        // Even an equal-size retry must complete the durability barrier: a
+        // previous request may have grown the image but failed to sync it.
+        self.disk_image.grow(bytes)?;
+        let sectors = bytes >> SECTOR_SHIFT;
+        self.config.capacity = sectors;
+        if let Some(disk) = self.disk.as_mut() {
+            disk.nsectors = sectors;
+        }
+        if let DeviceState::Activated(_, ref interrupt) = self.device_state {
+            interrupt.signal_config_change();
+        }
+        Ok(())
+    }
+
     /// Provides the PARTUUID of this block device.
     pub fn partuuid(&self) -> Option<&String> {
         self.partuuid.as_ref()
@@ -952,6 +999,169 @@ mod overlay_tests {
     use std::fmt;
     use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
     use utils::tempfile::TempFile;
+
+    #[test]
+    fn rejected_disk_growth_keeps_the_previous_capacity() {
+        let storage: Box<dyn DynStorage> = Box::new(FailingStorage {
+            control: Arc::new(FailureControl::default()),
+            helper: CommonStorageHelper::default(),
+        });
+        let raw = Raw::open_image_sync(storage, true).unwrap();
+        let access = SyncFormatAccess::new(raw).unwrap();
+        let original = access.size();
+        assert!(
+            access
+                .resize_grow(original * 2, imago::format::PreallocateMode::Zero)
+                .is_err()
+        );
+        assert_eq!(
+            access.size(),
+            original,
+            "failed growth must not publish capacity"
+        );
+        // A repeated request must still report the failure, not a false no-op success.
+        assert!(
+            access
+                .resize_grow(original * 2, imago::format::PreallocateMode::Zero)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn disk_growth_preserves_data_and_publishes_zeroed_capacity() {
+        for image_type in [ImageType::Raw, ImageType::Qcow2] {
+            let base = TempFile::new().unwrap();
+            base.as_file().set_len(1024 * 1024).unwrap();
+            let path = base.as_path().to_str().unwrap();
+            let overlay = format!("{path}.grow.qcow2");
+            let disk_path = if image_type == ImageType::Qcow2 {
+                create_overlay(&overlay, path, ImageType::Raw).unwrap();
+                overlay.as_str()
+            } else {
+                path
+            };
+            let mut block = Block::new(
+                "grow".into(),
+                None,
+                CacheType::Writeback,
+                disk_path.into(),
+                image_type,
+                false,
+                false,
+                SyncMode::Full,
+                BlockIoEngine::Sync,
+                None,
+            )
+            .unwrap();
+            let marker = [0x5a; 512];
+            block
+                .disk_image
+                .writev(IoVector::from(&marker[..]), 0)
+                .unwrap();
+            block.grow(2 * 1024 * 1024).unwrap();
+            let capacity = block.config.capacity;
+            assert_eq!(capacity * SECTOR_SIZE, 2 * 1024 * 1024);
+            let mut data = [0; 512];
+            block
+                .disk_image
+                .readv(IoVectorMut::from(&mut data[..]), 0)
+                .unwrap();
+            assert_eq!(data, marker);
+            block
+                .disk_image
+                .readv(IoVectorMut::from(&mut data[..]), 1024 * 1024)
+                .unwrap();
+            assert_eq!(data, [0; 512]);
+            assert!(block.grow(512).is_err());
+            assert!(block.grow(2 * 1024 * 1024 + 1).is_err());
+            block.grow(2 * 1024 * 1024).unwrap();
+            drop(block);
+            if image_type == ImageType::Qcow2 {
+                std::fs::remove_file(overlay).unwrap();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn growing_overlay_does_not_expose_backing_data_or_change_siblings() {
+        use std::os::unix::fs::FileExt;
+
+        let base = TempFile::new().unwrap();
+        base.as_file().set_len(2 * 1024 * 1024).unwrap();
+        base.as_file()
+            .write_all_at(&[0xab; 512], 1024 * 1024)
+            .unwrap();
+        let base_path = base.as_path().to_str().unwrap();
+        let overlay = format!("{base_path}.small.qcow2");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let storage = ImagoFile::create_open(
+                StorageCreateOptions::new().filename(&overlay),
+            ).await.unwrap();
+            Qcow2::<Box<dyn DynStorage>, Arc<imago::FormatAccess<Box<dyn DynStorage>>>>::create_builder(
+                Box::new(storage),
+            )
+            .size(1024 * 1024)
+            .backing(base_path.to_string(), "raw".to_string())
+            .create().await.unwrap();
+        });
+        let mut block = Block::new(
+            "private-overlay".into(),
+            None,
+            CacheType::Writeback,
+            overlay.clone(),
+            ImageType::Qcow2,
+            false,
+            false,
+            SyncMode::Full,
+            BlockIoEngine::Sync,
+            None,
+        )
+        .unwrap();
+        block.grow(2 * 1024 * 1024).unwrap();
+        let mut data = [0xff; 512];
+        block
+            .disk_image
+            .readv(IoVectorMut::from(&mut data[..]), 1024 * 1024)
+            .unwrap();
+        assert_eq!(
+            data, [0; 512],
+            "new capacity must not reveal the longer backing"
+        );
+        block
+            .disk_image
+            .writev(IoVector::from(&[0xcd; 512][..]), 1024 * 1024)
+            .unwrap();
+        block.disk_image.flush().unwrap();
+        base.as_file()
+            .read_exact_at(&mut data, 1024 * 1024)
+            .unwrap();
+        assert_eq!(
+            data, [0xab; 512],
+            "other readers of the base must remain unchanged"
+        );
+        drop(block);
+        let (reopened, _) = open_disk_format(
+            &overlay,
+            ImageType::Qcow2,
+            false,
+            false,
+            false,
+            BlockIoEngine::Sync,
+            None,
+        )
+        .unwrap();
+        assert_eq!(reopened.size(), 2 * 1024 * 1024);
+        reopened
+            .readv(IoVectorMut::from(&mut data[..]), 1024 * 1024)
+            .unwrap();
+        assert_eq!(data, [0xcd; 512]);
+        drop(reopened);
+        std::fs::remove_file(overlay).unwrap();
+    }
 
     #[derive(Debug, Default)]
     struct FailureControl {

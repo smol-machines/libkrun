@@ -149,6 +149,39 @@ impl MMIODeviceManager {
         }
     }
 
+    /// Grow the open writable backing and notify the guest of its new capacity.
+    /// The caller must serialize this with snapshot/pivot operations and ensure
+    /// the disk is not an immutable backing used by another machine.
+    #[cfg(feature = "blk")]
+    pub(crate) fn grow_block_device(
+        &self,
+        id: &str,
+        bytes: u64,
+    ) -> std::result::Result<(), String> {
+        let mut matched = None;
+        for device in &self.virtio_devices {
+            let guard = device.lock().expect("poisoned virtio device lock");
+            let Some(block) = guard.as_any().downcast_ref::<devices::virtio::Block>() else {
+                continue;
+            };
+            if block.id() == id {
+                if matched.is_some() {
+                    return Err(format!("multiple block devices have id '{id}'"));
+                }
+                matched = Some(Arc::clone(device));
+            }
+        }
+        let device = matched.ok_or_else(|| format!("block '{id}' not found"))?;
+        let mut guard = device.lock().expect("poisoned virtio device lock");
+        let block = guard
+            .as_mut_any()
+            .downcast_mut::<devices::virtio::Block>()
+            .expect("matched block device changed type");
+        block
+            .grow(bytes)
+            .map_err(|error| format!("grow block '{id}': {error}"))
+    }
+
     /// Validate only after all workers have stopped, including after a previous
     /// failed attempt that left the devices quiesced.
     pub fn validate_snapshot_boundary(&self) -> std::result::Result<(), String> {

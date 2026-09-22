@@ -1677,6 +1677,23 @@ fn read_control_command<R: std::io::Read>(reader: &mut R) -> std::io::Result<Vec
     }
 }
 
+#[cfg(feature = "blk")]
+fn parse_disk_growth(arg: &str) -> Result<(&str, u64), &'static str> {
+    let mut fields = arg.split_whitespace();
+    let id = fields
+        .next()
+        .ok_or("expected disk id and capacity in bytes")?;
+    let bytes = fields
+        .next()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|bytes| *bytes > 0 && bytes.is_multiple_of(512))
+        .ok_or("capacity must be a nonzero sector-aligned byte count")?;
+    if fields.next().is_some() {
+        return Err("expected exactly disk id and capacity in bytes");
+    }
+    Ok((id, bytes))
+}
+
 fn handle_control_stream<S: std::io::Read + std::io::Write + Send + 'static>(
     mut stream: S,
     vmm: &Arc<Mutex<vmm::Vmm>>,
@@ -1695,6 +1712,18 @@ fn handle_control_stream<S: std::io::Read + std::io::Write + Send + 'static>(
             // be an unused-variable error under -D warnings.
             let _arg = parts.next().map(str::trim).unwrap_or("");
             match verb.as_str() {
+                #[cfg(feature = "blk")]
+                "GROW_DISK_CAPABILITIES" => "OK grow-disk-v1\n".to_string(),
+                // The privileged embedder must enforce exclusive disk ownership
+                // and serialize machine lifecycle operations before requesting growth.
+                #[cfg(feature = "blk")]
+                "GROW_DISK" => match parse_disk_growth(_arg) {
+                    Ok((id, bytes)) => match vmm.lock().unwrap().grow_block_device(id, bytes) {
+                        Ok(()) => format!("OK disk {id} capacity {bytes}\n"),
+                        Err(error) => format!("ERR EIO {error}\n"),
+                    },
+                    Err(error) => format!("ERR EINVAL {error}\n"),
+                },
                 #[cfg(all(snapshot_supported, deferred_stream_supported))]
                 "SAVE_CAPABILITIES" => "OK deferred-stream-v1\n".to_string(),
                 #[cfg(all(snapshot_supported, target_os = "linux", target_arch = "x86_64"))]
@@ -1854,6 +1883,26 @@ fn handle_control_stream<S: std::io::Read + std::io::Write + Send + 'static>(
 #[cfg(test)]
 mod control_command_tests {
     use super::*;
+
+    #[cfg(feature = "blk")]
+    #[test]
+    fn disk_growth_command_requires_an_exact_aligned_capacity() {
+        assert_eq!(
+            parse_disk_growth("storage 2147483648"),
+            Ok(("storage", 2147483648))
+        );
+        for invalid in [
+            "",
+            "storage",
+            "storage 0",
+            "storage -512",
+            "storage 513",
+            "storage 18446744073709551616",
+            "storage 512 extra",
+        ] {
+            assert!(parse_disk_growth(invalid).is_err(), "{invalid}");
+        }
+    }
 
     #[cfg(all(snapshot_supported, fork_continue_supported))]
     #[test]
