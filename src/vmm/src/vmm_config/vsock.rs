@@ -144,6 +144,7 @@ pub(crate) mod tests {
             egress_cidrs: None,
             egress_hosts: None,
             egress_resolvers: None,
+            stream_intercept: None,
         }
     }
 
