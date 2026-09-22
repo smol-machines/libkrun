@@ -1755,6 +1755,8 @@ fn handle_control_stream<S: std::io::Read + std::io::Write + Send + 'static>(
                     }
                     Err(error) => format!("ERR EIO {error}\n"),
                 },
+                #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+                "CPU_SHRINK_CAPABILITIES" => "OK preserved-offline-cpu-slots-v1\n".into(),
                 #[cfg(all(
                     any(
                         all(target_os = "linux", target_arch = "x86_64"),

@@ -12,6 +12,21 @@ pub struct CpuGrowthTopology {
 }
 
 impl CpuGrowthTopology {
+    /// Online quota can be smaller than the preserved KVM CPU slots. The
+    /// checkpoint still needs every slot, including offline CPU MP state.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    pub(crate) fn restored_slot_count(
+        &self,
+        configured_online: u8,
+        saved_slots: usize,
+    ) -> Result<u8, String> {
+        let slots =
+            u8::try_from(saved_slots).map_err(|_| "checkpoint CPU slot count is too large")?;
+        if configured_online == 0 || configured_online > slots || slots > self.capacity {
+            return Err("configured CPU quota does not fit checkpoint CPU topology".into());
+        }
+        Ok(slots)
+    }
     pub(crate) fn encode(&self) -> [u8; 5] {
         [
             1,
@@ -92,6 +107,21 @@ impl CpuGrowthProgress {
 ))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shrunk_cpu_quota_preserves_offline_checkpoint_slots() {
+        let topology = CpuGrowthTopology {
+            capacity: 16,
+            ht_enabled: false,
+            nested_enabled: false,
+            cpu_template: None,
+        };
+        assert_eq!(topology.restored_slot_count(2, 4).unwrap(), 4);
+        assert_eq!(topology.restored_slot_count(4, 4).unwrap(), 4);
+        for (online, slots) in [(0, 4), (5, 4), (2, 17), (1, 0), (1, 256)] {
+            assert!(topology.restored_slot_count(online, slots).is_err());
+        }
+    }
 
     #[test]
     fn topology_roundtrip_preserves_policy_and_rejects_invalid_counts() {
