@@ -49,6 +49,8 @@ pub struct VsockDeviceConfig {
     pub egress_hosts: Option<Vec<String>>,
     /// Optional host-trusted DNS resolvers (queries are forwarded only here).
     pub egress_resolvers: Option<Vec<IpAddr>>,
+    /// Optional host interceptor for guest stream connects to one port.
+    pub stream_intercept: Option<devices::virtio::vsock::StreamIntercept>,
 }
 
 struct VsockWrapper {
@@ -100,6 +102,7 @@ impl VsockBuilder {
             cfg.egress_cidrs,
             cfg.egress_hosts,
             cfg.egress_resolvers,
+            cfg.stream_intercept,
         )
         .map_err(VsockConfigError::CreateVsockDevice)
     }

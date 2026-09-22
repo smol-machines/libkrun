@@ -17,7 +17,7 @@ use super::muxer_thread::MuxerThread;
 use super::packet::TsiConnectReq;
 use super::packet::{TsiGetnameRsp, VsockPacket};
 use super::proxy::ProxyRawHandle;
-use super::proxy::{ListenerDesc, Proxy, ProxyRemoval, ProxyStatus, ProxyUpdate};
+use super::proxy::{ListenerDesc, Proxy, ProxyRemoval, ProxyStatus, ProxyUpdate, StreamIntercept};
 use super::reaper::ReaperThread;
 use super::snapshot_gate::SnapshotGate;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -140,6 +140,10 @@ pub struct VsockMuxer {
     /// Sender to the DNS worker thread; Some only when DNS filtering is active.
     dns_sender: Option<Sender<DnsRequest>>,
     snapshot_gate: Arc<SnapshotGate>,
+    /// Redirect guest stream connects to one destination port through a host
+    /// interceptor (see `krun_set_stream_intercept`). Applied after the egress
+    /// policy admitted the real destination.
+    stream_intercept: Option<StreamIntercept>,
 }
 
 impl VsockMuxer {
@@ -151,7 +155,14 @@ impl VsockMuxer {
         egress_cidrs: Option<Vec<(IpAddr, u8)>>,
         egress_hosts: Option<Vec<String>>,
         egress_resolvers: Option<Vec<IpAddr>>,
+        stream_intercept: Option<StreamIntercept>,
     ) -> Self {
+        if let Some(ref intercept) = stream_intercept {
+            info!(
+                "stream intercept configured: guest port {} -> {}",
+                intercept.port, intercept.endpoint
+            );
+        }
         if let Some(ref cidrs) = egress_cidrs {
             info!("egress policy configured with {} CIDR rule(s)", cidrs.len());
         }
@@ -176,6 +187,7 @@ impl VsockMuxer {
             floor: floor_mode(),
             dns_sender: None,
             snapshot_gate: Arc::new(SnapshotGate::default()),
+            stream_intercept,
         }
     }
 
@@ -632,7 +644,14 @@ impl VsockMuxer {
                             });
                             return;
                         }
-                        proxy.connect(pkt, req)
+                        let redirected = self.stream_intercept.as_ref().filter(|intercept| {
+                            !proxy.is_dgram()
+                                && req.addr.inet().is_some_and(|a| a.port() == intercept.port)
+                        });
+                        match redirected {
+                            Some(intercept) => proxy.connect_intercepted(pkt, req, intercept),
+                            None => proxy.connect(pkt, req),
+                        }
                     };
                     self.process_proxy_update(id, update);
                 }
