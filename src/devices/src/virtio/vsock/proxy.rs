@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::io;
+use std::net::{IpAddr, SocketAddr};
 #[cfg(unix)]
 use std::os::unix::io::RawFd;
 
@@ -146,6 +147,43 @@ impl fmt::Display for ProxyError {
     }
 }
 
+/// Host-side interception of guest TSI stream connects.
+///
+/// Guest flows to `port` are dialed to `endpoint` (a loopback listener the VMM
+/// owner runs, e.g. a credential-substituting HTTPS interceptor) instead of the
+/// destination the guest asked for. The proxy writes a fixed preamble first so
+/// the listener learns the real destination and can verify the flow came from
+/// this VM rather than from any process that found the port.
+///
+/// Wire layout, all integers big-endian: `"SMOLICPT"`, version `1`, the
+/// 32-byte token, family (`4`/`6`), destination port, destination address.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamIntercept {
+    pub endpoint: SocketAddr,
+    pub token: [u8; 32],
+    pub port: u16,
+}
+
+impl StreamIntercept {
+    /// Preamble announcing `destination` to the interceptor.
+    pub fn preamble(&self, destination: SocketAddr) -> Vec<u8> {
+        let mut out = Vec::with_capacity(60);
+        out.extend_from_slice(b"SMOLICPT");
+        out.push(1);
+        out.extend_from_slice(&self.token);
+        match destination.ip() {
+            IpAddr::V4(_) => out.push(4),
+            IpAddr::V6(_) => out.push(6),
+        }
+        out.extend_from_slice(&destination.port().to_be_bytes());
+        match destination.ip() {
+            IpAddr::V4(ip) => out.extend_from_slice(&ip.octets()),
+            IpAddr::V6(ip) => out.extend_from_slice(&ip.octets()),
+        }
+        out
+    }
+}
+
 pub trait Proxy: Send {
     /// Raw handle the muxer registers with the epoll layer for this proxy's host
     /// socket. Cross-platform replacement for the former `AsRawFd` supertrait.
@@ -159,6 +197,16 @@ pub trait Proxy: Send {
         false
     }
     fn connect(&mut self, pkt: &VsockPacket, req: TsiConnectReq) -> ProxyUpdate;
+    /// Connect through a [`StreamIntercept`] instead of to `req.addr` directly.
+    /// Proxies without a redirected path fall back to a plain connect.
+    fn connect_intercepted(
+        &mut self,
+        pkt: &VsockPacket,
+        req: TsiConnectReq,
+        _intercept: &StreamIntercept,
+    ) -> ProxyUpdate {
+        self.connect(pkt, req)
+    }
     fn confirm_connect(&mut self, _pkt: &VsockPacket) -> Option<ProxyUpdate> {
         None
     }

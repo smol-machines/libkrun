@@ -1007,6 +1007,39 @@ int32_t krun_set_egress_policy(uint32_t ctx_id,
                                const char **c_dns_resolvers);
 
 /**
+ * Redirects guest TSI stream connects to one destination port through a host
+ * interceptor. Every guest TCP connect to "port" (after the egress policy has
+ * admitted the real destination) is dialed to "c_endpoint" instead, and the
+ * stream is prefixed with a preamble naming the destination the guest asked
+ * for: the ASCII magic "SMOLICPT", a version byte (1), the 32-byte token,
+ * an address-family byte (4 or 6), the destination port and address, all
+ * integers big-endian. getpeername() in the guest still reports the original
+ * destination. Datagram sockets and other ports are unaffected.
+ *
+ * This is what lets an HTTPS credential-substituting proxy sit transparently
+ * under a TSI-networked guest.
+ *
+ * Arguments:
+ *  "ctx_id"      - the configuration context ID.
+ *  "c_endpoint"  - null-terminated "ip:port" of the interceptor; must be a
+ *                  loopback address.
+ *  "c_token_hex" - null-terminated 64-character hex encoding of the 32-byte
+ *                  token the interceptor expects in every preamble.
+ *  "port"        - destination port whose connects are redirected (e.g. 443).
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ *  -EINVAL if an argument is malformed, the endpoint is not loopback, or port
+ *          is zero.
+ *  -ENOENT if ctx_id is invalid.
+ *  -ENODEV if vsock is disabled.
+ */
+int32_t krun_set_stream_intercept(uint32_t ctx_id,
+                                  const char *c_endpoint,
+                                  const char *c_token_hex,
+                                  uint16_t port);
+
+/**
  * Returns the eventfd file descriptor to signal the guest to shut down orderly. This must be
  * called before starting the microVM with "krun_start_event".
  *

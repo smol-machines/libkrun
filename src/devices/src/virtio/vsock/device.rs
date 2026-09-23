@@ -63,6 +63,7 @@ pub struct Vsock {
 
 impl Vsock {
     /// Create a new virtio-vsock device with the given VM CID.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         cid: u64,
         host_port_map: Option<HashMap<u16, u16>>,
@@ -71,6 +72,7 @@ impl Vsock {
         egress_cidrs: Option<Vec<(IpAddr, u8)>>,
         egress_hosts: Option<Vec<String>>,
         egress_resolvers: Option<Vec<IpAddr>>,
+        stream_intercept: Option<super::proxy::StreamIntercept>,
     ) -> super::Result<Vsock> {
         Ok(Vsock {
             cid,
@@ -82,6 +84,7 @@ impl Vsock {
                 egress_cidrs,
                 egress_hosts,
                 egress_resolvers,
+                stream_intercept,
             ),
             queue_rx: None,
             queue_tx: None,
@@ -419,7 +422,8 @@ mod tests {
 
     #[test]
     fn save_state_uses_listener_metadata_captured_before_quiesce() {
-        let mut vsock = Vsock::new(3, None, None, TsiFlags::empty(), None, None, None).unwrap();
+        let mut vsock =
+            Vsock::new(3, None, None, TsiFlags::empty(), None, None, None, None).unwrap();
         let listener = ListenerDesc {
             family: defs::LINUX_AF_INET,
             peer_port: 41,

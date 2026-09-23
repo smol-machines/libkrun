@@ -217,6 +217,7 @@ struct ContextConfig {
     unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
     egress_hosts: Option<Vec<String>>,
     egress_resolvers: Option<Vec<std::net::IpAddr>>,
+    stream_intercept: Option<devices::virtio::vsock::StreamIntercept>,
     shutdown_efd: Option<EventFd>,
     gpu_virgl_flags: Option<u32>,
     gpu_shm_size: Option<usize>,
@@ -3231,6 +3232,66 @@ pub unsafe extern "C" fn krun_set_egress_policy(
 
 #[allow(clippy::missing_safety_doc)]
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn krun_set_stream_intercept(
+    ctx_id: u32,
+    c_endpoint: *const c_char,
+    c_token_hex: *const c_char,
+    port: u16,
+) -> i32 {
+    use devices::virtio::vsock::StreamIntercept;
+
+    if c_endpoint.is_null() || c_token_hex.is_null() || port == 0 {
+        return -libc::EINVAL;
+    }
+    let endpoint: std::net::SocketAddr = match unsafe { CStr::from_ptr(c_endpoint) }
+        .to_str()
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        Some(addr) => addr,
+        None => return -libc::EINVAL,
+    };
+    // The interceptor must be a listener the VMM owner runs on this host; a
+    // routable endpoint would let the preamble token leave the machine.
+    if !endpoint.ip().is_loopback() || endpoint.port() == 0 {
+        return -libc::EINVAL;
+    }
+    let token_hex = match unsafe { CStr::from_ptr(c_token_hex) }.to_str() {
+        Ok(hex) if hex.len() == 64 => hex,
+        _ => return -libc::EINVAL,
+    };
+    let mut token = [0u8; 32];
+    for (i, byte) in token.iter_mut().enumerate() {
+        match u8::from_str_radix(&token_hex[2 * i..2 * i + 2], 16) {
+            Ok(value) => *byte = value,
+            Err(_) => return -libc::EINVAL,
+        }
+    }
+
+    let mut map = match CTX_MAP.lock() {
+        Ok(map) => map,
+        Err(_) => return -libc::EINVAL,
+    };
+    match map.entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            let cfg = ctx_cfg.get_mut();
+            if cfg.vsock_config == VsockConfig::Disabled {
+                return -libc::ENODEV;
+            }
+            cfg.stream_intercept = Some(StreamIntercept {
+                endpoint,
+                token,
+                port,
+            });
+        }
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+
+    KRUN_SUCCESS
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn krun_set_rlimits(ctx_id: u32, c_rlimits: *const *const c_char) -> i32 {
     unsafe {
         let rlimits = if c_rlimits.is_null() {
@@ -5215,6 +5276,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     let egress_cidrs = ctx_cfg.egress_cidrs.take();
     let egress_hosts = ctx_cfg.egress_hosts.take();
     let egress_resolvers = ctx_cfg.egress_resolvers.take();
+    let stream_intercept = ctx_cfg.stream_intercept.take();
 
     match &ctx_cfg.vsock_config {
         VsockConfig::Disabled => (),
@@ -5228,6 +5290,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
                 egress_cidrs,
                 egress_hosts,
                 egress_resolvers,
+                stream_intercept,
             };
             ctx_cfg.vmr.set_vsock_device(vsock_device_config).unwrap();
         }

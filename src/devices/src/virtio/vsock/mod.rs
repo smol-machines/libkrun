@@ -29,6 +29,7 @@ mod vsock_addr;
 pub use self::defs::TsiFlags;
 pub use self::defs::uapi::VIRTIO_ID_VSOCK as TYPE_VSOCK;
 pub use self::device::{Vsock, VsockState};
+pub use self::proxy::StreamIntercept;
 
 use bitflags::bitflags;
 use vm_memory::GuestMemoryError;
