@@ -157,6 +157,9 @@ impl fmt::Display for ProxyError {
 ///
 /// Wire layout, all integers big-endian: `"SMOLICPT"`, version `1`, the
 /// 32-byte token, family (`4`/`6`), destination port, destination address.
+/// The listener answers with one byte before any payload flows: `0` once it
+/// has connected to the destination, otherwise the Linux errno of that
+/// connect, which the guest then sees as the result of its own connect.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StreamIntercept {
     pub endpoint: SocketAddr,

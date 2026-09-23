@@ -84,6 +84,11 @@ pub struct TsiStreamProxy {
     /// interceptor; `getpeername` answers with it so the guest never sees the
     /// loopback endpoint.
     intercept_peer: Option<SocketAddr>,
+    /// A redirected flow stays `Connecting` until the interceptor answers the
+    /// preamble with its own connect result, so the guest sees the real
+    /// destination's outcome (and can fall back, e.g. IPv6 to IPv4) rather
+    /// than a loopback connect that always succeeds.
+    awaiting_verdict: bool,
 }
 
 impl TsiStreamProxy {
@@ -159,6 +164,7 @@ impl TsiStreamProxy {
             tx_buf: VecDeque::new(),
             preamble: VecDeque::new(),
             intercept_peer: None,
+            awaiting_verdict: false,
             rx_paused: false,
             pending_accepts: 0,
             #[cfg(target_os = "linux")]
@@ -207,6 +213,7 @@ impl TsiStreamProxy {
             tx_buf: VecDeque::new(),
             preamble: VecDeque::new(),
             intercept_peer: None,
+            awaiting_verdict: false,
             rx_paused: false,
             pending_accepts: 0,
             #[cfg(target_os = "linux")]
@@ -505,11 +512,68 @@ impl TsiStreamProxy {
         }
     }
 
+    /// Drive a redirected flow's handshake with the interceptor: send the
+    /// preamble, then read the one-byte verdict (`0`, or the Linux errno of the
+    /// interceptor's connect to the real destination) and report it to the
+    /// guest as the outcome of its connect.
+    fn advance_verdict(&mut self, update: &mut ProxyUpdate) {
+        if !self.preamble.is_empty() {
+            if self.flush_tx().is_err() {
+                return self.fail_connect(update, libc::ECONNREFUSED);
+            }
+            if !self.preamble.is_empty() {
+                update.polling = Some((
+                    self.id,
+                    raw_handle(&self.sock),
+                    EventSet::OUT | EventSet::EDGE_TRIGGERED,
+                ));
+                return;
+            }
+        }
+        let mut verdict = [0u8; 1];
+        match sys::recv_into(&self.sock, &mut verdict) {
+            Ok(1) if verdict[0] == 0 => {
+                debug!("connect: interceptor reached the destination");
+                self.awaiting_verdict = false;
+                self.switch_to_connected();
+                self.push_connect_rsp(0);
+                update.signal_queue = true;
+                // As for a direct connect: no socket events until OP_REQUEST.
+                update.polling = Some((self.id, raw_handle(&self.sock), EventSet::empty()));
+            }
+            Ok(1) => {
+                debug!(
+                    "connect: interceptor could not reach the destination: errno {}",
+                    verdict[0]
+                );
+                self.fail_connect(update, verdict[0] as i32);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                update.polling = Some((self.id, raw_handle(&self.sock), EventSet::IN));
+            }
+            Ok(_) | Err(_) => self.fail_connect(update, libc::ECONNREFUSED),
+        }
+    }
+
+    fn fail_connect(&mut self, update: &mut ProxyUpdate, errno: i32) {
+        self.awaiting_verdict = false;
+        self.push_connect_rsp(-errno);
+        self.status = ProxyStatus::Closed;
+        update.polling = Some((self.id, raw_handle(&self.sock), EventSet::empty()));
+        update.signal_queue = true;
+        update.remove_proxy = ProxyRemoval::Deferred;
+    }
+
     /// Dial `addr` on the host socket, reporting the outcome to the guest.
     fn dial(&mut self, addr: std::io::Result<socket2::SockAddr>) -> ProxyUpdate {
         let mut update = ProxyUpdate::default();
         let result = match addr {
             Ok(addr) => match self.sock.connect(&addr) {
+                Ok(()) if self.awaiting_verdict => {
+                    debug!("connect: Connected to interceptor, awaiting its verdict");
+                    self.status = ProxyStatus::Connecting;
+                    0
+                }
                 Ok(()) => {
                     debug!("connect: Connected");
                     self.switch_to_connected();
@@ -792,6 +856,7 @@ impl Proxy for TsiStreamProxy {
         }
         self.intercept_peer = Some(destination);
         self.preamble = intercept.preamble(destination).into();
+        self.awaiting_verdict = true;
         debug!(
             "connect: redirecting {} to interceptor {}",
             destination, intercept.endpoint
@@ -1104,6 +1169,11 @@ impl Proxy for TsiStreamProxy {
 
     fn process_event(&mut self, evset: EventSet) -> ProxyUpdate {
         let mut update = ProxyUpdate::default();
+
+        if self.awaiting_verdict && self.status == ProxyStatus::Connecting {
+            self.advance_verdict(&mut update);
+            return update;
+        }
 
         if evset.contains(EventSet::HANG_UP) {
             debug!("process_event: HANG_UP");
