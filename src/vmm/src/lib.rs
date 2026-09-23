@@ -494,6 +494,13 @@ fn paused_vm_with_failed_ram_mapping_cannot_capture_or_rearm() {
 }
 
 impl Vmm {
+    /// Guest-physical address where device windows (virtio-fs DAX, GPU) begin;
+    /// everything below it is RAM.
+    #[cfg(target_os = "linux")]
+    fn device_windows_start(&self) -> vm_memory::GuestAddress {
+        vm_memory::GuestAddress(self.arch_memory_info.shm_start_addr)
+    }
+
     #[cfg(target_os = "linux")]
     fn ensure_ram_mapping_valid(&self) -> Result<()> {
         ensure_ram_mapping_valid(self.ram_remap_failure.as_deref())
@@ -1036,9 +1043,14 @@ impl Vmm {
             let memory = if let Some(generation) = layered_generation {
                 snapshot::DeferredMemorySave::from_layered(generation)
             } else {
-                snapshot::start_deferred_memory_save(&self.guest_memory, generation_dir).map_err(
-                    |error| Error::Snapshot(format!("retain COW guest-memory generation: {error}")),
-                )?
+                snapshot::start_deferred_memory_save_with_windows(
+                    &self.guest_memory,
+                    generation_dir,
+                    Some(self.device_windows_start()),
+                )
+                .map_err(|error| {
+                    Error::Snapshot(format!("retain COW guest-memory generation: {error}"))
+                })?
             };
             #[cfg(not(target_os = "linux"))]
             let memory = snapshot::start_deferred_memory_save(&self.guest_memory, generation_dir)
@@ -1333,7 +1345,11 @@ impl Vmm {
             };
             let generation_copy = if needs_materialization && generation_guardian.is_none() {
                 Some(
-                    snapshot::start_fork_generation_copy(&self.guest_memory).map_err(|error| {
+                    snapshot::start_fork_generation_copy_with_windows(
+                        &self.guest_memory,
+                        Some(self.device_windows_start()),
+                    )
+                    .map_err(|error| {
                         Error::Snapshot(format!("start RAM generation worker: {error}"))
                     })?,
                 )
