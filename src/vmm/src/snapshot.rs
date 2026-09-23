@@ -1312,13 +1312,28 @@ fn stable_memfd_generation(
 #[cfg(target_os = "linux")]
 pub fn start_deferred_memory_save(
     parent: &GuestMemoryMmap,
+    generation_dir: &std::path::Path,
+) -> io::Result<DeferredMemorySave> {
+    start_deferred_memory_save_with_windows(parent, generation_dir, None)
+}
+
+/// [`start_deferred_memory_save`] for a guest whose device windows (virtio-fs
+/// DAX, GPU) begin at `device_windows_from`; see
+/// [`start_fork_generation_copy_with_windows`].
+#[cfg(target_os = "linux")]
+pub fn start_deferred_memory_save_with_windows(
+    parent: &GuestMemoryMmap,
     _generation_dir: &std::path::Path,
+    device_windows_from: Option<GuestAddress>,
 ) -> io::Result<DeferredMemorySave> {
     // Reject anonymous regions before changing any mappings. Portable capture
     // falls back to the established synchronous SAVE path for this shape.
     let _ = stable_memfd_generation(parent)?;
     let generation = if guest_memory_backing_is_immutable(parent)? {
-        DeferredLinuxGeneration::Copy(start_fork_generation_copy(parent)?)
+        DeferredLinuxGeneration::Copy(start_fork_generation_copy_with_windows(
+            parent,
+            device_windows_from,
+        )?)
     } else {
         rebase_guest_memory_private(parent)?;
         let (descs, files) = stable_memfd_generation(parent)?;
@@ -1462,10 +1477,28 @@ impl DeferredMemorySave {
 /// generation. Call only at a fully quiesced snapshot boundary.
 #[cfg(target_os = "linux")]
 pub fn start_fork_generation_copy(parent: &GuestMemoryMmap) -> io::Result<ForkGenerationCopy> {
+    start_fork_generation_copy_with_windows(parent, None)
+}
+
+/// [`start_fork_generation_copy`] for a guest whose device windows begin at
+/// `device_windows_from`.
+///
+/// A virtio-fs DAX window is not plain RAM: parts of it are host files mapped
+/// in at the guest's request, and a mapping can run past the end of its file.
+/// The guest never reads there, but touching such a page raises SIGBUS, which
+/// would kill the copy worker. Window regions are therefore read through
+/// `process_vm_readv`, which reports an unreadable page as an error instead of
+/// a signal; those pages stay zero in the copy. RAM keeps the direct path.
+#[cfg(target_os = "linux")]
+pub fn start_fork_generation_copy_with_windows(
+    parent: &GuestMemoryMmap,
+    device_windows_from: Option<GuestAddress>,
+) -> io::Result<ForkGenerationCopy> {
     struct CopyRegion {
         source: *const u8,
         len: usize,
         destination_fd: libc::c_int,
+        device_window: bool,
     }
 
     unsafe fn is_zero(source: *const u8, len: usize) -> bool {
@@ -1505,6 +1538,7 @@ pub fn start_fork_generation_copy(parent: &GuestMemoryMmap) -> io::Result<ForkGe
             source: source.cast_const(),
             len,
             destination_fd: file.as_raw_fd(),
+            device_window: device_windows_from.is_some_and(|start| region.start_addr() >= start),
         });
         files.push(file);
     }
@@ -1514,6 +1548,15 @@ pub fn start_fork_generation_copy(parent: &GuestMemoryMmap) -> io::Result<ForkGe
             "guest RAM has no regions",
         ));
     }
+    // The child may not allocate, so the bounce buffer for window reads is
+    // made here and inherited.
+    const WINDOW_CHUNK: usize = 1024 * 1024;
+    let mut window_buffer = if copies.iter().any(|copy| copy.device_window) {
+        vec![0_u8; WINDOW_CHUNK]
+    } else {
+        Vec::new()
+    };
+    let window_buffer_ptr = window_buffer.as_mut_ptr();
 
     let mut status_pipe = [-1; 2];
     if unsafe { libc::pipe2(status_pipe.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
@@ -1544,7 +1587,127 @@ pub fn start_fork_generation_copy(parent: &GuestMemoryMmap) -> io::Result<ForkGe
         let mut child_errno = 0_i32;
         const PAGE_SIZE: usize = 4096;
         const COPY_CHUNK: usize = 16 * 1024 * 1024;
+        // Write `len` bytes from `source` to the region's copy at `at`, as whole
+        // runs of non-zero pages. Returns an errno on failure.
+        unsafe fn write_nonzero_pages(
+            source: *const u8,
+            len: usize,
+            destination_fd: libc::c_int,
+            at: usize,
+        ) -> i32 {
+            const PAGE_SIZE: usize = 4096;
+            let mut offset = 0_usize;
+            while offset < len {
+                let page_len = (len - offset).min(PAGE_SIZE);
+                if unsafe { is_zero(source.add(offset), page_len) } {
+                    offset += page_len;
+                    continue;
+                }
+                let run_start = offset;
+                offset += page_len;
+                while offset < len {
+                    let page_len = (len - offset).min(PAGE_SIZE);
+                    if unsafe { is_zero(source.add(offset), page_len) } {
+                        break;
+                    }
+                    offset += page_len;
+                }
+                let mut written = 0_usize;
+                while written < offset - run_start {
+                    let result = unsafe {
+                        libc::pwrite(
+                            destination_fd,
+                            source.add(run_start + written).cast::<libc::c_void>(),
+                            offset - run_start - written,
+                            (at + run_start + written) as libc::off_t,
+                        )
+                    };
+                    if result < 0 {
+                        let errno = unsafe { *libc::__errno_location() };
+                        if errno == libc::EINTR {
+                            continue;
+                        }
+                        return errno;
+                    }
+                    if result == 0 {
+                        return libc::EIO;
+                    }
+                    written += result as usize;
+                }
+            }
+            0
+        }
+        // Read `len` bytes of this process's own memory at `source` into
+        // `buffer`, returning how many bytes were readable before a fault.
+        unsafe fn read_own_memory(
+            pid: libc::pid_t,
+            source: *const u8,
+            buffer: *mut u8,
+            len: usize,
+        ) -> usize {
+            let local = libc::iovec {
+                iov_base: buffer.cast::<libc::c_void>(),
+                iov_len: len,
+            };
+            let remote = libc::iovec {
+                iov_base: source.cast_mut().cast::<libc::c_void>(),
+                iov_len: len,
+            };
+            let result = unsafe { libc::process_vm_readv(pid, &local, 1, &remote, 1, 0) };
+            if result < 0 { 0 } else { result as usize }
+        }
+        let own_pid = unsafe { libc::getpid() };
         'regions: for copy in &copies {
+            if copy.device_window {
+                let mut offset = 0_usize;
+                while offset < copy.len {
+                    let chunk = (copy.len - offset).min(WINDOW_CHUNK);
+                    let source = unsafe { copy.source.add(offset) };
+                    let readable =
+                        unsafe { read_own_memory(own_pid, source, window_buffer_ptr, chunk) };
+                    if readable == chunk {
+                        child_errno = unsafe {
+                            write_nonzero_pages(
+                                window_buffer_ptr,
+                                chunk,
+                                copy.destination_fd,
+                                offset,
+                            )
+                        };
+                    } else {
+                        // Some page in this chunk cannot be read; take it a
+                        // page at a time and leave the unreadable ones zero.
+                        let mut page = 0_usize;
+                        while page < chunk && child_errno == 0 {
+                            let page_len = (chunk - page).min(PAGE_SIZE);
+                            let got = unsafe {
+                                read_own_memory(
+                                    own_pid,
+                                    source.add(page),
+                                    window_buffer_ptr,
+                                    page_len,
+                                )
+                            };
+                            if got == page_len {
+                                child_errno = unsafe {
+                                    write_nonzero_pages(
+                                        window_buffer_ptr,
+                                        page_len,
+                                        copy.destination_fd,
+                                        offset + page,
+                                    )
+                                };
+                            }
+                            page += page_len;
+                        }
+                    }
+                    if child_errno != 0 {
+                        break 'regions;
+                    }
+                    offset += chunk;
+                }
+                continue;
+            }
             let mut offset = 0_usize;
             while offset < copy.len {
                 let page_len = (copy.len - offset).min(PAGE_SIZE);
@@ -1614,6 +1777,8 @@ pub fn start_fork_generation_copy(parent: &GuestMemoryMmap) -> io::Result<ForkGe
     }
 
     unsafe { libc::close(status_pipe[1]) };
+    // The child has its own copy of the buffer; the parent's is not needed.
+    drop(window_buffer);
     Ok(ForkGenerationCopy {
         child_pid,
         status_fd: status_pipe[0],
@@ -3044,6 +3209,69 @@ mod tests {
 
         drop(memory);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A DAX window can hold a host file mapped past its end. The guest never
+    /// reads there, and neither may the copy worker: a direct read raises
+    /// SIGBUS and kills it. Window regions copy what is readable and leave the
+    /// rest zero.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fork_worker_survives_a_window_mapped_past_its_file() {
+        use std::io::Write as _;
+        use std::os::unix::fs::FileExt as _;
+        const PAGE: usize = 4096;
+        const REGION_SIZE: usize = 2 * 1024 * 1024;
+        const WINDOW_GPA: u64 = 0x40_0000;
+        let memory = GuestMemoryMmap::from_ranges(&[
+            (GuestAddress(0), REGION_SIZE),
+            (GuestAddress(WINDOW_GPA), REGION_SIZE),
+        ])
+        .unwrap();
+        memory
+            .write_slice(&[0x11; PAGE], GuestAddress(0x1000))
+            .unwrap();
+
+        // One page of file behind a two-page mapping: the second page is past
+        // the end of the file.
+        let fd = unsafe { libc::memfd_create(c"dax-backing".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0);
+        let mut backing = unsafe { <File as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+        backing.write_all(&[0x33; PAGE]).unwrap();
+        let window = memory.get_host_address(GuestAddress(WINDOW_GPA)).unwrap();
+        let mapped = unsafe {
+            libc::mmap(
+                window.cast::<libc::c_void>(),
+                2 * PAGE,
+                libc::PROT_READ,
+                libc::MAP_SHARED | libc::MAP_FIXED,
+                backing.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(mapped, libc::MAP_FAILED);
+
+        let generation =
+            start_fork_generation_copy_with_windows(&memory, Some(GuestAddress(WINDOW_GPA)))
+                .unwrap();
+        let (_descs, files) = generation.finish().unwrap();
+        let mut page = [0_u8; PAGE];
+        files[0].read_exact_at(&mut page, 0x1000).unwrap();
+        assert_eq!(page, [0x11; PAGE]);
+        files[1].read_exact_at(&mut page, 0).unwrap();
+        assert_eq!(page, [0x33; PAGE]);
+        files[1].read_exact_at(&mut page, PAGE as u64).unwrap();
+        assert_eq!(page, [0; PAGE]);
+
+        // Without knowing where the windows are, the worker dies on that page.
+        let error = start_fork_generation_copy(&memory)
+            .unwrap()
+            .finish()
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("exited without status"),
+            "{error}"
+        );
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
