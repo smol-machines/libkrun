@@ -529,13 +529,15 @@ impl PassthroughFs {
         Self::safe_relative_path(relative).then(|| relative.to_string_lossy().into_owned())
     }
 
+    /// The inode's path relative to the export root (empty = the root itself),
+    /// or `None` if the snapshot records a path that is not safely beneath it.
+    /// Only a lexical check: [`Self::open_beneath`] is what keeps the reopen
+    /// inside the export at resolution time.
     fn restore_inode_path(&self, snap: &FuseInodeSnap) -> Option<PathBuf> {
-        let root = std::fs::canonicalize(&self.cfg.root_dir)
-            .unwrap_or_else(|_| PathBuf::from(&self.cfg.root_dir));
         if let Some(relative) = snap.relative_path.as_deref() {
             let relative = Path::new(relative);
             if Self::safe_relative_path(relative) {
-                return Some(root.join(relative));
+                return Some(relative.to_path_buf());
             }
             warn!("fs restore: rejecting unsafe relative inode path {relative:?}");
             return None;
@@ -545,12 +547,13 @@ impl PassthroughFs {
         // restored when its absolute paths already belonged to this export.
         // Never let an imported checkpoint make the VMM open an arbitrary host
         // path outside the configured root.
-        let legacy = PathBuf::from(&snap.path);
-        match legacy.strip_prefix(&root) {
+        let root = std::fs::canonicalize(&self.cfg.root_dir)
+            .unwrap_or_else(|_| PathBuf::from(&self.cfg.root_dir));
+        match Path::new(&snap.path).strip_prefix(&root) {
             Ok(relative)
                 if relative.as_os_str().is_empty() || Self::safe_relative_path(relative) =>
             {
-                Some(legacy)
+                Some(relative.to_path_buf())
             }
             _ => {
                 warn!(
@@ -560,6 +563,40 @@ impl PassthroughFs {
                 None
             }
         }
+    }
+
+    /// Open `relative` beneath the export root directory `root`, one component
+    /// at a time, as an `O_PATH` fd — without following a symlink anywhere in
+    /// the path. A lexically clean path is not enough: resolving it from the
+    /// host root follows symlinks in every intermediate component, and the tree
+    /// can change between snapshot and restore, so an intermediate directory
+    /// replaced by a symlink would carry the reopen outside the export. Here an
+    /// intermediate symlink is opened as the link itself and the next step
+    /// fails with `ENOTDIR`; a trailing symlink yields the symlink inode,
+    /// matching `do_lookup`. An empty path is the root itself.
+    fn open_beneath(root: &File, relative: &Path) -> io::Result<File> {
+        let mut current = root.try_clone()?;
+        for component in relative.components() {
+            let Component::Normal(name) = component else {
+                return Err(einval());
+            };
+            let name = CString::new(name.as_encoded_bytes()).map_err(|_| einval())?;
+            // SAFETY: `current` is a valid fd, `name` is NUL-terminated, and the
+            // return value is checked.
+            let fd = unsafe {
+                libc::openat(
+                    current.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: we just opened this fd.
+            current = unsafe { File::from_raw_fd(fd) };
+        }
+        Ok(current)
     }
 
     pub fn new(cfg: Config, inode_alloc: Arc<InodeAllocator>) -> io::Result<PassthroughFs> {
@@ -748,37 +785,28 @@ impl PassthroughFs {
     ///
     /// [`snapshot`]: Self::snapshot
     pub fn restore(&self, state: &FuseServerState) -> io::Result<()> {
+        // Every inode is reopened beneath the root inode's fd; clone it before
+        // taking the write lock below.
+        let root = self
+            .inodes
+            .read()
+            .unwrap()
+            .get(&fuse::ROOT_ID)
+            .map(|data| data.file.try_clone())
+            .ok_or_else(ebadf)??;
         {
             let mut inodes = self.inodes.write().unwrap();
             for snap in &state.inodes {
                 let Some(path) = self.restore_inode_path(snap) else {
                     continue;
                 };
-                let cpath = match CString::new(path.as_os_str().as_encoded_bytes()) {
-                    Ok(c) => c,
-                    Err(_) => continue,
+                let f = match Self::open_beneath(&root, &path) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        warn!("fs restore: reopen {} failed: {e}", path.display());
+                        continue;
+                    }
                 };
-                // SAFETY: constant flags, checked return value. `O_NOFOLLOW`
-                // matches `do_lookup`: a symlink inode must resolve to the symlink
-                // itself, not its target (the target may not even exist on the
-                // host — e.g. an absolute symlink like /bin/sh -> /bin/busybox).
-                let fd = unsafe {
-                    libc::openat(
-                        libc::AT_FDCWD,
-                        cpath.as_ptr(),
-                        libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                    )
-                };
-                if fd < 0 {
-                    warn!(
-                        "fs restore: reopen {} failed: {}",
-                        path.display(),
-                        io::Error::last_os_error()
-                    );
-                    continue;
-                }
-                // SAFETY: we just opened this fd.
-                let f = unsafe { File::from_raw_fd(fd) };
                 let (st, mnt_id) = match statx(&f) {
                     Ok(v) => v,
                     Err(e) => {
@@ -2741,6 +2769,7 @@ impl FileSystem for PassthroughFs {
 mod tests {
     use super::*;
     use std::fs;
+    use std::os::unix::fs::MetadataExt;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     // A non-zero uid the server can be made to run as, plus a guest
@@ -2750,6 +2779,56 @@ mod tests {
     const SERVER_UID: libc::uid_t = 1;
     const SERVER_GID: libc::gid_t = 1;
     const GUEST_UID: libc::uid_t = 1000;
+
+    // A restore reopens inodes beneath the export root without following any
+    // symlink: an intermediate component that is (or became) a symlink must be
+    // refused rather than resolved, while a trailing symlink is the link itself.
+    #[test]
+    fn restore_reopens_stay_beneath_the_export_root() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "libkrun-open-beneath-{}-{nonce}",
+            std::process::id()
+        ));
+        let root = base.join("export");
+        fs::create_dir_all(root.join("dir")).unwrap();
+        fs::write(root.join("dir/file"), b"inside").unwrap();
+        fs::create_dir(base.join("elsewhere")).unwrap();
+        fs::write(base.join("elsewhere/file"), b"outside").unwrap();
+        std::os::unix::fs::symlink(base.join("elsewhere"), root.join("linked")).unwrap();
+        let root_fd = File::open(&root).unwrap();
+        let ino = |f: &File| statx(f).unwrap().0.st_ino;
+
+        let inside = PassthroughFs::open_beneath(&root_fd, Path::new("dir/file")).unwrap();
+        assert_eq!(
+            ino(&inside),
+            fs::metadata(root.join("dir/file")).unwrap().ino()
+        );
+
+        let through_link = PassthroughFs::open_beneath(&root_fd, Path::new("linked/file"));
+        assert_eq!(
+            through_link.unwrap_err().raw_os_error(),
+            Some(libc::ENOTDIR),
+            "an intermediate symlink must not be followed"
+        );
+
+        let link = PassthroughFs::open_beneath(&root_fd, Path::new("linked")).unwrap();
+        assert_eq!(
+            ino(&link),
+            fs::symlink_metadata(root.join("linked")).unwrap().ino()
+        );
+
+        assert!(PassthroughFs::open_beneath(&root_fd, Path::new("../export")).is_err());
+        assert_eq!(
+            ino(&PassthroughFs::open_beneath(&root_fd, Path::new("")).unwrap()),
+            ino(&root_fd)
+        );
+
+        fs::remove_dir_all(&base).unwrap();
+    }
 
     #[test]
     fn regular_opens_skip_redundant_close_flushes() {
