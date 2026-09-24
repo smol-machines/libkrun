@@ -100,7 +100,9 @@ impl DeviceSnapshot {
         match self {
             DeviceSnapshot::Console(s) => s.queues.clone(),
             #[cfg(not(target_os = "windows"))]
-            DeviceSnapshot::Vsock(s) => vec![s.queue_rx.clone(), s.queue_tx.clone()],
+            DeviceSnapshot::Vsock(s) => {
+                vec![s.queue_rx.clone(), s.queue_tx.clone(), s.queue_ev.clone()]
+            }
             #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
             DeviceSnapshot::Fs(s) => s.queues.clone(),
             #[cfg(not(feature = "tee"))]
@@ -268,7 +270,8 @@ mod tests {
                     acked_features: 0x1234,
                     activated: true,
                     queue_rx: Some(qs.clone()),
-                    queue_tx: Some(qs),
+                    queue_tx: Some(qs.clone()),
+                    queue_ev: Some(qs),
                     listeners: Vec::new(),
                 }),
             ],
@@ -280,6 +283,19 @@ mod tests {
             state, restored,
             "device state must round-trip through bytes"
         );
+        assert_eq!(
+            restored.devices[1].queue_states().len(),
+            3,
+            "a vsock restore must re-activate its event queue too"
+        );
+    }
+
+    #[test]
+    fn vsock_snapshot_without_event_queue_still_loads() {
+        // Snapshots taken before the event queue was captured.
+        let old = br#"{"cid":7,"acked_features":0,"activated":true,"queue_rx":null,"queue_tx":null,"listeners":[]}"#;
+        let state: VsockState = serde_json::from_slice(old).expect("deserialize");
+        assert_eq!(state.queue_ev, None);
     }
 
     // A GPU device carries only transport state (features + queue rings) into a

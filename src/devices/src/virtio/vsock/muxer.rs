@@ -338,6 +338,37 @@ impl VsockMuxer {
         self.snapshot_gate.resume();
     }
 
+    /// Deliver nothing to the guest until it has handled a transport reset.
+    ///
+    /// The guest handles the reset event asynchronously and resets every
+    /// connected socket it has at that moment, without telling the peer. A
+    /// host connection delivered before that would be reset too, and its host
+    /// end would wait forever. `fallback` bounds the hold for a guest that
+    /// never acknowledges the event.
+    pub(crate) fn hold_rx_for_transport_reset(&self, fallback: std::time::Duration) {
+        self.snapshot_gate.hold_for_transport_reset();
+        let gate = self.snapshot_gate.clone();
+        std::thread::Builder::new()
+            .name("vsock-reset-hold".into())
+            .spawn(move || {
+                std::thread::sleep(fallback);
+                if gate.is_held_for_transport_reset() {
+                    warn!("vsock: guest did not acknowledge the transport reset; releasing RX");
+                    gate.release_transport_reset();
+                }
+            })
+            .map(drop)
+            .unwrap_or_else(|e| error!("vsock: failed to start reset hold timer: {e}"));
+    }
+
+    pub(crate) fn release_rx_after_transport_reset(&self) {
+        self.snapshot_gate.release_transport_reset();
+    }
+
+    pub(crate) fn rx_held_for_transport_reset(&self) -> bool {
+        self.snapshot_gate.is_held_for_transport_reset()
+    }
+
     pub(crate) fn has_pending_rx(&self) -> bool {
         !self.rxq.lock().unwrap().is_empty()
     }

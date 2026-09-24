@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use utils::byte_order;
 use utils::eventfd::EventFd;
-use vm_memory::GuestMemoryMmap;
+use vm_memory::{Bytes, GuestMemoryMmap};
 
 use super::super::{
     ActivateError, ActivateResult, DeviceQueue, DeviceState, Queue as VirtQueue, QueueConfig,
@@ -30,6 +30,13 @@ pub(crate) const RXQ_INDEX: usize = 0;
 pub(crate) const TXQ_INDEX: usize = 1;
 pub(crate) const EVQ_INDEX: usize = 2;
 
+/// `virtio_vsock_event.id` telling the driver that every connection it holds is
+/// gone (virtio spec 5.10.6.7). The guest resets its connected sockets and
+/// keeps its listeners.
+const VIRTIO_VSOCK_EVENT_TRANSPORT_RESET: u32 = 0;
+/// Longest RX stays held waiting for the guest to handle a transport reset.
+const TRANSPORT_RESET_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// The virtio features supported by our vsock device:
 /// - VIRTIO_F_VERSION_1: the device conforms to at least version 1.0 of the VirtIO spec.
 /// - VIRTIO_F_IN_ORDER: the device returns used buffers in the same order that the driver makes
@@ -43,6 +50,9 @@ pub struct Vsock {
     pub(crate) muxer: VsockMuxer,
     pub(crate) queue_rx: Option<Arc<Mutex<VirtQueue>>>,
     pub(crate) queue_tx: Option<Arc<Mutex<VirtQueue>>>,
+    /// The event queue. The device only uses it to announce a transport reset
+    /// after a restore.
+    pub(crate) queue_ev: Option<Arc<Mutex<VirtQueue>>>,
     // Queue events are stored separately for event handling.
     pub(crate) queue_events: Vec<Arc<EventFd>>,
     pub(crate) avail_features: u64,
@@ -52,6 +62,12 @@ pub struct Vsock {
     /// Inbound listeners staged by `restore_state`, re-established once the muxer
     /// worker is live in `finish_restore_activation` (fork-clone path).
     pending_restore_listeners: Vec<ListenerDesc>,
+    /// Set by `restore_state` when the snapshot carries the event queue, so
+    /// `finish_restore_activation` can tell the guest its connections are gone.
+    pending_transport_reset: bool,
+    /// A transport reset was posted; RX is held until the guest refills the
+    /// event queue, which its driver does right after handling the event.
+    pub(crate) awaiting_transport_reset_ack: bool,
     /// Listener metadata captured before RX producers are gated for a snapshot.
     ///
     /// A producer can hold a proxy mutex while waiting to enter the snapshot
@@ -88,6 +104,7 @@ impl Vsock {
             ),
             queue_rx: None,
             queue_tx: None,
+            queue_ev: None,
             queue_events: Vec::new(),
             avail_features: AVAIL_FEATURES,
             acked_features: 0,
@@ -95,6 +112,8 @@ impl Vsock {
                 .map_err(super::VsockError::EventFd)?,
             device_state: DeviceState::Inactive,
             pending_restore_listeners: Vec::new(),
+            pending_transport_reset: false,
+            awaiting_transport_reset_ack: false,
             quiesced_listeners: None,
         })
     }
@@ -119,6 +138,9 @@ impl Vsock {
         };
 
         let mut have_used = false;
+        if self.muxer.rx_held_for_transport_reset() {
+            return have_used;
+        }
 
         debug!("process_rx before while");
         let queue_rx = self
@@ -234,6 +256,11 @@ pub struct VsockState {
     pub activated: bool,
     pub queue_rx: Option<QueueState>,
     pub queue_tx: Option<QueueState>,
+    /// The event queue, needed to announce a transport reset to the restored
+    /// guest. `#[serde(default)]` keeps older snapshots (without it) loadable;
+    /// those restore without the announcement.
+    #[serde(default)]
+    pub queue_ev: Option<QueueState>,
     /// Live TSI inbound-port-forward listeners at snapshot time, re-established
     /// on a fork clone against its own host port map (see [`ListenerDesc`]).
     /// `#[serde(default)]` keeps older snapshots (without this field) loadable.
@@ -253,6 +280,7 @@ impl Vsock {
             activated: matches!(self.device_state, DeviceState::Activated(..)),
             queue_rx: q(&self.queue_rx),
             queue_tx: q(&self.queue_tx),
+            queue_ev: q(&self.queue_ev),
             listeners: self
                 .quiesced_listeners
                 .clone()
@@ -279,10 +307,61 @@ impl Vsock {
         // model — for a fresh-device restore the proxy_map is already empty, so
         // this is a no-op there.
         self.muxer.reset_connections();
+        if let (Some(m), Some(qs)) = (self.queue_ev.as_ref(), state.queue_ev.as_ref()) {
+            m.lock().unwrap().restore_state(qs)?;
+        }
         // Stash inbound listeners; they are re-established in
         // `finish_restore_activation`, after the muxer worker/epoll is live.
         self.pending_restore_listeners = state.listeners.clone();
+        // A fresh device restored from a snapshot: the guest's view still has
+        // every connection that was open when the snapshot was taken, but their
+        // host ends are gone. Without being told, it keeps them established
+        // forever, and whatever serves them (e.g. an agent with a bounded number
+        // of connection handlers) waits on them indefinitely. Nothing may reach
+        // the guest until it has handled the reset (see
+        // `hold_rx_for_transport_reset`).
+        if !self.is_activated() && state.queue_ev.is_some() {
+            self.pending_transport_reset = true;
+            self.muxer
+                .hold_rx_for_transport_reset(TRANSPORT_RESET_ACK_TIMEOUT);
+        }
         Ok(())
+    }
+
+    /// Tell the guest driver that all of its connections are gone.
+    ///
+    /// Posts a `VIRTIO_VSOCK_EVENT_TRANSPORT_RESET` into the next buffer the
+    /// driver made available on the event queue. Returns whether one was posted.
+    fn send_transport_reset(&mut self) -> bool {
+        let DeviceState::Activated(ref mem, _) = self.device_state else {
+            return false;
+        };
+        let Some(queue_ev) = self.queue_ev.as_ref() else {
+            return false;
+        };
+        let mut queue_ev = queue_ev.lock().unwrap();
+        let Some(head) = queue_ev.pop(mem) else {
+            warn!("vsock: no event buffer available to announce a transport reset");
+            return false;
+        };
+        let event_len = std::mem::size_of::<u32>() as u32;
+        let used_len = if head.is_write_only() && head.len >= event_len {
+            match mem.write_obj(VIRTIO_VSOCK_EVENT_TRANSPORT_RESET.to_le(), head.addr) {
+                Ok(()) => event_len,
+                Err(e) => {
+                    error!("vsock: failed to write transport reset event: {e:?}");
+                    0
+                }
+            }
+        } else {
+            error!("vsock: event buffer is not a writable virtio_vsock_event");
+            0
+        };
+        if let Err(e) = queue_ev.add_used(mem, head.index, used_len) {
+            error!("vsock: failed to return event buffer: {e:?}");
+            return false;
+        }
+        used_len == event_len
     }
 }
 
@@ -313,6 +392,14 @@ impl VirtioDevice for Vsock {
         if !self.pending_restore_listeners.is_empty() {
             let listeners = std::mem::take(&mut self.pending_restore_listeners);
             self.muxer.restore_listeners(listeners);
+        }
+        if std::mem::take(&mut self.pending_transport_reset) {
+            if self.send_transport_reset() {
+                self.awaiting_transport_reset_ack = true;
+                self.device_state.signal_used_queue();
+            } else {
+                self.muxer.release_rx_after_transport_reset();
+            }
         }
     }
 
@@ -389,11 +476,11 @@ impl VirtioDevice for Vsock {
 
         // Extract queues from DeviceQueues and wrap in Arc<Mutex<>>.
         let mut queues_vec: Vec<VirtQueue> = queues.into_iter().map(|dq| dq.queue).collect();
-        // Note: EVQ (index 2) is currently unused, we just take it to maintain the vec.
-        let _evq = queues_vec.pop().unwrap();
+        let ev_queue = queues_vec.pop().unwrap();
         let tx_queue = queues_vec.pop().unwrap();
         let rx_queue = queues_vec.pop().unwrap();
 
+        self.queue_ev = Some(Arc::new(Mutex::new(ev_queue)));
         self.queue_tx = Some(Arc::new(Mutex::new(tx_queue)));
         self.queue_rx = Some(Arc::new(Mutex::new(rx_queue)));
         self.muxer.activate(

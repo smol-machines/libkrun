@@ -3,6 +3,8 @@ use std::sync::{Condvar, Mutex, MutexGuard};
 #[derive(Default)]
 struct GateState {
     paused: bool,
+    /// RX is held until a restored guest has handled a transport reset.
+    transport_reset: bool,
     active: usize,
 }
 
@@ -17,7 +19,7 @@ pub(crate) struct SnapshotGate {
 impl SnapshotGate {
     pub(super) fn enter(&self) -> SnapshotActivity<'_> {
         let mut state = self.state.lock().unwrap();
-        while state.paused {
+        while state.paused || state.transport_reset {
             state = self.changed.wait(state).unwrap();
         }
         state.active += 1;
@@ -36,6 +38,26 @@ impl SnapshotGate {
         let mut state = self.state.lock().unwrap();
         state.paused = false;
         self.changed.notify_all();
+    }
+
+    /// Hold RX producers until [`release_transport_reset`](Self::release_transport_reset).
+    ///
+    /// Unlike [`pause`](Self::pause) this does not wait for active producers:
+    /// it is set before the restored guest runs, when none can be mid-packet.
+    pub(super) fn hold_for_transport_reset(&self) {
+        self.state.lock().unwrap().transport_reset = true;
+    }
+
+    pub(super) fn release_transport_reset(&self) {
+        let mut state = self.state.lock().unwrap();
+        if state.transport_reset {
+            state.transport_reset = false;
+            self.changed.notify_all();
+        }
+    }
+
+    pub(super) fn is_held_for_transport_reset(&self) -> bool {
+        self.state.lock().unwrap().transport_reset
     }
 
     fn finish(&self, mut state: MutexGuard<'_, GateState>) {
@@ -66,6 +88,29 @@ mod tests {
     use std::time::Duration;
 
     use super::SnapshotGate;
+
+    #[test]
+    fn transport_reset_hold_blocks_writers_until_released() {
+        let gate = Arc::new(SnapshotGate::default());
+        gate.hold_for_transport_reset();
+        let entered = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let gate = gate.clone();
+            let entered = entered.clone();
+            thread::spawn(move || {
+                let _activity = gate.enter();
+                entered.store(true, Ordering::SeqCst);
+            })
+        };
+        thread::sleep(Duration::from_millis(50));
+        assert!(!entered.load(Ordering::SeqCst));
+        assert!(gate.is_held_for_transport_reset());
+
+        gate.release_transport_reset();
+        writer.join().unwrap();
+        assert!(entered.load(Ordering::SeqCst));
+        assert!(!gate.is_held_for_transport_reset());
+    }
 
     #[test]
     fn pause_waits_for_an_active_writer() {
