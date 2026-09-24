@@ -222,7 +222,9 @@ impl Epoll {
                         ptr::null(),
                     )
                 };
-                assert_eq!(ret, 0);
+                if ret == -1 {
+                    return Err(io::Error::last_os_error());
+                }
             }
             ControlOperation::Delete => {
                 let mut kevs: Vec<Kevent> = Vec::new();
@@ -379,6 +381,15 @@ mod tests {
     use super::*;
 
     use crate::eventfd::{EFD_NONBLOCK, EventFd};
+
+    #[test]
+    fn test_ctl_invalid_fd_returns_error() {
+        let epoll = Epoll::new().unwrap();
+        let event = EpollEvent::new(EventSet::IN, 1);
+
+        assert!(epoll.ctl(ControlOperation::Add, -1, &event).is_err());
+        assert!(epoll.ctl(ControlOperation::Modify, -1, &event).is_err());
+    }
 
     #[test]
     fn test_event_ops() {
