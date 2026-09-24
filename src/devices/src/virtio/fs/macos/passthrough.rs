@@ -616,6 +616,65 @@ impl PassthroughFs {
         Ok(PathBuf::from(OsStr::from_bytes(path.to_bytes())))
     }
 
+    /// `(dev, ino)` of `relative` beneath the export root `root`, resolved one
+    /// component at a time without following a symlink anywhere in the path.
+    /// A lexically clean path is not enough: resolving it from the host root
+    /// follows symlinks in every intermediate component, and the tree can change
+    /// between snapshot and restore, so an intermediate directory replaced by a
+    /// symlink would yield an identity outside the export (later opened through
+    /// volfs). Intermediates are opened `O_DIRECTORY | O_NOFOLLOW` (a symlink
+    /// fails with `ELOOP`); the final component is `fstatat`ed with
+    /// `AT_SYMLINK_NOFOLLOW`, so a trailing symlink is the link itself. The root
+    /// itself may be a symlink (as in `setup_root_inode`).
+    fn identity_beneath(root: &Path, relative: &Path) -> io::Result<(i32, u64)> {
+        let open_dir = |dirfd: RawFd, name: &CStr, flags: libc::c_int| -> io::Result<File> {
+            // SAFETY: `name` is NUL-terminated and the return value is checked.
+            let fd = unsafe {
+                libc::openat(
+                    dirfd,
+                    name.as_ptr(),
+                    flags | libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: we just opened this fd.
+            Ok(unsafe { File::from_raw_fd(fd) })
+        };
+        let root = CString::new(root.as_os_str().as_bytes()).map_err(|_| einval())?;
+        let mut dir = open_dir(libc::AT_FDCWD, &root, 0)?;
+        let mut components = relative.components().peekable();
+        while let Some(component) = components.next() {
+            let Component::Normal(name) = component else {
+                return Err(einval());
+            };
+            let name = CString::new(name.as_bytes()).map_err(|_| einval())?;
+            if components.peek().is_some() {
+                dir = open_dir(dir.as_raw_fd(), &name, libc::O_NOFOLLOW)?;
+                continue;
+            }
+            let mut st = MaybeUninit::<libc::stat>::zeroed();
+            // SAFETY: `dir` is a valid fd, `name` is NUL-terminated, `st` is a
+            // valid out-pointer, and the return value is checked.
+            let rc = unsafe {
+                libc::fstatat(
+                    dir.as_raw_fd(),
+                    name.as_ptr(),
+                    st.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if rc < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: fstatat succeeded and initialized `st`.
+            let st = unsafe { st.assume_init() };
+            return Ok((st.st_dev, st.st_ino));
+        }
+        Err(einval())
+    }
+
     fn restore_inode_identity(&self, snap: &FuseInodeSnap) -> Option<(i32, u64)> {
         if let Some(relative) = snap.relative_path.as_deref() {
             let relative = Path::new(relative);
@@ -623,18 +682,13 @@ impl PassthroughFs {
                 warn!("fs restore: rejecting unsafe relative inode path {relative:?}");
                 return None;
             }
-            let root = std::fs::canonicalize(&self.cfg.root_dir)
-                .unwrap_or_else(|_| PathBuf::from(&self.cfg.root_dir));
-            let path = root.join(relative);
-            let cpath = CString::new(path.as_os_str().as_bytes()).ok()?;
-            let st = match lstat(&cpath, false) {
-                Ok(st) => st,
+            return match Self::identity_beneath(Path::new(&self.cfg.root_dir), relative) {
+                Ok(identity) => Some(identity),
                 Err(error) => {
-                    warn!("fs restore: lstat {} failed: {error}", path.display());
-                    return None;
+                    warn!("fs restore: resolve {relative:?} beneath export root failed: {error}");
+                    None
                 }
             };
-            return Some((st.st_dev, st.st_ino));
         }
 
         // Same-host compatibility for snapshots created before relative paths.
@@ -2810,7 +2864,56 @@ fn is_terminal_ioctl(cmd: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::PassthroughFs;
     use super::is_terminal_ioctl;
+    use std::fs;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Path;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    // A restore resolves inode identities beneath the export root without
+    // following any symlink: an intermediate component that is (or became) a
+    // symlink must be refused, while a trailing symlink is the link itself.
+    #[test]
+    fn restore_identities_stay_beneath_the_export_root() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "libkrun-identity-beneath-{}-{nonce}",
+            std::process::id()
+        ));
+        let root = base.join("export");
+        fs::create_dir_all(root.join("dir")).unwrap();
+        fs::write(root.join("dir/file"), b"inside").unwrap();
+        fs::create_dir(base.join("elsewhere")).unwrap();
+        fs::write(base.join("elsewhere/file"), b"outside").unwrap();
+        std::os::unix::fs::symlink(base.join("elsewhere"), root.join("linked")).unwrap();
+        let identity = |p: &Path| {
+            let m = fs::symlink_metadata(p).unwrap();
+            (m.dev() as i32, m.ino())
+        };
+
+        assert_eq!(
+            PassthroughFs::identity_beneath(&root, Path::new("dir/file")).unwrap(),
+            identity(&root.join("dir/file"))
+        );
+        assert_eq!(
+            PassthroughFs::identity_beneath(&root, Path::new("linked/file"))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ELOOP),
+            "an intermediate symlink must not be followed"
+        );
+        assert_eq!(
+            PassthroughFs::identity_beneath(&root, Path::new("linked")).unwrap(),
+            identity(&root.join("linked"))
+        );
+        assert!(PassthroughFs::identity_beneath(&root, Path::new("../export/dir")).is_err());
+
+        fs::remove_dir_all(&base).unwrap();
+    }
 
     #[test]
     fn terminal_ioctls_are_recognized() {
