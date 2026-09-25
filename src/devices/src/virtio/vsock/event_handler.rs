@@ -98,6 +98,12 @@ impl Vsock {
         if let Err(e) = self.queue_events[EVQ_INDEX].read() {
             error!("Failed to consume vsock evq event: {e:?}");
         }
+        // The driver refills the event queue after handling an event, so this
+        // kick means a posted transport reset has been handled.
+        if std::mem::take(&mut self.awaiting_transport_reset_ack) {
+            self.muxer.release_rx_after_transport_reset();
+            return self.process_stream_rx();
+        }
         false
     }
 
@@ -140,6 +146,21 @@ impl Vsock {
             )
             .unwrap_or_else(|e| {
                 error!("Failed to register vsock txq with event manager: {e:?}");
+            });
+
+        // The event queue's kick tells us a restored guest has handled a
+        // transport reset (see `handle_evq_event`).
+        event_manager
+            .register(
+                self.queue_events[EVQ_INDEX].as_raw_fd(),
+                EpollEvent::new(
+                    EventSet::IN,
+                    self.queue_events[EVQ_INDEX].as_raw_fd() as u64,
+                ),
+                self_subscriber.clone(),
+            )
+            .unwrap_or_else(|e| {
+                error!("Failed to register vsock evq with event manager: {e:?}");
             });
 
         event_manager
