@@ -6,6 +6,18 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  unit-tests-macos:
+    name: Unit tests (macOS utils)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup build environment
+        uses: ./.github/actions/setup-build-env
+
+      - name: Test macOS event registration
+        run: cargo test --locked -p krun-utils macos::epoll::tests
+
   unit-tests-linux-x86_64:
     name: Unit tests (Linux x86_64)
     runs-on: ubuntu-26.04
