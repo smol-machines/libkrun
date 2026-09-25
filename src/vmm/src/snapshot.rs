@@ -1499,6 +1499,102 @@ pub fn start_fork_generation_copy_with_windows(
         len: usize,
         destination_fd: libc::c_int,
         device_window: bool,
+        /// The file this RAM is mapped from, and where in it: used to find
+        /// never-written pages without touching them.
+        backing: Option<(libc::c_int, u64)>,
+    }
+
+    /// Answers "can this guest page hold data?" without touching the page.
+    ///
+    /// Reading a never-written page of a memfd-backed mapping allocates it: a
+    /// zero scan over the whole region would permanently fill the source's
+    /// RAM file to the full guest size, charged to the source. A page can only
+    /// hold data if the backing file has data there, or if the source has its
+    /// own private copy of it (pagemap: present or swapped, not file-backed).
+    /// Anything it cannot determine is treated as data, as before.
+    struct PageDataCursor {
+        pagemap_fd: libc::c_int,
+        backing_fd: libc::c_int,
+        backing_start: u64,
+        source: usize,
+        /// Pagemap entries for `window_len` pages starting at `window_start`.
+        window: *mut u64,
+        window_start: usize,
+        window_len: usize,
+        window_valid: bool,
+        /// The backing file's data extent at or after the last queried offset.
+        data_start: u64,
+        data_end: u64,
+        extents_valid: bool,
+    }
+
+    const PAGEMAP_WINDOW_PAGES: usize = 512;
+
+    impl PageDataCursor {
+        /// Whether the page at `offset` (from the region start) may hold data.
+        unsafe fn may_hold_data(&mut self, offset: usize) -> bool {
+            const PAGE_SIZE: usize = 4096;
+            const PM_PRESENT: u64 = 1 << 63;
+            const PM_SWAP: u64 = 1 << 62;
+            const PM_FILE: u64 = 1 << 61;
+            let file_offset = self.backing_start + offset as u64;
+            if self.extents_valid && file_offset >= self.data_end {
+                let start = unsafe {
+                    libc::lseek(self.backing_fd, file_offset as libc::off_t, libc::SEEK_DATA)
+                };
+                if start < 0 {
+                    if unsafe { *libc::__errno_location() } == libc::ENXIO {
+                        // no data at or after this offset
+                        self.data_start = u64::MAX;
+                        self.data_end = u64::MAX;
+                    } else {
+                        self.extents_valid = false;
+                    }
+                } else {
+                    let end = unsafe { libc::lseek(self.backing_fd, start, libc::SEEK_HOLE) };
+                    if end < 0 {
+                        self.extents_valid = false;
+                    } else {
+                        self.data_start = start as u64;
+                        self.data_end = end as u64;
+                    }
+                }
+            }
+            if !self.extents_valid
+                || (file_offset >= self.data_start && file_offset < self.data_end)
+            {
+                return true;
+            }
+            // Not in the file: data only if the source has its own copy.
+            if self.pagemap_fd < 0 {
+                return true;
+            }
+            let page = offset / PAGE_SIZE;
+            if !self.window_valid
+                || page < self.window_start
+                || page >= self.window_start + self.window_len
+            {
+                let address = self.source + page * PAGE_SIZE;
+                let wanted = PAGEMAP_WINDOW_PAGES * std::mem::size_of::<u64>();
+                let read = unsafe {
+                    libc::pread(
+                        self.pagemap_fd,
+                        self.window.cast::<libc::c_void>(),
+                        wanted,
+                        ((address / PAGE_SIZE) * std::mem::size_of::<u64>()) as libc::off_t,
+                    )
+                };
+                if read < std::mem::size_of::<u64>() as isize {
+                    self.window_valid = false;
+                    return true;
+                }
+                self.window_start = page;
+                self.window_len = read as usize / std::mem::size_of::<u64>();
+                self.window_valid = true;
+            }
+            let entry = unsafe { *self.window.add(page - self.window_start) };
+            entry & (PM_PRESENT | PM_SWAP) != 0 && entry & PM_FILE == 0
+        }
     }
 
     unsafe fn is_zero(source: *const u8, len: usize) -> bool {
@@ -1539,6 +1635,9 @@ pub fn start_fork_generation_copy_with_windows(
             len,
             destination_fd: file.as_raw_fd(),
             device_window: device_windows_from.is_some_and(|start| region.start_addr() >= start),
+            backing: region
+                .file_offset()
+                .map(|backing| (backing.file().as_raw_fd(), backing.start())),
         });
         files.push(file);
     }
@@ -1557,6 +1656,8 @@ pub fn start_fork_generation_copy_with_windows(
         Vec::new()
     };
     let window_buffer_ptr = window_buffer.as_mut_ptr();
+    let mut pagemap_window = vec![0_u64; PAGEMAP_WINDOW_PAGES];
+    let pagemap_window_ptr = pagemap_window.as_mut_ptr();
 
     let mut status_pipe = [-1; 2];
     if unsafe { libc::pipe2(status_pipe.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
@@ -1657,6 +1758,14 @@ pub fn start_fork_generation_copy_with_windows(
             if result < 0 { 0 } else { result as usize }
         }
         let own_pid = unsafe { libc::getpid() };
+        // This process's own page table: it was forked from the source, so its
+        // private pages are the source's at the capture point.
+        let pagemap_fd = unsafe {
+            libc::open(
+                c"/proc/self/pagemap".as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC,
+            )
+        };
         'regions: for copy in &copies {
             if copy.device_window {
                 let mut offset = 0_usize;
@@ -1708,10 +1817,33 @@ pub fn start_fork_generation_copy_with_windows(
                 }
                 continue;
             }
+            let mut cursor = copy
+                .backing
+                .map(|(backing_fd, backing_start)| PageDataCursor {
+                    pagemap_fd,
+                    backing_fd,
+                    backing_start,
+                    source: copy.source as usize,
+                    window: pagemap_window_ptr,
+                    window_start: 0,
+                    window_len: 0,
+                    window_valid: false,
+                    data_start: 0,
+                    data_end: 0,
+                    extents_valid: true,
+                });
+            let mut skip = |offset: usize, page_len: usize| -> bool {
+                if let Some(cursor) = cursor.as_mut()
+                    && !unsafe { cursor.may_hold_data(offset) }
+                {
+                    return true;
+                }
+                unsafe { is_zero(copy.source.add(offset), page_len) }
+            };
             let mut offset = 0_usize;
             while offset < copy.len {
                 let page_len = (copy.len - offset).min(PAGE_SIZE);
-                if unsafe { is_zero(copy.source.add(offset), page_len) } {
+                if skip(offset, page_len) {
                     offset += page_len;
                     continue;
                 }
@@ -1720,7 +1852,7 @@ pub fn start_fork_generation_copy_with_windows(
                 offset += page_len;
                 while offset < copy.len && offset - run_start < COPY_CHUNK {
                     let page_len = (copy.len - offset).min(PAGE_SIZE);
-                    if unsafe { is_zero(copy.source.add(offset), page_len) } {
+                    if skip(offset, page_len) {
                         break;
                     }
                     offset += page_len;
@@ -1777,8 +1909,9 @@ pub fn start_fork_generation_copy_with_windows(
     }
 
     unsafe { libc::close(status_pipe[1]) };
-    // The child has its own copy of the buffer; the parent's is not needed.
+    // The child has its own copy of the buffers; the parent's are not needed.
     drop(window_buffer);
+    drop(pagemap_window);
     Ok(ForkGenerationCopy {
         child_pid,
         status_fd: status_pipe[0],
@@ -3321,6 +3454,63 @@ mod tests {
                 libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK
             );
         }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn fork_worker_does_not_allocate_unwritten_source_ram() {
+        if run_with_private_address_space("fork_worker_does_not_allocate_unwritten_source_ram") {
+            return;
+        }
+        use crate::builder::create_guest_ram_memfd;
+        use std::os::unix::fs::MetadataExt;
+        use vm_memory::FileOffset;
+
+        const PAGE: usize = 4096;
+        const SIZE: usize = 8 * 1024 * 1024;
+        let memfd = create_guest_ram_memfd(SIZE).expect("sealable memfd");
+        let inspect = memfd.try_clone().expect("inspection fd");
+        let memory = GuestMemoryMmap::from_ranges_with_files([(
+            GuestAddress(0),
+            SIZE,
+            Some(FileOffset::new(memfd, 0)),
+        )])
+        .expect("memfd-backed source");
+        // Written before the source goes private: lives in the RAM file.
+        memory
+            .write_slice(&[0x11; PAGE], GuestAddress(PAGE as u64))
+            .unwrap();
+        rebase_guest_memory_private(&memory).expect("private source rebase");
+        // Written after: lives only in the source's private pages.
+        memory
+            .write_slice(&[0x22; PAGE], GuestAddress(3 * PAGE as u64))
+            .unwrap();
+        let allocated_before = inspect.metadata().unwrap().blocks();
+
+        let (descs, _files) = start_fork_generation_copy(&memory)
+            .unwrap()
+            .finish()
+            .unwrap();
+
+        assert_eq!(
+            inspect.metadata().unwrap().blocks(),
+            allocated_before,
+            "copying the generation allocated unwritten pages of the source RAM file"
+        );
+        let clone = open_cow_memory_from_pid(std::process::id() as i32, &descs).unwrap();
+        let mut page = [0_u8; PAGE];
+        clone
+            .read_slice(&mut page, GuestAddress(PAGE as u64))
+            .unwrap();
+        assert_eq!(page, [0x11; PAGE]);
+        clone
+            .read_slice(&mut page, GuestAddress(3 * PAGE as u64))
+            .unwrap();
+        assert_eq!(page, [0x22; PAGE]);
+        clone
+            .read_slice(&mut page, GuestAddress(5 * PAGE as u64))
+            .unwrap();
+        assert_eq!(page, [0; PAGE]);
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
