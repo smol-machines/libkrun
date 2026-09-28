@@ -710,7 +710,9 @@ impl Instance {
     // Requires all writers to be quiesced. The caller validates private RAM
     // views and excludes device-owned mappings before scanning page state.
     fn capture_quiesced(&self) -> io::Result<(Image, usize)> {
-        let pagemap = File::open("/proc/self/pagemap")?;
+        // A hardened VMM is not dumpable and cannot open its own page map;
+        // fall back to the descriptor the embedder opened before hardening.
+        let pagemap = crate::snapshot::open_own_pagemap()?;
         let base = self
             .memory
             .get_host_address(GuestAddress(self.image.gpa))
@@ -835,6 +837,57 @@ fn dirty_page_ranges_use_host_page_units() {
             vec![(page_size, 3 * page_size)]
         );
     }
+}
+
+#[test]
+fn capture_uses_the_embedder_pagemap_once_the_process_is_not_dumpable() {
+    use crate::snapshot::MemoryRegionDesc;
+    const NAME: &str = "capture_uses_the_embedder_pagemap_once_the_process_is_not_dumpable";
+    // Becoming non-dumpable is irreversible, so run in a child test process.
+    if std::env::var("KRUN_NONDUMPABLE_CAPTURE_TEST").as_deref() != Ok(NAME) {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("layered_restore::{NAME}"),
+                "--nocapture",
+            ])
+            .env("KRUN_NONDUMPABLE_CAPTURE_TEST", NAME)
+            .status()
+            .unwrap();
+        assert!(status.success(), "non-dumpable capture test failed");
+        return;
+    }
+    // Harden like the VMM: the embedder opens the page map first.
+    let pagemap = File::open("/proc/self/pagemap").unwrap();
+    // SAFETY: this child test process runs this test alone.
+    unsafe { std::env::set_var("KRUN_PAGEMAP_FD", pagemap.as_raw_fd().to_string()) };
+    assert_eq!(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) }, 0);
+    if unsafe { libc::geteuid() } != 0 {
+        assert_eq!(
+            File::open("/proc/self/pagemap").unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+    let size = 4 * host_page_size();
+    let file = crate::builder::create_guest_ram_memfd(size).unwrap();
+    let generation = Generation::from_immutable_file(
+        &[MemoryRegionDesc {
+            gpa: 0,
+            len: size as u64,
+        }],
+        &file,
+    )
+    .unwrap();
+    let memory = generation.restore().unwrap();
+    memory
+        .write_slice(
+            &vec![0x5a; host_page_size()],
+            GuestAddress(host_page_size() as u64),
+        )
+        .unwrap();
+    let (_, copied) = generation.capture_quiesced(&memory).unwrap();
+    assert_eq!(copied, host_page_size());
+    drop(pagemap);
 }
 
 #[test]

@@ -1686,7 +1686,7 @@ impl HeldMemory {
 /// the embedder may open it before hardening and pass the descriptor in
 /// `KRUN_PAGEMAP_FD`.
 #[cfg(target_os = "linux")]
-fn open_own_pagemap() -> io::Result<File> {
+pub(crate) fn open_own_pagemap() -> io::Result<File> {
     use std::os::fd::{BorrowedFd, FromRawFd};
     match File::open("/proc/self/pagemap") {
         Ok(file) => Ok(file),
