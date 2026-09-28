@@ -2949,9 +2949,11 @@ fn start_macos_fork_generation_clone(
         });
     }
     if clones.is_empty() {
+        // A branch's RAM is anonymous, so there is no file to retain while the
+        // VM runs on. Callers fall back to a synchronous save.
         return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "guest RAM has no file-backed regions",
+            io::ErrorKind::Unsupported,
+            "deferred durable save requires file-backed guest RAM",
         ));
     }
     dir.sync_all()?;
@@ -3988,6 +3990,33 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
         assert!(!directory.join("memory-0.bin.partial").exists());
         assert_eq!(fs::read(&collision).unwrap(), b"existing");
+
+        drop(memory);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn deferred_save_of_anonymous_ram_is_unsupported_so_callers_save_synchronously() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "libkrun-macos-anonymous-ram-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        // A branch's RAM: no backing file at all.
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10_0000)]).unwrap();
+
+        let error = start_deferred_memory_save(&memory, &directory)
+            .err()
+            .expect("anonymous RAM cannot be retained while the VM runs");
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        // The save handler reports this as ENOTSUP, the signal to fall back.
+        assert!(error.to_string().contains("deferred durable save requires"));
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
 
         drop(memory);
         fs::remove_dir_all(directory).unwrap();
