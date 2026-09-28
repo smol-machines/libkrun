@@ -1555,7 +1555,10 @@ pub fn start_held_memory_save(
     device_windows_from: Option<GuestAddress>,
     valid: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> io::Result<DeferredMemorySave> {
-    if !cow_backing.is_empty() && cow_backing.len() != parent.num_regions() {
+    // The backing describes the regions the clone was restored with. RAM
+    // added live is appended above them with its own file, so the backing may
+    // cover only a prefix of the regions, never more than all of them.
+    if cow_backing.len() > parent.num_regions() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "copy-on-write backing does not match guest RAM regions",
@@ -4294,6 +4297,64 @@ mod tests {
         expected[9 * PAGE..10 * PAGE].fill(0x44);
         expected[SIZE + 2 * PAGE..SIZE + 3 * PAGE].fill(0x55);
         assert!(image == expected, "held save image differs from the clone");
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn held_save_includes_ram_added_to_a_clone() {
+        if run_with_private_address_space("held_save_includes_ram_added_to_a_clone") {
+            return;
+        }
+        use crate::builder::create_guest_ram_memfd;
+        use std::os::fd::AsRawFd;
+        use vm_memory::{FileOffset, GuestRegionCollectionError, GuestRegionMmap};
+
+        const PAGE: usize = 4096;
+        const SIZE: usize = 8 * 1024 * 1024;
+        const ADDED_GPA: u64 = 0x100_0000;
+        let source = create_guest_ram_memfd(SIZE).unwrap();
+        source.write_all_at(&[0x11; PAGE], 0).unwrap();
+        let descs = [MemfdRegionDesc {
+            gpa: 0,
+            len: SIZE as u64,
+            fd: source.as_raw_fd(),
+            offset: 0,
+            path: String::new(),
+        }];
+        let (clone, backing) =
+            open_cow_memory_from_pid_with_backing(std::process::id() as i32, &descs).unwrap();
+        let clone = clone.with_shared_growth();
+        // Live RAM growth appends a memfd-backed region above the restored RAM,
+        // after the clone's copy-on-write backing was recorded.
+        let added = std::sync::Arc::new(
+            GuestRegionMmap::from_range(
+                GuestAddress(ADDED_GPA),
+                SIZE,
+                Some(FileOffset::new(create_guest_ram_memfd(SIZE).unwrap(), 0)),
+            )
+            .unwrap(),
+        );
+        clone
+            .append_shared_region_with(added, |_| Ok::<(), GuestRegionCollectionError>(()))
+            .unwrap();
+        clone
+            .write_slice(&[0x66; PAGE], GuestAddress(ADDED_GPA + PAGE as u64))
+            .unwrap();
+
+        let valid = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let save = start_held_memory_save(&clone, &backing, None, valid).unwrap();
+        let mut wire = Vec::new();
+        let regions = save.finish_sparse_stream(&mut wire).unwrap();
+
+        assert_eq!(regions.len(), 2);
+        let image = decode_sparse_ram(&wire);
+        let mut expected = vec![0_u8; 2 * SIZE];
+        expected[..PAGE].fill(0x11);
+        expected[SIZE + PAGE..SIZE + 2 * PAGE].fill(0x66);
+        assert!(
+            image == expected,
+            "held save image differs from the grown clone"
+        );
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
