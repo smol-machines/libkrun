@@ -426,23 +426,42 @@ pub fn write_guest_memory_sparse(
     mem: &GuestMemoryMmap,
     out: &mut File,
 ) -> io::Result<Vec<MemoryRegionDesc>> {
+    write_guest_memory_sparse_with_windows(mem, out, None)
+}
+
+/// [`write_guest_memory_sparse`] for a guest whose device windows (virtio-fs
+/// DAX, GPU) begin at `device_windows_from`. A window can map a host file past
+/// its end, and reading such a page raises SIGBUS, so windows are read the way
+/// another process would and unreadable pages are saved as zeros.
+#[cfg(unix)]
+pub fn write_guest_memory_sparse_with_windows(
+    mem: &GuestMemoryMmap,
+    out: &mut File,
+    device_windows_from: Option<GuestAddress>,
+) -> io::Result<Vec<MemoryRegionDesc>> {
     let mut descs = Vec::new();
     let mut output_offset = out.stream_position()?;
 
     for region in mem.iter() {
         let gpa = region.start_addr();
         let len = region.len();
-        let copied_from_backing = copy_region_backing_extents(region, out, output_offset)?;
+        let device_window = device_windows_from.is_some_and(|from| gpa >= from);
+        let copied_from_backing =
+            !device_window && copy_region_backing_extents(region, out, output_offset)?;
         if !copied_from_backing {
             out.seek(SeekFrom::Start(output_offset))?;
             let host = mem
                 .get_host_address(gpa)
                 .map_err(|e| io::Error::other(format!("get_host_address: {e:?}")))?;
-            // Safety: identical to `write_guest_memory`: this region owns `len`
-            // stable bytes and the caller has frozen the VM.
-            let bytes = unsafe { std::slice::from_raw_parts(host as *const u8, len as usize) };
             let mut sparse = SparseFileWriter::new(out)?;
-            sparse.write_all(bytes)?;
+            if device_window {
+                write_device_window(host as *const u8, len as usize, &mut sparse)?;
+            } else {
+                // Safety: identical to `write_guest_memory`: this region owns
+                // `len` stable bytes and the caller has frozen the VM.
+                let bytes = unsafe { std::slice::from_raw_parts(host as *const u8, len as usize) };
+                sparse.write_all(bytes)?;
+            }
             sparse.finish()?;
         }
         descs.push(MemoryRegionDesc {
@@ -457,6 +476,51 @@ pub fn write_guest_memory_sparse(
     out.set_len(output_offset)?;
     out.seek(SeekFrom::Start(output_offset))?;
     Ok(descs)
+}
+
+/// Copy a device window through `process_vm_readv` on this process, which
+/// reports a page mapped past its file's end as unreadable instead of raising
+/// SIGBUS. Unreadable pages are written as zeros.
+#[cfg(target_os = "linux")]
+fn write_device_window<W: Write>(source: *const u8, len: usize, out: &mut W) -> io::Result<()> {
+    const CHUNK: usize = 1 << 20;
+    // A fault covers a whole host page, which can be larger than 4 KiB.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+    let pid = unsafe { libc::getpid() };
+    let mut buffer = vec![0_u8; CHUNK];
+    let zeros = vec![0_u8; page];
+    let mut offset = 0;
+    while offset < len {
+        let want = (len - offset).min(CHUNK);
+        let local = libc::iovec {
+            iov_base: buffer.as_mut_ptr().cast::<libc::c_void>(),
+            iov_len: want,
+        };
+        let remote = libc::iovec {
+            iov_base: unsafe { source.add(offset) }
+                .cast_mut()
+                .cast::<libc::c_void>(),
+            iov_len: want,
+        };
+        let read = unsafe { libc::process_vm_readv(pid, &local, 1, &remote, 1, 0) };
+        let read = if read < 0 { 0 } else { read as usize };
+        out.write_all(&buffer[..read])?;
+        offset += read;
+        if read < want {
+            // The next page cannot be read: save it as zeros and move past it.
+            let skip = page.min(len - offset);
+            out.write_all(&zeros[..skip])?;
+            offset += skip;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn write_device_window<W: Write>(source: *const u8, len: usize, out: &mut W) -> io::Result<()> {
+    // Safety: the caller has frozen the VM; windows other than Linux DAX are
+    // plain mappings here.
+    out.write_all(unsafe { std::slice::from_raw_parts(source, len) })
 }
 
 #[cfg(target_os = "linux")]
@@ -4383,6 +4447,64 @@ mod tests {
         assert!(
             image == expected,
             "held save image differs from the grown clone"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sync_save_zeroes_window_pages_mapped_past_their_file() {
+        if run_with_private_address_space("sync_save_zeroes_window_pages_mapped_past_their_file") {
+            return;
+        }
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        const WINDOW_GPA: u64 = 0x100_0000;
+        // A DAX window is anonymous memory with host files mapped over it.
+        let memory = GuestMemoryMmap::from_ranges(&[
+            (GuestAddress(0), 2 * page),
+            (GuestAddress(WINDOW_GPA), 3 * page),
+        ])
+        .unwrap();
+        memory
+            .write_slice(&vec![0x11; page], GuestAddress(page as u64))
+            .unwrap();
+        let file = crate::builder::create_guest_ram_memfd(3 * page).unwrap();
+        file.write_all_at(&vec![0x5a; page], 0).unwrap();
+        let window = memory.get_host_address(GuestAddress(WINDOW_GPA)).unwrap();
+        let mapped = unsafe {
+            libc::mmap(
+                window.cast(),
+                3 * page,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_FIXED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        assert_eq!(mapped, window.cast());
+        // The mapping now runs past its file's end: touching the last two
+        // pages raises SIGBUS, as with a DAX mapping that outlived the file.
+        file.set_len(page as u64).unwrap();
+
+        let mut out = crate::builder::create_guest_ram_memfd(0).unwrap();
+        let descs = write_guest_memory_sparse_with_windows(
+            &memory,
+            &mut out,
+            Some(GuestAddress(WINDOW_GPA)),
+        )
+        .unwrap();
+        assert_eq!(descs.len(), 2);
+        let mut image = Vec::new();
+        out.seek(SeekFrom::Start(0)).unwrap();
+        out.read_to_end(&mut image).unwrap();
+        let mut expected = vec![0_u8; 5 * page];
+        expected[page..2 * page].fill(0x11);
+        expected[2 * page..3 * page].fill(0x5a);
+        assert!(
+            image == expected,
+            "window pages past EOF must save as zeros"
         );
     }
 

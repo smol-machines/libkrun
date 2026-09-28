@@ -1340,7 +1340,13 @@ impl Vmm {
         &mut self,
         mem_out: &mut std::fs::File,
     ) -> Result<(VmCheckpoint, Vec<snapshot::MemoryRegionDesc>)> {
-        self.checkpoint_frozen_with(|memory| snapshot::write_guest_memory_sparse(memory, mem_out))
+        #[cfg(target_os = "linux")]
+        let device_windows_from = Some(self.device_windows_start());
+        #[cfg(not(target_os = "linux"))]
+        let device_windows_from = None;
+        self.checkpoint_frozen_with(|memory| {
+            snapshot::write_guest_memory_sparse_with_windows(memory, mem_out, device_windows_from)
+        })
     }
 
     /// Capture CPU and device state together with an immutable COW RAM
