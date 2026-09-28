@@ -1801,6 +1801,10 @@ fn handle_control_stream<S: std::io::Read + std::io::Write + Send + 'static>(
                 "SAVE_CAPABILITIES" => "OK deferred-stream-v1\n".to_string(),
                 #[cfg(all(snapshot_supported, target_os = "linux", target_arch = "x86_64"))]
                 "SAVE_SPARSE_CAPABILITIES" => "OK sparse-stream-v1 ownership-v1\n".to_string(),
+                // PREPARE_SAVE_HELD reads RAM in place, without rebasing it, for a
+                // guest with device windows (virtio-fs DAX mappings stay intact).
+                #[cfg(all(snapshot_supported, deferred_stream_supported, target_os = "linux"))]
+                "SAVE_HELD_CAPABILITIES" => "OK held-windows-in-place-v1\n".to_string(),
                 "PAUSE" => match vmm.lock().unwrap().pause() {
                     Ok(()) => "OK paused\n".to_string(),
                     Err(e) => format!("ERR EIO {e}\n"),

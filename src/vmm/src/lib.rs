@@ -1390,11 +1390,29 @@ impl Vmm {
             let memory = if let Some(generation) = layered_generation {
                 snapshot::DeferredMemorySave::from_layered(generation)
             } else {
-                match snapshot::start_deferred_memory_save_with_windows(
-                    &self.guest_memory,
-                    generation_dir,
-                    Some(self.device_windows_start()),
-                ) {
+                // A deferred save rebases guest RAM, which would drop host files
+                // mapped into a device window (virtio-fs DAX) if the VM resumed
+                // after a failed save. A held save never resumes on success and
+                // can read the paused mappings in place instead.
+                use vm_memory::{GuestMemory, GuestMemoryRegion};
+                let windows_start = self.device_windows_start();
+                let has_device_windows = self
+                    .guest_memory
+                    .iter()
+                    .any(|region| region.start_addr() >= windows_start);
+                let deferred = if held && has_device_windows {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "guest has device windows: hold its memory in place",
+                    ))
+                } else {
+                    snapshot::start_deferred_memory_save_with_windows(
+                        &self.guest_memory,
+                        generation_dir,
+                        Some(windows_start),
+                    )
+                };
+                match deferred {
                     Ok(memory) => memory,
                     Err(error) if held && error.kind() == std::io::ErrorKind::Unsupported => {
                         let valid = Arc::new(std::sync::atomic::AtomicBool::new(true));
