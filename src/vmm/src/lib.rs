@@ -1056,7 +1056,8 @@ impl Vmm {
     fn checkpoint_frozen_deferred_sparse_with(
         &mut self,
         generation_dir: &std::path::Path,
-        held: bool,
+        // Only Linux can fall back to reading a held VM's RAM in place.
+        #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] held: bool,
     ) -> Result<(VmCheckpoint, snapshot::DeferredMemorySave)> {
         self.pause()?;
         let capture = (|| {
