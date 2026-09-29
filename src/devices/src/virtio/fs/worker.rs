@@ -58,6 +58,15 @@ pub(super) struct WorkerQueue {
 }
 
 impl FsServer {
+    #[cfg(target_os = "windows")]
+    fn has_active_dax_mappings(&self) -> bool {
+        match self {
+            FsServer::ReadWrite(server) => server.fs().inner().has_active_dax_mappings(),
+            FsServer::ReadOnly(server) => server.fs().inner().inner().has_active_dax_mappings(),
+            FsServer::Null(_) => false,
+        }
+    }
+
     /// Re-establish this server's DAX window mappings.
     ///
     /// The window lives inside guest RAM, so anything that replaces those host
@@ -135,6 +144,11 @@ pub(super) struct FsWorker {
 }
 
 impl FsWorker {
+    #[cfg(target_os = "windows")]
+    pub(super) fn has_active_dax_mappings(&self) -> bool {
+        self.server.has_active_dax_mappings()
+    }
+
     pub(super) fn new_server(
         _shm_region: Option<VirtioShmRegion>,
         passthrough_cfg: Option<passthrough::Config>,

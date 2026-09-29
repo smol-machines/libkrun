@@ -182,6 +182,12 @@ struct CachedDirEntry {
     type_: u32,
 }
 
+struct OpenFile {
+    inode: Inode,
+    file: File,
+    flags: i32,
+}
+
 // CachePolicy — mirrors the macOS version
 #[derive(Debug, Default, Clone)]
 pub enum CachePolicy {
@@ -1067,6 +1073,10 @@ pub struct PassthroughFs {
 
     next_handle: AtomicU64,
 
+    /// Guest-visible file handle tokens. Raw Windows HANDLE values cannot be
+    /// reused by a replacement VMM process after checkpoint restore.
+    handles: RwLock<BTreeMap<Handle, OpenFile>>,
+
     dir_caches: RwLock<BTreeMap<Handle, Mutex<Vec<CachedDirEntry>>>>,
 
     /// Handle to the root directory, kept open for FILE_OPEN_BY_FILE_ID.
@@ -1085,6 +1095,10 @@ unsafe impl Send for PassthroughFs {}
 unsafe impl Sync for PassthroughFs {}
 
 impl PassthroughFs {
+    pub fn has_active_dax_mappings(&self) -> bool {
+        !self.map_windows.lock().unwrap().is_empty()
+    }
+
     pub fn new(mut cfg: Config, inode_alloc: Arc<InodeAllocator>) -> io::Result<Self> {
         // `NtCreateFile` needs an absolute NT path; a relative `root_dir` (e.g.
         // "rootfs") expands to the invalid `\??\rootfs` and fails with ENOENT,
@@ -1100,6 +1114,7 @@ impl PassthroughFs {
             inodes: RwLock::new(MultikeyBTreeMap::new()),
             inode_alloc,
             next_handle: AtomicU64::new(1),
+            handles: RwLock::new(BTreeMap::new()),
             dir_caches: RwLock::new(BTreeMap::new()),
             root_handle: RwLock::new(root_handle),
             writeback: AtomicBool::new(false),
@@ -1109,19 +1124,183 @@ impl PassthroughFs {
         })
     }
 
-    /// Capture the passthrough server's logical state for checkpoint/fork.
-    ///
-    /// TODO(whp-host): snapshot/fork is not yet supported on Windows; capturing
-    /// the inode/handle maps (the Windows analogue of the Linux `/proc/self/fd`
-    /// path recovery) is left for the snapshot port. Returns an empty state so
-    /// the (Unix-only) snapshot machinery can compile on Windows.
+    /// Capture the guest-visible inode identities for a new FUSE server.
     pub fn snapshot(&self) -> super::super::device::FuseServerState {
-        super::super::device::FuseServerState::default()
+        use super::super::device::{FuseInodeSnap, FuseServerState};
+        let root = Path::new(&self.cfg.root_dir);
+        let inodes = self.inodes.read().unwrap();
+        FuseServerState {
+            inodes: inodes
+                .iter()
+                .filter_map(|(nodeid, data)| {
+                    if *nodeid == fuse::ROOT_ID {
+                        return None;
+                    }
+                    let path = data.get_path();
+                    let relative = path.strip_prefix(root).ok()?;
+                    Some(FuseInodeSnap {
+                        nodeid: *nodeid,
+                        relative_path: Some(relative.to_string_lossy().into_owned()),
+                        path: path.to_string_lossy().into_owned(),
+                        refcount: data.refcount.load(Ordering::Relaxed),
+                    })
+                })
+                .collect(),
+            handles: self
+                .handles
+                .read()
+                .unwrap()
+                .iter()
+                .map(|(handle, data)| super::super::device::FuseHandleSnap {
+                    handle: *handle,
+                    nodeid: data.inode,
+                    flags: data.flags,
+                })
+                .collect(),
+            next_inode: self.inode_alloc.current(),
+            next_handle: self.next_handle.load(Ordering::Relaxed),
+            writeback: self.writeback.load(Ordering::Relaxed),
+            announce_submounts: self.announce_submounts.load(Ordering::Relaxed),
+            zero_message_opendir: false,
+            dax_maps: Vec::new(),
+        }
     }
 
-    /// Restore a previously captured passthrough state. No-op on Windows until
-    /// snapshot/fork is ported.
-    pub fn restore(&self, _state: &super::super::device::FuseServerState) -> io::Result<()> {
+    /// Rebuild the nodeids the guest kernel still holds after FUSE_INIT.
+    pub fn restore(&self, state: &super::super::device::FuseServerState) -> io::Result<()> {
+        self.seed_root_inode()?;
+        let root = fs::canonicalize(&self.cfg.root_dir)?;
+        let parent_ids: HashMap<PathBuf, Inode> = state
+            .inodes
+            .iter()
+            .filter_map(|snap| {
+                snap.relative_path
+                    .as_ref()
+                    .map(|relative| (PathBuf::from(relative), snap.nodeid))
+            })
+            .collect();
+        let mut inodes = self.inodes.write().unwrap();
+        for snap in &state.inodes {
+            let Some(relative) = &snap.relative_path else {
+                continue;
+            };
+            let relative = Path::new(relative);
+            if !relative
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)))
+            {
+                continue;
+            }
+            let path = root.join(relative);
+            // The final component can be a Linux-style symlink whose target
+            // does not resolve as a Windows path (for example /bin/sh). Check
+            // the parent for containment while retaining the symlink itself.
+            let Ok(canonical_parent) = fs::canonicalize(path.parent().unwrap_or(&root)) else {
+                continue;
+            };
+            if !canonical_parent.starts_with(&root) {
+                continue;
+            }
+            let Ok(info) = get_file_info(&path) else {
+                continue;
+            };
+            inodes.insert(
+                snap.nodeid,
+                InodeAltKey {
+                    file_index: info.file_index,
+                    volume_serial: info.volume_serial,
+                },
+                Arc::new(InodeData {
+                    inode: snap.nodeid,
+                    parent_inode: relative
+                        .parent()
+                        .and_then(|parent| parent_ids.get(parent))
+                        .copied()
+                        .unwrap_or(fuse::ROOT_ID),
+                    file_index: info.file_index,
+                    path: RwLock::new(Arc::new(path.clone())),
+                    wide_path: RwLock::new(Arc::new(path_to_wide(&path))),
+                    refcount: AtomicU64::new(snap.refcount),
+                }),
+            );
+        }
+        drop(inodes);
+        self.inode_alloc.restore(state.next_inode);
+        self.next_handle.store(state.next_handle, Ordering::Relaxed);
+        self.writeback.store(state.writeback, Ordering::Relaxed);
+        self.announce_submounts
+            .store(state.announce_submounts, Ordering::Relaxed);
+        let mut handles = self.handles.write().unwrap();
+        for snap in &state.handles {
+            let Some(data) = self.inodes.read().unwrap().get(&snap.nodeid).cloned() else {
+                continue;
+            };
+            let mut flags = parse_linux_open_flags(
+                snap.flags & !(LINUX_O_CREAT | LINUX_O_TRUNC | LINUX_O_EXCL),
+                state.writeback,
+            );
+            flags.create_disposition = FILE_OPEN;
+            let root_h = *self.root_handle.read().unwrap();
+            match open_by_id(root_h, data.file_index, &flags)
+                .or_else(|_| open_handle(&data.get_path(), &flags))
+            {
+                Ok(raw) => {
+                    handles.insert(
+                        snap.handle,
+                        OpenFile {
+                            inode: snap.nodeid,
+                            file: unsafe { File::from_raw_handle(raw as RawHandle) },
+                            flags: snap.flags,
+                        },
+                    );
+                }
+                Err(e) => warn!(
+                    "fs restore: reopen handle {} (nodeid {}) failed: {e}",
+                    snap.handle, snap.nodeid
+                ),
+            }
+        }
+        Ok(())
+    }
+
+    fn register_file_handle(&self, inode: Inode, raw: HANDLE, flags: i32) -> Handle {
+        let token = self.next_handle.fetch_add(1, Ordering::Relaxed);
+        self.handles.write().unwrap().insert(
+            token,
+            OpenFile {
+                inode,
+                file: unsafe { File::from_raw_handle(raw as RawHandle) },
+                flags,
+            },
+        );
+        token
+    }
+
+    fn handle_is_read_only(&self, handle: Handle) -> bool {
+        let handles = self.handles.read().unwrap();
+        handles.get(&handle).map_or(true, |data| {
+            is_handle_read_only(data.file.as_raw_handle() as u64)
+        })
+    }
+
+    fn seed_root_inode(&self) -> io::Result<()> {
+        let root_path = PathBuf::from(&self.cfg.root_dir);
+        let info = get_file_info(&root_path).map_err(win_err_to_linux)?;
+        self.inodes.write().unwrap().insert(
+            fuse::ROOT_ID,
+            InodeAltKey {
+                file_index: info.file_index,
+                volume_serial: info.volume_serial,
+            },
+            Arc::new(InodeData {
+                inode: fuse::ROOT_ID,
+                parent_inode: fuse::ROOT_ID,
+                file_index: info.file_index,
+                path: RwLock::new(Arc::new(root_path.clone())),
+                wide_path: RwLock::new(Arc::new(path_to_wide(&root_path))),
+                refcount: AtomicU64::new(2),
+            }),
+        );
         Ok(())
     }
 
@@ -1310,7 +1489,10 @@ impl PassthroughFs {
             _ => {}
         }
 
-        Ok((Some(h as u64), opts))
+        Ok((
+            Some(self.register_file_handle(inode, h, linux_flags as i32)),
+            opts,
+        ))
     }
 
     fn do_release(&self, _inode: Inode, handle: Handle) -> io::Result<()> {
@@ -1318,10 +1500,7 @@ impl PassthroughFs {
         if handle & (1 << 63) != 0 {
             self.dir_caches.write().unwrap().remove(&handle);
         } else {
-            let h = handle as HANDLE;
-            if h != INVALID_HANDLE_VALUE && !h.is_null() {
-                unsafe { CloseHandle(h) };
-            }
+            self.handles.write().unwrap().remove(&handle);
         }
         Ok(())
     }
@@ -1332,28 +1511,12 @@ impl PassthroughFs {
     fn reopen_inode(&self, inode: Inode, handle: Handle, desired_access: u32) -> io::Result<File> {
         // If the handle is a valid persistent raw file handle (not zero, and no directory tag bit)
         if handle != 0 && (handle & (1 << 63)) == 0 {
-            const DUPLICATE_SAME_ACCESS: u32 = 2;
-            let current_process =
-                unsafe { windows_sys::Win32::System::Threading::GetCurrentProcess() };
-            let mut dup_h: HANDLE = INVALID_HANDLE_VALUE;
-
-            let res = unsafe {
-                windows_sys::Win32::Foundation::DuplicateHandle(
-                    current_process,
-                    handle as HANDLE,
-                    current_process,
-                    &mut dup_h,
-                    0,
-                    0,
-                    DUPLICATE_SAME_ACCESS,
-                )
-            };
-
-            if res != 0 {
-                return Ok(unsafe { File::from_raw_handle(dup_h as RawHandle) });
-            } else {
-                return Err(win_err_to_linux(io::Error::last_os_error()));
+            let handles = self.handles.read().unwrap();
+            let data = handles.get(&handle).ok_or_else(ebadf)?;
+            if data.inode != inode {
+                return Err(ebadf());
             }
+            return data.file.try_clone().map_err(win_err_to_linux);
         }
 
         let data = self.inode_data(inode)?;
@@ -1483,27 +1646,7 @@ impl FileSystem for PassthroughFs {
     type Handle = Handle;
 
     fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
-        let root_path = PathBuf::from(&self.cfg.root_dir);
-        let file_info = get_file_info(&root_path).map_err(win_err_to_linux)?;
-
-        let alt_key = InodeAltKey {
-            file_index: file_info.file_index,
-            volume_serial: file_info.volume_serial,
-        };
-
-        let mut inodes = self.inodes.write().unwrap();
-        inodes.insert(
-            fuse::ROOT_ID,
-            alt_key,
-            Arc::new(InodeData {
-                inode: fuse::ROOT_ID,
-                parent_inode: fuse::ROOT_ID,
-                file_index: file_info.file_index,
-                path: RwLock::new(Arc::new(root_path.clone())),
-                wide_path: RwLock::new(Arc::new(path_to_wide(&root_path))),
-                refcount: AtomicU64::new(2),
-            }),
-        );
+        self.seed_root_inode()?;
 
         // Windows is notoriously "chatty" when it comes to filesystem metadata
         // By enabling READDIRPLUS we allow the filesystem to return both the name and the metadata in a single response.
@@ -1524,6 +1667,7 @@ impl FileSystem for PassthroughFs {
 
     fn destroy(&self) {
         self.dir_caches.write().unwrap().clear();
+        self.handles.write().unwrap().clear();
         self.inodes.write().unwrap().clear();
         let h = std::mem::replace(
             &mut *self.root_handle.write().unwrap(),
@@ -1845,7 +1989,7 @@ impl FileSystem for PassthroughFs {
         if valid.contains(SetattrValid::SIZE) {
             if let Some(h) = handle {
                 // POSIX Compliance: Allocating space on a Read-Only FD should return EBADF
-                if is_handle_read_only(h) {
+                if self.handle_is_read_only(h) {
                     return Err(ebadf());
                 }
 
@@ -2237,7 +2381,8 @@ impl FileSystem for PassthroughFs {
             _ => {}
         }
 
-        Ok((entry, Some(h as u64), opts))
+        let token = self.register_file_handle(entry.inode, h, flags as i32);
+        Ok((entry, Some(token), opts))
     }
 
     fn read<W: io::Write + ZeroCopyWriter>(
@@ -2273,7 +2418,7 @@ impl FileSystem for PassthroughFs {
         _flags: u32,
     ) -> io::Result<usize> {
         // POSIX Compliance: Writing to a Read-Only FD should return EBADF
-        if is_handle_read_only(handle) {
+        if self.handle_is_read_only(handle) {
             return Err(ebadf());
         }
 
@@ -2312,7 +2457,7 @@ impl FileSystem for PassthroughFs {
     ) -> io::Result<()> {
         // On Windows, to perform a flush we need to have a file handle with write access.
         // If the file has been open as read-only, there is nothing to flush
-        if is_handle_read_only(handle) {
+        if self.handle_is_read_only(handle) {
             return Ok(());
         }
 
@@ -2322,7 +2467,7 @@ impl FileSystem for PassthroughFs {
     }
 
     fn fsync(&self, _ctx: Context, inode: Inode, datasync: bool, handle: Handle) -> io::Result<()> {
-        if is_handle_read_only(handle) {
+        if self.handle_is_read_only(handle) {
             // A read-only handle has no pending write buffers, so fsync is a no-op!
             return Ok(());
         }
@@ -2541,7 +2686,7 @@ impl FileSystem for PassthroughFs {
         length: u64,
     ) -> io::Result<()> {
         // EBADF - fd is not a valid file descriptor, or is not opened for writing.
-        if is_handle_read_only(handle) {
+        if self.handle_is_read_only(handle) {
             return Err(ebadf());
         }
 

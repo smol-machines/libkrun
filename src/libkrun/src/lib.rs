@@ -1009,6 +1009,9 @@ fn atomic_write_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()
         std::fs::hard_link(&partial, path)?;
         published = true;
         let _ = std::fs::remove_file(&partial);
+        // Windows does not allow File::open on a directory. The data file was
+        // flushed before its hard link became visible; NTFS journals the link.
+        #[cfg(not(target_os = "windows"))]
         if let Some(parent) = path.parent() {
             std::fs::File::open(parent)?.sync_all()?;
         }
@@ -4140,7 +4143,7 @@ pub extern "C" fn krun_get_shutdown_eventfd(ctx_id: u32) -> i32 {
                 #[cfg(target_os = "windows")]
                 {
                     let _ = efd;
-                    return -libc::ENOTSUP;
+                    -libc::ENOTSUP
                 }
             } else {
                 -libc::EINVAL

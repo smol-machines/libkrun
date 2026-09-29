@@ -19,18 +19,20 @@ use windows_sys::Win32::System::Hypervisor::{
     WHvCapabilityCodeProcessorFeaturesBanks, WHvCreatePartition, WHvCreateVirtualProcessor,
     WHvDeletePartition, WHvDeleteVirtualProcessor, WHvEmulatorCreateEmulator,
     WHvEmulatorDestroyEmulator, WHvEmulatorTryIoEmulation, WHvEmulatorTryMmioEmulation,
-    WHvGetCapability, WHvGetVirtualProcessorRegisters, WHvMapGpaRange, WHvMapGpaRangeFlagExecute,
-    WHvMapGpaRangeFlagRead, WHvMapGpaRangeFlagWrite, WHvPartitionPropertyCodeCpuidResultList,
-    WHvPartitionPropertyCodeExtendedVmExits, WHvPartitionPropertyCodeLocalApicEmulationMode,
-    WHvPartitionPropertyCodeProcessorCount, WHvPartitionPropertyCodeProcessorFeaturesBanks,
+    WHvGetCapability, WHvGetPartitionProperty, WHvGetVirtualProcessorRegisters, WHvMapGpaRange,
+    WHvMapGpaRangeFlagExecute, WHvMapGpaRangeFlagRead, WHvMapGpaRangeFlagWrite,
+    WHvPartitionPropertyCodeCpuidResultList, WHvPartitionPropertyCodeExtendedVmExits,
+    WHvPartitionPropertyCodeLocalApicEmulationMode, WHvPartitionPropertyCodeProcessorCount,
+    WHvPartitionPropertyCodeProcessorFeaturesBanks, WHvPartitionPropertyCodeReferenceTime,
     WHvPartitionPropertyCodeSyntheticProcessorFeaturesBanks,
-    WHvPartitionPropertyCodeX64MsrExitBitmap, WHvRequestInterrupt, WHvRunVirtualProcessor,
-    WHvRunVpExitReasonCanceled, WHvRunVpExitReasonInvalidVpRegisterValue,
-    WHvRunVpExitReasonMemoryAccess, WHvRunVpExitReasonUnrecoverableException,
-    WHvRunVpExitReasonUnsupportedFeature, WHvRunVpExitReasonX64Cpuid, WHvRunVpExitReasonX64Halt,
-    WHvRunVpExitReasonX64InterruptWindow, WHvRunVpExitReasonX64IoPortAccess,
-    WHvRunVpExitReasonX64MsrAccess, WHvSetPartitionProperty, WHvSetVirtualProcessorRegisters,
-    WHvSetupPartition, WHvX64LocalApicEmulationModeXApic,
+    WHvPartitionPropertyCodeX64MsrExitBitmap, WHvRegisterInternalActivityState,
+    WHvRegisterInterruptState, WHvRegisterPendingEvent, WHvRegisterPendingInterruption,
+    WHvRequestInterrupt, WHvRunVirtualProcessor, WHvRunVpExitReasonCanceled,
+    WHvRunVpExitReasonInvalidVpRegisterValue, WHvRunVpExitReasonMemoryAccess,
+    WHvRunVpExitReasonUnrecoverableException, WHvRunVpExitReasonUnsupportedFeature,
+    WHvRunVpExitReasonX64Cpuid, WHvRunVpExitReasonX64Halt, WHvRunVpExitReasonX64InterruptWindow,
+    WHvRunVpExitReasonX64IoPortAccess, WHvRunVpExitReasonX64MsrAccess, WHvSetPartitionProperty,
+    WHvSetVirtualProcessorRegisters, WHvSetupPartition, WHvX64LocalApicEmulationModeXApic,
     WHvX64RegisterDeliverabilityNotifications, WHvX64RegisterRax, WHvX64RegisterRbx,
     WHvX64RegisterRcx, WHvX64RegisterRdx, WHvX64RegisterRflags, WHvX64RegisterRip,
     WHvX64RegisterRsp,
@@ -48,12 +50,13 @@ use windows_sys::Win32::System::Hypervisor::{
     WHvX64RegisterDr1, WHvX64RegisterDr2, WHvX64RegisterDr3, WHvX64RegisterDr6, WHvX64RegisterDr7,
     WHvX64RegisterDs, WHvX64RegisterEfer, WHvX64RegisterEs, WHvX64RegisterFs, WHvX64RegisterGdtr,
     WHvX64RegisterGs, WHvX64RegisterIdtr, WHvX64RegisterKernelGsBase, WHvX64RegisterLdtr,
-    WHvX64RegisterLstar, WHvX64RegisterPat, WHvX64RegisterR8, WHvX64RegisterR9, WHvX64RegisterR10,
-    WHvX64RegisterR11, WHvX64RegisterR12, WHvX64RegisterR13, WHvX64RegisterR14, WHvX64RegisterR15,
-    WHvX64RegisterRbp, WHvX64RegisterRdi, WHvX64RegisterRsi, WHvX64RegisterSfmask,
-    WHvX64RegisterSs, WHvX64RegisterStar, WHvX64RegisterSysenterCs, WHvX64RegisterSysenterEip,
-    WHvX64RegisterSysenterEsp, WHvX64RegisterTr, WHvX64RegisterTsc, WHvX64RegisterTscAux,
-    WHvX64RegisterXCr0,
+    WHvX64RegisterLstar, WHvX64RegisterPat, WHvX64RegisterPendingDebugException, WHvX64RegisterR8,
+    WHvX64RegisterR9, WHvX64RegisterR10, WHvX64RegisterR11, WHvX64RegisterR12, WHvX64RegisterR13,
+    WHvX64RegisterR14, WHvX64RegisterR15, WHvX64RegisterRbp, WHvX64RegisterRdi, WHvX64RegisterRsi,
+    WHvX64RegisterSfmask, WHvX64RegisterSs, WHvX64RegisterStar, WHvX64RegisterSysenterCs,
+    WHvX64RegisterSysenterEip, WHvX64RegisterSysenterEsp, WHvX64RegisterTr, WHvX64RegisterTsc,
+    WHvX64RegisterTscAux, WHvX64RegisterTscDeadline, WHvX64RegisterXCr0, WHvX64RegisterXfd,
+    WHvX64RegisterXfdErr, WHvX64RegisterXss,
 };
 use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows_sys::core::HRESULT;
@@ -64,6 +67,7 @@ pub enum Error {
     HypervisorNotPresent,
     CreatePartition(i32),
     SetPartitionProperty(i32),
+    GetPartitionProperty(i32),
     SetupPartition(i32),
     DeletePartition(i32),
     MapGpaRange(i32),
@@ -90,6 +94,9 @@ impl Display for Error {
             CreatePartition(hr) => write!(f, "WHvCreatePartition failed: HRESULT 0x{hr:08x}"),
             SetPartitionProperty(hr) => {
                 write!(f, "WHvSetPartitionProperty failed: HRESULT 0x{hr:08x}")
+            }
+            GetPartitionProperty(hr) => {
+                write!(f, "WHvGetPartitionProperty failed: HRESULT 0x{hr:08x}")
             }
             SetupPartition(hr) => write!(f, "WHvSetupPartition failed: HRESULT 0x{hr:08x}"),
             DeletePartition(hr) => write!(f, "WHvDeletePartition failed: HRESULT 0x{hr:08x}"),
@@ -273,6 +280,43 @@ pub struct InterruptRequest {
 }
 
 impl WhpVm {
+    /// Partition reference time in 100 ns units, used by the guest's Hyper-V clocksource.
+    pub fn reference_time(&self) -> Result<u64, Error> {
+        let mut value = 0_u64;
+        let mut written = 0_u32;
+        let hr = unsafe {
+            WHvGetPartitionProperty(
+                self.handle,
+                WHvPartitionPropertyCodeReferenceTime,
+                &mut value as *mut u64 as *mut _,
+                mem::size_of::<u64>() as u32,
+                &mut written,
+            )
+        };
+        if hr != S_OK {
+            return Err(Error::GetPartitionProperty(hr));
+        }
+        if written != mem::size_of::<u64>() as u32 {
+            return Err(Error::GetPartitionProperty(0x8007_000du32 as i32));
+        }
+        Ok(value)
+    }
+
+    /// Rebase a new partition's reference clock to the captured guest time.
+    pub fn set_reference_time(&self, value: u64) -> Result<(), Error> {
+        let hr = unsafe {
+            WHvSetPartitionProperty(
+                self.handle,
+                WHvPartitionPropertyCodeReferenceTime,
+                &value as *const u64 as *const _,
+                mem::size_of::<u64>() as u32,
+            )
+        };
+        if hr != S_OK {
+            return Err(Error::SetPartitionProperty(hr));
+        }
+        Ok(())
+    }
     /// Creates a new WHP partition.
     /// WHP has a create → configure → finalize model
     /// WHvCreatePartition — allocates the partition object but it's not yet usable.
@@ -1045,6 +1089,24 @@ pub struct WhpVcpu {
 }
 
 impl WhpVcpu {
+    fn activity_state(&self) -> Result<u64, Error> {
+        let mut value: WHV_REGISTER_VALUE = unsafe { mem::zeroed() };
+        let name = WHvRegisterInternalActivityState;
+        let hr = unsafe {
+            WHvGetVirtualProcessorRegisters(
+                self.vm.partition_handle(),
+                self.index,
+                &name,
+                1,
+                &mut value,
+            )
+        };
+        if hr == S_OK {
+            Ok(unsafe { value.Reg64 })
+        } else {
+            Err(Error::GetRegisters(hr))
+        }
+    }
     /// Creates a new virtual processor within the given partition.
     pub fn new(vm: Arc<WhpVm>, index: u32) -> Result<Self, Error> {
         let hr = unsafe { WHvCreateVirtualProcessor(vm.partition_handle(), index, 0) };
@@ -1379,6 +1441,9 @@ const CHECKPOINT_REGS: &[WHV_REGISTER_NAME] = &[
     WHvX64RegisterCr4,
     WHvX64RegisterCr8,
     WHvX64RegisterXCr0,
+    WHvX64RegisterXss,
+    WHvX64RegisterXfd,
+    WHvX64RegisterXfdErr,
     // Debug registers.
     WHvX64RegisterDr0,
     WHvX64RegisterDr1,
@@ -1399,7 +1464,15 @@ const CHECKPOINT_REGS: &[WHV_REGISTER_NAME] = &[
     WHvX64RegisterCstar,
     WHvX64RegisterSfmask,
     WHvX64RegisterTsc,
+    WHvX64RegisterTscDeadline,
     WHvX64RegisterTscAux,
+    // Pending events and interrupt shadow survive a halted vCPU. Restoring
+    // registers without them can strand a guest waiting for its next tick.
+    WHvRegisterPendingInterruption,
+    WHvRegisterInterruptState,
+    WHvRegisterPendingEvent,
+    WHvX64RegisterDeliverabilityNotifications,
+    WHvX64RegisterPendingDebugException,
 ];
 
 /// Full architectural state of a WHP virtual processor, captured for
@@ -1558,6 +1631,19 @@ impl WhpVcpu {
     /// per-register fallback), then the XSAVE area, then the LAPIC state so the
     /// interrupt-controller view wins over CR8/APIC-base.
     pub fn restore_state(&self, state: &WhpVcpuState) -> Result<(), Error> {
+        // WHP creates every secondary VP in StartupSuspend. A cold restore
+        // skips the guest's INIT/SIPI boot sequence, so a restored AP would
+        // otherwise remain parked with its interrupts pending forever. Release
+        // it while paused, then load the checkpoint's architectural registers.
+        if self.index != 0 && self.activity_state()? & 1 != 0 {
+            self.vm.request_interrupt(&InterruptRequest {
+                interrupt_type: InterruptType::Sipi,
+                destination_mode: InterruptDestinationMode::Physical,
+                trigger_mode: InterruptTriggerMode::Edge,
+                destination: self.index,
+                vector: 0x10,
+            })?;
+        }
         let part = self.vm.partition_handle();
         let values: Vec<WHV_REGISTER_VALUE> =
             state.reg_values.iter().map(bytes_to_reg_value).collect();

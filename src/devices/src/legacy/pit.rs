@@ -50,6 +50,9 @@ pub struct Pit {
     reload_lo: u8,
     /// Channel-0 operating mode (0–5); modes 2 and 3 are periodic.
     mode: u8,
+    /// Last programmed counter, needed to arm a replacement timer thread when
+    /// a checkpoint resumes in a new process.
+    reload: Option<u16>,
 }
 
 impl Pit {
@@ -67,7 +70,44 @@ impl Pit {
             expect_hi: false,
             reload_lo: 0,
             mode: 2,
+            reload: None,
         })
+    }
+
+    /// Logical channel-0 state. A new host timer thread starts unarmed, so
+    /// retaining only the guest's I/O register state would stop guest time.
+    pub fn save_state(&self) -> [u8; 8] {
+        let [reload_lo, reload_hi] = self.reload.unwrap_or(0).to_le_bytes();
+        [
+            u8::from(self.access_lohi),
+            u8::from(self.expect_hi),
+            self.reload_lo,
+            self.mode,
+            u8::from(self.reload.is_some()),
+            reload_lo,
+            reload_hi,
+            0,
+        ]
+    }
+
+    /// Rebuild the timer cadence before the restored guest resumes.
+    pub fn restore_state(&mut self, state: [u8; 8]) {
+        self.access_lohi = state[0] != 0;
+        self.expect_hi = state[1] != 0;
+        self.reload_lo = state[2];
+        self.mode = state[3];
+        self.reload = (state[4] != 0).then(|| u16::from_le_bytes([state[5], state[6]]));
+        if let Some(reload) = self.reload {
+            self.arm(reload);
+        }
+    }
+
+    /// A one-shot event can expire while vCPUs are paused. Supply a fresh
+    /// clock event after they resume so the guest can schedule its next tick.
+    pub fn rearm_after_resume(&self) {
+        if let Some(reload) = self.reload {
+            self.arm(reload);
+        }
     }
 
     fn arm(&self, reload: u16) {
@@ -115,6 +155,7 @@ impl BusDevice for Pit {
                     if self.expect_hi {
                         let reload = (u16::from(val) << 8) | u16::from(self.reload_lo);
                         self.expect_hi = false;
+                        self.reload = Some(reload);
                         self.arm(reload);
                     } else {
                         self.reload_lo = val;
@@ -122,6 +163,7 @@ impl BusDevice for Pit {
                     }
                 } else {
                     // Lobyte-only or hibyte-only access: a single write completes it.
+                    self.reload = Some(u16::from(val));
                     self.arm(u16::from(val));
                 }
             }

@@ -3410,32 +3410,43 @@ pub fn open_cow_memory_from_paths(descs: &[MemfdRegionDesc]) -> io::Result<Guest
     GuestMemoryMmap::from_regions(regions).map_err(|e| io_err(format!("from_regions: {e:?}")))
 }
 
+/// Flush file-backed guest RAM only after vCPUs and device writers are
+/// quiesced. A clone maps a new section of these files, so flushing before the
+/// checkpoint boundary could expose an older generation to that section.
+#[cfg(target_os = "windows")]
+pub fn flush_guest_memory_backing(mem: &GuestMemoryMmap) -> io::Result<()> {
+    use windows_sys::Win32::System::Memory::FlushViewOfFile;
+
+    for region in mem.iter().filter(|region| region.file_offset().is_some()) {
+        let host = mem
+            .get_host_address(region.start_addr())
+            .map_err(|error| io::Error::other(format!("guest RAM address: {error:?}")))?;
+        // SAFETY: `host` points to this live mapped region of `len` bytes.
+        if unsafe { FlushViewOfFile(host as *const core::ffi::c_void, region.len() as usize) } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 /// Windows variant of [`memfd_region_descs`]: records each region's backing-file
 /// path (recovered via `GetFinalPathNameByHandleW` on the open handle) so a clone
 /// can open it. Windows has no `/proc/<pid>/fd`, so cross-process sharing goes
 /// through the file path (the macOS model); the owner must stay alive (frozen)
 /// and the file must remain on disk for the clone's lifetime. Anonymous regions
-/// get an empty path.
+/// get an empty path. A file-backed region whose path cannot be resolved must
+/// fail capture: treating it as anonymous would silently zero that RAM in the
+/// child.
 #[cfg(target_os = "windows")]
-pub fn memfd_region_descs(mem: &GuestMemoryMmap) -> Vec<MemfdRegionDesc> {
+pub fn memfd_region_descs(mem: &GuestMemoryMmap) -> io::Result<Vec<MemfdRegionDesc>> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_NAME_NORMALIZED, GetFinalPathNameByHandleW,
     };
-    use windows_sys::Win32::System::Memory::FlushViewOfFile;
 
     mem.iter()
-        .map(|region| {
-            // Flush the golden's mapped guest-RAM writes to the backing file so a
-            // clone's freshly-created copy-on-write section reads coherent data
-            // (a new file-mapping section is not guaranteed to observe another
-            // section's not-yet-flushed dirty pages).
-            if region.file_offset().is_some()
-                && let Ok(host) = mem.get_host_address(region.start_addr())
-            {
-                // SAFETY: `host` is this region's live mapped view of `len` bytes.
-                unsafe { FlushViewOfFile(host as *const core::ffi::c_void, region.len() as usize) };
-            }
+        .map(|region| -> io::Result<MemfdRegionDesc> {
             let (path, offset) = match region.file_offset() {
                 Some(fo) => {
                     let handle = fo.file().as_raw_handle();
@@ -3450,22 +3461,34 @@ pub fn memfd_region_descs(mem: &GuestMemoryMmap) -> Vec<MemfdRegionDesc> {
                             FILE_NAME_NORMALIZED,
                         )
                     };
-                    let path = if len > 0 && (len as usize) < buf.len() {
-                        String::from_utf16_lossy(&buf[..len as usize])
-                    } else {
-                        String::new()
-                    };
+                    if len == 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    if len as usize >= buf.len() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "guest RAM backing path is too long",
+                        ));
+                    }
+                    let path = String::from_utf16(&buf[..len as usize])
+                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                    if path.is_empty() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "guest RAM backing path is empty",
+                        ));
+                    }
                     (path, fo.start())
                 }
                 None => (String::new(), 0),
             };
-            MemfdRegionDesc {
+            Ok(MemfdRegionDesc {
                 gpa: region.start_addr().raw_value(),
                 len: region.len(),
                 fd: if path.is_empty() { -1 } else { 0 },
                 offset,
                 path,
-            }
+            })
         })
         .collect()
 }
@@ -3480,6 +3503,7 @@ pub fn memfd_region_descs(mem: &GuestMemoryMmap) -> Vec<MemfdRegionDesc> {
 /// regions (empty path) get a fresh zeroed mapping.
 #[cfg(target_os = "windows")]
 pub fn open_cow_memory_from_paths(descs: &[MemfdRegionDesc]) -> io::Result<GuestMemoryMmap> {
+    use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
     use vm_memory::GuestRegionMmap;
     use vm_memory::mmap::MmapRegion;
@@ -3494,7 +3518,12 @@ pub fn open_cow_memory_from_paths(descs: &[MemfdRegionDesc]) -> io::Result<Guest
     for d in descs {
         let size = d.len as usize;
         let region = if !d.path.is_empty() {
-            let file = std::fs::File::open(&d.path)
+            // The golden created this file with DELETE_ON_CLOSE. Every later
+            // opener must permit delete sharing or Windows rejects the open.
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0x1 | 0x2 | 0x4)
+                .open(&d.path)
                 .map_err(|e| io_err(format!("open {}: {e}", d.path)))?;
             // A copy-on-write section over the golden's RAM file. PAGE_WRITECOPY
             // (with a read-only file handle) backs FILE_MAP_COPY; CoW writes go to

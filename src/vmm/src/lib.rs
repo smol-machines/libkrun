@@ -439,6 +439,10 @@ pub struct Vmm {
     /// chips (the WHP software IOAPIC — see [`VmCheckpoint::ioapic`]).
     #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
     intc: devices::legacy::IrqChip,
+    /// Host-emulated PIT clockevent, retained so its programmed cadence can be
+    /// carried to a replacement WHP partition.
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    pit: Arc<Mutex<devices::legacy::Pit>>,
 }
 
 /// RAM ownership returned by a fork-and-continue capture.
@@ -576,6 +580,15 @@ fn paused_vm_with_failed_ram_mapping_cannot_capture_or_rearm() {
 }
 
 impl Vmm {
+    #[cfg(snapshot_supported)]
+    fn save_vm_state(&self) -> Result<vstate::VmState> {
+        #[allow(unused_mut)] // Windows adds host-emulated PIT state.
+        let mut state = self.vm.save_state().map_err(Error::Vm)?;
+        #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+        state.set_pit_state(self.pit.lock().unwrap().save_state());
+        Ok(state)
+    }
+
     /// Guest-physical address where device windows (virtio-fs DAX, GPU) begin;
     /// everything below it is RAM.
     #[cfg(target_os = "linux")]
@@ -1000,6 +1013,14 @@ impl Vmm {
         self.restore_activate_devices(&checkpoint.devices)
             .map_err(Error::Snapshot)?;
         self.restore_vcpu_states(checkpoint.vcpu_states)?;
+        // Re-arm the one-shot PIT only after vCPU state is restored. An IRQ
+        // delivered earlier can be overwritten by WHP's register restore,
+        // leaving the guest with no next clock event.
+        #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+        self.pit
+            .lock()
+            .unwrap()
+            .restore_state(checkpoint.vm_state.pit_state());
         #[cfg(target_os = "linux")]
         self.mmio_device_manager.replay_restored_interrupts();
         Ok(())
@@ -1292,7 +1313,7 @@ impl Vmm {
         self.pause()?;
         self.quiesce_devices()?;
         let vcpu_states = self.save_vcpu_states()?;
-        let vm_state = self.vm.save_state().map_err(Error::Vm)?;
+        let vm_state = self.save_vm_state()?;
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         self.vm
             .validate_migration_clock(&vm_state, &vcpu_states)
@@ -1384,7 +1405,7 @@ impl Vmm {
         let capture = (|| {
             self.quiesce_devices()?;
             let vcpu_states = self.save_vcpu_states()?;
-            let vm_state = self.vm.save_state().map_err(Error::Vm)?;
+            let vm_state = self.save_vm_state()?;
             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             self.vm
                 .validate_migration_clock(&vm_state, &vcpu_states)
@@ -1482,7 +1503,7 @@ impl Vmm {
         let capture = (|| {
             self.quiesce_devices()?;
             let vcpu_states = self.save_vcpu_states()?;
-            let vm_state = self.vm.save_state().map_err(Error::Vm)?;
+            let vm_state = self.save_vm_state()?;
             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             self.vm
                 .validate_migration_clock(&vm_state, &vcpu_states)
@@ -1561,6 +1582,12 @@ impl Vmm {
         self.restore_vcpu_states(checkpoint.vcpu_states)?;
         // Re-arm workers from the restored queue indices.
         self.rearm_devices();
+        // Register restore may clear a previously injected one-shot PIT IRQ.
+        #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+        self.pit
+            .lock()
+            .unwrap()
+            .restore_state(checkpoint.vm_state.pit_state());
         Ok(())
     }
 
@@ -1580,7 +1607,7 @@ impl Vmm {
         self.pause()?;
         self.quiesce_devices()?;
         let vcpu_states = self.save_vcpu_states()?;
-        let vm_state = self.vm.save_state().map_err(Error::Vm)?;
+        let vm_state = self.save_vm_state()?;
         let devices = self.snapshot_devices();
         let mem_clone = snapshot::cow_clone_guest_memory(&self.guest_memory)
             .map_err(|e| Error::Snapshot(format!("cow-clone guest memory: {e}")))?;
@@ -1643,6 +1670,10 @@ impl Vmm {
     pub fn checkpoint_for_fork(&mut self) -> Result<(VmCheckpoint, ForkMemory)> {
         // Validate the immutable prerequisite before pausing vCPUs or draining
         // device workers. A failed FORK must not alter the running VM.
+        #[cfg(target_os = "windows")]
+        let descs = snapshot::memfd_region_descs(&self.guest_memory)
+            .map_err(|error| Error::Snapshot(format!("inspect fork RAM backing: {error}")))?;
+        #[cfg(not(target_os = "windows"))]
         let descs = snapshot::memfd_region_descs(&self.guest_memory);
         #[cfg(target_os = "linux")]
         let layered = self.layered_ram.is_some();
@@ -1659,8 +1690,11 @@ impl Vmm {
         self.pause()?;
         let checkpoint = (|| {
             self.quiesce_devices()?;
+            #[cfg(target_os = "windows")]
+            snapshot::flush_guest_memory_backing(&self.guest_memory)
+                .map_err(|error| Error::Snapshot(format!("flush fork RAM: {error}")))?;
             let vcpu_states = self.save_vcpu_states()?;
-            let vm_state = self.vm.save_state().map_err(Error::Vm)?;
+            let vm_state = self.save_vm_state()?;
             let devices = self.snapshot_devices();
             #[cfg(target_os = "linux")]
             if let Some(generation) = self.capture_layered_ram()? {
@@ -1736,7 +1770,7 @@ impl Vmm {
                 self.mmio_device_manager.replay_fs_dax_maps();
             }
             let vcpu_states = self.save_vcpu_states()?;
-            let vm_state = self.vm.save_state().map_err(Error::Vm)?;
+            let vm_state = self.save_vm_state()?;
             let devices = self.snapshot_devices();
             let layered_generation = self.capture_layered_ram()?;
             let generation_guardian = if needs_materialization {
@@ -1916,7 +1950,7 @@ impl Vmm {
         let capture = (|| {
             self.quiesce_devices()?;
             let vcpu_states = self.save_vcpu_states()?;
-            let vm_state = self.vm.save_state().map_err(Error::Vm)?;
+            let vm_state = self.save_vm_state()?;
             let devices = self.snapshot_devices();
             let generation_copy =
                 snapshot::start_macos_fork_generation_copy(&self.guest_memory, generation_dir)
@@ -2128,6 +2162,14 @@ impl Vmm {
                     Ok(()) => {
                         self.run_state = VmmRunState::Running;
                         self.paused_at = None;
+                        // WHP must inject restored device IRQs after the VPs
+                        // have entered their run loops. Interrupts requested
+                        // while they are still in the paused restore loop can
+                        // be lost even though WHvRequestInterrupt succeeds.
+                        #[cfg(target_os = "windows")]
+                        self.mmio_device_manager.replay_restored_interrupts();
+                        #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+                        self.pit.lock().unwrap().rearm_after_resume();
                         Ok(())
                     }
                     Err(e) => {

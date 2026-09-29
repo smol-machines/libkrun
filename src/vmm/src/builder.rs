@@ -1124,6 +1124,8 @@ pub fn build_microvm(
     #[allow(unused_mut)]
     let mut vcpus;
     let intc: IrqChip;
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    let pit: Arc<Mutex<devices::legacy::Pit>>;
     // For x86_64 we need to create the interrupt controller before calling `KVM_CREATE_VCPUS`
     // while on aarch64 we need to do it the other way around.
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -1188,6 +1190,19 @@ pub fn build_microvm(
             &mut mmio_device_manager,
             Some(intc.clone()),
         )?;
+
+        // Keep a direct handle to the host PIT so checkpoint/restore can carry
+        // its programmed timer into the replacement WHP partition.
+        pit = Arc::new(Mutex::new(
+            devices::legacy::Pit::new(intc.clone())
+                .map_err(|e| Error::LegacyIOBus(device_manager::legacy::Error::EventFd(e)))
+                .map_err(StartMicrovmError::Internal)?,
+        ));
+        pio_device_manager
+            .io_bus
+            .insert(pit.clone(), 0x40, 0x4)
+            .map_err(|e| Error::LegacyIOBus(device_manager::legacy::Error::BusError(e)))
+            .map_err(StartMicrovmError::Internal)?;
 
         vcpus = create_vcpus_x86_64_whp(
             &vm,
@@ -1405,6 +1420,8 @@ pub fn build_microvm(
         pio_device_manager,
         #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
         intc: intc.clone(),
+        #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+        pit,
     };
 
     // Set raw mode for FDs that are connected to legacy serial devices.
@@ -2697,25 +2714,6 @@ fn attach_legacy_devices(
         .register_devices()
         .map_err(Error::LegacyIOBus)
         .map_err(StartMicrovmError::Internal)?;
-
-    // WHP has no PIT, and its emulated LAPIC timer delivers no interrupts to the
-    // guest, so without this the guest has no working clockevent and timers /
-    // `nanosleep` hang. Emulate the i8254 channel-0 timer (IRQ 0): it asserts
-    // IRQ 0 through the IOAPIC at the cadence the guest programs via ports
-    // 0x40/0x43, giving the guest's i8253 clockevent a tick. Paired with
-    // `nolapic_timer` on the kernel cmdline so the guest picks the PIT over the
-    // dead LAPIC timer.
-    #[cfg(target_os = "windows")]
-    if let Some(intc) = intc.clone() {
-        let pit = devices::legacy::Pit::new(intc)
-            .map_err(|e| Error::LegacyIOBus(device_manager::legacy::Error::EventFd(e)))
-            .map_err(StartMicrovmError::Internal)?;
-        pio_device_manager
-            .io_bus
-            .insert(Arc::new(Mutex::new(pit)), 0x40, 0x4)
-            .map_err(|e| Error::LegacyIOBus(device_manager::legacy::Error::BusError(e)))
-            .map_err(StartMicrovmError::Internal)?;
-    }
 
     // On WHP the IOAPIC is always a software device reached over MMIO: WHP
     // emulates the LAPIC but not the IOAPIC, so the guest must be able to
