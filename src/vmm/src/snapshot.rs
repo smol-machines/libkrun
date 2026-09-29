@@ -21,7 +21,7 @@ use std::io::{self, Read, Write};
 use std::io::{Seek, SeekFrom};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::fd::AsRawFd;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::fs::FileExt;
 
 use vm_memory::{Address, FileOffset, GuestAddress, GuestMemory, GuestMemoryRegion};
@@ -89,7 +89,7 @@ fn stream_sparse_memory_files<W: Write>(
     stream_sparse_memory_files_with_seek(sources, output, next_memory_data_offset)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn next_memory_data_offset(file: &File, offset: u64) -> io::Result<Option<u64>> {
     let offset =
         i64::try_from(offset).map_err(|_| io::Error::other("RAM source offset exceeds off_t"))?;
@@ -116,7 +116,7 @@ fn next_memory_data_offset(file: &File, offset: u64) -> io::Result<Option<u64>> 
 }
 
 /// Guest RAM read as a sparse stream: one region's bytes, addressed from 0.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 trait SparseRamSource {
     fn len(&self) -> u64;
     /// The first offset at or after `offset` that may hold data, `None` if
@@ -127,7 +127,7 @@ trait SparseRamSource {
     fn read_exact_at(&mut self, buffer: &mut [u8], offset: u64) -> io::Result<()>;
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 struct FileRamSource<'a, F> {
     file: &'a File,
     start: u64,
@@ -135,7 +135,7 @@ struct FileRamSource<'a, F> {
     next_data: &'a std::cell::RefCell<F>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl<F: FnMut(&File, u64) -> io::Result<Option<u64>>> SparseRamSource for FileRamSource<'_, F> {
     fn len(&self) -> u64 {
         self.len
@@ -152,6 +152,41 @@ impl<F: FnMut(&File, u64) -> io::Result<Option<u64>>> SparseRamSource for FileRa
 
     fn read_exact_at(&mut self, buffer: &mut [u8], offset: u64) -> io::Result<()> {
         self.file.read_exact_at(buffer, self.start + offset)
+    }
+}
+
+/// A macOS generation region: an APFS clone file, or a region with no backing
+/// file, which reads as zero and holds no data.
+#[cfg(target_os = "macos")]
+enum MacRamSource<'a, F> {
+    File(FileRamSource<'a, F>),
+    Zero(u64),
+}
+
+#[cfg(target_os = "macos")]
+impl<F: FnMut(&File, u64) -> io::Result<Option<u64>>> SparseRamSource for MacRamSource<'_, F> {
+    fn len(&self) -> u64 {
+        match self {
+            Self::File(source) => source.len(),
+            Self::Zero(len) => *len,
+        }
+    }
+
+    fn next_data(&mut self, offset: u64) -> io::Result<Option<u64>> {
+        match self {
+            Self::File(source) => source.next_data(offset),
+            Self::Zero(_) => Ok(None),
+        }
+    }
+
+    fn read_exact_at(&mut self, buffer: &mut [u8], offset: u64) -> io::Result<()> {
+        match self {
+            Self::File(source) => source.read_exact_at(buffer, offset),
+            Self::Zero(_) => {
+                buffer.fill(0);
+                Ok(())
+            }
+        }
     }
 }
 
@@ -189,7 +224,7 @@ fn stream_sparse_memory_files_with_seek<W: Write>(
     stream_sparse_ram(&mut sources, output)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn stream_sparse_ram<W: Write>(
     sources: &mut [&mut dyn SparseRamSource],
     output: &mut W,
@@ -285,7 +320,7 @@ fn stream_sparse_ram<W: Write>(
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn append_sparse_range(ranges: &mut Vec<(u64, u64)>, offset: u64, end: u64) {
     let full = ranges.len() == 65536;
     if let Some((previous, length)) = ranges.last_mut()
@@ -2750,6 +2785,75 @@ impl DeferredMemorySave {
         result
     }
 
+    /// Stream the generation as the sparse portable stream. Guest RAM files
+    /// start sparse and their APFS clones keep that layout, so `SEEK_DATA`
+    /// reads only the extents the guest wrote instead of all configured RAM.
+    pub fn finish_sparse_stream_with_header<W: Write>(
+        self,
+        output: &mut W,
+        header: impl FnOnce(&[MemoryRegionDesc], &mut W) -> io::Result<()>,
+    ) -> io::Result<Vec<MemoryRegionDesc>> {
+        let descs = self.generation.finish()?;
+        let result = (|| {
+            let regions: Vec<_> = descs
+                .iter()
+                .map(|d| MemoryRegionDesc {
+                    gpa: d.gpa,
+                    len: d.len,
+                })
+                .collect();
+            let files = descs
+                .iter()
+                .map(|d| {
+                    if d.path.is_empty() {
+                        Ok(None)
+                    } else {
+                        File::open(&d.path).map(Some)
+                    }
+                })
+                .collect::<io::Result<Vec<_>>>()?;
+            for (desc, file) in descs.iter().zip(&files) {
+                if let Some(file) = file {
+                    let end = desc
+                        .offset
+                        .checked_add(desc.len)
+                        .ok_or_else(|| io::Error::other("RAM source offset overflow"))?;
+                    if end > file.metadata()?.len() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "RAM source is truncated",
+                        ));
+                    }
+                }
+            }
+            header(&regions, output)?;
+            let next_data = std::cell::RefCell::new(next_memory_data_offset);
+            let mut owned: Vec<_> = descs
+                .iter()
+                .zip(&files)
+                .map(|(desc, file)| match file {
+                    Some(file) => MacRamSource::File(FileRamSource {
+                        file,
+                        start: desc.offset,
+                        len: desc.len,
+                        next_data: &next_data,
+                    }),
+                    None => MacRamSource::Zero(desc.len),
+                })
+                .collect();
+            let mut sources: Vec<&mut dyn SparseRamSource> = owned
+                .iter_mut()
+                .map(|source| source as &mut dyn SparseRamSource)
+                .collect();
+            stream_sparse_ram(&mut sources, output)?;
+            Ok(regions)
+        })();
+        for path in descs.iter().map(|d| &d.path).filter(|p| !p.is_empty()) {
+            let _ = std::fs::remove_file(path);
+        }
+        result
+    }
+
     /// Combine the materialized Mach aliases into the portable sparse-memory
     /// stream and remove the intermediate per-region files.
     pub fn finish(self, output: &mut File) -> io::Result<Vec<MemoryRegionDesc>> {
@@ -4317,7 +4421,7 @@ mod tests {
     }
 
     /// Decode a `SMOLRSP1` stream into the full logical image.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn decode_sparse_ram(wire: &[u8]) -> Vec<u8> {
         assert_eq!(&wire[..8], b"SMOLRSP1");
         let logical = u64::from_le_bytes(wire[8..16].try_into().unwrap()) as usize;
@@ -4338,6 +4442,72 @@ mod tests {
         }
         assert!(payload.is_empty());
         image
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_sparse_stream_reads_only_the_written_extents_of_an_apfs_clone() {
+        use std::ffi::CString;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::FileExt;
+        // Guest RAM files start sparse; the save's clone keeps that layout.
+        let len = 64 * 1024 * 1024;
+        let live = crate::builder::create_guest_ram_memfd(len).unwrap();
+        for offset in [4095, 1048575, 40 * 1048576 + 17, 64 * 1048576 - 7] {
+            live.write_all_at(b"payload", offset).unwrap();
+        }
+        let dir =
+            std::env::temp_dir().join(format!("krun-sparse-clone-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let dir_file = File::open(&dir).unwrap();
+        let name = CString::new("memory-0.bin").unwrap();
+        assert_eq!(
+            unsafe { libc::fclonefileat(live.as_raw_fd(), dir_file.as_raw_fd(), name.as_ptr(), 0) },
+            0
+        );
+        let clone = File::open(dir.join("memory-0.bin")).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        // A region with no backing file sits between two views of the clone.
+        let mut probes = 0_usize;
+        let counted = std::cell::RefCell::new(|file: &File, offset: u64| {
+            probes += 1;
+            super::next_memory_data_offset(file, offset)
+        });
+        let (head, tail) = (48 * 1048576_u64, 16 * 1048576_u64);
+        let mut sources = [
+            super::MacRamSource::File(super::FileRamSource {
+                file: &clone,
+                start: 0,
+                len: head,
+                next_data: &counted,
+            }),
+            super::MacRamSource::Zero(8192),
+            super::MacRamSource::File(super::FileRamSource {
+                file: &clone,
+                start: head,
+                len: tail,
+                next_data: &counted,
+            }),
+        ];
+        let mut refs: Vec<&mut dyn super::SparseRamSource> = sources
+            .iter_mut()
+            .map(|source| source as &mut dyn super::SparseRamSource)
+            .collect();
+        let mut wire = Vec::new();
+        super::stream_sparse_ram(&mut refs, &mut wire).unwrap();
+        drop(refs);
+        drop(sources);
+        let image = decode_sparse_ram(&wire);
+        let mut expected = vec![0_u8; len + 8192];
+        live.read_exact_at(&mut expected[..head as usize], 0)
+            .unwrap();
+        live.read_exact_at(&mut expected[head as usize + 8192..], head)
+            .unwrap();
+        assert_eq!(image, expected);
+        // Each written extent is found by one probe, not by reading holes.
+        assert!(probes <= 8, "probed {probes} times for four extents");
+        assert!(wire.len() < 4 * 1048576, "streamed {} bytes", wire.len());
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
