@@ -1243,13 +1243,19 @@ impl WhpVcpu {
         assert_eq!(names.len(), values.len());
         let count = names.len() as u32;
 
+        // Copy onto 16-byte-aligned storage before handing the array to WHP;
+        // `values` is typically a stack array, which carries only the union's
+        // 8-byte alignment. See [`AlignedRegisterValue`].
+        let aligned: Vec<AlignedRegisterValue> =
+            values.iter().copied().map(AlignedRegisterValue).collect();
+
         let hr = unsafe {
             WHvSetVirtualProcessorRegisters(
                 self.vm.partition_handle(),
                 self.index,
                 names.as_ptr(),
                 count,
-                values.as_ptr(),
+                aligned.as_ptr().cast(),
             )
         };
         if hr != S_OK {
@@ -1471,11 +1477,41 @@ impl WhpVcpuState {
     }
 }
 
+/// A `WHV_REGISTER_VALUE` forced onto a 16-byte boundary.
+///
+/// A register value is a 128-bit ABI slot, but `windows-sys` declares the union
+/// as plain `#[repr(C)]` — its widest member is a pair of `u64`s, so the type
+/// only carries 8-byte alignment. WinHvPlatform reads the register-value array
+/// with 16-byte-aligned accesses, and an under-aligned array faults inside the
+/// platform DLL with `0xC0000005` before the VM ever starts. Heap buffers
+/// usually survive by luck (the allocator hands back 16-byte-aligned blocks);
+/// stack arrays are where this actually bites. Wrapping the value makes the
+/// alignment explicit at every array we hand to WHP instead of depending on
+/// where the buffer happened to live.
+#[repr(C, align(16))]
+#[derive(Clone, Copy)]
+struct AlignedRegisterValue(WHV_REGISTER_VALUE);
+
+// The wrapper must be a pure alignment change: WHP walks the array by element
+// stride, so any size difference would desynchronise it from `names`.
+const _: () = assert!(
+    mem::size_of::<AlignedRegisterValue>() == mem::size_of::<WHV_REGISTER_VALUE>(),
+    "AlignedRegisterValue must not change WHV_REGISTER_VALUE's size"
+);
+// The whole point of the wrapper. Asserted rather than tested because the crate
+// only builds for Windows, so a unit test would never run on most hosts.
+const _: () = assert!(
+    mem::align_of::<AlignedRegisterValue>() == 16,
+    "WHP register values must be 16-byte aligned"
+);
+
 /// Converts a raw 16-byte register value to a `WHV_REGISTER_VALUE`.
 fn bytes_to_reg_value(bytes: &[u8; 16]) -> WHV_REGISTER_VALUE {
     // SAFETY: `WHV_REGISTER_VALUE` is a 16-byte POD union (`Reg128` is its widest
-    // member); any 16-byte pattern is a valid bit-image of it.
-    unsafe { *(bytes.as_ptr() as *const WHV_REGISTER_VALUE) }
+    // member); any 16-byte pattern is a valid bit-image of it. The read is
+    // unaligned because `bytes` is a byte array (alignment 1) and the union
+    // wants 8.
+    unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const WHV_REGISTER_VALUE) }
 }
 
 /// Converts a `WHV_REGISTER_VALUE` to its raw 16-byte image.
@@ -1559,8 +1595,11 @@ impl WhpVcpu {
     /// interrupt-controller view wins over CR8/APIC-base.
     pub fn restore_state(&self, state: &WhpVcpuState) -> Result<(), Error> {
         let part = self.vm.partition_handle();
-        let values: Vec<WHV_REGISTER_VALUE> =
-            state.reg_values.iter().map(bytes_to_reg_value).collect();
+        let values: Vec<AlignedRegisterValue> = state
+            .reg_values
+            .iter()
+            .map(|bytes| AlignedRegisterValue(bytes_to_reg_value(bytes)))
+            .collect();
 
         let hr = unsafe {
             WHvSetVirtualProcessorRegisters(
@@ -1568,7 +1607,7 @@ impl WhpVcpu {
                 self.index,
                 state.reg_names.as_ptr(),
                 state.reg_names.len() as u32,
-                values.as_ptr(),
+                values.as_ptr().cast(),
             )
         };
         if hr != S_OK {
@@ -1587,8 +1626,16 @@ impl WhpVcpu {
                 WHvX64RegisterEfer,
             ];
             for (name, value) in state.reg_names.iter().zip(values.iter()) {
-                let hr =
-                    unsafe { WHvSetVirtualProcessorRegisters(part, self.index, name, 1, value) };
+                // Elements of an aligned array are themselves 16-byte aligned.
+                let hr = unsafe {
+                    WHvSetVirtualProcessorRegisters(
+                        part,
+                        self.index,
+                        name,
+                        1,
+                        (value as *const AlignedRegisterValue).cast(),
+                    )
+                };
                 if hr != S_OK {
                     if CORE.contains(name) {
                         error!("restoring core vCPU register {name} failed: HRESULT 0x{hr:08x}");
