@@ -9,7 +9,7 @@ use std::mem::{self, MaybeUninit};
 use std::sync::Arc;
 
 use log::{debug, error};
-use windows_sys::Win32::Foundation::S_OK;
+use windows_sys::Win32::Foundation::{S_OK, WHV_E_INSUFFICIENT_BUFFER};
 use windows_sys::Win32::System::Hypervisor::{
     WHV_CAPABILITY, WHV_EMULATOR_CALLBACKS, WHV_EMULATOR_STATUS, WHV_MEMORY_ACCESS_CONTEXT,
     WHV_PARTITION_HANDLE, WHV_PARTITION_PROPERTY, WHV_PARTITION_PROPERTY_CODE,
@@ -77,6 +77,10 @@ pub enum Error {
     RunVirtualProcessor(i32),
     GetRegisters(i32),
     SetRegisters(i32),
+    GetInterruptControllerState(i32),
+    SetInterruptControllerState(i32),
+    GetXsaveState(i32),
+    SetXsaveState(i32),
     MemoryAlignment,
     CreateEmulator(i32),
     DestroyEmulator(i32),
@@ -123,6 +127,22 @@ impl Display for Error {
                     "WHvSetVirtualProcessorRegisters failed: HRESULT 0x{hr:08x}"
                 )
             }
+            GetInterruptControllerState(hr) => write!(
+                f,
+                "WHvGetVirtualProcessorInterruptControllerState failed: HRESULT 0x{hr:08x}"
+            ),
+            SetInterruptControllerState(hr) => write!(
+                f,
+                "WHvSetVirtualProcessorInterruptControllerState failed: HRESULT 0x{hr:08x}"
+            ),
+            GetXsaveState(hr) => write!(
+                f,
+                "WHvGetVirtualProcessorXsaveState failed: HRESULT 0x{hr:08x}"
+            ),
+            SetXsaveState(hr) => write!(
+                f,
+                "WHvSetVirtualProcessorXsaveState failed: HRESULT 0x{hr:08x}"
+            ),
             MemoryAlignment => write!(f, "WHP memory mapping must be 4KB aligned"),
             CreateEmulator(hr) => {
                 write!(f, "WHvEmulatorCreateEmulator failed: HRESULT 0x{hr:08x}")
@@ -1564,8 +1584,7 @@ impl WhpVcpu {
     /// Registers are read in one batch when the host accepts the whole list;
     /// otherwise it falls back to reading each register individually and keeping
     /// only the ones the host knows (older Windows lacks some newer register
-    /// names). The LAPIC and XSAVE areas are best-effort: a host that does not
-    /// expose them yields an empty blob, which restore then skips.
+    /// names). LAPIC and XSAVE state are required for a restorable checkpoint.
     pub fn save_state(&self) -> Result<WhpVcpuState, Error> {
         let part = self.vm.partition_handle();
         let n = CHECKPOINT_REGS.len();
@@ -1605,18 +1624,22 @@ impl WhpVcpu {
             }
         }
 
-        let lapic = self.get_state_blob(|buf, len, written| unsafe {
-            WHvGetVirtualProcessorInterruptControllerState(
-                part,
-                self.index,
-                buf as *mut c_void,
-                len,
-                written,
-            )
-        });
-        let xsave = self.get_state_blob(|buf, len, written| unsafe {
-            WHvGetVirtualProcessorXsaveState(part, self.index, buf as *mut c_void, len, written)
-        });
+        let lapic = self
+            .get_state_blob(|buf, len, written| unsafe {
+                WHvGetVirtualProcessorInterruptControllerState(
+                    part,
+                    self.index,
+                    buf as *mut c_void,
+                    len,
+                    written,
+                )
+            })
+            .map_err(Error::GetInterruptControllerState)?;
+        let xsave = self
+            .get_state_blob(|buf, len, written| unsafe {
+                WHvGetVirtualProcessorXsaveState(part, self.index, buf as *mut c_void, len, written)
+            })
+            .map_err(Error::GetXsaveState)?;
 
         Ok(WhpVcpuState {
             reg_names,
@@ -1685,48 +1708,61 @@ impl WhpVcpu {
             }
         }
 
-        if !state.xsave.is_empty() {
-            let hr = unsafe {
-                WHvSetVirtualProcessorXsaveState(
-                    part,
-                    self.index,
-                    state.xsave.as_ptr() as *const c_void,
-                    state.xsave.len() as u32,
-                )
-            };
-            if hr != S_OK {
-                error!("WHvSetVirtualProcessorXsaveState failed: HRESULT 0x{hr:08x}");
-            }
+        if state.xsave.is_empty() || state.xsave.len() > 1 << 20 {
+            return Err(Error::SetXsaveState(0x8007_000d_u32 as i32));
+        }
+        let hr = unsafe {
+            WHvSetVirtualProcessorXsaveState(
+                part,
+                self.index,
+                state.xsave.as_ptr() as *const c_void,
+                state.xsave.len() as u32,
+            )
+        };
+        if hr != S_OK {
+            return Err(Error::SetXsaveState(hr));
         }
 
-        if !state.lapic.is_empty() {
-            let hr = unsafe {
-                WHvSetVirtualProcessorInterruptControllerState(
-                    part,
-                    self.index,
-                    state.lapic.as_ptr() as *const c_void,
-                    state.lapic.len() as u32,
-                )
-            };
-            if hr != S_OK {
-                error!("WHvSetVirtualProcessorInterruptControllerState failed: HRESULT 0x{hr:08x}");
-            }
+        if state.lapic.is_empty() || state.lapic.len() > 1 << 20 {
+            return Err(Error::SetInterruptControllerState(0x8007_000d_u32 as i32));
+        }
+        let hr = unsafe {
+            WHvSetVirtualProcessorInterruptControllerState(
+                part,
+                self.index,
+                state.lapic.as_ptr() as *const c_void,
+                state.lapic.len() as u32,
+            )
+        };
+        if hr != S_OK {
+            return Err(Error::SetInterruptControllerState(hr));
         }
 
         Ok(())
     }
 
-    /// Reads a variable-length WHP state blob (LAPIC or XSAVE) into a right-sized
-    /// `Vec`. Returns an empty vec if the host does not support the query.
-    fn get_state_blob(&self, get: impl Fn(*mut u8, u32, *mut u32) -> HRESULT) -> Vec<u8> {
+    /// Reads a variable-length WHP state blob, retrying with the required size.
+    fn get_state_blob(
+        &self,
+        get: impl Fn(*mut u8, u32, *mut u32) -> HRESULT,
+    ) -> Result<Vec<u8>, HRESULT> {
         let mut buf = vec![0u8; 4096];
-        let mut written: u32 = 0;
-        let hr = get(buf.as_mut_ptr(), buf.len() as u32, &mut written);
-        if hr != S_OK {
-            return Vec::new();
+        loop {
+            let mut written: u32 = 0;
+            let hr = get(buf.as_mut_ptr(), buf.len() as u32, &mut written);
+            if hr == S_OK {
+                if written == 0 || written as usize > buf.len() {
+                    return Err(0x8007_000d_u32 as i32);
+                }
+                buf.truncate(written as usize);
+                return Ok(buf);
+            }
+            if hr != WHV_E_INSUFFICIENT_BUFFER || written as usize <= buf.len() || written > 1 << 20
+            {
+                return Err(hr);
+            }
+            buf.resize(written as usize, 0);
         }
-        buf.truncate(written as usize);
-        buf
     }
 }
 
