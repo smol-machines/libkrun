@@ -9,7 +9,7 @@ use std::mem::{self, MaybeUninit};
 use std::sync::Arc;
 
 use log::{debug, error};
-use windows_sys::Win32::Foundation::S_OK;
+use windows_sys::Win32::Foundation::{S_OK, WHV_E_INSUFFICIENT_BUFFER};
 use windows_sys::Win32::System::Hypervisor::{
     WHV_CAPABILITY, WHV_EMULATOR_CALLBACKS, WHV_EMULATOR_STATUS, WHV_MEMORY_ACCESS_CONTEXT,
     WHV_PARTITION_HANDLE, WHV_PARTITION_PROPERTY, WHV_PARTITION_PROPERTY_CODE,
@@ -19,18 +19,20 @@ use windows_sys::Win32::System::Hypervisor::{
     WHvCapabilityCodeProcessorFeaturesBanks, WHvCreatePartition, WHvCreateVirtualProcessor,
     WHvDeletePartition, WHvDeleteVirtualProcessor, WHvEmulatorCreateEmulator,
     WHvEmulatorDestroyEmulator, WHvEmulatorTryIoEmulation, WHvEmulatorTryMmioEmulation,
-    WHvGetCapability, WHvGetVirtualProcessorRegisters, WHvMapGpaRange, WHvMapGpaRangeFlagExecute,
-    WHvMapGpaRangeFlagRead, WHvMapGpaRangeFlagWrite, WHvPartitionPropertyCodeCpuidResultList,
-    WHvPartitionPropertyCodeExtendedVmExits, WHvPartitionPropertyCodeLocalApicEmulationMode,
-    WHvPartitionPropertyCodeProcessorCount, WHvPartitionPropertyCodeProcessorFeaturesBanks,
+    WHvGetCapability, WHvGetPartitionProperty, WHvGetVirtualProcessorRegisters, WHvMapGpaRange,
+    WHvMapGpaRangeFlagExecute, WHvMapGpaRangeFlagRead, WHvMapGpaRangeFlagWrite,
+    WHvPartitionPropertyCodeCpuidResultList, WHvPartitionPropertyCodeExtendedVmExits,
+    WHvPartitionPropertyCodeLocalApicEmulationMode, WHvPartitionPropertyCodeProcessorCount,
+    WHvPartitionPropertyCodeProcessorFeaturesBanks, WHvPartitionPropertyCodeReferenceTime,
     WHvPartitionPropertyCodeSyntheticProcessorFeaturesBanks,
-    WHvPartitionPropertyCodeX64MsrExitBitmap, WHvRequestInterrupt, WHvRunVirtualProcessor,
-    WHvRunVpExitReasonCanceled, WHvRunVpExitReasonInvalidVpRegisterValue,
-    WHvRunVpExitReasonMemoryAccess, WHvRunVpExitReasonUnrecoverableException,
-    WHvRunVpExitReasonUnsupportedFeature, WHvRunVpExitReasonX64Cpuid, WHvRunVpExitReasonX64Halt,
-    WHvRunVpExitReasonX64InterruptWindow, WHvRunVpExitReasonX64IoPortAccess,
-    WHvRunVpExitReasonX64MsrAccess, WHvSetPartitionProperty, WHvSetVirtualProcessorRegisters,
-    WHvSetupPartition, WHvX64LocalApicEmulationModeXApic,
+    WHvPartitionPropertyCodeX64MsrExitBitmap, WHvRegisterInternalActivityState,
+    WHvRegisterInterruptState, WHvRegisterPendingEvent, WHvRegisterPendingInterruption,
+    WHvRequestInterrupt, WHvRunVirtualProcessor, WHvRunVpExitReasonCanceled,
+    WHvRunVpExitReasonInvalidVpRegisterValue, WHvRunVpExitReasonMemoryAccess,
+    WHvRunVpExitReasonUnrecoverableException, WHvRunVpExitReasonUnsupportedFeature,
+    WHvRunVpExitReasonX64Cpuid, WHvRunVpExitReasonX64Halt, WHvRunVpExitReasonX64InterruptWindow,
+    WHvRunVpExitReasonX64IoPortAccess, WHvRunVpExitReasonX64MsrAccess, WHvSetPartitionProperty,
+    WHvSetVirtualProcessorRegisters, WHvSetupPartition, WHvX64LocalApicEmulationModeXApic,
     WHvX64RegisterDeliverabilityNotifications, WHvX64RegisterRax, WHvX64RegisterRbx,
     WHvX64RegisterRcx, WHvX64RegisterRdx, WHvX64RegisterRflags, WHvX64RegisterRip,
     WHvX64RegisterRsp,
@@ -48,12 +50,13 @@ use windows_sys::Win32::System::Hypervisor::{
     WHvX64RegisterDr1, WHvX64RegisterDr2, WHvX64RegisterDr3, WHvX64RegisterDr6, WHvX64RegisterDr7,
     WHvX64RegisterDs, WHvX64RegisterEfer, WHvX64RegisterEs, WHvX64RegisterFs, WHvX64RegisterGdtr,
     WHvX64RegisterGs, WHvX64RegisterIdtr, WHvX64RegisterKernelGsBase, WHvX64RegisterLdtr,
-    WHvX64RegisterLstar, WHvX64RegisterPat, WHvX64RegisterR8, WHvX64RegisterR9, WHvX64RegisterR10,
-    WHvX64RegisterR11, WHvX64RegisterR12, WHvX64RegisterR13, WHvX64RegisterR14, WHvX64RegisterR15,
-    WHvX64RegisterRbp, WHvX64RegisterRdi, WHvX64RegisterRsi, WHvX64RegisterSfmask,
-    WHvX64RegisterSs, WHvX64RegisterStar, WHvX64RegisterSysenterCs, WHvX64RegisterSysenterEip,
-    WHvX64RegisterSysenterEsp, WHvX64RegisterTr, WHvX64RegisterTsc, WHvX64RegisterTscAux,
-    WHvX64RegisterXCr0,
+    WHvX64RegisterLstar, WHvX64RegisterPat, WHvX64RegisterPendingDebugException, WHvX64RegisterR8,
+    WHvX64RegisterR9, WHvX64RegisterR10, WHvX64RegisterR11, WHvX64RegisterR12, WHvX64RegisterR13,
+    WHvX64RegisterR14, WHvX64RegisterR15, WHvX64RegisterRbp, WHvX64RegisterRdi, WHvX64RegisterRsi,
+    WHvX64RegisterSfmask, WHvX64RegisterSs, WHvX64RegisterStar, WHvX64RegisterSysenterCs,
+    WHvX64RegisterSysenterEip, WHvX64RegisterSysenterEsp, WHvX64RegisterTr, WHvX64RegisterTsc,
+    WHvX64RegisterTscAux, WHvX64RegisterTscDeadline, WHvX64RegisterXCr0, WHvX64RegisterXfd,
+    WHvX64RegisterXfdErr, WHvX64RegisterXss,
 };
 use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows_sys::core::HRESULT;
@@ -64,6 +67,7 @@ pub enum Error {
     HypervisorNotPresent,
     CreatePartition(i32),
     SetPartitionProperty(i32),
+    GetPartitionProperty(i32),
     SetupPartition(i32),
     DeletePartition(i32),
     MapGpaRange(i32),
@@ -73,6 +77,10 @@ pub enum Error {
     RunVirtualProcessor(i32),
     GetRegisters(i32),
     SetRegisters(i32),
+    GetInterruptControllerState(i32),
+    SetInterruptControllerState(i32),
+    GetXsaveState(i32),
+    SetXsaveState(i32),
     MemoryAlignment,
     CreateEmulator(i32),
     DestroyEmulator(i32),
@@ -90,6 +98,9 @@ impl Display for Error {
             CreatePartition(hr) => write!(f, "WHvCreatePartition failed: HRESULT 0x{hr:08x}"),
             SetPartitionProperty(hr) => {
                 write!(f, "WHvSetPartitionProperty failed: HRESULT 0x{hr:08x}")
+            }
+            GetPartitionProperty(hr) => {
+                write!(f, "WHvGetPartitionProperty failed: HRESULT 0x{hr:08x}")
             }
             SetupPartition(hr) => write!(f, "WHvSetupPartition failed: HRESULT 0x{hr:08x}"),
             DeletePartition(hr) => write!(f, "WHvDeletePartition failed: HRESULT 0x{hr:08x}"),
@@ -116,6 +127,22 @@ impl Display for Error {
                     "WHvSetVirtualProcessorRegisters failed: HRESULT 0x{hr:08x}"
                 )
             }
+            GetInterruptControllerState(hr) => write!(
+                f,
+                "WHvGetVirtualProcessorInterruptControllerState failed: HRESULT 0x{hr:08x}"
+            ),
+            SetInterruptControllerState(hr) => write!(
+                f,
+                "WHvSetVirtualProcessorInterruptControllerState failed: HRESULT 0x{hr:08x}"
+            ),
+            GetXsaveState(hr) => write!(
+                f,
+                "WHvGetVirtualProcessorXsaveState failed: HRESULT 0x{hr:08x}"
+            ),
+            SetXsaveState(hr) => write!(
+                f,
+                "WHvSetVirtualProcessorXsaveState failed: HRESULT 0x{hr:08x}"
+            ),
             MemoryAlignment => write!(f, "WHP memory mapping must be 4KB aligned"),
             CreateEmulator(hr) => {
                 write!(f, "WHvEmulatorCreateEmulator failed: HRESULT 0x{hr:08x}")
@@ -273,6 +300,43 @@ pub struct InterruptRequest {
 }
 
 impl WhpVm {
+    /// Partition reference time in 100 ns units, used by the guest's Hyper-V clocksource.
+    pub fn reference_time(&self) -> Result<u64, Error> {
+        let mut value = 0_u64;
+        let mut written = 0_u32;
+        let hr = unsafe {
+            WHvGetPartitionProperty(
+                self.handle,
+                WHvPartitionPropertyCodeReferenceTime,
+                &mut value as *mut u64 as *mut _,
+                mem::size_of::<u64>() as u32,
+                &mut written,
+            )
+        };
+        if hr != S_OK {
+            return Err(Error::GetPartitionProperty(hr));
+        }
+        if written != mem::size_of::<u64>() as u32 {
+            return Err(Error::GetPartitionProperty(0x8007_000du32 as i32));
+        }
+        Ok(value)
+    }
+
+    /// Rebase a new partition's reference clock to the captured guest time.
+    pub fn set_reference_time(&self, value: u64) -> Result<(), Error> {
+        let hr = unsafe {
+            WHvSetPartitionProperty(
+                self.handle,
+                WHvPartitionPropertyCodeReferenceTime,
+                &value as *const u64 as *const _,
+                mem::size_of::<u64>() as u32,
+            )
+        };
+        if hr != S_OK {
+            return Err(Error::SetPartitionProperty(hr));
+        }
+        Ok(())
+    }
     /// Creates a new WHP partition.
     /// WHP has a create → configure → finalize model
     /// WHvCreatePartition — allocates the partition object but it's not yet usable.
@@ -1045,6 +1109,24 @@ pub struct WhpVcpu {
 }
 
 impl WhpVcpu {
+    fn activity_state(&self) -> Result<u64, Error> {
+        let mut value: WHV_REGISTER_VALUE = unsafe { mem::zeroed() };
+        let name = WHvRegisterInternalActivityState;
+        let hr = unsafe {
+            WHvGetVirtualProcessorRegisters(
+                self.vm.partition_handle(),
+                self.index,
+                &name,
+                1,
+                &mut value,
+            )
+        };
+        if hr == S_OK {
+            Ok(unsafe { value.Reg64 })
+        } else {
+            Err(Error::GetRegisters(hr))
+        }
+    }
     /// Creates a new virtual processor within the given partition.
     pub fn new(vm: Arc<WhpVm>, index: u32) -> Result<Self, Error> {
         let hr = unsafe { WHvCreateVirtualProcessor(vm.partition_handle(), index, 0) };
@@ -1379,6 +1461,9 @@ const CHECKPOINT_REGS: &[WHV_REGISTER_NAME] = &[
     WHvX64RegisterCr4,
     WHvX64RegisterCr8,
     WHvX64RegisterXCr0,
+    WHvX64RegisterXss,
+    WHvX64RegisterXfd,
+    WHvX64RegisterXfdErr,
     // Debug registers.
     WHvX64RegisterDr0,
     WHvX64RegisterDr1,
@@ -1399,7 +1484,15 @@ const CHECKPOINT_REGS: &[WHV_REGISTER_NAME] = &[
     WHvX64RegisterCstar,
     WHvX64RegisterSfmask,
     WHvX64RegisterTsc,
+    WHvX64RegisterTscDeadline,
     WHvX64RegisterTscAux,
+    // Pending events and interrupt shadow survive a halted vCPU. Restoring
+    // registers without them can strand a guest waiting for its next tick.
+    WHvRegisterPendingInterruption,
+    WHvRegisterInterruptState,
+    WHvRegisterPendingEvent,
+    WHvX64RegisterDeliverabilityNotifications,
+    WHvX64RegisterPendingDebugException,
 ];
 
 /// Full architectural state of a WHP virtual processor, captured for
@@ -1491,8 +1584,7 @@ impl WhpVcpu {
     /// Registers are read in one batch when the host accepts the whole list;
     /// otherwise it falls back to reading each register individually and keeping
     /// only the ones the host knows (older Windows lacks some newer register
-    /// names). The LAPIC and XSAVE areas are best-effort: a host that does not
-    /// expose them yields an empty blob, which restore then skips.
+    /// names). LAPIC and XSAVE state are required for a restorable checkpoint.
     pub fn save_state(&self) -> Result<WhpVcpuState, Error> {
         let part = self.vm.partition_handle();
         let n = CHECKPOINT_REGS.len();
@@ -1532,18 +1624,22 @@ impl WhpVcpu {
             }
         }
 
-        let lapic = self.get_state_blob(|buf, len, written| unsafe {
-            WHvGetVirtualProcessorInterruptControllerState(
-                part,
-                self.index,
-                buf as *mut c_void,
-                len,
-                written,
-            )
-        });
-        let xsave = self.get_state_blob(|buf, len, written| unsafe {
-            WHvGetVirtualProcessorXsaveState(part, self.index, buf as *mut c_void, len, written)
-        });
+        let lapic = self
+            .get_state_blob(|buf, len, written| unsafe {
+                WHvGetVirtualProcessorInterruptControllerState(
+                    part,
+                    self.index,
+                    buf as *mut c_void,
+                    len,
+                    written,
+                )
+            })
+            .map_err(Error::GetInterruptControllerState)?;
+        let xsave = self
+            .get_state_blob(|buf, len, written| unsafe {
+                WHvGetVirtualProcessorXsaveState(part, self.index, buf as *mut c_void, len, written)
+            })
+            .map_err(Error::GetXsaveState)?;
 
         Ok(WhpVcpuState {
             reg_names,
@@ -1558,6 +1654,19 @@ impl WhpVcpu {
     /// per-register fallback), then the XSAVE area, then the LAPIC state so the
     /// interrupt-controller view wins over CR8/APIC-base.
     pub fn restore_state(&self, state: &WhpVcpuState) -> Result<(), Error> {
+        // WHP creates every secondary VP in StartupSuspend. A cold restore
+        // skips the guest's INIT/SIPI boot sequence, so a restored AP would
+        // otherwise remain parked with its interrupts pending forever. Release
+        // it while paused, then load the checkpoint's architectural registers.
+        if self.index != 0 && self.activity_state()? & 1 != 0 {
+            self.vm.request_interrupt(&InterruptRequest {
+                interrupt_type: InterruptType::Sipi,
+                destination_mode: InterruptDestinationMode::Physical,
+                trigger_mode: InterruptTriggerMode::Edge,
+                destination: self.index,
+                vector: 0x10,
+            })?;
+        }
         let part = self.vm.partition_handle();
         let values: Vec<WHV_REGISTER_VALUE> =
             state.reg_values.iter().map(bytes_to_reg_value).collect();
@@ -1599,48 +1708,61 @@ impl WhpVcpu {
             }
         }
 
-        if !state.xsave.is_empty() {
-            let hr = unsafe {
-                WHvSetVirtualProcessorXsaveState(
-                    part,
-                    self.index,
-                    state.xsave.as_ptr() as *const c_void,
-                    state.xsave.len() as u32,
-                )
-            };
-            if hr != S_OK {
-                error!("WHvSetVirtualProcessorXsaveState failed: HRESULT 0x{hr:08x}");
-            }
+        if state.xsave.is_empty() || state.xsave.len() > 1 << 20 {
+            return Err(Error::SetXsaveState(0x8007_000d_u32 as i32));
+        }
+        let hr = unsafe {
+            WHvSetVirtualProcessorXsaveState(
+                part,
+                self.index,
+                state.xsave.as_ptr() as *const c_void,
+                state.xsave.len() as u32,
+            )
+        };
+        if hr != S_OK {
+            return Err(Error::SetXsaveState(hr));
         }
 
-        if !state.lapic.is_empty() {
-            let hr = unsafe {
-                WHvSetVirtualProcessorInterruptControllerState(
-                    part,
-                    self.index,
-                    state.lapic.as_ptr() as *const c_void,
-                    state.lapic.len() as u32,
-                )
-            };
-            if hr != S_OK {
-                error!("WHvSetVirtualProcessorInterruptControllerState failed: HRESULT 0x{hr:08x}");
-            }
+        if state.lapic.is_empty() || state.lapic.len() > 1 << 20 {
+            return Err(Error::SetInterruptControllerState(0x8007_000d_u32 as i32));
+        }
+        let hr = unsafe {
+            WHvSetVirtualProcessorInterruptControllerState(
+                part,
+                self.index,
+                state.lapic.as_ptr() as *const c_void,
+                state.lapic.len() as u32,
+            )
+        };
+        if hr != S_OK {
+            return Err(Error::SetInterruptControllerState(hr));
         }
 
         Ok(())
     }
 
-    /// Reads a variable-length WHP state blob (LAPIC or XSAVE) into a right-sized
-    /// `Vec`. Returns an empty vec if the host does not support the query.
-    fn get_state_blob(&self, get: impl Fn(*mut u8, u32, *mut u32) -> HRESULT) -> Vec<u8> {
+    /// Reads a variable-length WHP state blob, retrying with the required size.
+    fn get_state_blob(
+        &self,
+        get: impl Fn(*mut u8, u32, *mut u32) -> HRESULT,
+    ) -> Result<Vec<u8>, HRESULT> {
         let mut buf = vec![0u8; 4096];
-        let mut written: u32 = 0;
-        let hr = get(buf.as_mut_ptr(), buf.len() as u32, &mut written);
-        if hr != S_OK {
-            return Vec::new();
+        loop {
+            let mut written: u32 = 0;
+            let hr = get(buf.as_mut_ptr(), buf.len() as u32, &mut written);
+            if hr == S_OK {
+                if written == 0 || written as usize > buf.len() {
+                    return Err(0x8007_000d_u32 as i32);
+                }
+                buf.truncate(written as usize);
+                return Ok(buf);
+            }
+            if hr != WHV_E_INSUFFICIENT_BUFFER || written as usize <= buf.len() || written > 1 << 20
+            {
+                return Err(hr);
+            }
+            buf.resize(written as usize, 0);
         }
-        buf.truncate(written as usize);
-        buf
     }
 }
 

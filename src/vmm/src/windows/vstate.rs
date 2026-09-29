@@ -119,17 +119,19 @@ impl Vm {
         Ok(())
     }
 
-    /// Capture VM-level checkpoint state. WHP exposes no host-serializable
-    /// in-partition device state (no in-kernel IRQ chip/PIT analogue), so there
-    /// is nothing to capture — mirrors the empty macOS `VmState`.
+    /// Capture the partition reference time used by the guest's Hyper-V clock.
     pub fn save_state(&self) -> Result<VmState> {
-        Ok(VmState)
+        Ok(VmState {
+            reference_time: self.whp_vm.reference_time().map_err(Error::VmSetup)?,
+            pit_state: [0; 8],
+        })
     }
 
-    /// Restore VM-level checkpoint state. No-op for the same reason as
-    /// [`Self::save_state`].
-    pub fn restore_state(&self, _state: &VmState) -> Result<()> {
-        Ok(())
+    /// Restore reference time before resuming any vCPU.
+    pub fn restore_state(&self, state: &VmState) -> Result<()> {
+        self.whp_vm
+            .set_reference_time(state.reference_time)
+            .map_err(Error::VmSetup)
     }
 
     /// Maps every guest-memory region into the WHP partition's guest physical
@@ -555,6 +557,7 @@ impl Vcpu {
             let _ = self.response_sender.send(VcpuResponse::Exited(1));
             return;
         }
+        let mut exit_code = 0;
         loop {
             if !self.service_events() {
                 break;
@@ -565,16 +568,18 @@ impl Vcpu {
                     Ok(false) => break,
                     Err(e) => {
                         error!("WHP vCPU {} run error: {e}", self.id);
+                        exit_code = 1;
                         break;
                     }
                 },
                 Err(e) => {
                     error!("WHP vCPU {} WHvRunVirtualProcessor failed: {e}", self.id);
+                    exit_code = 1;
                     break;
                 }
             }
         }
-        let _ = self.response_sender.send(VcpuResponse::Exited(0));
+        let _ = self.response_sender.send(VcpuResponse::Exited(exit_code));
     }
 }
 
@@ -593,19 +598,36 @@ impl VcpuState {
     }
 }
 
-/// VM-level checkpoint state. WHP has no host-serializable in-partition device
-/// state to capture here (no in-kernel IRQ chip/PIT analogue exposed), mirroring
-/// the empty macOS `VmState`.
+/// VM-level checkpoint state for the guest-visible Hyper-V reference clock.
 #[derive(Clone, Debug, Default)]
-pub struct VmState;
+pub struct VmState {
+    reference_time: u64,
+    pit_state: [u8; 8],
+}
 
 impl VmState {
-    pub fn serialize(&self) -> Vec<u8> {
-        Vec::new()
+    pub fn set_pit_state(&mut self, state: [u8; 8]) {
+        self.pit_state = state;
     }
 
-    pub fn deserialize(_bytes: &[u8]) -> result::Result<VmState, String> {
-        Ok(VmState)
+    pub fn pit_state(&self) -> [u8; 8] {
+        self.pit_state
+    }
+
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut bytes = self.reference_time.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&self.pit_state);
+        bytes
+    }
+
+    pub fn deserialize(bytes: &[u8]) -> result::Result<VmState, String> {
+        if bytes.len() != 16 {
+            return Err("Windows checkpoint is missing reference time or PIT timer state".into());
+        }
+        Ok(VmState {
+            reference_time: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+            pit_state: bytes[8..16].try_into().unwrap(),
+        })
     }
 }
 

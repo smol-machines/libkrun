@@ -228,16 +228,34 @@ impl MMIODeviceManager {
 
     /// Capture the runtime state of every snapshot-supporting virtio device.
     pub fn snapshot_devices(&self) -> VmDevicesState {
+        // Read transport status before locking devices, matching the restore
+        // lock order. A completion can be pending at the checkpoint boundary
+        // even after the device workers have been quiesced.
+        let status_of: Vec<_> = self
+            .mmio_transports
+            .iter()
+            .map(|transport| {
+                let transport = transport.lock().expect("poisoned transport lock");
+                (transport.device(), transport.interrupt_status())
+            })
+            .collect();
         let mut snapshots = Vec::new();
+        let mut interrupt_status = Vec::new();
         for dev in &self.virtio_devices {
             let guard = dev.lock().expect("poisoned virtio device lock");
             if let Some(snap) = snapshot_device(&*guard) {
                 snapshots.push(snap);
+                interrupt_status.push(
+                    status_of
+                        .iter()
+                        .find(|(device, _)| Arc::ptr_eq(device, dev))
+                        .map_or(0, |(_, status)| *status),
+                );
             }
         }
         VmDevicesState {
             devices: snapshots,
-            interrupt_status: Vec::new(),
+            interrupt_status,
         }
     }
 
@@ -247,7 +265,7 @@ impl MMIODeviceManager {
         state: &VmDevicesState,
     ) -> std::result::Result<(), String> {
         let mut used = vec![false; self.mmio_transports.len()];
-        for snap in &state.devices {
+        for (index, snap) in state.devices.iter().enumerate() {
             let want = snap.device_type();
             let queue_states = snap.queue_states();
             let acked = snap.acked_features();
@@ -262,6 +280,9 @@ impl MMIODeviceManager {
                 }
                 restore_device(&mut *t.locked_device(), snap)?;
                 t.restore_and_activate(&queue_states, acked)?;
+                t.set_restored_interrupt_status(
+                    state.interrupt_status.get(index).copied().unwrap_or(0),
+                );
                 t.locked_device().finish_restore_activation();
                 used[i] = true;
                 applied = true;
@@ -274,6 +295,17 @@ impl MMIODeviceManager {
             }
         }
         Ok(())
+    }
+
+    /// Re-inject pending device IRQs only after the restored LAPIC state is in
+    /// place. This also covers interrupts posted while devices re-activated.
+    pub fn replay_restored_interrupts(&self) {
+        for transport in &self.mmio_transports {
+            transport
+                .lock()
+                .expect("poisoned transport lock")
+                .replay_restored_interrupt();
+        }
     }
 
     /// Quiesce every virtio device before snapshotting.

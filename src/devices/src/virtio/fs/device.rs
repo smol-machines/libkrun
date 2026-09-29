@@ -276,7 +276,19 @@ impl Fs {
         }
         for worker in self.worker_threads.drain(..) {
             match worker.join() {
-                Ok(w) => self.quiesced_workers.push(w),
+                Ok(w) => {
+                    // Windows restores FUSE inodes and handles, but WHP's DAX
+                    // window mappings are host-owned views that need a separate
+                    // replay path. Refuse a checkpoint while any are active.
+                    #[cfg(target_os = "windows")]
+                    if w.has_active_dax_mappings() {
+                        self.snapshot_error = Some(
+                            "Windows checkpoint cannot capture active virtio-fs DAX mappings"
+                                .into(),
+                        );
+                    }
+                    self.quiesced_workers.push(w);
+                }
                 Err(e) => {
                     error!("virtio_fs: error reclaiming worker: {e:?}");
                     self.snapshot_error = Some("filesystem worker failed before checkpoint".into());
