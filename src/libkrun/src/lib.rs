@@ -903,7 +903,13 @@ fn handle_finish_save_stream<W: Write>(dir: &str, stream: &mut W) -> String {
 
 /// Metadata is a captured-state handoff, not a durable completion marker.
 /// The final reply follows successful RAM output and metadata persistence.
-#[cfg(all(snapshot_supported, target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(
+    snapshot_supported,
+    any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "macos", target_arch = "aarch64")
+    )
+))]
 fn handle_finish_save_sparse<W: Write>(dir: &str, stream: &mut W) -> String {
     let Some(result) = PREPARED_SAVES.finish(dir, |prepared| {
         let state = prepared.checkpoint.serialize();
@@ -926,7 +932,13 @@ fn handle_finish_save_sparse<W: Write>(dir: &str, stream: &mut W) -> String {
     }
 }
 
-#[cfg(all(snapshot_supported, target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(
+    snapshot_supported,
+    any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "macos", target_arch = "aarch64")
+    )
+))]
 fn write_checkpoint_stream_header(
     output: &mut impl Write,
     state: &[u8],
@@ -1802,7 +1814,13 @@ fn handle_control_stream<S: std::io::Read + std::io::Write + Send + 'static>(
                 },
                 #[cfg(all(snapshot_supported, deferred_stream_supported))]
                 "SAVE_CAPABILITIES" => "OK deferred-stream-v1\n".to_string(),
-                #[cfg(all(snapshot_supported, target_os = "linux", target_arch = "x86_64"))]
+                #[cfg(all(
+                    snapshot_supported,
+                    any(
+                        all(target_os = "linux", target_arch = "x86_64"),
+                        all(target_os = "macos", target_arch = "aarch64")
+                    )
+                ))]
                 "SAVE_SPARSE_CAPABILITIES" => "OK sparse-stream-v1 ownership-v1\n".to_string(),
                 // PREPARE_SAVE_HELD reads RAM in place, without rebasing it, for a
                 // guest with device windows (virtio-fs DAX mappings stay intact).
@@ -1908,11 +1926,17 @@ fn handle_control_stream<S: std::io::Read + std::io::Write + Send + 'static>(
                         .spawn(move || {
                             if let Some(mut stream) = worker_stream.lock().unwrap().take() {
                                 let response = if sparse_memory {
-                                    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+                                    #[cfg(any(
+                                        all(target_os = "linux", target_arch = "x86_64"),
+                                        all(target_os = "macos", target_arch = "aarch64")
+                                    ))]
                                     {
                                         handle_finish_save_sparse(&dir, &mut stream)
                                     }
-                                    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+                                    #[cfg(not(any(
+                                        all(target_os = "linux", target_arch = "x86_64"),
+                                        all(target_os = "macos", target_arch = "aarch64")
+                                    )))]
                                     {
                                         "ERR ENOTSUP sparse save is unavailable\n".to_string()
                                     }
