@@ -696,11 +696,12 @@ fn publish_portable_save(
     memory: Option<File>,
     checkpoint: vmm::VmCheckpoint,
     descs: &[vmm::snapshot::MemoryRegionDesc],
+    durable: bool,
 ) -> std::result::Result<(u64, usize), String> {
     let memory_partial = dir.join("memory.bin.partial");
     let checkpoint_partial = dir.join("checkpoint.bin.partial");
     let manifest_partial = dir.join("manifest.bin.partial");
-    if let Some(memory) = &memory {
+    if let Some(memory) = memory.as_ref().filter(|_| durable) {
         memory
             .sync_all()
             .map_err(|error| format!("sync memory image: {error}"))?;
@@ -715,9 +716,11 @@ fn publish_portable_save(
     (&checkpoint_file)
         .write_all(&checkpoint_bytes)
         .map_err(|error| format!("write checkpoint state: {error}"))?;
-    checkpoint_file
-        .sync_all()
-        .map_err(|error| format!("sync checkpoint state: {error}"))?;
+    if durable {
+        checkpoint_file
+            .sync_all()
+            .map_err(|error| format!("sync checkpoint state: {error}"))?;
+    }
 
     let manifest_bytes = encode_portable_manifest(descs);
     let manifest_file = std::fs::OpenOptions::new()
@@ -728,9 +731,11 @@ fn publish_portable_save(
     (&manifest_file)
         .write_all(&manifest_bytes)
         .map_err(|error| format!("write snapshot manifest: {error}"))?;
-    manifest_file
-        .sync_all()
-        .map_err(|error| format!("sync snapshot manifest: {error}"))?;
+    if durable {
+        manifest_file
+            .sync_all()
+            .map_err(|error| format!("sync snapshot manifest: {error}"))?;
+    }
 
     if memory.is_some() {
         std::fs::rename(&memory_partial, dir.join("memory.bin"))
@@ -749,8 +754,14 @@ fn publish_portable_save(
 /// manifest is renamed into place last, so a reader never accepts a partial
 /// checkpoint. The VM remains paused on success to let the caller capture its
 /// disks at the same consistency boundary; failures resume it automatically.
+///
+/// A durable save syncs every file before replying. Without `durable` the
+/// files are complete for this host's readers but not yet on disk: the VM is
+/// still paused while the reply is pending, so the sync would stall the guest
+/// on the host disk's flush rate. Only a caller that resumes the VM and copies
+/// the files elsewhere before discarding them should skip it.
 #[cfg(snapshot_supported)]
-fn handle_save(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
+fn handle_save(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str, durable: bool) -> String {
     if dir.is_empty() {
         return "ERR EINVAL snapshot dir required\n".to_string();
     }
@@ -778,7 +789,7 @@ fn handle_save(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
             .unwrap()
             .checkpoint_frozen(&mut memory)
             .map_err(|error| format!("capture VM: {error}"))?;
-        publish_portable_save(dir, Some(memory), checkpoint, &descs)
+        publish_portable_save(dir, Some(memory), checkpoint, &descs, durable)
     })();
 
     match result {
@@ -868,7 +879,7 @@ fn handle_finish_save(dir: &str) -> String {
                 .memory
                 .finish(&mut memory)
                 .map_err(|error| format!("serialize retained RAM generation: {error}"))?;
-            publish_portable_save(dir_path, Some(memory), prepared.checkpoint, &descs)
+            publish_portable_save(dir_path, Some(memory), prepared.checkpoint, &descs, true)
         },
     ) else {
         return "ERR ENOENT no prepared durable save\n".to_string();
@@ -890,7 +901,13 @@ fn handle_finish_save_stream<W: Write>(dir: &str, stream: &mut W) -> String {
             .finish_stream(stream)
             .map_err(|error| format!("stream retained RAM: {error}"))
             .and_then(|descs| {
-                publish_portable_save(std::path::Path::new(dir), None, prepared.checkpoint, &descs)
+                publish_portable_save(
+                    std::path::Path::new(dir),
+                    None,
+                    prepared.checkpoint,
+                    &descs,
+                    true,
+                )
             })
     }) else {
         return "ERR ENOENT no prepared durable save\n".to_string();
@@ -921,7 +938,13 @@ fn handle_finish_save_sparse<W: Write>(dir: &str, stream: &mut W) -> String {
             })
             .map_err(|error| format!("stream sparse retained RAM: {error}"))
             .and_then(|descs| {
-                publish_portable_save(std::path::Path::new(dir), None, prepared.checkpoint, &descs)
+                publish_portable_save(
+                    std::path::Path::new(dir),
+                    None,
+                    prepared.checkpoint,
+                    &descs,
+                    true,
+                )
             })
     }) else {
         return "ERR ENOENT no prepared durable save\n".to_string();
@@ -1884,7 +1907,13 @@ fn handle_control_stream<S: std::io::Read + std::io::Write + Send + 'static>(
                 // checkpoint and leave the VM paused so the caller can capture
                 // disk state from the same boundary.
                 #[cfg(snapshot_supported)]
-                "SAVE" => handle_save(vmm, _arg),
+                "SAVE" => handle_save(vmm, _arg, true),
+                // SAVE_UNSYNCED <dir>: SAVE without syncing its files, for a
+                // caller that resumes the VM and packs them into a durable
+                // artifact of its own. The source resumes after the RAM copy
+                // instead of after the host disk flushes it.
+                #[cfg(snapshot_supported)]
+                "SAVE_UNSYNCED" => handle_save(vmm, _arg, false),
                 // PREPARE_SAVE captures an immutable COW RAM generation and
                 // leaves the VM paused only for caller-side disk staging.
                 // After RESUME, FINISH_SAVE persists that retained generation;
