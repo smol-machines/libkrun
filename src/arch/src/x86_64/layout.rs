@@ -22,11 +22,13 @@ pub const INITRD_SEV_START: u64 = 0xa00000;
 /// Start of the high memory.
 pub const HIMEM_START: u64 = 0x0010_0000; //1 MB.
 
-// Typically, on x86 systems 16 IRQs are used (0-15).
 /// First usable IRQ ID for virtio device interrupts on x86_64.
 pub const IRQ_BASE: u32 = 5;
-/// Last usable IRQ ID for virtio device interrupts on x86_64.
-pub const IRQ_MAX: u32 = 15;
+/// Last usable IRQ ID for virtio device interrupts on x86_64. Every x86 irqchip
+/// libkrun uses (KVM's in-kernel or split IOAPIC, WHP's) has 24 pins, and the
+/// MP table describes each one, so virtio-mmio devices can use pins 16-23 too
+/// instead of stopping at the legacy ISA range.
+pub const IRQ_MAX: u32 = 23;
 
 /// Address for the TSS setup.
 pub const KVM_TSS_ADDRESS: u64 = 0xfffb_d000;
