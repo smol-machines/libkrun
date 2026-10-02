@@ -404,7 +404,7 @@ impl Cpu {
                     self.ram
                         .atomic_u32(pa)
                         .unwrap()
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
+                        .try_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
                             Some(amo32(op, cur, src as u32))
                         })
                         .unwrap() as u64
@@ -412,7 +412,7 @@ impl Cpu {
                     self.ram
                         .atomic_u64(pa)
                         .unwrap()
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
+                        .try_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
                             Some(amo64(op, cur, src))
                         })
                         .unwrap()
