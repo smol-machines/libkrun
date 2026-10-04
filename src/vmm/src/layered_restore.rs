@@ -469,16 +469,16 @@ impl Generation {
         memory: &GuestMemoryMmap,
         excluded: &[u64],
     ) -> io::Result<(Self, usize)> {
-        self.capture_quiesced_within(memory, excluded, COMPACT_EXTENTS)
+        self.capture_quiesced_within(memory, excluded, CompactLimits::DEFAULT)
     }
 
-    /// Capture with each private region compacted to its share of
-    /// `max_extents`, in proportion to its size.
+    /// Capture with each private region given its share of `limits`, in
+    /// proportion to its size.
     fn capture_quiesced_within(
         &self,
         memory: &GuestMemoryMmap,
         excluded: &[u64],
-        max_extents: usize,
+        limits: CompactLimits,
     ) -> io::Result<(Self, usize)> {
         self.validate_memory(memory, excluded)?;
         let private_len: u128 = self
@@ -498,8 +498,8 @@ impl Generation {
                 memory: memory.clone(),
                 image: image.clone(),
             };
-            let share = (max_extents as u128 * image.len as u128 / private_len.max(1)) as usize;
-            let (next, bytes) = instance.capture_quiesced_within(share.max(1))?;
+            let (next, bytes) =
+                instance.capture_quiesced_within(limits.share(image.len, private_len))?;
             copied = copied
                 .checked_add(bytes)
                 .ok_or_else(|| invalid("copied RAM size overflow"))?;
@@ -782,15 +782,16 @@ impl Instance {
     // views and excludes device-owned mappings before scanning page state.
     #[cfg(test)]
     fn capture_quiesced(&self) -> io::Result<(Image, usize)> {
-        self.capture_quiesced_within(COMPACT_EXTENTS)
+        self.capture_quiesced_within(CompactLimits::DEFAULT)
     }
 
-    /// Capture this instance's private pages into a new sealed delta and
-    /// return a layout of at most `max_extents` extents. Each capture splits
-    /// older extents around the pages the guest wrote since the last one, so
-    /// a machine that keeps branching fragments without bound unless the
-    /// shortest unchanged runs are folded into the delta as well.
-    fn capture_quiesced_within(&self, max_extents: usize) -> io::Result<(Image, usize)> {
+    /// Capture this instance's private pages into a new sealed delta. Each
+    /// capture splits older extents around the pages the guest wrote since the
+    /// last one, so a machine that keeps branching fragments without bound;
+    /// past `limits.trigger` extents the shortest unchanged runs are folded
+    /// into the delta as well until at most `limits.goal` remain, and past
+    /// `limits.files` backing files the whole region is consolidated.
+    fn capture_quiesced_within(&self, limits: CompactLimits) -> io::Result<(Image, usize)> {
         // A hardened VMM is not dumpable and cannot open its own page map;
         // fall back to the descriptor the embedder opened before hardening.
         let pagemap = crate::snapshot::open_own_pagemap()?;
@@ -799,12 +800,21 @@ impl Instance {
             .get_host_address(GuestAddress(self.image.gpa))
             .unwrap() as u64;
         let dirty = private_page_ranges(&pagemap, base, self.image.len, host_page_size())?;
-        if dirty.is_empty() && self.image.extents.len() <= max_extents {
+        if dirty.is_empty() && self.image.extents.len() <= limits.trigger {
             return Ok((self.image.clone(), 0));
         }
         let plan = plan_layout(&self.image.extents, &dirty);
-        let fold = fold_threshold(&plan, max_extents.max(1));
-        let copy = copy_ranges(&plan, fold);
+        let mut folded = choose_folds(&plan, limits.trigger, limits.goal);
+        let kept_files: std::collections::HashSet<_> = plan
+            .iter()
+            .zip(&folded)
+            .filter_map(|(piece, folded)| piece.old.filter(|_| !folded))
+            .map(|index| Arc::as_ptr(&self.image.extents[index].file))
+            .collect();
+        if kept_files.len() + 1 > limits.files {
+            folded.fill(true);
+        }
+        let copy = copy_ranges(&plan, &folded);
         let delta = if copy.is_empty() {
             None
         } else {
@@ -824,7 +834,7 @@ impl Instance {
                         .map_err(|error| {
                             io::Error::other(format!("read private RAM: {error:?}"))
                         })?;
-                    delta.write_all_at(&buffer[..len], offset as u64)?;
+                    write_nonzero_pages(&delta, &buffer[..len], offset as u64)?;
                 }
             }
             let seals =
@@ -834,11 +844,11 @@ impl Instance {
             }
             Some(Arc::new(delta))
         };
-        let copied = copy.iter().map(|(start, end)| end - start).sum();
+        let copied: usize = copy.iter().map(|(start, end)| end - start).sum();
         // Flatten the mapping index now; a restore never walks a delta chain.
         let mut extents: Vec<Extent> = Vec::with_capacity(plan.len());
-        for piece in &plan {
-            match piece.old.filter(|_| !piece.folded(fold)) {
+        for (piece, folded) in plan.iter().zip(&folded) {
+            match piece.old.filter(|_| !folded) {
                 Some(index) => {
                     let old = &self.image.extents[index];
                     extents.push(Extent {
@@ -872,6 +882,14 @@ impl Instance {
             cursor = extent.end;
         }
         assert_eq!(cursor, self.image.len);
+        if copied > dirty.iter().map(|(start, end)| end - start).sum::<usize>() {
+            log::info!(
+                "compacted layered RAM at {:#x}: {} extents instead of {}, {copied} bytes copied",
+                self.image.gpa,
+                extents.len(),
+                plan.len()
+            );
+        }
         Ok((
             Image {
                 gpa: self.image.gpa,
@@ -883,11 +901,71 @@ impl Instance {
     }
 }
 
-/// Extents a captured generation keeps before capture compacts it. Every
-/// extent is a separate mapping in each VMM that runs the generation and is
-/// remapped on every capture, and the hard limit above refuses a generation
-/// past 65536; this leaves room for a branch's children to fragment it again.
-const COMPACT_EXTENTS: usize = 16384;
+/// Write the non-zero pages of `bytes` at `offset`. A zero page stays a hole
+/// in the delta, which reads back as zero without holding memory.
+fn write_nonzero_pages(file: &File, bytes: &[u8], offset: u64) -> io::Result<()> {
+    let page = host_page_size();
+    let mut run: Option<usize> = None;
+    for start in (0..bytes.len()).step_by(page) {
+        let end = (start + page).min(bytes.len());
+        let zero = bytes[start..end].iter().all(|byte| *byte == 0);
+        match (zero, run) {
+            (false, None) => run = Some(start),
+            (true, Some(first)) => {
+                file.write_all_at(&bytes[first..start], offset + first as u64)?;
+                run = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(first) = run {
+        file.write_all_at(&bytes[first..], offset + first as u64)?;
+    }
+    Ok(())
+}
+
+/// When a capture compacts one region of a generation.
+#[derive(Clone, Copy, Debug)]
+struct CompactLimits {
+    trigger: usize,
+    goal: usize,
+    files: usize,
+}
+
+impl CompactLimits {
+    const DEFAULT: Self = Self {
+        trigger: COMPACT_TRIGGER,
+        goal: COMPACT_GOAL,
+        files: COMPACT_FILES,
+    };
+
+    /// This region's share of the limits, in proportion to its size.
+    fn share(self, len: usize, private_len: u128) -> Self {
+        let share = |total: usize, floor: usize| {
+            ((total as u128 * len as u128 / private_len.max(1)) as usize).max(floor)
+        };
+        Self {
+            trigger: share(self.trigger, 1),
+            goal: share(self.goal, 1),
+            files: share(self.files, 2),
+        }
+    }
+}
+
+/// A capture that leaves more distinct backing files than this consolidates
+/// the region into its new delta. A generation past 1024 files is refused.
+const COMPACT_FILES: usize = 512;
+
+/// A capture that would leave more extents than this compacts the generation
+/// down to `COMPACT_GOAL`. Every extent is a separate mapping in each VMM that
+/// runs the generation and is remapped on every capture, and a generation past
+/// 65536 extents is refused outright, so stay well below both that limit and
+/// the kernel's default per-process mapping limit.
+const COMPACT_TRIGGER: usize = 32768;
+
+/// Extents left after a compaction. The gap to `COMPACT_TRIGGER` lets a
+/// machine branch several times before the next compaction copies anything.
+const COMPACT_GOAL: usize = 16384;
 
 /// One run of the next layout: either a piece of an existing extent (by
 /// index) or pages the guest wrote, which always go to the new delta.
@@ -901,11 +979,6 @@ struct Piece {
 impl Piece {
     fn len(&self) -> usize {
         self.end - self.start
-    }
-
-    /// Whether this run is copied into the new delta.
-    fn folded(&self, fold: Option<usize>) -> bool {
-        self.old.is_none() || fold.is_some_and(|limit| self.len() <= limit)
     }
 }
 
@@ -976,29 +1049,27 @@ fn plan_layout(old: &[Extent], dirty: &[(usize, usize)]) -> Vec<Piece> {
     merged
 }
 
-/// Number of extents `plan` maps once every piece `fold` selects is copied
-/// into the delta, where consecutive copied pieces become a single extent.
-fn folded_extent_count(plan: &[Piece], fold: Option<usize>) -> usize {
-    let mut count = 0;
-    let mut previous_folded = false;
-    for piece in plan {
-        let folded = piece.folded(fold);
-        if !(folded && previous_folded) {
-            count += 1;
-        }
-        previous_folded = folded;
-    }
-    count
+/// Number of extents mapped when the pieces `folded` marks are copied into the
+/// delta: consecutive copied pieces become a single extent.
+fn folded_extent_count(folded: &[bool]) -> usize {
+    folded
+        .iter()
+        .enumerate()
+        .filter(|&(index, &this)| !(this && index > 0 && folded[index - 1]))
+        .count()
 }
 
-/// The shortest-run threshold that fits `plan` in `max_extents`: every older
-/// piece no longer than it is copied into the delta. Folding more pieces never
-/// adds an extent, so the smallest sufficient threshold copies the least.
-/// `None` when the plan already fits.
-fn fold_threshold(plan: &[Piece], max_extents: usize) -> Option<usize> {
-    if plan.len() <= max_extents {
-        return None;
+/// Choose which pieces of `plan` to copy into the new delta. Pages the guest
+/// wrote always are. When that alone leaves more than `trigger` extents, the
+/// shortest unchanged pieces are folded in as well until at most `goal`
+/// remain: each fold merges a piece with its copied neighbours, so the
+/// shortest pieces remove the most extents per byte copied.
+fn choose_folds(plan: &[Piece], trigger: usize, goal: usize) -> Vec<bool> {
+    let mut folded: Vec<bool> = plan.iter().map(|piece| piece.old.is_none()).collect();
+    if plan.len() <= trigger {
+        return folded;
     }
+    let goal = goal.clamp(1, trigger);
     let mut lengths: Vec<usize> = plan
         .iter()
         .filter(|piece| piece.old.is_some())
@@ -1006,16 +1077,42 @@ fn fold_threshold(plan: &[Piece], max_extents: usize) -> Option<usize> {
         .collect();
     lengths.sort_unstable();
     lengths.dedup();
-    // Folding every piece leaves one extent, so the largest length fits.
-    let index =
-        lengths.partition_point(|&limit| folded_extent_count(plan, Some(limit)) > max_extents);
-    lengths.get(index).copied()
+    let fold_up_to = |limit: usize| -> Vec<bool> {
+        plan.iter()
+            .map(|piece| piece.old.is_none() || piece.len() <= limit)
+            .collect()
+    };
+    // Folding more pieces never adds an extent, and folding every piece
+    // leaves one, so the smallest sufficient length exists.
+    let index = lengths.partition_point(|&limit| folded_extent_count(&fold_up_to(limit)) > goal);
+    let Some(&limit) = lengths.get(index) else {
+        return folded;
+    };
+    // Every shorter piece is needed; of the pieces exactly `limit` long, fold
+    // only as many as it takes to reach the goal.
+    for (flag, piece) in folded.iter_mut().zip(plan) {
+        *flag |= piece.len() < limit;
+    }
+    let mut count = folded_extent_count(&folded);
+    for index in 0..plan.len() {
+        if count <= goal {
+            break;
+        }
+        if folded[index] || plan[index].len() != limit {
+            continue;
+        }
+        let left = index > 0 && folded[index - 1];
+        let right = index + 1 < plan.len() && folded[index + 1];
+        folded[index] = true;
+        count -= usize::from(left) + usize::from(right);
+    }
+    folded
 }
 
 /// The coalesced runs copied into the new delta.
-fn copy_ranges(plan: &[Piece], fold: Option<usize>) -> Vec<(usize, usize)> {
+fn copy_ranges(plan: &[Piece], folded: &[bool]) -> Vec<(usize, usize)> {
     let mut ranges: Vec<(usize, usize)> = Vec::new();
-    for piece in plan.iter().filter(|piece| piece.folded(fold)) {
+    for (piece, _) in plan.iter().zip(folded).filter(|(_, folded)| **folded) {
         match ranges.last_mut() {
             Some(last) if last.1 == piece.start => last.1 = piece.end,
             _ => ranges.push((piece.start, piece.end)),
@@ -1448,26 +1545,52 @@ fn compaction_folds_only_the_shortest_unchanged_runs() {
     // old 0..1, dirty 1..2, old 2..3, dirty 3..4, old 4..8, dirty 8..9, old 9..16
     let plan = plan_layout(&old, &pages(&[(1, 2), (3, 4), (8, 9)]));
     assert_eq!(plan.len(), 7);
-    assert_eq!(fold_threshold(&plan, 7), None);
-    assert_eq!(copy_ranges(&plan, None), pages(&[(1, 2), (3, 4), (8, 9)]));
-    // Folding the two one-page runs is enough for five extents.
-    let fold = fold_threshold(&plan, 5);
-    assert_eq!(fold, Some(page));
-    assert_eq!(folded_extent_count(&plan, fold), 4);
-    assert_eq!(copy_ranges(&plan, fold), pages(&[(0, 4), (8, 9)]));
-    let fold = fold_threshold(&plan, 3);
-    assert_eq!(fold, Some(4 * page));
-    assert_eq!(copy_ranges(&plan, fold), pages(&[(0, 9)]));
-    let fold = fold_threshold(&plan, 1);
-    assert_eq!(folded_extent_count(&plan, fold), 1);
-    assert_eq!(copy_ranges(&plan, fold), pages(&[(0, 16)]));
+    let copied = |trigger, goal| {
+        let folded = choose_folds(&plan, trigger, goal);
+        (folded_extent_count(&folded), copy_ranges(&plan, &folded))
+    };
+    // Within the trigger only the written pages are copied.
+    assert_eq!(copied(7, 2), (7, pages(&[(1, 2), (3, 4), (8, 9)])));
+    // Folding the two one-page runs reaches five extents.
+    assert_eq!(copied(6, 5), (4, pages(&[(0, 4), (8, 9)])));
+    assert_eq!(copied(6, 3), (2, pages(&[(0, 9)])));
+    assert_eq!(copied(6, 1), (1, pages(&[(0, 16)])));
+}
+
+#[test]
+fn compaction_folds_only_as_many_equal_runs_as_needed() {
+    let page = host_page_size();
+    let file = Arc::new(crate::builder::create_guest_ram_memfd(10 * page).unwrap());
+    let old = [Extent {
+        start: 0,
+        end: 10 * page,
+        offset: 0,
+        file,
+    }];
+    // Every other page written: ten one-page pieces, five of them unchanged.
+    let dirty: Vec<_> = (1..10)
+        .step_by(2)
+        .map(|index| (index * page, (index + 1) * page))
+        .collect();
+    let plan = plan_layout(&old, &dirty);
+    assert_eq!(plan.len(), 10);
+    let folded = choose_folds(&plan, 8, 8);
+    assert_eq!(folded_extent_count(&folded), 7);
+    assert_eq!(
+        copy_ranges(&plan, &folded),
+        [(0, 4), (5, 6), (7, 8), (9, 10)]
+            .iter()
+            .map(|&(s, e)| (s * page, e * page))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn repeated_branches_stay_within_the_extent_budget_and_exact() {
     use crate::snapshot::MemoryRegionDesc;
     const PAGES: usize = 1024;
-    const MAX_EXTENTS: usize = 32;
+    const TRIGGER: usize = 32;
+    const GOAL: usize = 16;
     let page = host_page_size();
     let file = crate::builder::create_guest_ram_memfd(PAGES * page).unwrap();
     // Distinct base bytes, so a folded unchanged run that copied the wrong
@@ -1511,12 +1634,26 @@ fn repeated_branches_stay_within_the_extent_budget_and_exact() {
                 .unwrap();
         }
         let (next, copied) = generation
-            .capture_quiesced_within(&memory, &[], MAX_EXTENTS)
+            .capture_quiesced_within(
+                &memory,
+                &[],
+                CompactLimits {
+                    trigger: TRIGGER,
+                    goal: GOAL,
+                    files: 8,
+                },
+            )
             .unwrap();
         assert!(copied >= written.len() * page);
         folded |= copied > written.len() * page;
+        let files: std::collections::HashSet<_> = next.regions[0]
+            .extents
+            .iter()
+            .map(|extent| Arc::as_ptr(&extent.file))
+            .collect();
+        assert!(files.len() <= 8, "round {round}: {} files", files.len());
         assert!(
-            next.regions[0].extents.len() <= MAX_EXTENTS,
+            next.regions[0].extents.len() <= TRIGGER,
             "round {round}: {} extents",
             next.regions[0].extents.len()
         );
@@ -1536,6 +1673,68 @@ fn repeated_branches_stay_within_the_extent_budget_and_exact() {
             .unwrap();
         assert!(actual == model, "generation {round} diverged");
     }
+}
+
+#[test]
+fn consolidation_preserves_contents_and_keeps_zero_pages_as_holes() {
+    use crate::snapshot::MemoryRegionDesc;
+    use std::os::unix::fs::MetadataExt;
+    const PAGES: usize = 64;
+    let page = host_page_size();
+    let file = crate::builder::create_guest_ram_memfd(PAGES * page).unwrap();
+    file.write_all_at(&vec![0x11; page], 0).unwrap();
+    let generation = Generation::from_immutable_file(
+        &[MemoryRegionDesc {
+            gpa: 0,
+            len: (PAGES * page) as u64,
+        }],
+        &file,
+    )
+    .unwrap();
+    let memory = generation.restore().unwrap();
+    memory
+        .write_slice(&vec![0x22; page], GuestAddress((3 * page) as u64))
+        .unwrap();
+    // A private page that holds only zeros needs no backing either.
+    memory
+        .write_slice(&vec![0; page], GuestAddress((5 * page) as u64))
+        .unwrap();
+    // A one-file budget leaves no room for the old backing beside the delta.
+    let limits = CompactLimits {
+        trigger: COMPACT_TRIGGER,
+        goal: COMPACT_GOAL,
+        files: 1,
+    };
+    let instance = Instance {
+        memory: memory.clone(),
+        image: generation.regions[0].clone(),
+    };
+    let (image, copied) = instance.capture_quiesced_within(limits).unwrap();
+    let next = Generation {
+        regions: vec![image],
+    };
+    assert_eq!(copied, PAGES * page);
+    assert_eq!(next.regions[0].extents.len(), 1);
+    let delta = &next.regions[0].extents[0].file;
+    assert!(!Arc::ptr_eq(delta, &generation.regions[0].extents[0].file));
+    assert_eq!(delta.metadata().unwrap().blocks() * 512, 2 * page as u64);
+    let mut expected = vec![0; PAGES * page];
+    expected[..page].fill(0x11);
+    expected[3 * page..4 * page].fill(0x22);
+    let mut actual = vec![0; PAGES * page];
+    next.restore()
+        .unwrap()
+        .read_slice(&mut actual, GuestAddress(0))
+        .unwrap();
+    assert!(actual == expected);
+    // The ancestor generation is unchanged.
+    generation
+        .restore()
+        .unwrap()
+        .read_slice(&mut actual, GuestAddress(0))
+        .unwrap();
+    expected[3 * page..4 * page].fill(0);
+    assert!(actual == expected);
 }
 
 #[test]
@@ -1562,7 +1761,7 @@ fn scattered_writes_past_the_hard_limit_are_compacted_not_refused() {
             .unwrap();
     }
     let (next, _) = generation.capture_quiesced(&memory).unwrap();
-    assert!(next.regions[0].extents.len() <= COMPACT_EXTENTS);
+    assert!(next.regions[0].extents.len() <= COMPACT_GOAL);
     next.encode_manifest().unwrap();
     next.rebase_quiesced(&memory).unwrap();
     let restored = next.restore().unwrap();
