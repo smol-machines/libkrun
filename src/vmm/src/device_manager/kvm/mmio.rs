@@ -112,6 +112,11 @@ pub struct MMIODeviceManager {
     /// MMIO transports, kept so a restored clone can re-activate each device
     /// from saved queue state (the guest won't redo the virtio handshake).
     mmio_transports: Vec<Arc<Mutex<devices::virtio::MmioTransport>>>,
+    /// Subtracted from a device's interrupt number to get its KVM irqfd GSI.
+    /// 0 numbers devices from the first SPI after `IRQ_BASE`; a board recreated
+    /// from a macOS checkpoint numbers them by INTID instead (see
+    /// [`Self::use_intid_numbering`]).
+    gsi_offset: u32,
 }
 
 impl MMIODeviceManager {
@@ -128,7 +133,26 @@ impl MMIODeviceManager {
             id_to_dev_info: HashMap::new(),
             virtio_devices: Vec::new(),
             mmio_transports: Vec::new(),
+            gsi_offset: 0,
         }
+    }
+
+    /// Number devices the way macOS does: the guest was told each device's
+    /// interrupt by INTID, so device `n` raises INTID `IRQ_BASE + n`, which is
+    /// KVM SPI (GSI) `n`, instead of SPI `IRQ_BASE + n`.
+    #[cfg(target_arch = "aarch64")]
+    pub fn use_intid_numbering(&mut self) {
+        self.gsi_offset = arch::aarch64::layout::IRQ_BASE;
+    }
+
+    /// The next MMIO address and interrupt a device would be given.
+    #[cfg(target_arch = "aarch64")]
+    pub fn next_slot(&self) -> (u64, u32) {
+        (self.mmio_base, self.irq)
+    }
+
+    fn gsi(&self) -> u32 {
+        self.irq - self.gsi_offset
     }
 
     /// Register a MMIO IOAPIC device.
@@ -169,7 +193,7 @@ impl MMIODeviceManager {
                 .map_err(Error::RegisterIoEvent)?;
         }
 
-        vm.register_irqfd(mmio_device.interrupt_evt(), self.irq)
+        vm.register_irqfd(mmio_device.interrupt_evt(), self.gsi())
             .map_err(Error::RegisterIrqFd)?;
 
         mmio_device.set_irq_line(self.irq);
@@ -232,7 +256,7 @@ impl MMIODeviceManager {
             return Err(Error::IrqsExhausted);
         }
 
-        vm.register_irqfd(serial.lock().unwrap().interrupt_evt(), self.irq)
+        vm.register_irqfd(serial.lock().unwrap().interrupt_evt(), self.gsi())
             .map_err(Error::RegisterIrqFd)?;
 
         {
@@ -281,7 +305,7 @@ impl MMIODeviceManager {
         // Attaching the RTC device.
         let rtc_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).map_err(Error::EventFd)?;
         let device = devices::legacy::RTC::new(rtc_evt.try_clone().map_err(Error::EventFd)?);
-        vm.register_irqfd(&rtc_evt, self.irq)
+        vm.register_irqfd(&rtc_evt, self.gsi())
             .map_err(Error::RegisterIrqFd)?;
 
         self.bus
@@ -293,6 +317,54 @@ impl MMIODeviceManager {
             (DeviceType::RTC, "rtc".to_string()),
             MMIODeviceInfo {
                 addr: ret,
+                _len: MMIO_LEN,
+                _irq: self.irq,
+            },
+        );
+
+        self.mmio_base += MMIO_LEN;
+        self.irq += 1;
+
+        Ok(())
+    }
+
+    /// Register a PL061 GPIO, which macOS boards have and a board recreated
+    /// from a macOS checkpoint must keep at the same address and interrupt.
+    #[cfg(target_arch = "aarch64")]
+    pub fn register_mmio_gpio(
+        &mut self,
+        vm: &VmFd,
+        intc: IrqChip,
+        event_manager: &mut polly::event_manager::EventManager,
+        shutdown_efd: EventFd,
+    ) -> Result<()> {
+        if self.irq > self.last_irq {
+            return Err(Error::IrqsExhausted);
+        }
+
+        let gpio_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).map_err(Error::EventFd)?;
+        let gpio = Arc::new(Mutex::new(devices::legacy::Gpio::new(
+            shutdown_efd,
+            gpio_evt.try_clone().map_err(Error::EventFd)?,
+        )));
+        event_manager
+            .add_subscriber(gpio.clone())
+            .map_err(|e| Error::EventFd(std::io::Error::other(format!("{e:?}"))))?;
+        vm.register_irqfd(&gpio_evt, self.gsi())
+            .map_err(Error::RegisterIrqFd)?;
+        {
+            let mut gpio = gpio.lock().unwrap();
+            gpio.set_intc(intc);
+            gpio.set_irq_line(self.irq);
+        }
+
+        self.bus
+            .insert(gpio, self.mmio_base, MMIO_LEN)
+            .map_err(Error::BusError)?;
+        self.id_to_dev_info.insert(
+            (DeviceType::Gpio, DeviceType::Gpio.to_string()),
+            MMIODeviceInfo {
+                addr: self.mmio_base,
                 _len: MMIO_LEN,
                 _irq: self.irq,
             },

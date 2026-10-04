@@ -155,7 +155,10 @@ impl Vm {
                 Vec::new()
             }
         };
-        Ok(VmState { gic_distributor })
+        Ok(VmState {
+            gic_distributor,
+            board: None,
+        })
     }
 
     /// Restore VM-level state: replay the GIC distributor registers onto the
@@ -769,6 +772,10 @@ pub struct VmState {
     /// In-kernel HVF GIC distributor registers as (reg-offset, value) pairs
     /// (see [`Vm::save_state`]). Empty when there is no in-kernel GIC.
     pub gic_distributor: Vec<(u32, u64)>,
+    /// The guest-visible board (GIC placement, legacy devices), recorded so a
+    /// checkpoint can be restored by another hypervisor. `None` in blobs that
+    /// predate it.
+    pub board: Option<crate::arm_board::BoardLayout>,
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -782,6 +789,11 @@ impl VmState {
         for &(reg, val) in &self.gic_distributor {
             out.extend_from_slice(&reg.to_le_bytes());
             out.extend_from_slice(&val.to_le_bytes());
+        }
+        if let Some(board) = &self.board {
+            let board = board.encode();
+            out.extend_from_slice(&(board.len() as u32).to_le_bytes());
+            out.extend_from_slice(&board);
         }
         out
     }
@@ -809,7 +821,19 @@ impl VmState {
             let val = u64::from_le_bytes(take(bytes, &mut pos, 8)?.try_into().map_err(|_| err())?);
             gic_distributor.push((reg, val));
         }
-        Ok(VmState { gic_distributor })
+        let board = if pos < bytes.len() {
+            let len = u32::from_le_bytes(take(bytes, &mut pos, 4)?.try_into().map_err(|_| err())?)
+                as usize;
+            Some(crate::arm_board::BoardLayout::decode(&take(
+                bytes, &mut pos, len,
+            )?)?)
+        } else {
+            None
+        };
+        Ok(VmState {
+            gic_distributor,
+            board,
+        })
     }
 }
 

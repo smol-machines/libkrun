@@ -699,6 +699,14 @@ pub fn build_microvm(
         .transpose()
         .map_err(StartMicrovmError::GuestMemoryMmap)?;
 
+    // A machine first booted on macOS keeps the board macOS gave it: the GIC
+    // and the legacy devices are recreated at the addresses and interrupts
+    // the running guest already knows.
+    #[cfg(all(target_os = "linux", target_arch = "aarch64", snapshot_supported))]
+    let restore_board = restore_checkpoint
+        .as_ref()
+        .and_then(|checkpoint| checkpoint.vm_state.board().cloned());
+
     let payload = choose_payload(vm_resources)?;
     vmm_timing!("payload selected");
 
@@ -884,6 +892,13 @@ pub fn build_microvm(
     } else {
         kernel_cmdline.insert_str(DEFAULT_KERNEL_CMDLINE).unwrap();
     }
+
+    // Apple silicon signs pointers with an implementation-defined algorithm
+    // no other CPU can verify, so a guest that used it could never resume on
+    // another host. macOS guests boot without pointer authentication, which
+    // keeps every checkpoint restorable on Linux arm64.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    kernel_cmdline.insert_str("arm64.nopauth").unwrap();
 
     if let Some(cmdline) = &vm_resources.kernel_cmdline.krun_env {
         kernel_cmdline.insert_str(cmdline.as_str()).unwrap();
@@ -1112,6 +1127,10 @@ pub fn build_microvm(
         &mut (arch::MMIO_MEM_START.clone()),
         (arch::IRQ_BASE, arch::IRQ_MAX),
     );
+    #[cfg(all(target_os = "linux", target_arch = "aarch64", snapshot_supported))]
+    if restore_board.is_some() {
+        mmio_device_manager.use_intid_numbering();
+    }
 
     #[cfg(target_os = "macos")]
     let vcpu_list = {
@@ -1244,30 +1263,63 @@ pub fn build_microvm(
             // GICv3. To relieve the users from having to configure the gic version manually,
             // try first to instantiate a GICv3, and fall back to a GICv2 if it fails.
             let vcpu_count = vm_resources.vm_config().vcpu_count.unwrap() as u64;
-            let gic = match KvmGicV3::new(vm.fd(), vcpu_count) {
-                Ok(gicv3) => {
-                    // Register the vGICv3 with the VM so checkpoint/restore
-                    // (fork) can transfer its state; per-CPU registers are
-                    // addressed by each vCPU's MPIDR.
-                    vm.register_vgic(
-                        gicv3.device_fd(),
-                        vcpus.iter().map(|v| v.get_mpidr()).collect(),
-                    );
-                    IrqChipDevice::new(Box::new(gicv3))
-                }
-                Err(_) => {
-                    warn!("KVM GICv3 creation failed, falling back to KVM GICv2");
-                    let gicv2 = KvmGicV2::new(vm.fd(), vcpu_count);
-                    // Register the vGICv2 with the VM so checkpoint/restore
-                    // (fork) can transfer its state; per-CPU registers are
-                    // addressed by vCPU index (v2's cpuid attr field).
-                    vm.register_vgic_v2(gicv2.device_fd(), vcpu_count);
-                    IrqChipDevice::new(Box::new(gicv2))
+            #[cfg(snapshot_supported)]
+            let board_gic = match &restore_board {
+                Some(board) => Some(create_board_gic(&mut vm, &vcpus, vcpu_count, board)?),
+                None => None,
+            };
+            #[cfg(not(snapshot_supported))]
+            let board_gic: Option<IrqChipDevice> = None;
+            let gic = if let Some(gic) = board_gic {
+                gic
+            } else {
+                match KvmGicV3::new(vm.fd(), vcpu_count) {
+                    Ok(gicv3) => {
+                        // Register the vGICv3 with the VM so checkpoint/restore
+                        // (fork) can transfer its state; per-CPU registers are
+                        // addressed by each vCPU's MPIDR.
+                        vm.register_vgic(
+                            gicv3.device_fd(),
+                            vcpus.iter().map(|v| v.get_mpidr()).collect(),
+                        );
+                        IrqChipDevice::new(Box::new(gicv3))
+                    }
+                    Err(_) => {
+                        warn!("KVM GICv3 creation failed, falling back to KVM GICv2");
+                        let gicv2 = KvmGicV2::new(vm.fd(), vcpu_count);
+                        // Register the vGICv2 with the VM so checkpoint/restore
+                        // (fork) can transfer its state; per-CPU registers are
+                        // addressed by vCPU index (v2's cpuid attr field).
+                        vm.register_vgic_v2(gicv2.device_fd(), vcpu_count);
+                        IrqChipDevice::new(Box::new(gicv2))
+                    }
                 }
             };
             Arc::new(Mutex::new(gic))
         };
 
+        #[cfg(snapshot_supported)]
+        if let Some(board) = &restore_board {
+            attach_board_legacy_devices(
+                &vm,
+                &mut mmio_device_manager,
+                &mut kernel_cmdline,
+                intc.clone(),
+                serial_devices,
+                event_manager,
+                _shutdown_efd.as_ref(),
+                board,
+            )?;
+        } else {
+            attach_legacy_devices(
+                &vm,
+                &mut mmio_device_manager,
+                &mut kernel_cmdline,
+                intc.clone(),
+                serial_devices,
+            )?;
+        }
+        #[cfg(not(snapshot_supported))]
         attach_legacy_devices(
             &vm,
             &mut mmio_device_manager,
@@ -1418,7 +1470,10 @@ pub fn build_microvm(
         balloon: None,
         #[cfg(target_arch = "x86_64")]
         pio_device_manager,
-        #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+        #[cfg(any(
+            all(target_arch = "x86_64", target_os = "windows"),
+            all(target_arch = "aarch64", target_os = "macos")
+        ))]
         intc: intc.clone(),
         #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
         pit,
@@ -2787,6 +2842,112 @@ fn attach_legacy_devices(
         .map_err(Error::RegisterMMIODevice)
         .map_err(StartMicrovmError::Internal)?;
 
+    Ok(())
+}
+
+/// Create the vGICv3 where macOS placed its GIC for a machine being restored
+/// from a macOS checkpoint, and register it for checkpoint/restore.
+#[cfg(all(target_os = "linux", target_arch = "aarch64", snapshot_supported))]
+fn create_board_gic(
+    vm: &mut Vm,
+    vcpus: &[Vcpu],
+    vcpu_count: u64,
+    board: &super::arm_board::BoardLayout,
+) -> std::result::Result<IrqChipDevice, StartMicrovmError> {
+    const REDIST_PER_CPU: u64 = 0x2_0000;
+    if board.gic_dist_size != 0x1_0000 || board.gic_redist_size < vcpu_count * REDIST_PER_CPU {
+        return Err(StartMicrovmError::GuestMemoryMmap(format!(
+            "the checkpoint's GIC layout (distributor {:#x} bytes, redistributors {:#x} bytes) \
+             cannot hold a KVM GICv3 for {vcpu_count} vCPUs",
+            board.gic_dist_size, board.gic_redist_size
+        )));
+    }
+    let gicv3 = KvmGicV3::new_at(
+        vm.fd(),
+        vcpu_count,
+        board.gic_dist_base,
+        board.gic_redist_base,
+    )
+    .map_err(|e| {
+        StartMicrovmError::GuestMemoryMmap(format!(
+            "this host cannot recreate the checkpoint's GICv3: {e}"
+        ))
+    })?;
+    vm.register_vgic(
+        gicv3.device_fd(),
+        vcpus.iter().map(|v| v.get_mpidr()).collect(),
+    );
+    vm.set_board(board.clone());
+    Ok(IrqChipDevice::new(Box::new(gicv3)))
+}
+
+/// Register the legacy devices of a macOS board at the addresses and
+/// interrupts the guest knows, so the virtio devices that follow land where
+/// they were too.
+#[allow(clippy::too_many_arguments)]
+#[cfg(all(target_os = "linux", target_arch = "aarch64", snapshot_supported))]
+fn attach_board_legacy_devices(
+    vm: &Vm,
+    mmio_device_manager: &mut MMIODeviceManager,
+    kernel_cmdline: &mut kernel::cmdline::Cmdline,
+    intc: IrqChip,
+    serial: Vec<Arc<Mutex<Serial>>>,
+    event_manager: &mut EventManager,
+    shutdown_efd: Option<&EventFd>,
+    board: &super::arm_board::BoardLayout,
+) -> std::result::Result<(), StartMicrovmError> {
+    use super::arm_board::LegacyKind;
+
+    let mismatch = |what: String| {
+        StartMicrovmError::GuestMemoryMmap(format!(
+            "this machine's devices do not match the checkpoint's board: {what}"
+        ))
+    };
+    let mut serial = serial.into_iter();
+    for dev in &board.legacy {
+        let slot = mmio_device_manager.next_slot();
+        if slot != (dev.addr, dev.intid) {
+            return Err(mismatch(format!(
+                "{:?} expected at {:#x} (INTID {}), next free slot is {:#x} (INTID {})",
+                dev.kind, dev.addr, dev.intid, slot.0, slot.1
+            )));
+        }
+        let registered = match dev.kind {
+            LegacyKind::Serial => {
+                let s = serial
+                    .next()
+                    .ok_or_else(|| mismatch("the checkpoint has more serial ports".into()))?;
+                mmio_device_manager.register_mmio_serial(vm.fd(), kernel_cmdline, intc.clone(), s)
+            }
+            LegacyKind::Rtc => mmio_device_manager.register_mmio_rtc(vm.fd()),
+            LegacyKind::Gpio => {
+                let shutdown = match shutdown_efd {
+                    Some(efd) => efd.try_clone(),
+                    None => EventFd::new(utils::eventfd::EFD_NONBLOCK),
+                }
+                .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("GPIO eventfd: {e}")))?;
+                mmio_device_manager.register_mmio_gpio(
+                    vm.fd(),
+                    intc.clone(),
+                    event_manager,
+                    shutdown,
+                )
+            }
+        };
+        registered
+            .map_err(Error::RegisterMMIODevice)
+            .map_err(StartMicrovmError::Internal)?;
+    }
+    if serial.next().is_some() {
+        return Err(mismatch("this machine has more serial ports".into()));
+    }
+    let slot = mmio_device_manager.next_slot();
+    if slot != (board.first_virtio_addr, board.first_virtio_intid) {
+        return Err(mismatch(format!(
+            "virtio devices start at {:#x} (INTID {}) in the checkpoint but would start at {:#x} (INTID {})",
+            board.first_virtio_addr, board.first_virtio_intid, slot.0, slot.1
+        )));
+    }
     Ok(())
 }
 

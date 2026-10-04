@@ -620,6 +620,12 @@ pub struct Vm {
     /// receive device IRQs).
     #[cfg(target_arch = "aarch64")]
     vgic: Option<VgicSnapshotHandle>,
+
+    /// The board of a machine first booted under another hypervisor (macOS),
+    /// which this VM recreated to restore it. Carried into this VM's own
+    /// checkpoints so later restores rebuild the same board.
+    #[cfg(target_arch = "aarch64")]
+    board: Option<crate::arm_board::BoardLayout>,
 }
 
 /// The pieces needed to capture/restore the in-kernel vGIC state: a dup of
@@ -664,6 +670,8 @@ impl Vm {
             guest_memfds: Vec::new(),
             #[cfg(target_arch = "aarch64")]
             vgic: None,
+            #[cfg(target_arch = "aarch64")]
+            board: None,
         })
     }
 
@@ -680,6 +688,13 @@ impl Vm {
     #[cfg(target_arch = "aarch64")]
     pub fn register_vgic_v2(&mut self, gic_fd: &DeviceFd, vcpu_count: u64) {
         self.register_vgic_flavor(gic_fd, VgicFlavor::V2 { vcpu_count });
+    }
+
+    /// Record that this VM runs on a board recreated from another hypervisor's
+    /// checkpoint (see [`Vm::board`]).
+    #[cfg(target_arch = "aarch64")]
+    pub fn set_board(&mut self, board: crate::arm_board::BoardLayout) {
+        self.board = Some(board);
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -1278,7 +1293,11 @@ impl Vm {
     #[cfg(target_arch = "aarch64")]
     pub fn save_state(&self) -> Result<VmState> {
         match &self.vgic {
-            Some(handle) => vgic::save(handle).map_err(Error::VmGicState),
+            Some(handle) => {
+                let mut state = vgic::save(handle).map_err(Error::VmGicState)?;
+                state.board = self.board.clone();
+                Ok(state)
+            }
             // Refuse rather than warn: an empty GIC blob produces a clone whose
             // freshly-created GIC has every interrupt masked, so the restored
             // guest is deaf — vsock kicks never interrupt it and the agent can
@@ -1416,6 +1435,9 @@ pub struct VmState {
     gicv2_dist: Vec<(u64, u32)>,
     /// GICv2 CPU-interface (`GICC_*`) registers, keyed the same way.
     gicv2_cpu: Vec<(u64, u32)>,
+    /// The board to recreate when the machine first booted under another
+    /// hypervisor (see [`crate::hvf_import`]); `None` for a native machine.
+    pub(crate) board: Option<crate::arm_board::BoardLayout>,
 }
 
 /// In-kernel vGICv3 state transfer via `KVM_{GET,SET}_DEVICE_ATTR`, the KVM
@@ -1660,6 +1682,14 @@ mod vgic {
     }
 
     fn restore_v3(fd: &DeviceFd, state: &VmState) -> Result<(), String> {
+        // State from another hypervisor's GIC carries its own read-only
+        // implementation fields, which KVM rejects unless they match its own.
+        // Only the guest-controlled bits of those registers travel.
+        let imported = state.board.is_some();
+        const ICC_CTLR_EL1: u64 = icc(3, 0, 12, 12, 4);
+        const ICC_CTLR_GUEST_BITS: u64 = 0b11; // CBPR, EOImode
+        const GICD_CTLR_GUEST_BITS: u32 = 0b11; // EnableGrp0, EnableGrp1
+
         // Everything except GICD_CTLR first, so the distributor only starts
         // delivering once pending/enable/routing state is fully in place.
         let mut ctlr = None;
@@ -1674,9 +1704,21 @@ mod vgic {
             set_reg(fd, KVM_DEV_ARM_VGIC_GRP_REDIST_REGS, attr, val)?;
         }
         for &(attr, val) in &state.icc_regs {
+            let val = if imported && attr & 0xffff_ffff == ICC_CTLR_EL1 {
+                let own: u64 = get_reg(fd, KVM_DEV_ARM_VGIC_GRP_CPU_SYSREGS, attr)?;
+                (own & !ICC_CTLR_GUEST_BITS) | (val & ICC_CTLR_GUEST_BITS)
+            } else {
+                val
+            };
             set_reg(fd, KVM_DEV_ARM_VGIC_GRP_CPU_SYSREGS, attr, val)?;
         }
         if let Some(val) = ctlr {
+            let val = if imported {
+                let own: u32 = get_reg(fd, KVM_DEV_ARM_VGIC_GRP_DIST_REGS, GICD_CTLR as u64)?;
+                (own & !GICD_CTLR_GUEST_BITS) | (val & GICD_CTLR_GUEST_BITS)
+            } else {
+                val
+            };
             set_reg(fd, KVM_DEV_ARM_VGIC_GRP_DIST_REGS, GICD_CTLR as u64, val)?;
         }
         Ok(())
@@ -1869,6 +1911,13 @@ impl VmState {
             out.extend_from_slice(&attr.to_le_bytes());
             out.extend_from_slice(&val.to_le_bytes());
         }
+        // Trailing and only present for a machine first booted on macOS, so
+        // native blobs are unchanged.
+        if let Some(board) = &self.board {
+            let board = board.encode();
+            out.extend_from_slice(&(board.len() as u32).to_le_bytes());
+            out.extend_from_slice(&board);
+        }
         out
     }
 
@@ -1925,13 +1974,43 @@ impl VmState {
                 gicv2_cpu.push((attr, val));
             }
         }
+        let board = if pos < bytes.len() {
+            let len = count(&mut pos)?;
+            Some(crate::arm_board::BoardLayout::decode(take(&mut pos, len)?)?)
+        } else {
+            None
+        };
         Ok(VmState {
             dist_regs,
             redist_regs,
             icc_regs,
             gicv2_dist,
             gicv2_cpu,
+            board,
         })
+    }
+
+    /// vGICv3 state translated from another hypervisor's checkpoint, with the
+    /// board that hypervisor gave the guest.
+    pub(crate) fn imported_v3(
+        dist_regs: Vec<(u32, u32)>,
+        redist_regs: Vec<(u64, u32)>,
+        icc_regs: Vec<(u64, u64)>,
+        board: crate::arm_board::BoardLayout,
+    ) -> VmState {
+        VmState {
+            dist_regs,
+            redist_regs,
+            icc_regs,
+            board: Some(board),
+            ..VmState::default()
+        }
+    }
+
+    /// The board to recreate for a machine first booted under another
+    /// hypervisor.
+    pub fn board(&self) -> Option<&crate::arm_board::BoardLayout> {
+        self.board.as_ref()
     }
 }
 
@@ -3273,6 +3352,14 @@ pub struct VcpuState {
 
 #[cfg(target_arch = "aarch64")]
 impl VcpuState {
+    /// vCPU state translated from another hypervisor's checkpoint.
+    pub(crate) fn imported(mp_state: u32, regs: Vec<(u64, u128)>) -> VcpuState {
+        VcpuState {
+            mp_state: kvm_mp_state { mp_state },
+            regs,
+        }
+    }
+
     /// Serialize the full vCPU register state to a self-describing byte blob
     /// (mirrors the x86 signature for the cross-platform `VmCheckpoint`).
     pub fn serialize(&self) -> Vec<u8> {

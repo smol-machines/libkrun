@@ -296,6 +296,11 @@ pub struct HvfVcpuState {
     /// time-based guest code (e.g. the agent's deadline loops) wedges, so the
     /// guest accepts vsock connections at the kernel level but never replies.
     pub vtimer_offset: u64,
+    /// The guest's virtual counter (`CNTVCT_EL0`) when the state was captured.
+    /// `vtimer_offset` only has meaning against this host's counter; another
+    /// hypervisor restores guest time from this value instead. 0 when the blob
+    /// predates the field.
+    pub guest_counter: u64,
 }
 
 /// GIC redistributor registers captured per-vCPU (offsets == `hv_gic_redistributor_reg_t`).
@@ -391,6 +396,7 @@ impl HvfVcpuState {
             out.extend_from_slice(&val.to_le_bytes());
         }
         out.extend_from_slice(&self.vtimer_offset.to_le_bytes());
+        out.extend_from_slice(&self.guest_counter.to_le_bytes());
         out
     }
 
@@ -447,6 +453,11 @@ impl HvfVcpuState {
         } else {
             0
         };
+        let guest_counter = if pos < bytes.len() {
+            u64_at(bytes, &mut pos)?
+        } else {
+            0
+        };
         Ok(HvfVcpuState {
             gp,
             pc,
@@ -458,6 +469,7 @@ impl HvfVcpuState {
             gic_redist,
             gic_icc,
             vtimer_offset,
+            guest_counter,
         })
     }
 }
@@ -599,6 +611,8 @@ pub fn vcpu_save_state(vcpuid: u64) -> Result<HvfVcpuState, Error> {
     if ret != HV_SUCCESS {
         return Err(Error::VcpuGetVtimerOffset);
     }
+    // The guest's virtual counter is the host counter minus the offset.
+    let guest_counter = unsafe { mach_absolute_time() }.wrapping_sub(vtimer_offset);
 
     Ok(HvfVcpuState {
         gp,
@@ -611,6 +625,7 @@ pub fn vcpu_save_state(vcpuid: u64) -> Result<HvfVcpuState, Error> {
         gic_redist,
         gic_icc,
         vtimer_offset,
+        guest_counter,
     })
 }
 
