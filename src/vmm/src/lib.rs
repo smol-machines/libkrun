@@ -14,6 +14,8 @@
 extern crate log;
 
 /// Handles setup and initialization a `Vmm` object.
+#[cfg(target_arch = "aarch64")]
+pub mod arm_board;
 pub mod builder;
 /// Checkpointed CPU discovery policy and live creation bookkeeping.
 pub mod cpu_growth;
@@ -44,6 +46,8 @@ pub mod snapshot;
 /// Wrappers over structures used to configure the VMM.
 pub mod vmm_config;
 
+#[cfg(all(target_os = "linux", target_arch = "aarch64", snapshot_supported))]
+mod hvf_import;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
@@ -265,6 +269,26 @@ pub struct VmCheckpoint {
     pub memory_growth: Option<memory_topology::MemoryGrowthTopology>,
 }
 
+/// Leads a checkpoint written by the macOS backend. Its VM and vCPU sections
+/// are HVF-shaped, so another backend must translate them rather than parse
+/// them. A blob without the tag is native to the backend reading it. Read as
+/// a little-endian length the tag is over 1 GiB, which no untagged blob's
+/// leading VM-state section can be.
+#[cfg(snapshot_supported)]
+const HVF_CHECKPOINT_TAG: &[u8; 8] = b"SMVCHVF1";
+
+/// A checkpoint blob split into its sections, before a hypervisor backend
+/// interprets the VM and vCPU sections.
+#[cfg(snapshot_supported)]
+pub(crate) struct CheckpointSections<'a> {
+    pub(crate) vm: &'a [u8],
+    pub(crate) vcpus: Vec<&'a [u8]>,
+    pub(crate) devices: devices::virtio::persist::VmDevicesState,
+    pub(crate) ioapic: Option<Vec<u8>>,
+    pub(crate) cpu_growth: Option<cpu_growth::CpuGrowthTopology>,
+    pub(crate) memory_growth: Option<memory_topology::MemoryGrowthTopology>,
+}
+
 #[cfg(snapshot_supported)]
 impl VmCheckpoint {
     /// Serialize the checkpoint (VM + vCPU + device state, *not* guest RAM —
@@ -277,6 +301,8 @@ impl VmCheckpoint {
             out.extend_from_slice(b);
         }
         let mut out = Vec::new();
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        out.extend_from_slice(HVF_CHECKPOINT_TAG);
         put(&mut out, &self.vm_state.serialize());
         out.extend_from_slice(&(self.vcpu_states.len() as u32).to_le_bytes());
         for v in &self.vcpu_states {
@@ -301,8 +327,47 @@ impl VmCheckpoint {
         out
     }
 
-    /// Reconstruct from a blob produced by [`Self::serialize`].
+    /// Reconstruct from a blob produced by [`Self::serialize`], on this or (for
+    /// a macOS arm64 checkpoint restored on Linux arm64) another backend.
     pub fn deserialize(bytes: &[u8]) -> std::result::Result<VmCheckpoint, String> {
+        let Some(body) = bytes.strip_prefix(HVF_CHECKPOINT_TAG) else {
+            return Self::from_native_sections(Self::split_sections(bytes)?);
+        };
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        return Self::from_native_sections(Self::split_sections(body)?);
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        return hvf_import::import(Self::split_sections(body)?);
+        #[cfg(not(all(any(target_os = "macos", target_os = "linux"), target_arch = "aarch64")))]
+        {
+            let _ = body;
+            Err(
+                "this checkpoint was captured on an arm64 Mac and can only be restored \
+                 on an arm64 Mac or arm64 Linux host"
+                    .to_string(),
+            )
+        }
+    }
+
+    fn from_native_sections(
+        sections: CheckpointSections<'_>,
+    ) -> std::result::Result<VmCheckpoint, String> {
+        let vm_state = vstate::VmState::deserialize(sections.vm)?;
+        let vcpu_states = sections
+            .vcpus
+            .iter()
+            .map(|bytes| vstate::VcpuState::deserialize(bytes))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(VmCheckpoint {
+            vm_state,
+            vcpu_states,
+            devices: sections.devices,
+            ioapic: sections.ioapic,
+            cpu_growth: sections.cpu_growth,
+            memory_growth: sections.memory_growth,
+        })
+    }
+
+    fn split_sections(bytes: &[u8]) -> std::result::Result<CheckpointSections<'_>, String> {
         fn take<'a>(b: &'a [u8], pos: &mut usize) -> std::result::Result<&'a [u8], String> {
             if *pos + 4 > b.len() {
                 return Err("checkpoint truncated (length header)".to_string());
@@ -317,15 +382,15 @@ impl VmCheckpoint {
             Ok(s)
         }
         let mut pos = 0usize;
-        let vm_state = vstate::VmState::deserialize(take(bytes, &mut pos)?)?;
+        let vm = take(bytes, &mut pos)?;
         if pos + 4 > bytes.len() {
             return Err("checkpoint truncated (vcpu count)".to_string());
         }
         let n = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4;
-        let mut vcpu_states = Vec::with_capacity(n);
+        let mut vcpus = Vec::with_capacity(n.min(1024));
         for _ in 0..n {
-            vcpu_states.push(vstate::VcpuState::deserialize(take(bytes, &mut pos)?)?);
+            vcpus.push(take(bytes, &mut pos)?);
         }
         let devices = devices::virtio::persist::VmDevicesState::from_bytes(take(bytes, &mut pos)?)?;
         // Userspace IRQ-chip section: empty (or absent, for blobs written before
@@ -356,9 +421,9 @@ impl VmCheckpoint {
         if pos != bytes.len() {
             return Err("unexpected trailing checkpoint state".into());
         }
-        Ok(VmCheckpoint {
-            vm_state,
-            vcpu_states,
+        Ok(CheckpointSections {
+            vm,
+            vcpus,
             devices,
             ioapic,
             cpu_growth,
@@ -436,8 +501,12 @@ pub struct Vmm {
     #[cfg(target_arch = "x86_64")]
     pio_device_manager: PortIODeviceManager,
     /// The interrupt controller, held for checkpoint/restore of userspace IRQ
-    /// chips (the WHP software IOAPIC — see [`VmCheckpoint::ioapic`]).
-    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    /// chips (the WHP software IOAPIC — see [`VmCheckpoint::ioapic`]) and, on
+    /// macOS, to record the GIC placement in a checkpoint's board layout.
+    #[cfg(any(
+        all(target_arch = "x86_64", target_os = "windows"),
+        all(target_arch = "aarch64", target_os = "macos")
+    ))]
     intc: devices::legacy::IrqChip,
     /// Host-emulated PIT clockevent, retained so its programmed cadence can be
     /// carried to a replacement WHP partition.
@@ -586,7 +655,68 @@ impl Vmm {
         let mut state = self.vm.save_state().map_err(Error::Vm)?;
         #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
         state.set_pit_state(self.pit.lock().unwrap().save_state());
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            state.board = self.board_layout();
+        }
         Ok(state)
+    }
+
+    /// The board this guest booted on, for restoring the checkpoint under
+    /// another hypervisor. `None` without the in-kernel GIC, whose register
+    /// state a checkpoint does not capture.
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    fn board_layout(&self) -> Option<arm_board::BoardLayout> {
+        use devices::fdt::DeviceInfoForFDT;
+        use devices::legacy::gic::GICDevice;
+
+        let props = self.intc.lock().unwrap().device_properties();
+        let [
+            gic_dist_base,
+            gic_dist_size,
+            gic_redist_base,
+            gic_redist_size,
+        ] = props[..]
+        else {
+            return None;
+        };
+        let cpu_slots = self
+            .mac_cpu_topology
+            .as_ref()
+            .map_or(self.vcpus_handles.len() as u32, |t| u32::from(t.capacity));
+
+        let mut legacy = Vec::new();
+        let mut first_virtio: Option<(u64, u32)> = None;
+        for ((kind, _), info) in self.mmio_device_manager.get_device_info() {
+            let kind = match kind {
+                DeviceType::Serial => arm_board::LegacyKind::Serial,
+                DeviceType::RTC => arm_board::LegacyKind::Rtc,
+                DeviceType::Gpio => arm_board::LegacyKind::Gpio,
+                DeviceType::Virtio(_) => {
+                    if first_virtio.is_none_or(|(addr, _)| info.addr() < addr) {
+                        first_virtio = Some((info.addr(), info.irq()));
+                    }
+                    continue;
+                }
+            };
+            legacy.push(arm_board::LegacyDevice {
+                kind,
+                addr: info.addr(),
+                intid: info.irq(),
+            });
+        }
+        legacy.sort_by_key(|dev| dev.addr);
+        let (first_virtio_addr, first_virtio_intid) = first_virtio?;
+        Some(arm_board::BoardLayout {
+            gic_dist_base,
+            gic_dist_size,
+            gic_redist_base,
+            gic_redist_size,
+            cpu_slots,
+            legacy,
+            first_virtio_addr,
+            first_virtio_intid,
+        })
     }
 
     /// Guest-physical address where device windows (virtio-fs DAX, GPU) begin;

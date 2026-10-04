@@ -28,11 +28,22 @@ pub struct KvmGicV3 {
 
 impl KvmGicV3 {
     pub fn new(vm: &VmFd, vcpu_count: u64) -> Result<Self, Error> {
+        let dist_addr = arch::MMIO_MEM_START - KVM_VGIC_V3_BASE_SIZE;
+        let redists_addr = dist_addr - 2 * KVM_VGIC_V3_BASE_SIZE * vcpu_count;
+        Self::new_at(vm, vcpu_count, dist_addr, redists_addr)
+    }
+
+    /// Create the vGIC with its distributor and redistributors at given guest
+    /// addresses, to recreate the board of a machine that booted elsewhere.
+    pub fn new_at(
+        vm: &VmFd,
+        vcpu_count: u64,
+        dist_addr: u64,
+        redists_addr: u64,
+    ) -> Result<Self, Error> {
         let dist_size = KVM_VGIC_V3_BASE_SIZE;
-        let dist_addr = arch::MMIO_MEM_START - dist_size;
         let redist_size = 2 * dist_size;
         let redists_size = redist_size * vcpu_count;
-        let redists_addr = dist_addr - redists_size;
 
         let mut gic_device = kvm_bindings::kvm_create_device {
             type_: kvm_bindings::kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_V3,
