@@ -805,6 +805,7 @@ impl Instance {
         }
         let plan = plan_layout(&self.image.extents, &dirty);
         let mut folded = choose_folds(&plan, limits.trigger, limits.goal);
+        release_superseded_deltas(&plan, &self.image.extents, &mut folded);
         let kept_files: std::collections::HashSet<_> = plan
             .iter()
             .zip(&folded)
@@ -1107,6 +1108,44 @@ fn choose_folds(plan: &[Piece], trigger: usize, goal: usize) -> Vec<bool> {
         count -= usize::from(left) + usize::from(right);
     }
     folded
+}
+
+/// A delta stays resident as a whole while any of its pages is mapped. Fold
+/// the rest of every delta that the next layout would use for less than half
+/// of its resident bytes, so it can be released instead of pinning memory the
+/// guest has since overwritten; every delta kept is then at least half live.
+/// The restored base is a file on disk and is never folded this way.
+fn release_superseded_deltas(plan: &[Piece], old: &[Extent], folded: &mut [bool]) {
+    let mut live: std::collections::HashMap<*const File, (&Arc<File>, u64)> =
+        std::collections::HashMap::new();
+    for (piece, folded) in plan.iter().zip(folded.iter()) {
+        if let Some(index) = piece.old.filter(|_| !folded) {
+            let file = &old[index].file;
+            live.entry(Arc::as_ptr(file)).or_insert((file, 0)).1 += piece.len() as u64;
+        }
+    }
+    let superseded: std::collections::HashSet<*const File> = live
+        .into_iter()
+        .filter(|(_, (file, live))| {
+            use std::os::unix::fs::MetadataExt;
+            // Deltas are write-sealed memfds; a restore base is a file on disk.
+            let seals = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) };
+            let delta = seals >= 0 && seals & libc::F_SEAL_WRITE != 0;
+            delta
+                && file
+                    .metadata()
+                    .is_ok_and(|metadata| metadata.blocks() * 512 > 2 * live)
+        })
+        .map(|(file, _)| file)
+        .collect();
+    if superseded.is_empty() {
+        return;
+    }
+    for (piece, folded) in plan.iter().zip(folded.iter_mut()) {
+        if let Some(index) = piece.old {
+            *folded |= superseded.contains(&Arc::as_ptr(&old[index].file));
+        }
+    }
 }
 
 /// The coalesced runs copied into the new delta.
@@ -1735,6 +1774,61 @@ fn consolidation_preserves_contents_and_keeps_zero_pages_as_holes() {
         .unwrap();
     expected[3 * page..4 * page].fill(0);
     assert!(actual == expected);
+}
+
+#[test]
+fn a_mostly_overwritten_delta_is_folded_away() {
+    use crate::snapshot::MemoryRegionDesc;
+    const PAGES: usize = 64;
+    let page = host_page_size();
+    let file = crate::builder::create_guest_ram_memfd(PAGES * page).unwrap();
+    let generation = Generation::from_immutable_file(
+        &[MemoryRegionDesc {
+            gpa: 0,
+            len: (PAGES * page) as u64,
+        }],
+        &file,
+    )
+    .unwrap();
+    let memory = generation.restore().unwrap();
+    memory
+        .write_slice(&vec![0x31; 16 * page], GuestAddress(0))
+        .unwrap();
+    let (first, _) = generation.capture_quiesced(&memory).unwrap();
+    first.rebase_quiesced(&memory).unwrap();
+    let delta = first.regions[0].extents[0].file.clone();
+    // Overwrite 12 of the delta's 16 pages: only a quarter stays live.
+    memory
+        .write_slice(&vec![0x42; 12 * page], GuestAddress(0))
+        .unwrap();
+    let (second, copied) = first.capture_quiesced(&memory).unwrap();
+    assert_eq!(copied, 16 * page);
+    assert!(
+        second.regions[0]
+            .extents
+            .iter()
+            .all(|extent| !Arc::ptr_eq(&extent.file, &delta))
+    );
+    let mut actual = vec![0; PAGES * page];
+    second
+        .restore()
+        .unwrap()
+        .read_slice(&mut actual, GuestAddress(0))
+        .unwrap();
+    assert!(actual[..12 * page].iter().all(|byte| *byte == 0x42));
+    assert!(
+        actual[12 * page..16 * page]
+            .iter()
+            .all(|byte| *byte == 0x31)
+    );
+    assert!(actual[16 * page..].iter().all(|byte| *byte == 0));
+    // Half or more still live: the delta is kept and nothing extra is copied.
+    second.rebase_quiesced(&memory).unwrap();
+    memory
+        .write_slice(&vec![0x53; 4 * page], GuestAddress(0))
+        .unwrap();
+    let (_, copied) = second.capture_quiesced(&memory).unwrap();
+    assert_eq!(copied, 4 * page);
 }
 
 #[test]
