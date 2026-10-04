@@ -469,7 +469,24 @@ impl Generation {
         memory: &GuestMemoryMmap,
         excluded: &[u64],
     ) -> io::Result<(Self, usize)> {
+        self.capture_quiesced_within(memory, excluded, CompactLimits::DEFAULT)
+    }
+
+    /// Capture with each private region given its share of `limits`, in
+    /// proportion to its size.
+    fn capture_quiesced_within(
+        &self,
+        memory: &GuestMemoryMmap,
+        excluded: &[u64],
+        limits: CompactLimits,
+    ) -> io::Result<(Self, usize)> {
         self.validate_memory(memory, excluded)?;
+        let private_len: u128 = self
+            .regions
+            .iter()
+            .filter(|image| !excluded.contains(&image.gpa))
+            .map(|image| image.len as u128)
+            .sum();
         let mut regions = Vec::new();
         let mut copied = 0_usize;
         for image in &self.regions {
@@ -481,7 +498,8 @@ impl Generation {
                 memory: memory.clone(),
                 image: image.clone(),
             };
-            let (next, bytes) = instance.capture_quiesced()?;
+            let (next, bytes) =
+                instance.capture_quiesced_within(limits.share(image.len, private_len))?;
             copied = copied
                 .checked_add(bytes)
                 .ok_or_else(|| invalid("copied RAM size overflow"))?;
@@ -762,7 +780,18 @@ impl Instance {
 
     // Requires all writers to be quiesced. The caller validates private RAM
     // views and excludes device-owned mappings before scanning page state.
+    #[cfg(test)]
     fn capture_quiesced(&self) -> io::Result<(Image, usize)> {
+        self.capture_quiesced_within(CompactLimits::DEFAULT)
+    }
+
+    /// Capture this instance's private pages into a new sealed delta. Each
+    /// capture splits older extents around the pages the guest wrote since the
+    /// last one, so a machine that keeps branching fragments without bound;
+    /// past `limits.trigger` extents the shortest unchanged runs are folded
+    /// into the delta as well until at most `limits.goal` remain, and past
+    /// `limits.files` backing files the whole region is consolidated.
+    fn capture_quiesced_within(&self, limits: CompactLimits) -> io::Result<(Image, usize)> {
         // A hardened VMM is not dumpable and cannot open its own page map;
         // fall back to the descriptor the embedder opened before hardening.
         let pagemap = crate::snapshot::open_own_pagemap()?;
@@ -771,97 +800,97 @@ impl Instance {
             .get_host_address(GuestAddress(self.image.gpa))
             .unwrap() as u64;
         let dirty = private_page_ranges(&pagemap, base, self.image.len, host_page_size())?;
-        if dirty.is_empty() {
+        if dirty.is_empty() && self.image.extents.len() <= limits.trigger {
             return Ok((self.image.clone(), 0));
         }
-        let delta =
-            crate::builder::create_guest_ram_memfd(self.image.len).map_err(io::Error::other)?;
-        let mut buffer = vec![0; 64 * 1024];
-        let mut copied = 0;
-        for &(start, end) in &dirty {
-            for offset in (start..end).step_by(buffer.len()) {
-                let len = (end - offset).min(buffer.len());
-                self.memory
-                    .read_slice(
-                        &mut buffer[..len],
-                        GuestAddress(self.image.gpa + offset as u64),
-                    )
-                    .map_err(|error| io::Error::other(format!("read private RAM: {error:?}")))?;
-                delta.write_all_at(&buffer[..len], offset as u64)?;
-                copied += len;
+        let plan = plan_layout(&self.image.extents, &dirty);
+        let mut folded = choose_folds(&plan, limits.trigger, limits.goal);
+        release_superseded_deltas(&plan, &self.image.extents, &mut folded);
+        let kept_files: std::collections::HashSet<_> = plan
+            .iter()
+            .zip(&folded)
+            .filter_map(|(piece, folded)| piece.old.filter(|_| !folded))
+            .map(|index| Arc::as_ptr(&self.image.extents[index].file))
+            .collect();
+        if kept_files.len() + 1 > limits.files {
+            folded.fill(true);
+        }
+        let copy = copy_ranges(&plan, &folded);
+        let delta = if copy.is_empty() {
+            None
+        } else {
+            let delta =
+                crate::builder::create_guest_ram_memfd(self.image.len).map_err(io::Error::other)?;
+            let mut buffer = vec![0; 64 * 1024];
+            // Folded runs are read through the current mapping, which shows the
+            // backing file's bytes for pages the guest never wrote.
+            for &(start, end) in &copy {
+                for offset in (start..end).step_by(buffer.len()) {
+                    let len = (end - offset).min(buffer.len());
+                    self.memory
+                        .read_slice(
+                            &mut buffer[..len],
+                            GuestAddress(self.image.gpa + offset as u64),
+                        )
+                        .map_err(|error| {
+                            io::Error::other(format!("read private RAM: {error:?}"))
+                        })?;
+                    write_nonzero_pages(&delta, &buffer[..len], offset as u64)?;
+                }
             }
-        }
-        let seals =
-            libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
-        if unsafe { libc::fcntl(delta.as_raw_fd(), libc::F_ADD_SEALS, seals) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let delta = Arc::new(delta);
-        let mut extents = Vec::new();
+            let seals =
+                libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+            if unsafe { libc::fcntl(delta.as_raw_fd(), libc::F_ADD_SEALS, seals) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Some(Arc::new(delta))
+        };
+        let copied: usize = copy.iter().map(|(start, end)| end - start).sum();
         // Flatten the mapping index now; a restore never walks a delta chain.
-        let mut first_dirty = 0;
-        for old in &self.image.extents {
-            let mut cursor = old.start;
-            while first_dirty < dirty.len() && dirty[first_dirty].1 <= old.start {
-                first_dirty += 1;
-            }
-            for &(start, end) in &dirty[first_dirty..] {
-                if end <= cursor {
-                    continue;
-                }
-                if start >= old.end {
-                    break;
-                }
-                if start > cursor {
+        let mut extents: Vec<Extent> = Vec::with_capacity(plan.len());
+        for (piece, folded) in plan.iter().zip(&folded) {
+            match piece.old.filter(|_| !folded) {
+                Some(index) => {
+                    let old = &self.image.extents[index];
                     extents.push(Extent {
-                        start: cursor,
-                        end: start,
-                        offset: old.offset + (cursor - old.start) as u64,
+                        start: piece.start,
+                        end: piece.end,
+                        offset: old.offset + (piece.start - old.start) as u64,
                         file: old.file.clone(),
                     });
                 }
-                cursor = end.min(old.end);
-                if cursor == old.end {
-                    break;
+                None => {
+                    let delta = delta.as_ref().expect("copied runs have a delta");
+                    if let Some(last) = extents
+                        .last_mut()
+                        .filter(|last| Arc::ptr_eq(&last.file, delta) && last.end == piece.start)
+                    {
+                        last.end = piece.end;
+                    } else {
+                        extents.push(Extent {
+                            start: piece.start,
+                            end: piece.end,
+                            offset: piece.start as u64,
+                            file: delta.clone(),
+                        });
+                    }
                 }
             }
-            if cursor < old.end {
-                extents.push(Extent {
-                    start: cursor,
-                    end: old.end,
-                    offset: old.offset + (cursor - old.start) as u64,
-                    file: old.file.clone(),
-                });
-            }
         }
-        for (start, end) in dirty {
-            extents.push(Extent {
-                start,
-                end,
-                offset: start as u64,
-                file: delta.clone(),
-            });
-        }
-        extents.sort_unstable_by_key(|extent| extent.start);
-        let mut merged: Vec<Extent> = Vec::with_capacity(extents.len());
-        for extent in extents {
-            if let Some(last) = merged.last_mut().filter(|last| {
-                last.end == extent.start
-                    && Arc::ptr_eq(&last.file, &extent.file)
-                    && last.offset + (last.end - last.start) as u64 == extent.offset
-            }) {
-                last.end = extent.end;
-            } else {
-                merged.push(extent);
-            }
-        }
-        let extents = merged;
         let mut cursor = 0;
         for extent in &extents {
             assert_eq!(extent.start, cursor);
             cursor = extent.end;
         }
         assert_eq!(cursor, self.image.len);
+        if copied > dirty.iter().map(|(start, end)| end - start).sum::<usize>() {
+            log::info!(
+                "compacted layered RAM at {:#x}: {} extents instead of {}, {copied} bytes copied",
+                self.image.gpa,
+                extents.len(),
+                plan.len()
+            );
+        }
         Ok((
             Image {
                 gpa: self.image.gpa,
@@ -871,6 +900,264 @@ impl Instance {
             copied,
         ))
     }
+}
+
+/// Write the non-zero pages of `bytes` at `offset`. A zero page stays a hole
+/// in the delta, which reads back as zero without holding memory.
+fn write_nonzero_pages(file: &File, bytes: &[u8], offset: u64) -> io::Result<()> {
+    let page = host_page_size();
+    let mut run: Option<usize> = None;
+    for start in (0..bytes.len()).step_by(page) {
+        let end = (start + page).min(bytes.len());
+        let zero = bytes[start..end].iter().all(|byte| *byte == 0);
+        match (zero, run) {
+            (false, None) => run = Some(start),
+            (true, Some(first)) => {
+                file.write_all_at(&bytes[first..start], offset + first as u64)?;
+                run = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(first) = run {
+        file.write_all_at(&bytes[first..], offset + first as u64)?;
+    }
+    Ok(())
+}
+
+/// When a capture compacts one region of a generation.
+#[derive(Clone, Copy, Debug)]
+struct CompactLimits {
+    trigger: usize,
+    goal: usize,
+    files: usize,
+}
+
+impl CompactLimits {
+    const DEFAULT: Self = Self {
+        trigger: COMPACT_TRIGGER,
+        goal: COMPACT_GOAL,
+        files: COMPACT_FILES,
+    };
+
+    /// This region's share of the limits, in proportion to its size.
+    fn share(self, len: usize, private_len: u128) -> Self {
+        let share = |total: usize, floor: usize| {
+            ((total as u128 * len as u128 / private_len.max(1)) as usize).max(floor)
+        };
+        Self {
+            trigger: share(self.trigger, 1),
+            goal: share(self.goal, 1),
+            files: share(self.files, 2),
+        }
+    }
+}
+
+/// A capture that leaves more distinct backing files than this consolidates
+/// the region into its new delta. A generation past 1024 files is refused.
+const COMPACT_FILES: usize = 512;
+
+/// A capture that would leave more extents than this compacts the generation
+/// down to `COMPACT_GOAL`. Every extent is a separate mapping in each VMM that
+/// runs the generation and is remapped on every capture, and a generation past
+/// 65536 extents is refused outright, so stay well below both that limit and
+/// the kernel's default per-process mapping limit.
+const COMPACT_TRIGGER: usize = 32768;
+
+/// Extents left after a compaction. The gap to `COMPACT_TRIGGER` lets a
+/// machine branch several times before the next compaction copies anything.
+const COMPACT_GOAL: usize = 16384;
+
+/// One run of the next layout: either a piece of an existing extent (by
+/// index) or pages the guest wrote, which always go to the new delta.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Piece {
+    start: usize,
+    end: usize,
+    old: Option<usize>,
+}
+
+impl Piece {
+    fn len(&self) -> usize {
+        self.end - self.start
+    }
+}
+
+/// Split `old` around the sorted, disjoint `dirty` runs, then merge neighbours
+/// that are contiguous in the same backing. The result is the layout before
+/// any compaction: one piece per extent the next generation would map.
+fn plan_layout(old: &[Extent], dirty: &[(usize, usize)]) -> Vec<Piece> {
+    let mut pieces = Vec::with_capacity(old.len() + 2 * dirty.len());
+    let mut first_dirty = 0;
+    for (index, extent) in old.iter().enumerate() {
+        let mut cursor = extent.start;
+        while first_dirty < dirty.len() && dirty[first_dirty].1 <= extent.start {
+            first_dirty += 1;
+        }
+        for &(start, end) in &dirty[first_dirty..] {
+            if start >= extent.end {
+                break;
+            }
+            if start > cursor {
+                pieces.push(Piece {
+                    start: cursor,
+                    end: start,
+                    old: Some(index),
+                });
+            }
+            cursor = cursor.max(end.min(extent.end));
+            if cursor == extent.end {
+                break;
+            }
+        }
+        if cursor < extent.end {
+            pieces.push(Piece {
+                start: cursor,
+                end: extent.end,
+                old: Some(index),
+            });
+        }
+    }
+    for &(start, end) in dirty {
+        pieces.push(Piece {
+            start,
+            end,
+            old: None,
+        });
+    }
+    pieces.sort_unstable_by_key(|piece| piece.start);
+    let mut merged: Vec<Piece> = Vec::with_capacity(pieces.len());
+    for piece in pieces {
+        if let Some(last) = merged.last_mut() {
+            let joins = last.end == piece.start
+                && match (last.old, piece.old) {
+                    (None, None) => true,
+                    (Some(a), Some(b)) => {
+                        let (a, b) = (&old[a], &old[b]);
+                        Arc::ptr_eq(&a.file, &b.file)
+                            && a.offset + (last.end - a.start) as u64
+                                == b.offset + (piece.start - b.start) as u64
+                    }
+                    _ => false,
+                };
+            if joins {
+                last.end = piece.end;
+                continue;
+            }
+        }
+        merged.push(piece);
+    }
+    merged
+}
+
+/// Number of extents mapped when the pieces `folded` marks are copied into the
+/// delta: consecutive copied pieces become a single extent.
+fn folded_extent_count(folded: &[bool]) -> usize {
+    folded
+        .iter()
+        .enumerate()
+        .filter(|&(index, &this)| !(this && index > 0 && folded[index - 1]))
+        .count()
+}
+
+/// Choose which pieces of `plan` to copy into the new delta. Pages the guest
+/// wrote always are. When that alone leaves more than `trigger` extents, the
+/// shortest unchanged pieces are folded in as well until at most `goal`
+/// remain: each fold merges a piece with its copied neighbours, so the
+/// shortest pieces remove the most extents per byte copied.
+fn choose_folds(plan: &[Piece], trigger: usize, goal: usize) -> Vec<bool> {
+    let mut folded: Vec<bool> = plan.iter().map(|piece| piece.old.is_none()).collect();
+    if plan.len() <= trigger {
+        return folded;
+    }
+    let goal = goal.clamp(1, trigger);
+    let mut lengths: Vec<usize> = plan
+        .iter()
+        .filter(|piece| piece.old.is_some())
+        .map(Piece::len)
+        .collect();
+    lengths.sort_unstable();
+    lengths.dedup();
+    let fold_up_to = |limit: usize| -> Vec<bool> {
+        plan.iter()
+            .map(|piece| piece.old.is_none() || piece.len() <= limit)
+            .collect()
+    };
+    // Folding more pieces never adds an extent, and folding every piece
+    // leaves one, so the smallest sufficient length exists.
+    let index = lengths.partition_point(|&limit| folded_extent_count(&fold_up_to(limit)) > goal);
+    let Some(&limit) = lengths.get(index) else {
+        return folded;
+    };
+    // Every shorter piece is needed; of the pieces exactly `limit` long, fold
+    // only as many as it takes to reach the goal.
+    for (flag, piece) in folded.iter_mut().zip(plan) {
+        *flag |= piece.len() < limit;
+    }
+    let mut count = folded_extent_count(&folded);
+    for index in 0..plan.len() {
+        if count <= goal {
+            break;
+        }
+        if folded[index] || plan[index].len() != limit {
+            continue;
+        }
+        let left = index > 0 && folded[index - 1];
+        let right = index + 1 < plan.len() && folded[index + 1];
+        folded[index] = true;
+        count -= usize::from(left) + usize::from(right);
+    }
+    folded
+}
+
+/// A delta stays resident as a whole while any of its pages is mapped. Fold
+/// the rest of every delta that the next layout would use for less than half
+/// of its resident bytes, so it can be released instead of pinning memory the
+/// guest has since overwritten; every delta kept is then at least half live.
+/// The restored base is a file on disk and is never folded this way.
+fn release_superseded_deltas(plan: &[Piece], old: &[Extent], folded: &mut [bool]) {
+    let mut live: std::collections::HashMap<*const File, (&Arc<File>, u64)> =
+        std::collections::HashMap::new();
+    for (piece, folded) in plan.iter().zip(folded.iter()) {
+        if let Some(index) = piece.old.filter(|_| !folded) {
+            let file = &old[index].file;
+            live.entry(Arc::as_ptr(file)).or_insert((file, 0)).1 += piece.len() as u64;
+        }
+    }
+    let superseded: std::collections::HashSet<*const File> = live
+        .into_iter()
+        .filter(|(_, (file, live))| {
+            use std::os::unix::fs::MetadataExt;
+            // Deltas are write-sealed memfds; a restore base is a file on disk.
+            let seals = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) };
+            let delta = seals >= 0 && seals & libc::F_SEAL_WRITE != 0;
+            delta
+                && file
+                    .metadata()
+                    .is_ok_and(|metadata| metadata.blocks() * 512 > 2 * live)
+        })
+        .map(|(file, _)| file)
+        .collect();
+    if superseded.is_empty() {
+        return;
+    }
+    for (piece, folded) in plan.iter().zip(folded.iter_mut()) {
+        if let Some(index) = piece.old {
+            *folded |= superseded.contains(&Arc::as_ptr(&old[index].file));
+        }
+    }
+}
+
+/// The coalesced runs copied into the new delta.
+fn copy_ranges(plan: &[Piece], folded: &[bool]) -> Vec<(usize, usize)> {
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for (piece, _) in plan.iter().zip(folded).filter(|(_, folded)| **folded) {
+        match ranges.last_mut() {
+            Some(last) if last.1 == piece.start => last.1 = piece.end,
+            _ => ranges.push((piece.start, piece.end)),
+        }
+    }
+    ranges
 }
 
 #[test]
@@ -1279,6 +1566,307 @@ fn fragmented_writes_then_dense_capture_preserve_ancestors() {
     let mut actual = vec![0; PAGES * host_page_size()];
     restored.read_slice(&mut actual, GuestAddress(0)).unwrap();
     assert!(actual.iter().all(|byte| *byte == 0x71));
+}
+
+#[test]
+fn compaction_folds_only_the_shortest_unchanged_runs() {
+    let page = host_page_size();
+    let file = Arc::new(crate::builder::create_guest_ram_memfd(16 * page).unwrap());
+    let old = [Extent {
+        start: 0,
+        end: 16 * page,
+        offset: 0,
+        file,
+    }];
+    let pages = |runs: &[(usize, usize)]| -> Vec<(usize, usize)> {
+        runs.iter().map(|&(s, e)| (s * page, e * page)).collect()
+    };
+    // old 0..1, dirty 1..2, old 2..3, dirty 3..4, old 4..8, dirty 8..9, old 9..16
+    let plan = plan_layout(&old, &pages(&[(1, 2), (3, 4), (8, 9)]));
+    assert_eq!(plan.len(), 7);
+    let copied = |trigger, goal| {
+        let folded = choose_folds(&plan, trigger, goal);
+        (folded_extent_count(&folded), copy_ranges(&plan, &folded))
+    };
+    // Within the trigger only the written pages are copied.
+    assert_eq!(copied(7, 2), (7, pages(&[(1, 2), (3, 4), (8, 9)])));
+    // Folding the two one-page runs reaches five extents.
+    assert_eq!(copied(6, 5), (4, pages(&[(0, 4), (8, 9)])));
+    assert_eq!(copied(6, 3), (2, pages(&[(0, 9)])));
+    assert_eq!(copied(6, 1), (1, pages(&[(0, 16)])));
+}
+
+#[test]
+fn compaction_folds_only_as_many_equal_runs_as_needed() {
+    let page = host_page_size();
+    let file = Arc::new(crate::builder::create_guest_ram_memfd(10 * page).unwrap());
+    let old = [Extent {
+        start: 0,
+        end: 10 * page,
+        offset: 0,
+        file,
+    }];
+    // Every other page written: ten one-page pieces, five of them unchanged.
+    let dirty: Vec<_> = (1..10)
+        .step_by(2)
+        .map(|index| (index * page, (index + 1) * page))
+        .collect();
+    let plan = plan_layout(&old, &dirty);
+    assert_eq!(plan.len(), 10);
+    let folded = choose_folds(&plan, 8, 8);
+    assert_eq!(folded_extent_count(&folded), 7);
+    assert_eq!(
+        copy_ranges(&plan, &folded),
+        [(0, 4), (5, 6), (7, 8), (9, 10)]
+            .iter()
+            .map(|&(s, e)| (s * page, e * page))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn repeated_branches_stay_within_the_extent_budget_and_exact() {
+    use crate::snapshot::MemoryRegionDesc;
+    const PAGES: usize = 1024;
+    const TRIGGER: usize = 32;
+    const GOAL: usize = 16;
+    let page = host_page_size();
+    let file = crate::builder::create_guest_ram_memfd(PAGES * page).unwrap();
+    // Distinct base bytes, so a folded unchanged run that copied the wrong
+    // backing would not read back as zero by accident.
+    let mut expected = vec![0_u8; PAGES * page];
+    for (index, chunk) in expected.chunks_mut(page).enumerate() {
+        chunk.fill((index % 251) as u8 + 1);
+    }
+    file.write_all_at(&expected, 0).unwrap();
+    let mut generation = Generation::from_immutable_file(
+        &[MemoryRegionDesc {
+            gpa: 0,
+            len: (PAGES * page) as u64,
+        }],
+        &file,
+    )
+    .unwrap();
+    let memory = generation.restore().unwrap();
+    let mut seed = 0x5eed_u64;
+    let mut ancestors = Vec::new();
+    let mut folded = false;
+    for round in 0..24_usize {
+        let mut written = std::collections::BTreeSet::new();
+        for _ in 0..48 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let index = seed as usize % PAGES;
+            written.insert(index);
+            let value = if round % 5 == 4 {
+                0
+            } else {
+                0x80 + round as u8
+            };
+            expected[index * page..(index + 1) * page].fill(value);
+            memory
+                .write_slice(
+                    &expected[index * page..(index + 1) * page],
+                    GuestAddress((index * page) as u64),
+                )
+                .unwrap();
+        }
+        let (next, copied) = generation
+            .capture_quiesced_within(
+                &memory,
+                &[],
+                CompactLimits {
+                    trigger: TRIGGER,
+                    goal: GOAL,
+                    files: 8,
+                },
+            )
+            .unwrap();
+        assert!(copied >= written.len() * page);
+        folded |= copied > written.len() * page;
+        let files: std::collections::HashSet<_> = next.regions[0]
+            .extents
+            .iter()
+            .map(|extent| Arc::as_ptr(&extent.file))
+            .collect();
+        assert!(files.len() <= 8, "round {round}: {} files", files.len());
+        assert!(
+            next.regions[0].extents.len() <= TRIGGER,
+            "round {round}: {} extents",
+            next.regions[0].extents.len()
+        );
+        next.rebase_quiesced(&memory).unwrap();
+        ancestors.push((next.clone(), expected.clone()));
+        generation = next;
+    }
+    assert!(folded, "the workload never needed compaction");
+    let mut actual = vec![0; PAGES * page];
+    memory.read_slice(&mut actual, GuestAddress(0)).unwrap();
+    assert!(actual == expected, "running source diverged");
+    for (round, (ancestor, model)) in ancestors.into_iter().enumerate() {
+        ancestor
+            .restore()
+            .unwrap()
+            .read_slice(&mut actual, GuestAddress(0))
+            .unwrap();
+        assert!(actual == model, "generation {round} diverged");
+    }
+}
+
+#[test]
+fn consolidation_preserves_contents_and_keeps_zero_pages_as_holes() {
+    use crate::snapshot::MemoryRegionDesc;
+    use std::os::unix::fs::MetadataExt;
+    const PAGES: usize = 64;
+    let page = host_page_size();
+    let file = crate::builder::create_guest_ram_memfd(PAGES * page).unwrap();
+    file.write_all_at(&vec![0x11; page], 0).unwrap();
+    let generation = Generation::from_immutable_file(
+        &[MemoryRegionDesc {
+            gpa: 0,
+            len: (PAGES * page) as u64,
+        }],
+        &file,
+    )
+    .unwrap();
+    let memory = generation.restore().unwrap();
+    memory
+        .write_slice(&vec![0x22; page], GuestAddress((3 * page) as u64))
+        .unwrap();
+    // A private page that holds only zeros needs no backing either.
+    memory
+        .write_slice(&vec![0; page], GuestAddress((5 * page) as u64))
+        .unwrap();
+    // A one-file budget leaves no room for the old backing beside the delta.
+    let limits = CompactLimits {
+        trigger: COMPACT_TRIGGER,
+        goal: COMPACT_GOAL,
+        files: 1,
+    };
+    let instance = Instance {
+        memory: memory.clone(),
+        image: generation.regions[0].clone(),
+    };
+    let (image, copied) = instance.capture_quiesced_within(limits).unwrap();
+    let next = Generation {
+        regions: vec![image],
+    };
+    assert_eq!(copied, PAGES * page);
+    assert_eq!(next.regions[0].extents.len(), 1);
+    let delta = &next.regions[0].extents[0].file;
+    assert!(!Arc::ptr_eq(delta, &generation.regions[0].extents[0].file));
+    assert_eq!(delta.metadata().unwrap().blocks() * 512, 2 * page as u64);
+    let mut expected = vec![0; PAGES * page];
+    expected[..page].fill(0x11);
+    expected[3 * page..4 * page].fill(0x22);
+    let mut actual = vec![0; PAGES * page];
+    next.restore()
+        .unwrap()
+        .read_slice(&mut actual, GuestAddress(0))
+        .unwrap();
+    assert!(actual == expected);
+    // The ancestor generation is unchanged.
+    generation
+        .restore()
+        .unwrap()
+        .read_slice(&mut actual, GuestAddress(0))
+        .unwrap();
+    expected[3 * page..4 * page].fill(0);
+    assert!(actual == expected);
+}
+
+#[test]
+fn a_mostly_overwritten_delta_is_folded_away() {
+    use crate::snapshot::MemoryRegionDesc;
+    const PAGES: usize = 64;
+    let page = host_page_size();
+    let file = crate::builder::create_guest_ram_memfd(PAGES * page).unwrap();
+    let generation = Generation::from_immutable_file(
+        &[MemoryRegionDesc {
+            gpa: 0,
+            len: (PAGES * page) as u64,
+        }],
+        &file,
+    )
+    .unwrap();
+    let memory = generation.restore().unwrap();
+    memory
+        .write_slice(&vec![0x31; 16 * page], GuestAddress(0))
+        .unwrap();
+    let (first, _) = generation.capture_quiesced(&memory).unwrap();
+    first.rebase_quiesced(&memory).unwrap();
+    let delta = first.regions[0].extents[0].file.clone();
+    // Overwrite 12 of the delta's 16 pages: only a quarter stays live.
+    memory
+        .write_slice(&vec![0x42; 12 * page], GuestAddress(0))
+        .unwrap();
+    let (second, copied) = first.capture_quiesced(&memory).unwrap();
+    assert_eq!(copied, 16 * page);
+    assert!(
+        second.regions[0]
+            .extents
+            .iter()
+            .all(|extent| !Arc::ptr_eq(&extent.file, &delta))
+    );
+    let mut actual = vec![0; PAGES * page];
+    second
+        .restore()
+        .unwrap()
+        .read_slice(&mut actual, GuestAddress(0))
+        .unwrap();
+    assert!(actual[..12 * page].iter().all(|byte| *byte == 0x42));
+    assert!(
+        actual[12 * page..16 * page]
+            .iter()
+            .all(|byte| *byte == 0x31)
+    );
+    assert!(actual[16 * page..].iter().all(|byte| *byte == 0));
+    // Half or more still live: the delta is kept and nothing extra is copied.
+    second.rebase_quiesced(&memory).unwrap();
+    memory
+        .write_slice(&vec![0x53; 4 * page], GuestAddress(0))
+        .unwrap();
+    let (_, copied) = second.capture_quiesced(&memory).unwrap();
+    assert_eq!(copied, 4 * page);
+}
+
+#[test]
+fn scattered_writes_past_the_hard_limit_are_compacted_not_refused() {
+    use crate::snapshot::MemoryRegionDesc;
+    // Every other page written splits one extent into more than the 65536
+    // a generation may hold: the shape that failed a restored machine's
+    // branches and checkpoints.
+    let pages = 2 * (65536 / 2 + 1);
+    let page = host_page_size();
+    let file = crate::builder::create_guest_ram_memfd(pages * page).unwrap();
+    let generation = Generation::from_immutable_file(
+        &[MemoryRegionDesc {
+            gpa: 0,
+            len: (pages * page) as u64,
+        }],
+        &file,
+    )
+    .unwrap();
+    let memory = generation.restore().unwrap();
+    for index in (0..pages).step_by(2) {
+        memory
+            .write_obj(0x5a_u8, GuestAddress((index * page) as u64))
+            .unwrap();
+    }
+    let (next, _) = generation.capture_quiesced(&memory).unwrap();
+    assert!(next.regions[0].extents.len() <= COMPACT_GOAL);
+    next.encode_manifest().unwrap();
+    next.rebase_quiesced(&memory).unwrap();
+    let restored = next.restore().unwrap();
+    for index in [0, 1, pages - 2, pages - 1] {
+        assert_eq!(
+            restored
+                .read_obj::<u8>(GuestAddress((index * page) as u64))
+                .unwrap(),
+            if index % 2 == 0 { 0x5a } else { 0 }
+        );
+    }
 }
 
 #[test]
