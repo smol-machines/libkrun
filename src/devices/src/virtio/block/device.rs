@@ -421,10 +421,7 @@ pub(crate) fn open_disk_format(
         .write(writable)
         .filename(path)
         .direct(direct_io);
-    #[cfg(target_os = "macos")]
     let file_opts = file_opts.relaxed_sync(relaxed_sync);
-    #[cfg(not(target_os = "macos"))]
-    let _ = relaxed_sync;
     let file = ImagoFile::open_sync(file_opts)?;
     let discard_alignment = file.discard_align();
 
@@ -553,16 +550,7 @@ impl Block {
 
         let disk_image_id = DiskProperties::build_disk_image_id(&disk_image);
 
-        let relaxed_sync = {
-            #[cfg(target_os = "macos")]
-            {
-                sync_mode == SyncMode::Relaxed
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                false
-            }
-        };
+        let relaxed_sync = sync_mode == SyncMode::Relaxed;
         let (disk_image, discard_alignment) = open_disk_format(
             &disk_image_path,
             disk_image_format,
