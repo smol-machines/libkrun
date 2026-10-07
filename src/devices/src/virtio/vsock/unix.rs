@@ -494,11 +494,24 @@ impl Proxy for UnixProxy {
         // host socket will take now. `tx_cnt` advances only for flushed bytes, so
         // a stalled host peer backpressures the guest via its own vsock window and
         // never blocks the muxer thread. See smol-machines/smolvm#1093.
-        if let Some(buf) = pkt.data() {
-            self.tx_buf.extend(buf.iter().copied());
-        }
+        // A guest honouring the window we advertise (buf_alloc = CONN_TX_BUF_SIZE,
+        // fwd_cnt = flushed bytes) never has more than that unflushed.
+        let accepted = match pkt.data() {
+            Some(buf) if self.tx_buf.len() + buf.len() > defs::CONN_TX_BUF_SIZE => {
+                warn!(
+                    "sendmsg: guest overran its tx window, resetting id={}",
+                    self.id
+                );
+                Err(())
+            }
+            Some(buf) => {
+                self.tx_buf.extend(buf.iter().copied());
+                Ok(())
+            }
+            None => Ok(()),
+        };
 
-        match self.flush_tx() {
+        match accepted.and_then(|()| self.flush_tx()) {
             Ok(advanced) => {
                 if advanced && self.maybe_send_credit_update() {
                     update.signal_queue = true;
@@ -961,5 +974,28 @@ mod tests {
         let mut received = [0u8; 8192];
         let n = peer.read(&mut received).unwrap();
         assert_eq!(n, 10, "sent the whole descriptor instead of the packet");
+    }
+
+    #[test]
+    fn unflushed_tx_data_stays_within_the_advertised_window() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x40000)]).unwrap();
+        let (tx, rx) = (
+            TestQueue::new(GuestAddress(0x1000), &mem, 8),
+            TestQueue::new(GuestAddress(0x4000), &mem, 8),
+        );
+        let (mut proxy, _peer) = proxy_with_peer(&mem, &rx);
+        let max = defs::MAX_PKT_BUF_SIZE as u32;
+        let pkt = tx_packet(&mem, &tx, max, max);
+
+        // The peer never reads, so a guest ignoring its credit piles data up.
+        for _ in 0..2 * defs::CONN_TX_BUF_SIZE / defs::MAX_PKT_BUF_SIZE {
+            proxy.sendmsg(&pkt);
+            assert!(
+                proxy.tx_buf.len() <= defs::CONN_TX_BUF_SIZE,
+                "tx_buf grew to {} bytes",
+                proxy.tx_buf.len()
+            );
+        }
+        assert_eq!(proxy.status, ProxyStatus::Closed);
     }
 }
