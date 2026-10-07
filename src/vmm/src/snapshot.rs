@@ -21,6 +21,8 @@ use std::io::{self, Read, Write};
 use std::io::{Seek, SeekFrom};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::fd::AsRawFd;
+#[cfg(target_os = "linux")]
+use std::os::fd::RawFd;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::fs::FileExt;
 
@@ -89,6 +91,15 @@ fn stream_sparse_memory_files<W: Write>(
     stream_sparse_memory_files_with_seek(sources, output, next_memory_data_offset)
 }
 
+#[cfg(target_os = "linux")]
+fn stream_sparse_memory_files_to_socket<W: Write>(
+    sources: &[(&File, u64, u64)],
+    output: &mut W,
+    socket: RawFd,
+) -> io::Result<()> {
+    stream_sparse_memory_files_inner(sources, output, next_memory_data_offset, Some(socket))
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn next_memory_data_offset(file: &File, offset: u64) -> io::Result<Option<u64>> {
     let offset =
@@ -125,6 +136,17 @@ trait SparseRamSource {
     /// Read `buffer.len()` bytes at `offset`. Bytes that cannot hold data may
     /// read as zero without being touched.
     fn read_exact_at(&mut self, buffer: &mut [u8], offset: u64) -> io::Result<()>;
+    /// Send file-backed RAM directly to a socket when available. A source
+    /// without a file returns None so the caller uses the ordinary read path.
+    #[cfg(target_os = "linux")]
+    fn send_to_socket(
+        &mut self,
+        _socket: RawFd,
+        _offset: u64,
+        _len: usize,
+    ) -> io::Result<Option<usize>> {
+        Ok(None)
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -152,6 +174,34 @@ impl<F: FnMut(&File, u64) -> io::Result<Option<u64>>> SparseRamSource for FileRa
 
     fn read_exact_at(&mut self, buffer: &mut [u8], offset: u64) -> io::Result<()> {
         self.file.read_exact_at(buffer, self.start + offset)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn send_to_socket(
+        &mut self,
+        socket: RawFd,
+        offset: u64,
+        len: usize,
+    ) -> io::Result<Option<usize>> {
+        let mut at = i64::try_from(self.start + offset)
+            .map_err(|_| io::Error::other("RAM source offset exceeds off_t"))?;
+        loop {
+            // Explicit offset leaves the shared file cursor untouched. The
+            // source is immutable for the whole checkpoint stream.
+            let sent = unsafe { libc::sendfile(socket, self.file.as_raw_fd(), &mut at, len) };
+            if sent > 0 {
+                return Ok(Some(sent as usize));
+            }
+            if sent == 0 {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            let error = io::Error::last_os_error();
+            match error.raw_os_error() {
+                Some(libc::EINTR) => continue,
+                Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP) => return Ok(None),
+                _ => return Err(error),
+            }
+        }
     }
 }
 
@@ -196,6 +246,16 @@ fn stream_sparse_memory_files_with_seek<W: Write>(
     output: &mut W,
     next_data: impl FnMut(&File, u64) -> io::Result<Option<u64>>,
 ) -> io::Result<()> {
+    stream_sparse_memory_files_inner(sources, output, next_data, None)
+}
+
+#[cfg(target_os = "linux")]
+fn stream_sparse_memory_files_inner<W: Write>(
+    sources: &[(&File, u64, u64)],
+    output: &mut W,
+    next_data: impl FnMut(&File, u64) -> io::Result<Option<u64>>,
+    socket: Option<RawFd>,
+) -> io::Result<()> {
     for (file, start, len) in sources {
         let end = start
             .checked_add(*len)
@@ -221,13 +281,23 @@ fn stream_sparse_memory_files_with_seek<W: Write>(
         .iter_mut()
         .map(|source| source as &mut dyn SparseRamSource)
         .collect();
-    stream_sparse_ram(&mut sources, output)
+    stream_sparse_ram_inner(&mut sources, output, socket)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn stream_sparse_ram<W: Write>(
     sources: &mut [&mut dyn SparseRamSource],
     output: &mut W,
+) -> io::Result<()> {
+    stream_sparse_ram_inner(sources, output, None)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn stream_sparse_ram_inner<W: Write>(
+    sources: &mut [&mut dyn SparseRamSource],
+    output: &mut W,
+    #[cfg(target_os = "linux")] socket: Option<RawFd>,
+    #[cfg(target_os = "macos")] _socket: Option<()>,
 ) -> io::Result<()> {
     const PAGE: usize = 4096;
     static ZERO: [u8; PAGE] = [0; PAGE];
@@ -311,6 +381,15 @@ fn stream_sparse_ram<W: Write>(
             let count = len
                 .min(region_base + region_len - offset)
                 .min(buffer.len() as u64);
+            #[cfg(target_os = "linux")]
+            if let Some(socket) = socket
+                && let Some(sent) =
+                    sources[region].send_to_socket(socket, offset - region_base, count as usize)?
+            {
+                offset += sent as u64;
+                len -= sent as u64;
+                continue;
+            }
             sources[region].read_exact_at(&mut buffer[..count as usize], offset - region_base)?;
             output.write_all(&buffer[..count as usize])?;
             offset += count;
@@ -2049,7 +2128,7 @@ impl DeferredMemorySave {
     /// The wire format is `SMOLRAM1`, a little-endian u64 logical length, then
     /// exactly that many bytes in portable region order.
     pub fn finish_stream<W: Write>(self, output: &mut W) -> io::Result<Vec<MemoryRegionDesc>> {
-        self.finish_stream_mode(output, false, |_, _| Ok(()))
+        self.finish_stream_mode(output, false, |_, _| Ok(()), None)
     }
 
     /// Produce a bounded sparse map and payload from immutable generation RAM.
@@ -2057,7 +2136,7 @@ impl DeferredMemorySave {
         self,
         output: &mut W,
     ) -> io::Result<Vec<MemoryRegionDesc>> {
-        self.finish_stream_mode(output, true, |_, _| Ok(()))
+        self.finish_stream_mode(output, true, |_, _| Ok(()), None)
     }
 
     /// Hand captured metadata to the consumer before RAM payload output.
@@ -2066,7 +2145,18 @@ impl DeferredMemorySave {
         output: &mut W,
         header: impl FnOnce(&[MemoryRegionDesc], &mut W) -> io::Result<()>,
     ) -> io::Result<Vec<MemoryRegionDesc>> {
-        self.finish_stream_mode(output, true, header)
+        self.finish_stream_mode(output, true, header, None)
+    }
+
+    /// The same sparse stream over a Unix socket. File-backed RAM payloads
+    /// use sendfile; anonymous or unsupported sources use the buffered path.
+    pub fn finish_sparse_stream_with_header_to_socket<W: Write>(
+        self,
+        output: &mut W,
+        socket: RawFd,
+        header: impl FnOnce(&[MemoryRegionDesc], &mut W) -> io::Result<()>,
+    ) -> io::Result<Vec<MemoryRegionDesc>> {
+        self.finish_stream_mode(output, true, header, Some(socket))
     }
 
     fn finish_stream_mode<W: Write>(
@@ -2074,6 +2164,7 @@ impl DeferredMemorySave {
         output: &mut W,
         sparse: bool,
         header: impl FnOnce(&[MemoryRegionDesc], &mut W) -> io::Result<()>,
+        socket: Option<RawFd>,
     ) -> io::Result<Vec<MemoryRegionDesc>> {
         let (descs, files) = match self.generation {
             DeferredLinuxGeneration::Stable { descs, files } => (descs, files),
@@ -2093,7 +2184,15 @@ impl DeferredMemorySave {
                 let regions = generation.memory_regions();
                 header(&regions, output)?;
                 if sparse {
-                    stream_sparse_memory_files(&generation.memory_sources(), output)?;
+                    if let Some(fd) = socket {
+                        stream_sparse_memory_files_to_socket(
+                            &generation.memory_sources(),
+                            output,
+                            fd,
+                        )?;
+                    } else {
+                        stream_sparse_memory_files(&generation.memory_sources(), output)?;
+                    }
                 } else {
                     write_memory_stream_header(output, &regions)?;
                     generation.write_to(output)?;
@@ -2120,7 +2219,11 @@ impl DeferredMemorySave {
                 .zip(&files)
                 .map(|(d, f)| (f, d.offset, d.len))
                 .collect();
-            stream_sparse_memory_files(&sources, output)?;
+            if let Some(fd) = socket {
+                stream_sparse_memory_files_to_socket(&sources, output, fd)?;
+            } else {
+                stream_sparse_memory_files(&sources, output)?;
+            }
         } else {
             write_memory_stream_header(output, &regions)?;
             for (desc, file) in descs.iter().zip(&files) {
@@ -3945,6 +4048,34 @@ mod tests {
                 assert_eq!(actual, full, "dense={dense} start={start}");
             }
         }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn sparse_socket_stream_matches_buffered_stream() {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::FileExt;
+        use std::os::unix::net::UnixStream;
+
+        let file = crate::builder::create_guest_ram_memfd(4 * 1024 * 1024).unwrap();
+        for offset in [4095, 8192, 1024 * 1024, 3 * 1024 * 1024 + 11] {
+            file.write_all_at(&[0xa5; 4096], offset).unwrap();
+        }
+        let sources = [(&file, 511, 4 * 1024 * 1024 - 1023)];
+        let mut expected = Vec::new();
+        super::stream_sparse_memory_files(&sources, &mut expected).unwrap();
+
+        let (mut sender, mut receiver) = UnixStream::pair().unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut actual = Vec::new();
+            receiver.read_to_end(&mut actual).unwrap();
+            actual
+        });
+        let socket = sender.as_raw_fd();
+        super::stream_sparse_memory_files_to_socket(&sources, &mut sender, socket).unwrap();
+        drop(sender);
+        assert_eq!(reader.join().unwrap(), expected);
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
