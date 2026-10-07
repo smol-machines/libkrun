@@ -404,6 +404,16 @@ impl NetWorker {
                 }
             }
 
+            // Backends assume a frame follows the vnet header; an empty or
+            // unreadable chain has none, so drop it.
+            if read_count <= VNET_HDR_LEN {
+                tx_queue
+                    .add_used(&self.mem, head_index, 0)
+                    .map_err(TxError::QueueError)?;
+                raise_irq = true;
+                continue;
+            }
+
             self.tx_frame_len = read_count;
             match self
                 .backend
@@ -529,5 +539,56 @@ impl NetWorker {
     fn read_into_rx_frame_buf_from_backend(&mut self) -> result::Result<(), ReadError> {
         self.rx_frame_buf_len = self.backend.read_frame(&mut self.rx_frame_buf)?;
         Ok(())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::legacy::DummyIrqChip;
+    use crate::virtio::queue::tests::VirtQueue;
+    use std::os::fd::{IntoRawFd, RawFd};
+    use std::sync::Arc;
+
+    /// A TX chain too short to hold a frame after the vnet header is dropped,
+    /// not handed to a backend that assumes a frame is there.
+    #[test]
+    fn a_tx_chain_without_a_frame_is_dropped() {
+        for (kind, backend) in [
+            (
+                socket2::Type::STREAM,
+                VirtioNetBackend::UnixstreamFd as fn(RawFd) -> _,
+            ),
+            (socket2::Type::DGRAM, VirtioNetBackend::UnixgramFd),
+        ] {
+            let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+            let (rx, tx) = (
+                VirtQueue::new(GuestAddress(0x1000), &mem, 8),
+                VirtQueue::new(GuestAddress(0x4000), &mem, 8),
+            );
+            tx.dtable[0].set(0x10000, 0, 0, 0);
+            tx.avail.ring[0].set(0);
+            tx.avail.idx.set(1);
+            let (ours, _peer) = socket2::Socket::pair(socket2::Domain::UNIX, kind, None).unwrap();
+            let queue = |ring: &VirtQueue| {
+                DeviceQueue::new(
+                    ring.create_queue(),
+                    Arc::new(EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap()),
+                )
+            };
+            let mut worker = NetWorker::new(
+                queue(&rx),
+                queue(&tx),
+                InterruptTransport::new(DummyIrqChip::new().into(), "net test".into()).unwrap(),
+                mem.clone(),
+                0,
+                backend(ours.into_raw_fd()),
+                EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
+            )
+            .unwrap();
+
+            assert!(worker.process_tx().is_ok(), "{kind:?}");
+            assert_eq!(tx.used.idx.get(), 1, "{kind:?}");
+        }
     }
 }
