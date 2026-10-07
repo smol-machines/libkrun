@@ -902,7 +902,7 @@ impl VsockMuxer {
                 }
                 let rxq = self.rxq.clone();
 
-                let mut unix = UnixProxy::new(
+                let mut unix = match UnixProxy::new(
                     id,
                     self.cid,
                     pkt.dst_port(),
@@ -912,8 +912,19 @@ impl VsockMuxer {
                     rxq,
                     path.to_path_buf(),
                     self.snapshot_gate.clone(),
-                )
-                .unwrap();
+                ) {
+                    Ok(unix) => unix,
+                    // e.g. EMFILE: the guest can open connections faster than they close.
+                    Err(e) => {
+                        warn!("host-IPC proxy for {path:?} failed, sending rst: {e:?}");
+                        let rx = MuxerRx::Reset {
+                            local_port: pkt.dst_port(),
+                            peer_port: pkt.src_port(),
+                        };
+                        push_packet(self.cid, rx, &self.rxq, queue, mem, &self.snapshot_gate);
+                        return;
+                    }
+                };
                 let tsi = TsiConnectReq {
                     peer_port: 0,
                     addr: SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0).into(),
@@ -1291,5 +1302,75 @@ mod tests {
         let cidrs = vec![(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 8)];
         assert!(ip_matches_cidrs(&sockaddr_v4(10, 99, 99, 99, 80), &cidrs));
         assert!(!ip_matches_cidrs(&sockaddr_v4(11, 0, 0, 0, 80), &cidrs));
+    }
+
+    /// Runs itself in a child process, since it uses up every file descriptor.
+    #[cfg(unix)]
+    #[test]
+    fn a_host_ipc_connect_without_a_free_fd_is_reset() {
+        use super::super::packet::VSOCK_PKT_HDR_SIZE;
+        use crate::virtio::queue::tests::VirtQueue as TestQueue;
+        use std::os::fd::AsRawFd;
+        use vm_memory::GuestAddress;
+
+        const NAME: &str =
+            "virtio::vsock::muxer::tests::a_host_ipc_connect_without_a_free_fd_is_reset";
+        if std::env::var_os("LIBKRUN_TEST_CHILD").is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture"])
+                .env("LIBKRUN_TEST_CHILD", "1")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        let (tx, rx) = (
+            TestQueue::new(GuestAddress(0x1000), &mem, 8),
+            TestQueue::new(GuestAddress(0x4000), &mem, 8),
+        );
+        let ipc = HashMap::from([(1024, (PathBuf::from("/nonexistent"), false))]);
+        let mut muxer = VsockMuxer::new(
+            3,
+            None,
+            Some(ipc),
+            TsiFlags::default(),
+            None,
+            None,
+            None,
+            None,
+        );
+        muxer.mem = Some(mem.clone());
+        muxer.queue = Some(Arc::new(Mutex::new(rx.create_queue())));
+        tx.dtable[0].set(0x10000, VSOCK_PKT_HDR_SIZE as u32, 0, 0);
+        tx.avail.ring[0].set(0);
+        tx.avail.idx.set(1);
+        let mut pkt =
+            VsockPacket::from_tx_virtq_head(&tx.create_queue().pop(&mem).unwrap()).unwrap();
+        pkt.set_op(uapi::VSOCK_OP_REQUEST)
+            .set_src_port(5)
+            .set_dst_port(1024);
+
+        let null = std::fs::File::open("/dev/null").unwrap();
+        let limit = libc::rlimit {
+            rlim_cur: 256,
+            rlim_max: 256,
+        };
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+        while unsafe { libc::dup(null.as_raw_fd()) } >= 0 {}
+        muxer.process_op_request(&pkt);
+
+        assert!(matches!(
+            muxer.rxq.lock().unwrap().pop(),
+            Some(MuxerRx::Reset {
+                local_port: 1024,
+                peer_port: 5
+            })
+        ));
     }
 }
