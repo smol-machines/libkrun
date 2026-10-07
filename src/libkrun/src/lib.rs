@@ -30,7 +30,7 @@ use std::fs::File;
 use std::io::IsTerminal;
 #[cfg(snapshot_supported)]
 use std::io::Write;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::fd::{BorrowedFd, FromRawFd};
@@ -927,15 +927,26 @@ fn handle_finish_save_stream<W: Write>(dir: &str, stream: &mut W) -> String {
         all(target_os = "macos", target_arch = "aarch64")
     )
 ))]
-fn handle_finish_save_sparse<W: Write>(dir: &str, stream: &mut W) -> String {
+fn handle_finish_save_sparse<W: Write + AsRawFd>(dir: &str, stream: &mut W) -> String {
     let Some(result) = PREPARED_SAVES.finish(dir, |prepared| {
         let state = prepared.checkpoint.serialize();
-        prepared
+        #[cfg(target_os = "linux")]
+        let socket = stream.as_raw_fd();
+        let write_header = |descs: &[vmm::snapshot::MemoryRegionDesc], output: &mut W| {
+            let layout = encode_portable_manifest(descs);
+            write_checkpoint_stream_header(output, &state, &layout)
+        };
+        #[cfg(target_os = "linux")]
+        let saved = prepared.memory.finish_sparse_stream_with_header_to_socket(
+            stream,
+            socket,
+            write_header,
+        );
+        #[cfg(target_os = "macos")]
+        let saved = prepared
             .memory
-            .finish_sparse_stream_with_header(stream, |descs, output| {
-                let layout = encode_portable_manifest(descs);
-                write_checkpoint_stream_header(output, &state, &layout)
-            })
+            .finish_sparse_stream_with_header(stream, write_header);
+        saved
             .map_err(|error| format!("stream sparse retained RAM: {error}"))
             .and_then(|descs| {
                 publish_portable_save(
@@ -1746,10 +1757,12 @@ fn parse_disk_growth(arg: &str) -> Result<(&str, u64), &'static str> {
     Ok((id, bytes))
 }
 
-fn handle_control_stream<S: std::io::Read + std::io::Write + Send + 'static>(
-    mut stream: S,
-    vmm: &Arc<Mutex<vmm::Vmm>>,
-) {
+#[cfg(unix)]
+type ControlStream = std::os::unix::net::UnixStream;
+#[cfg(windows)]
+type ControlStream = std::net::TcpStream;
+
+fn handle_control_stream(mut stream: ControlStream, vmm: &Arc<Mutex<vmm::Vmm>>) {
     let response = match read_control_command(&mut stream) {
         Ok(buf) if buf.is_empty() => "ERR EINVAL empty command\n".to_string(),
         Ok(buf) => {
