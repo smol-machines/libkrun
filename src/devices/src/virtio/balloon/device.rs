@@ -83,6 +83,9 @@ pub struct Balloon {
 /// A stats entry is a packed le16 tag followed by a le64 value. `repr(C)` would
 /// pad that to 16 bytes, so the fields are read individually.
 const STAT_ENTRY_LEN: usize = 10;
+/// Upper bound on a stats sample read from the guest: Linux sends one entry
+/// per known tag (VIRTIO_BALLOON_S_NR, 16 today), i.e. 160 bytes.
+const MAX_STATS_LEN: usize = 4096;
 
 /// Decode the guest's stats buffer. Returns `None` if it holds no complete
 /// entry; a trailing partial entry is ignored rather than rejecting the sample.
@@ -244,7 +247,8 @@ impl Balloon {
             let mut buf = Vec::new();
             for desc in head.into_iter() {
                 let at = buf.len();
-                buf.resize(at + desc.len as usize, 0);
+                // The guest sizes the buffer (up to 4 GiB); a real sample is far smaller.
+                buf.resize(at + cmp::min(desc.len as usize, MAX_STATS_LEN - at), 0);
                 if let Err(e) = mem.read_slice(&mut buf[at..], desc.addr) {
                     error!("balloon: unreadable stats buffer: {e:?}");
                     buf.truncate(at);
@@ -859,5 +863,60 @@ mod checkpoint_quiescence_tests {
             }
             assert_eq!(rings[index].used.idx.get(), 1, "queue {index}");
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod stats_allocation_tests {
+    use super::*;
+    use crate::legacy::DummyIrqChip;
+    use crate::virtio::queue::tests::VirtQueue;
+    use std::sync::Arc;
+    use vm_memory::GuestAddress;
+
+    fn max_rss_bytes() -> i64 {
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+        usage.ru_maxrss * 1024
+    }
+
+    /// The stats buffer length is guest-chosen (up to 4 GiB) and must not size
+    /// a host allocation.
+    #[test]
+    fn an_oversized_stats_descriptor_does_not_size_a_host_allocation() {
+        const CLAIMED: u32 = 1 << 30;
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        let rings: Vec<_> = (0..defs::NUM_QUEUES)
+            .map(|i| VirtQueue::new(GuestAddress(0x1000 + i as u64 * 0x1000), &memory, 8))
+            .collect();
+        let queues = rings
+            .iter()
+            .map(|ring| {
+                DeviceQueue::new(
+                    ring.create_queue(),
+                    Arc::new(EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap()),
+                )
+            })
+            .collect();
+        let mut balloon = Balloon::new().unwrap();
+        balloon
+            .activate(
+                memory.clone(),
+                InterruptTransport::new(DummyIrqChip::new().into(), "stats test".into()).unwrap(),
+                queues,
+            )
+            .unwrap();
+        rings[STQ_INDEX].dtable[0].addr.set(0x10000);
+        rings[STQ_INDEX].dtable[0].len.set(CLAIMED);
+        rings[STQ_INDEX].avail.ring[0].set(0);
+        rings[STQ_INDEX].avail.idx.set(1);
+
+        let before = max_rss_bytes();
+        balloon.process_stq();
+        let grown = max_rss_bytes() - before;
+        assert!(
+            grown < i64::from(CLAIMED) / 2,
+            "process_stq grew the peak RSS by {grown} bytes for a {CLAIMED}-byte claim"
+        );
     }
 }
