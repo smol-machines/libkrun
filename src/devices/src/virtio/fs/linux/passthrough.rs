@@ -1569,14 +1569,10 @@ impl FileSystem for PassthroughFs {
         F: FnMut(DirEntry, Entry) -> io::Result<usize>,
     {
         self.do_readdir(inode, handle, size, offset, |dir_entry| {
-            // Safe because the kernel guarantees that the buffer is nul-terminated. Additionally,
-            // the kernel will pad the name with '\0' bytes up to 8-byte alignment and there's no
-            // way for us to know exactly how many padding bytes there are. This would cause
-            // `CStr::from_bytes_with_nul` to return an error because it would think there are
-            // interior '\0' bytes. We trust the kernel to provide us with properly formatted data
-            // so we'll just skip the checks here.
-            let name = unsafe { CStr::from_bytes_with_nul_unchecked(dir_entry.name) };
-            let entry = self.lookup(ctx, inode, name)?;
+            // do_readdir already cut the name at its NUL, so it has no interior NUL.
+            let name = CString::new(dir_entry.name)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let entry = self.lookup(ctx, inode, &name)?;
 
             add_entry(dir_entry, entry)
         })
@@ -3161,5 +3157,57 @@ mod tests {
              the server uid (the scoped_cred Drop regressed to restoring euid 0)"
         );
         Ok(())
+    }
+
+    #[test]
+    fn readdirplus_looks_up_each_entry_by_its_full_name() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "libkrun-readdirplus-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("abc"), b"data").unwrap();
+        fs::write(root.join("ab"), b"other").unwrap();
+
+        let filesystem = PassthroughFs::new(
+            Config {
+                root_dir: root.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        FileSystem::init(&filesystem, FsOptions::ZERO_MESSAGE_OPENDIR).unwrap();
+        let context = Context {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        };
+        let mut found = Vec::new();
+        FileSystem::readdirplus(
+            &filesystem,
+            context,
+            fuse::ROOT_ID,
+            0,
+            4096,
+            0,
+            |dir_entry, entry| {
+                found.push((dir_entry.name.to_vec(), entry.attr.st_ino));
+                Ok(1)
+            },
+        )
+        .unwrap();
+        found.sort();
+        let ino = |name: &str| fs::metadata(root.join(name)).unwrap().ino();
+        assert_eq!(
+            found,
+            vec![(b"ab".to_vec(), ino("ab")), (b"abc".to_vec(), ino("abc"))]
+        );
+
+        fs::remove_dir_all(root).unwrap();
     }
 }
