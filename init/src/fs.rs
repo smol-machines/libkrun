@@ -8,6 +8,80 @@ use nix::errno::Errno;
 use nix::mount::{self, MsFlags};
 use nix::unistd;
 
+/// Run this init from a sealed in-memory copy of itself.
+///
+/// The VMM serves `/init.krun` as a one-shot virtio-fs entry, so once the
+/// guest has exec'd it the file cannot be read again, and a VMM that later
+/// resumes this guest (a restore, a branch) serves its own build's init at that
+/// inode. init sleeps in `waitpid` for the guest's whole life; when memory
+/// pressure evicts its clean code pages, the next wake-up (reaping any orphan)
+/// pages them back in from that inode and gets SIGBUS, and PID 1's death
+/// reboots the guest. Code backed by a memfd is never read back from the file.
+///
+/// Returns only if it could not re-exec; init then keeps running from
+/// virtio-fs exactly as before. Needs `/proc`; the re-exec'd copy mounts it
+/// again harmlessly and sees it is already running from memory.
+pub fn run_from_memory() {
+    use std::ffi::CString;
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    match fs::read_link("/proc/self/exe") {
+        Ok(path) if path.as_os_str().as_bytes().starts_with(b"/memfd:") => return,
+        Ok(_) => {}
+        Err(_) => return,
+    }
+    let Ok(mut exe) = File::open("/proc/self/exe") else {
+        return;
+    };
+    let fd = unsafe {
+        libc::memfd_create(
+            c"init.krun".as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
+    };
+    if fd < 0 {
+        return;
+    }
+    let mut copy = unsafe { File::from_raw_fd(fd) };
+    if io::copy(&mut exe, &mut copy).is_err() {
+        return;
+    }
+    drop(exe);
+    unsafe {
+        libc::fcntl(
+            fd,
+            libc::F_ADD_SEALS,
+            libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE,
+        )
+    };
+
+    let Ok(argv) = env::args_os()
+        .map(|arg| CString::new(arg.as_bytes()))
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        return;
+    };
+    let Ok(envp) = env::vars_os()
+        .map(|(key, value)| {
+            let mut pair = key.as_bytes().to_vec();
+            pair.push(b'=');
+            pair.extend_from_slice(value.as_bytes());
+            CString::new(pair)
+        })
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        return;
+    };
+    let mut argv_ptrs: Vec<*const libc::c_char> = argv.iter().map(|a| a.as_ptr()).collect();
+    argv_ptrs.push(std::ptr::null());
+    let mut envp_ptrs: Vec<*const libc::c_char> = envp.iter().map(|e| e.as_ptr()).collect();
+    envp_ptrs.push(std::ptr::null());
+    // An ELF image runs from a close-on-exec memfd: the kernel holds the file
+    // before the descriptor closes. Only on failure does this return.
+    unsafe { libc::fexecve(fd, argv_ptrs.as_ptr(), envp_ptrs.as_ptr()) };
+}
+
 /// Mount, treating EBUSY (already mounted) as success.
 fn mount_or_busy(
     src: Option<&str>,

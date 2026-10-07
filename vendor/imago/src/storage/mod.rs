@@ -31,8 +31,7 @@ pub struct StorageOpenOptions {
     /// Whether to bypass the host page cache (if applicable).
     pub(crate) direct: bool,
 
-    /// macOS-only: Use fsync() instead of F_FULLFSYNC on `sync()` method.
-    #[cfg(target_os = "macos")]
+    /// Relaxed synchronization: `sync()` does not wait for the drive.
     pub(crate) relaxed_sync: bool,
 }
 
@@ -907,13 +906,13 @@ impl StorageOpenOptions {
         self
     }
 
-    /// macOS-only: whether to use relaxed synchronization on `File`.
+    /// Whether to use relaxed synchronization on `File`.
     ///
-    /// If relaxed synchronization is enabled, `File::sync()` will use the `fsync()` syscall
-    /// instead of `fcntl(F_FULLFSYNC)`, which is a lighter synchronization mechanism that flushes
-    /// the filesystem cache to the drive, but doesn't request the drive to flush its internal
-    /// buffers to persistent storage.
-    #[cfg(target_os = "macos")]
+    /// If relaxed synchronization is enabled, `File::sync()` does not wait for the drive. On
+    /// macOS it uses the `fsync()` syscall instead of `fcntl(F_FULLFSYNC)`, which flushes the
+    /// filesystem cache to the drive but doesn't request the drive to flush its internal buffers
+    /// to persistent storage. Elsewhere it skips the fsync: every write is already in the host
+    /// page cache, where readers of the file see it, and only a host crash can lose it.
     pub fn relaxed_sync(mut self, relaxed_sync: bool) -> Self {
         self.relaxed_sync = relaxed_sync;
         self
@@ -934,8 +933,7 @@ impl StorageOpenOptions {
         self.direct
     }
 
-    /// macOS-only: return the relaxed synchronization state.
-    #[cfg(target_os = "macos")]
+    /// Return the relaxed synchronization state.
     pub fn get_relaxed_sync(&self) -> bool {
         self.relaxed_sync
     }

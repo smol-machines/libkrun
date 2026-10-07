@@ -197,7 +197,10 @@ int32_t krun_add_disk2(uint32_t ctx_id,
  *
  * On macOS this flushes the OS buffers, but does not ask the drive to flush
  * its buffered data, which significantly improves performance. 
- * On Linux this is the same as full sync.
+ * On Linux a flush writes back libkrun's own caches (such as qcow2 metadata)
+ * to the image file but skips the fsync: the data is in the host page cache,
+ * where every reader of the file sees it, so the VM, a restart and a copy of
+ * the image all keep it, and only a host crash can lose recent writes.
  */
 #define KRUN_SYNC_RELAXED 1
 /** 
@@ -219,9 +222,9 @@ int32_t krun_add_disk2(uint32_t ctx_id,
  *  "read_only"   - whether the mount should be read-only. Required if the caller does not have
  *                  write permissions (for disk images in /usr/share).
  *  "direct_io"   - whether to bypass the host caches.
- *  "sync_mode"   - whether to enable VIRTIO_BLK_F_FLUSH. On macOS, an additional relaxed sync
- *                  mode is available, which is enabled by default, and will not ask the drive
- *                  to flush its buffered data.
+ *  "sync_mode"   - whether to enable VIRTIO_BLK_F_FLUSH. A relaxed sync mode honors guest
+ *                  flushes without waiting for the drive (see KRUN_SYNC_RELAXED); it is the
+ *                  default on macOS.
  *
  * Returns:
  *  Zero on success or a negative error number on failure.
