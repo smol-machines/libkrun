@@ -494,7 +494,7 @@ impl Proxy for UnixProxy {
         // host socket will take now. `tx_cnt` advances only for flushed bytes, so
         // a stalled host peer backpressures the guest via its own vsock window and
         // never blocks the muxer thread. See smol-machines/smolvm#1093.
-        if let Some(buf) = pkt.buf() {
+        if let Some(buf) = pkt.data() {
             self.tx_buf.extend(buf.iter().copied());
         }
 
@@ -904,3 +904,62 @@ impl Proxy for UnixAcceptorProxy {
 const ACCEPTOR_FAMILY: Family = Family::Unix;
 #[cfg(windows)]
 const ACCEPTOR_FAMILY: Family = Family::Inet;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::virtio::queue::tests::VirtQueue as TestQueue;
+    use crate::virtio::vsock::packet::VSOCK_PKT_HDR_SIZE;
+    use std::io::Read;
+    use vm_memory::{Bytes, GuestAddress};
+
+    const HDR: u64 = 0x10000;
+    const DATA: u64 = 0x11000;
+
+    fn proxy_with_peer(mem: &GuestMemoryMmap, rx: &TestQueue) -> (UnixProxy, Socket) {
+        let (ours, peer) = Socket::pair(Domain::UNIX, Type::STREAM, None).unwrap();
+        ours.set_nonblocking(true).unwrap();
+        let proxy = UnixProxy::new_reverse(
+            1,
+            3,
+            1024,
+            2048,
+            ours,
+            mem.clone(),
+            Arc::new(Mutex::new(rx.create_queue())),
+            Arc::new(Mutex::new(MuxerRxQ::new())),
+            Arc::new(SnapshotGate::default()),
+        );
+        (proxy, peer)
+    }
+
+    /// A TX packet whose header claims `len` bytes in a `desc_len`-byte data descriptor.
+    fn tx_packet(mem: &GuestMemoryMmap, tx: &TestQueue, len: u32, desc_len: u32) -> VsockPacket {
+        tx.dtable[0].set(HDR, VSOCK_PKT_HDR_SIZE as u32, 1, 1);
+        tx.dtable[1].set(DATA, desc_len, 0, 0);
+        // The header's `len` field sits at byte 24.
+        mem.write_obj(len, GuestAddress(HDR + 24)).unwrap();
+        tx.avail.ring[0].set(0);
+        tx.avail.idx.set(1);
+        let head = tx.create_queue().pop(mem).unwrap();
+        VsockPacket::from_tx_virtq_head(&head).unwrap()
+    }
+
+    #[test]
+    fn only_the_header_length_reaches_the_host_socket() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x40000)]).unwrap();
+        let (tx, rx) = (
+            TestQueue::new(GuestAddress(0x1000), &mem, 8),
+            TestQueue::new(GuestAddress(0x4000), &mem, 8),
+        );
+        mem.write_slice(&[0x5a; 4096], GuestAddress(DATA)).unwrap();
+        let (mut proxy, mut peer) = proxy_with_peer(&mem, &rx);
+
+        proxy.sendmsg(&tx_packet(&mem, &tx, 10, 4096));
+
+        peer.set_nonblocking(true).unwrap();
+        let mut received = [0u8; 8192];
+        let n = peer.read(&mut received).unwrap();
+        assert_eq!(n, 10, "sent the whole descriptor instead of the packet");
+    }
+}

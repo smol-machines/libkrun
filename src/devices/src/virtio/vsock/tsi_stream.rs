@@ -938,7 +938,7 @@ impl Proxy for TsiStreamProxy {
         // Accept the whole buffer from the guest (a vsock data packet is
         // all-or-nothing — there is no way to tell the guest we took only part),
         // then drain as much as the host socket will take right now.
-        if let Some(buf) = pkt.buf() {
+        if let Some(buf) = pkt.data() {
             self.tx_buf.extend(buf.iter().copied());
         }
 
