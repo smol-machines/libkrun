@@ -64,8 +64,9 @@ pub struct File {
     /// Storage helper.
     common_storage_helper: CommonStorageHelper,
 
-    /// macOS-only: Use fsync() instead of F_FULLFSYNC on `sync()` method.
-    #[cfg(target_os = "macos")]
+    /// Relaxed synchronization: `sync()` does not wait for the drive. On macOS it
+    /// uses fsync() instead of F_FULLFSYNC; elsewhere it skips the fsync, since
+    /// every write is already in the host page cache.
     relaxed_sync: bool,
 
     /// Set once we know that discard is unsupported and we can skip trying.
@@ -86,7 +87,6 @@ impl TryFrom<fs::File> for File {
             file,
             None,
             false,
-            #[cfg(target_os = "macos")]
             false,
         )
     }
@@ -316,10 +316,14 @@ impl Storage for File {
     }
 
     async fn sync(&self) -> io::Result<()> {
-        #[cfg(target_os = "macos")]
         if self.relaxed_sync {
-            // Safe: File descriptor is valid and there aren't any other arguments.
-            while_eintr(|| unsafe { libc::fsync(self.file.write().unwrap().as_raw_fd()) })?;
+            #[cfg(target_os = "macos")]
+            {
+                // Safe: File descriptor is valid and there aren't any other arguments.
+                while_eintr(|| unsafe { libc::fsync(self.file.write().unwrap().as_raw_fd()) })?;
+            }
+            // Elsewhere every write already sits in the host page cache, where
+            // readers of the file see it; only a host crash can lose it.
             return Ok(());
         }
         self.file.write().unwrap().sync_all()
@@ -414,7 +418,7 @@ impl File {
         mut file: fs::File,
         filename: Option<PathBuf>,
         direct_io: bool,
-        #[cfg(target_os = "macos")] relaxed_sync: bool,
+        relaxed_sync: bool,
     ) -> io::Result<Self> {
         let size = get_file_size(&file).err_context(|| "Failed to determine file size")?;
 
@@ -456,7 +460,6 @@ impl File {
             discard_align,
             size: size.into(),
             common_storage_helper: Default::default(),
-            #[cfg(target_os = "macos")]
             relaxed_sync,
             discard_unsupported: AtomicBool::new(false),
         })
@@ -776,7 +779,6 @@ impl File {
             file,
             Some(filename_owned),
             opts.direct,
-            #[cfg(target_os = "macos")]
             opts.relaxed_sync,
         )
     }
