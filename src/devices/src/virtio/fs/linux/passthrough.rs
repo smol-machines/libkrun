@@ -2579,6 +2579,8 @@ impl FileSystem for PassthroughFs {
         // Take just a read lock as we're not going to alter the file descriptor offset.
         let fd_out = data_out.file.read().unwrap().as_raw_fd();
 
+        let len = len.try_into().map_err(|_| einval())?;
+        let flags = flags.try_into().map_err(|_| einval())?;
         // Safe because this will only modify `offset_in` and `offset_out` and we check
         // the return value.
         let res = unsafe {
@@ -2587,8 +2589,8 @@ impl FileSystem for PassthroughFs {
                 &mut (offset_in as i64) as &mut _ as *mut _,
                 fd_out,
                 &mut (offset_out as i64) as &mut _ as *mut _,
-                len.try_into().unwrap(),
-                flags.try_into().unwrap(),
+                len,
+                flags,
             )
         };
         if res < 0 {
@@ -3161,5 +3163,65 @@ mod tests {
              the server uid (the scoped_cred Drop regressed to restoring euid 0)"
         );
         Ok(())
+    }
+
+    #[test]
+    fn copy_file_range_rejects_flags_wider_than_the_syscall_takes() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("libkrun-copy-range-{}-{nonce}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("src"), b"data").unwrap();
+        fs::write(root.join("dst"), b"").unwrap();
+
+        let filesystem = PassthroughFs::new(
+            Config {
+                root_dir: root.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        FileSystem::init(&filesystem, FsOptions::empty()).unwrap();
+        let context = Context {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        };
+        let open = |name: &str| {
+            let name = CString::new(name).unwrap();
+            let entry = FileSystem::lookup(&filesystem, context, fuse::ROOT_ID, &name).unwrap();
+            let (handle, _) = FileSystem::open(
+                &filesystem,
+                context,
+                entry.inode,
+                false,
+                libc::O_RDWR as u32,
+            )
+            .unwrap();
+            (entry.inode, handle.unwrap())
+        };
+        let (src, src_handle) = open("src");
+        let (dst, dst_handle) = open("dst");
+
+        let error = FileSystem::copyfilerange(
+            &filesystem,
+            context,
+            src,
+            src_handle,
+            0,
+            dst,
+            dst_handle,
+            0,
+            4,
+            1 << 32,
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
+
+        fs::remove_dir_all(root).unwrap();
     }
 }
