@@ -497,7 +497,13 @@ impl Queue {
     /// Returns the number of yet-to-be-popped descriptor chains in the avail ring.
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self, mem: &GuestMemoryMmap) -> u16 {
-        (self.avail_idx(mem, Ordering::Acquire).unwrap() - self.next_avail).0
+        match self.avail_idx(mem, Ordering::Acquire) {
+            Ok(idx) => (idx - self.next_avail).0,
+            Err(e) => {
+                error!("failed to read the available ring index: {e:?}");
+                0
+            }
+        }
     }
 
     /// Checks if the driver has made any descriptor chains available in the avail ring.
@@ -540,11 +546,15 @@ impl Queue {
         fence(Ordering::Acquire);
 
         // `self.is_valid()` already performed all the bound checks on the descriptor table
-        // and virtq rings, so it's safe to unwrap guest memory reads and to use unchecked
-        // offsets.
-        let desc_index: u16 = mem
-            .read_obj(self.avail_ring.unchecked_add(u64::from(index_offset)))
-            .unwrap();
+        // and virtq rings, so it's safe to use unchecked offsets.
+        let desc_index: u16 =
+            match mem.read_obj(self.avail_ring.unchecked_add(u64::from(index_offset))) {
+                Ok(index) => index,
+                Err(e) => {
+                    error!("failed to read the available ring: {e:?}");
+                    return None;
+                }
+            };
 
         DescriptorChain::checked_new(mem, self.desc_table, self.actual_size(), desc_index)
             .inspect(|_| self.next_avail += Wrapping(1))
@@ -1239,5 +1249,22 @@ pub(crate) mod tests {
         let x = vq.used.ring[0].get();
         assert_eq!(x.id, 1);
         assert_eq!(x.len, 0x1000);
+    }
+
+    #[test]
+    fn popping_from_rings_outside_guest_memory_fails_cleanly() {
+        let m = &GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let vq = VirtQueue::new(GuestAddress(0), m, 16);
+
+        let mut q = vq.create_queue();
+        q.avail_ring = GuestAddress(0x10_0000);
+        assert_eq!(q.len(m), 0);
+        assert!(q.pop(m).is_none());
+
+        // The index is readable but the ring entry it points at is not.
+        let mut q = vq.create_queue();
+        q.avail_ring = GuestAddress(0x10000 - 4);
+        m.write_obj::<u16>(1, GuestAddress(0x10000 - 2)).unwrap();
+        assert!(q.pop(m).is_none());
     }
 }
