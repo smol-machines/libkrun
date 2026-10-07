@@ -67,6 +67,7 @@ fn main() -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     {
         fs::mount_filesystems()?;
+        fs::run_from_memory();
         fs::mount_block_root_device()?;
         fs::mount_shared_root()?;
     }
