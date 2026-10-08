@@ -554,7 +554,7 @@ impl Proxy for UnixProxy {
     }
 
     fn push_op_request(&self) {
-        info!(
+        debug!(
             "[VSOCK_TIMING] push_op_request: id={:#x} local_port={} peer_port={} (expecting RESPONSE with src_port={} dst_port={})",
             self.id, self.local_port, self.peer_port, self.peer_port, self.local_port
         );
@@ -625,6 +625,23 @@ impl Proxy for UnixProxy {
         // If we're in ReverseInit (sent OP_REQUEST, got RST because guest
         // listener isn't ready yet), immediately re-send OP_REQUEST.
         // The vsock virtio round-trip (~100-500μs) naturally throttles retries.
+        //
+        // The host socket is not polled until the guest accepts, so a host
+        // client that has already given up is only noticed here. Without this
+        // check every abandoned connect kept retrying: a host probing a slow
+        // guest every few ms stacked thousands of retry loops on the guest's
+        // vsock queue and slowed the boot it was waiting for.
+        if self.status == ProxyStatus::ReverseInit && sys::peer_hung_up(&self.sock) {
+            debug!(
+                "host closed id={:#x} before the guest accepted; not retrying",
+                self.id
+            );
+            self.status = ProxyStatus::Closed;
+            return ProxyUpdate {
+                remove_proxy: ProxyRemoval::Deferred,
+                ..Default::default()
+            };
+        }
         if self.status == ProxyStatus::ReverseInit && self.connect_retries < MAX_CONNECT_RETRIES {
             self.connect_retries += 1;
             if self.connect_retries.is_multiple_of(100) {
@@ -777,28 +794,28 @@ pub struct UnixAcceptorProxy {
 impl UnixAcceptorProxy {
     pub fn new(id: u64, path: &PathBuf, peer_port: u32) -> Result<Self, ProxyError> {
         let start = std::time::Instant::now();
-        info!(
+        debug!(
             "[VSOCK_TIMING] UnixAcceptorProxy::new() id={:#x} path={:?} peer_port={}",
             id, path, peer_port
         );
 
         let sock =
             Socket::new(Domain::UNIX, Type::STREAM, None).map_err(ProxyError::CreatingSocket)?;
-        info!(
+        debug!(
             "[VSOCK_TIMING] UnixAcceptorProxy socket created in {:?}",
             start.elapsed()
         );
 
         let addr = SockAddr::unix(path).map_err(ProxyError::CreatingSocket)?;
         sock.bind(&addr).map_err(ProxyError::CreatingSocket)?;
-        info!(
+        debug!(
             "[VSOCK_TIMING] UnixAcceptorProxy bound to {:?} in {:?}",
             path,
             start.elapsed()
         );
 
         sock.listen(5).map_err(ProxyError::CreatingSocket)?;
-        info!(
+        debug!(
             "[VSOCK_TIMING] UnixAcceptorProxy listening, total setup {:?}",
             start.elapsed()
         );
@@ -868,7 +885,7 @@ impl Proxy for UnixAcceptorProxy {
             return update;
         }
         if evset.contains(EventSet::IN) {
-            info!(
+            debug!(
                 "[VSOCK_TIMING] UnixAcceptorProxy id={:#x} received IN event, accepting connection",
                 self.id
             );
@@ -876,7 +893,7 @@ impl Proxy for UnixAcceptorProxy {
 
             match self.sock.accept() {
                 Ok((new_sock, _addr)) => {
-                    info!(
+                    debug!(
                         "[VSOCK_TIMING] UnixAcceptorProxy id={:#x} accepted connection in {:?}",
                         self.id,
                         accept_start.elapsed()

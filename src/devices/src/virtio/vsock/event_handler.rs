@@ -23,7 +23,7 @@ impl Vsock {
 
         let count = RX_EVENT_COUNT.fetch_add(1, Ordering::Relaxed);
         if count < 5 {
-            info!("[VSOCK_TIMING] handle_rxq_event: RX event #{}", count + 1);
+            debug!("[VSOCK_TIMING] handle_rxq_event: RX event #{}", count + 1);
         }
 
         debug!("RX queue event");
@@ -55,10 +55,10 @@ impl Vsock {
         let count = TX_EVENT_COUNT.fetch_add(1, Ordering::Relaxed);
         if count == 0 {
             let _ = FIRST_TX_TIME.set(std::time::Instant::now());
-            info!("[VSOCK_TIMING] handle_txq_event: FIRST TX event from guest!");
+            debug!("[VSOCK_TIMING] handle_txq_event: FIRST TX event from guest!");
         }
         if count < 5 {
-            info!("[VSOCK_TIMING] handle_txq_event: TX event #{}", count + 1);
+            debug!("[VSOCK_TIMING] handle_txq_event: TX event #{}", count + 1);
         }
 
         debug!("TX queue event");
@@ -108,7 +108,7 @@ impl Vsock {
     }
 
     fn handle_activate_event(&self, event_manager: &mut EventManager) {
-        info!(
+        debug!(
             "[VSOCK_TIMING] handle_activate_event called - registering RX/TX queues with event manager"
         );
         debug!("activate event");
@@ -169,7 +169,7 @@ impl Vsock {
                 error!("Failed to unregister vsock activate evt: {e:?}");
             });
 
-        info!("[VSOCK_TIMING] handle_activate_event completed - vsock queues registered");
+        debug!("[VSOCK_TIMING] handle_activate_event completed - vsock queues registered");
     }
 }
 

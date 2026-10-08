@@ -240,7 +240,7 @@ impl VsockMuxer {
         interrupt: InterruptTransport,
     ) {
         let activate_start = std::time::Instant::now();
-        info!("[VSOCK_TIMING] muxer.activate() called, cid={}", self.cid);
+        debug!("[VSOCK_TIMING] muxer.activate() called, cid={}", self.cid);
 
         self.queue = Some(queue.clone());
         self.mem = Some(mem.clone());
@@ -253,7 +253,7 @@ impl VsockMuxer {
         // TLS cert validation fails ("certificate not yet valid").
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
-            info!("[VSOCK_TIMING] starting TimesyncThread");
+            debug!("[VSOCK_TIMING] starting TimesyncThread");
             let timesync = TimesyncThread::new(
                 self.cid,
                 mem.clone(),
@@ -262,7 +262,7 @@ impl VsockMuxer {
                 self.snapshot_gate.clone(),
             );
             timesync.run();
-            info!("[VSOCK_TIMING] TimesyncThread started");
+            debug!("[VSOCK_TIMING] TimesyncThread started");
         }
 
         // Spawn the DNS worker (off-muxer blocking resolution) when DNS
@@ -283,13 +283,13 @@ impl VsockMuxer {
                 );
                 worker.run();
                 self.dns_sender = Some(dns_sender);
-                info!("[VSOCK_TIMING] DnsWorker spawned");
+                debug!("[VSOCK_TIMING] DnsWorker spawned");
             }
         }
 
         let (sender, receiver) = unbounded();
 
-        info!(
+        debug!(
             "[VSOCK_TIMING] creating MuxerThread with {} unix_ipc_ports",
             self.unix_ipc_port_map
                 .as_ref()
@@ -309,14 +309,14 @@ impl VsockMuxer {
             self.snapshot_gate.clone(),
         );
         thread.run();
-        info!("[VSOCK_TIMING] MuxerThread spawned");
+        debug!("[VSOCK_TIMING] MuxerThread spawned");
 
         self.reaper_sender = Some(sender);
         let reaper = ReaperThread::new(receiver, self.proxy_map.clone());
         reaper.run();
-        info!("[VSOCK_TIMING] ReaperThread spawned");
+        debug!("[VSOCK_TIMING] ReaperThread spawned");
 
-        info!(
+        debug!(
             "[VSOCK_TIMING] muxer.activate() completed in {:?}",
             activate_start.elapsed()
         );
@@ -871,7 +871,7 @@ impl VsockMuxer {
     fn process_op_request(&mut self, pkt: &VsockPacket) {
         debug!("OP_REQUEST");
         let id: u64 = ((pkt.src_port() as u64) << 32) | (pkt.dst_port() as u64);
-        info!(
+        debug!(
             "[VSOCK_TIMING] process_op_request: id={:#x} src_port={} dst_port={}",
             id,
             pkt.src_port(),
@@ -949,7 +949,7 @@ impl VsockMuxer {
     fn process_op_response(&self, pkt: &VsockPacket) {
         debug!("OP_RESPONSE");
         let id: u64 = ((pkt.src_port() as u64) << 32) | (pkt.dst_port() as u64);
-        info!(
+        debug!(
             "[VSOCK_TIMING] process_op_response: id={:#x} src_port={} dst_port={}",
             id,
             pkt.src_port(),
@@ -963,7 +963,7 @@ impl VsockMuxer {
             .map(|proxy| proxy.lock().unwrap().process_op_response(pkt));
 
         if update.is_none() {
-            info!(
+            debug!(
                 "[VSOCK_TIMING] process_op_response: NO PROXY FOUND for id={:#x}",
                 id
             );
@@ -1073,14 +1073,14 @@ impl VsockMuxer {
     fn process_stream_rst(&self, pkt: &VsockPacket) {
         debug!("OP_RST");
         let id: u64 = ((pkt.src_port() as u64) << 32) | (pkt.dst_port() as u64);
-        info!(
+        debug!(
             "[VSOCK_TIMING] process_stream_rst: GUEST SENT RST! id={:#x} src_port={} dst_port={}",
             id,
             pkt.src_port(),
             pkt.dst_port()
         );
         if let Some(proxy_lock) = self.proxy_map.read().unwrap().get(&id) {
-            info!(
+            debug!(
                 "[VSOCK_TIMING] OP_RST: releasing proxy id={:#x} src={} dst={}",
                 id,
                 pkt.src_port(),
@@ -1090,7 +1090,7 @@ impl VsockMuxer {
             let update = proxy.release();
             self.process_proxy_update(id, update);
         } else {
-            info!("[VSOCK_TIMING] OP_RST: no proxy found for id={:#x}", id);
+            debug!("[VSOCK_TIMING] OP_RST: no proxy found for id={:#x}", id);
         }
     }
 
@@ -1110,7 +1110,7 @@ impl VsockMuxer {
                 uapi::VSOCK_OP_RST => "RST",
                 _ => "UNKNOWN",
             };
-            info!(
+            debug!(
                 "[VSOCK_TIMING] send_stream_pkt #{}: op={} src_port={} dst_port={}",
                 count,
                 op_name,

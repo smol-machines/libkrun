@@ -455,7 +455,7 @@ impl VirtioDevice for Vsock {
         queues: Vec<DeviceQueue>,
     ) -> ActivateResult {
         let activate_start = std::time::Instant::now();
-        info!("[VSOCK_TIMING] device.activate() called, cid={}", self.cid);
+        debug!("[VSOCK_TIMING] device.activate() called, cid={}", self.cid);
 
         if queues.len() != defs::NUM_QUEUES {
             error!(
@@ -491,7 +491,7 @@ impl VirtioDevice for Vsock {
 
         self.device_state = DeviceState::Activated(mem, interrupt);
 
-        info!(
+        debug!(
             "[VSOCK_TIMING] device.activate() completed in {:?}",
             activate_start.elapsed()
         );

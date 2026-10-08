@@ -55,6 +55,30 @@ pub fn recv_into(sock: &Socket, buf: &mut [u8]) -> io::Result<usize> {
     }
 }
 
+/// True if the host end of `sock` has closed. A zero-timeout poll never blocks;
+/// a closed peer reports `POLLHUP` even while unread bytes are still queued, so
+/// this holds for a client that wrote a request and then gave up waiting.
+/// Windows reports no hang-up here and keeps the previous behavior.
+pub fn peer_hung_up(sock: &Socket) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let mut fd = libc::pollfd {
+            fd: sock.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd for a descriptor `sock` keeps open.
+        let ready = unsafe { libc::poll(&mut fd, 1, 0) };
+        ready > 0 && fd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+    }
+    #[cfg(windows)]
+    {
+        let _ = sock;
+        false
+    }
+}
+
 /// True if a nonblocking `connect` error means "connection in progress" rather
 /// than a hard failure (`EINPROGRESS` on Unix, `WSAEWOULDBLOCK` on Windows).
 pub fn connect_in_progress(e: &io::Error) -> bool {
@@ -123,5 +147,33 @@ fn wsa_to_linux_errno(wsa: i32) -> i32 {
         10061 => E_CONNREFUSED,         // WSAECONNREFUSED
         10064 | 10065 => E_HOSTUNREACH, // WSAEHOSTDOWN / WSAEHOSTUNREACH
         _ => E_IO,
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::peer_hung_up;
+    use socket2::Socket;
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn peer_hung_up_reports_only_a_closed_host_end() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let ours = Socket::from(std::os::fd::OwnedFd::from(ours));
+        assert!(!peer_hung_up(&ours));
+        drop(theirs);
+        assert!(peer_hung_up(&ours));
+    }
+
+    #[test]
+    fn peer_hung_up_holds_with_unread_bytes_queued() {
+        // A host probe writes its request, times out waiting, and closes.
+        let (ours, mut theirs) = UnixStream::pair().unwrap();
+        let ours = Socket::from(std::os::fd::OwnedFd::from(ours));
+        theirs.write_all(b"ping").unwrap();
+        assert!(!peer_hung_up(&ours));
+        drop(theirs);
+        assert!(peer_hung_up(&ours));
     }
 }

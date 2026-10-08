@@ -120,7 +120,7 @@ impl MuxerThread {
         if let Some((peer_port, accept_fd, family, proxy_type)) = update.new_proxy {
             let local_port: u32 = thread_rng.random_range(1024..u32::MAX);
             let new_id: u64 = ((peer_port as u64) << 32) | (local_port as u64);
-            info!(
+            debug!(
                 "[VSOCK_TIMING] creating new proxy: new_id={:#x} (peer_port={}, local_port={}) from acceptor id={:#x}",
                 new_id, peer_port, local_port, id
             );
@@ -154,7 +154,7 @@ impl MuxerThread {
                 .write()
                 .unwrap()
                 .insert(new_id, Mutex::new(new_proxy));
-            info!("[VSOCK_TIMING] new proxy inserted into proxy_map, calling push_op_request");
+            debug!("[VSOCK_TIMING] new proxy inserted into proxy_map, calling push_op_request");
             if let Some(proxy) = self.proxy_map.read().unwrap().get(&new_id) {
                 proxy.lock().unwrap().push_op_request();
             };
@@ -171,26 +171,26 @@ impl MuxerThread {
     /// (AF_UNIX is available on Unix and Windows via socket2).
     fn create_lisening_ipc_sockets(&self) {
         let start = std::time::Instant::now();
-        info!(
+        debug!(
             "[VSOCK_TIMING] create_lisening_ipc_sockets() called, {} ports to create",
             self.unix_ipc_port_map.len()
         );
 
         for (port, (path, do_listen)) in &self.unix_ipc_port_map {
             if !do_listen {
-                info!("[VSOCK_TIMING] skipping port {} (do_listen=false)", port);
+                debug!("[VSOCK_TIMING] skipping port {} (do_listen=false)", port);
                 continue;
             }
             let proxy_start = std::time::Instant::now();
             let id = ((*port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
-            info!(
+            debug!(
                 "[VSOCK_TIMING] creating UnixAcceptorProxy for port {} at {:?}",
                 port, path
             );
 
             let proxy = match UnixAcceptorProxy::new(id, path, *port) {
                 Ok(proxy) => {
-                    info!(
+                    debug!(
                         "[VSOCK_TIMING] UnixAcceptorProxy created for port {} in {:?}",
                         port,
                         proxy_start.elapsed()
@@ -209,10 +209,10 @@ impl MuxerThread {
             if let Some(proxy) = self.proxy_map.read().unwrap().get(&id) {
                 self.update_polling(id, proxy.lock().unwrap().poll_handle(), EventSet::IN);
             };
-            info!("[VSOCK_TIMING] port {} registered with epoll", port);
+            debug!("[VSOCK_TIMING] port {} registered with epoll", port);
         }
 
-        info!(
+        debug!(
             "[VSOCK_TIMING] create_lisening_ipc_sockets() completed in {:?}",
             start.elapsed()
         );
@@ -220,12 +220,12 @@ impl MuxerThread {
 
     fn work(mut self) {
         let work_start = std::time::Instant::now();
-        info!("[VSOCK_TIMING] MuxerThread work() started");
+        debug!("[VSOCK_TIMING] MuxerThread work() started");
 
         let mut thread_rng = rng();
         self.create_lisening_ipc_sockets();
 
-        info!(
+        debug!(
             "[VSOCK_TIMING] MuxerThread entering epoll loop after {:?}",
             work_start.elapsed()
         );
@@ -240,7 +240,7 @@ impl MuxerThread {
             {
                 Ok(ev_cnt) => {
                     if first_event && ev_cnt > 0 {
-                        info!(
+                        debug!(
                             "[VSOCK_TIMING] MuxerThread received first epoll event(s) after {:?} since work() start",
                             work_start.elapsed()
                         );
@@ -255,7 +255,7 @@ impl MuxerThread {
 
                         // Log connection-related events
                         if event_count <= 10 {
-                            info!(
+                            debug!(
                                 "[VSOCK_TIMING] processing event #{}: id={:#x} evset={:?}",
                                 event_count, id, evset
                             );
