@@ -620,6 +620,10 @@ pub struct RestoredMemory {
     pub fork_backed_regions: Vec<bool>,
     #[cfg(target_os = "linux")]
     pub layered_ram: Option<super::layered_restore::Generation>,
+    /// Per region, the file a copy-on-write region still exactly mirrors and
+    /// its offset, so promotion can copy only that file's data extents.
+    #[cfg(target_os = "linux")]
+    pub cow_backing: Vec<Option<(std::fs::File, u64)>>,
 }
 
 pub fn build_microvm(
@@ -663,6 +667,16 @@ pub fn build_microvm(
             cow_backing,
         }) => (
             Some(RestoredMemory {
+                // A duplicate that cannot be made only costs that region the
+                // slower page-by-page promotion.
+                cow_backing: cow_backing
+                    .iter()
+                    .map(|backing| {
+                        backing.as_ref().and_then(|(file, offset)| {
+                            file.try_clone().ok().map(|file| (file, *offset))
+                        })
+                    })
+                    .collect(),
                 guest_memory,
                 fork_backed_regions,
                 layered_ram: layered_ram.clone(),
@@ -2519,13 +2533,20 @@ pub fn create_guest_memory(
                 ))
             })?;
         let guest_mem = if memfd_backed_ram_enabled() && needs_fork_backing && !layered {
+            #[cfg(target_os = "linux")]
+            let promoted = super::snapshot::materialize_guest_memory_from_backing(
+                &guest_mem,
+                &fork_backed_regions,
+                &restored.cow_backing,
+            );
+            #[cfg(not(target_os = "linux"))]
             let promoted =
-                super::snapshot::materialize_guest_memory(&guest_mem, &fork_backed_regions)
-                    .map_err(|error| {
-                        StartMicrovmError::GuestMemoryMmap(format!(
-                            "materialize restored fork source: {error}"
-                        ))
-                    })?;
+                super::snapshot::materialize_guest_memory(&guest_mem, &fork_backed_regions);
+            let promoted = promoted.map_err(|error| {
+                StartMicrovmError::GuestMemoryMmap(format!(
+                    "materialize restored fork source: {error}"
+                ))
+            })?;
             // `guest_mem` shadows the returned value below. Drop the source
             // mapping explicitly after the copy rather than retaining a full
             // second guest-RAM mapping until this function returns.
