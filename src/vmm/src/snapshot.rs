@@ -1097,6 +1097,85 @@ pub fn materialize_guest_memory(
     Ok(dst)
 }
 
+/// [`materialize_guest_memory`] for a clone whose regions are still exact
+/// copy-on-write views of `backing` files: nothing has run in the clone yet.
+///
+/// Scanning the source mapping faults in every page of guest RAM just to find
+/// it is zero, so promoting a large, mostly empty clone cost seconds. Copying
+/// only the data extents of each backing file skips its never-written holes and
+/// leaves them as holes in the new memory. Regions without a backing file, or
+/// whose file cannot report extents, fall back to the page scan.
+#[cfg(target_os = "linux")]
+pub fn materialize_guest_memory_from_backing(
+    src: &GuestMemoryMmap,
+    fork_backed_regions: &[bool],
+    backing: &[Option<(File, u64)>],
+) -> io::Result<GuestMemoryMmap> {
+    if src.num_regions() != fork_backed_regions.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "guest-memory region count {} does not match fork backing mask {}",
+                src.num_regions(),
+                fork_backed_regions.len()
+            ),
+        ));
+    }
+    let mut copied = Vec::with_capacity(src.num_regions());
+    let ranges = src
+        .iter()
+        .zip(fork_backed_regions.iter().copied())
+        .enumerate()
+        .map(|(index, (region, file_backed))| {
+            let size = region.len() as usize;
+            if !file_backed {
+                copied.push(false);
+                return Ok((region.start_addr(), size, None));
+            }
+            let mut file =
+                crate::builder::create_guest_ram_memfd(size).map_err(io::Error::other)?;
+            let done = match backing.get(index).and_then(Option::as_ref) {
+                Some((source, offset)) => {
+                    copy_file_extents(source, *offset, region.len(), &mut file, 0)?
+                }
+                None => false,
+            };
+            copied.push(done);
+            Ok((region.start_addr(), size, Some(FileOffset::new(file, 0))))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let dst = GuestMemoryMmap::from_ranges_with_files(ranges)
+        .map_err(|error| io::Error::other(format!("materialize guest memory: {error:?}")))?;
+    const ZERO_PAGE: [u8; 4096] = [0; 4096];
+    for (region, done) in src.iter().zip(copied) {
+        if done {
+            continue;
+        }
+        let address = region.start_addr();
+        let source = src
+            .get_host_address(address)
+            .map_err(|error| io::Error::other(format!("source address: {error:?}")))?;
+        let destination = dst
+            .get_host_address(address)
+            .map_err(|error| io::Error::other(format!("destination address: {error:?}")))?;
+        // SAFETY: the restored image is quiescent, the entire region is mapped,
+        // and the newly allocated destination cannot overlap the source.
+        let bytes = unsafe { std::slice::from_raw_parts(source, region.len() as usize) };
+        for (page_index, page) in bytes.chunks(ZERO_PAGE.len()).enumerate() {
+            if page != &ZERO_PAGE[..page.len()] {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        page.as_ptr(),
+                        destination.add(page_index * ZERO_PAGE.len()),
+                        page.len(),
+                    );
+                }
+            }
+        }
+    }
+    Ok(dst)
+}
+
 /// Return whether a restored guest-memory mapping must be copied into fresh
 /// fork backing before it can become a live fork source.
 ///
@@ -5331,6 +5410,75 @@ mod tests {
         restored.read_slice(&mut expected, GuestAddress(0)).unwrap();
         promoted.read_slice(&mut actual, GuestAddress(0)).unwrap();
         assert_eq!(actual, expected);
+    }
+
+    // A clone still mirrors its source's backing file at promotion, so copying
+    // that file's data extents must give identical memory without touching, or
+    // allocating, the never-written rest.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn promotion_from_backing_copies_only_written_extents() {
+        use crate::builder::create_guest_ram_memfd;
+        use std::os::unix::fs::{FileExt, MetadataExt};
+
+        const LEN: usize = 32 * 1024 * 1024;
+        let backing = create_guest_ram_memfd(LEN).unwrap();
+        backing.write_all_at(&[0xA5; 4096], 4096 * 3).unwrap();
+        backing.write_all_at(&[0x5A], (LEN - 1) as u64).unwrap();
+        let view = GuestMemoryMmap::from_ranges_with_files([(
+            GuestAddress(0),
+            LEN,
+            Some(FileOffset::new(backing.try_clone().unwrap(), 0)),
+        )])
+        .unwrap();
+
+        let promoted =
+            materialize_guest_memory_from_backing(&view, &[true], &[Some((backing, 0))]).unwrap();
+        let allocated = promoted
+            .iter()
+            .next()
+            .unwrap()
+            .file_offset()
+            .unwrap()
+            .file()
+            .metadata()
+            .unwrap()
+            .blocks()
+            * 512;
+        assert!(
+            allocated <= 64 * 1024,
+            "promotion allocated {allocated} bytes for two written pages"
+        );
+        let mut expected = vec![0; LEN];
+        let mut actual = vec![0; LEN];
+        view.read_slice(&mut expected, GuestAddress(0)).unwrap();
+        promoted.read_slice(&mut actual, GuestAddress(0)).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    // A region with no backing file (an anonymous or demand-paged view) must
+    // still be promoted exactly, by scanning its pages.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn promotion_from_backing_scans_regions_without_a_file() {
+        let regions = [
+            (GuestAddress(0), 0x3000usize),
+            (GuestAddress(0x10000), 0x2000),
+        ];
+        let restored = GuestMemoryMmap::from_ranges(&regions).unwrap();
+        for (address, _) in regions {
+            restored.write_slice(&[0xC3; 4096], address).unwrap();
+        }
+        let promoted =
+            materialize_guest_memory_from_backing(&restored, &[true, false], &[None, None])
+                .unwrap();
+        for (address, len) in regions {
+            let mut expected = vec![0; len];
+            let mut actual = vec![0; len];
+            restored.read_slice(&mut expected, address).unwrap();
+            promoted.read_slice(&mut actual, address).unwrap();
+            assert_eq!(actual, expected);
+        }
     }
 
     #[test]
