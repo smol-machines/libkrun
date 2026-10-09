@@ -1812,6 +1812,15 @@ impl Vmm {
         if !has_memfd_backed_memory(&descs) && !layered {
             return Err(Error::ForkRequiresMemfd);
         }
+        // A source that continued past an earlier generation runs on private
+        // copy-on-write pages over that generation's memfd, so the memfd no
+        // longer holds its current RAM. Publishing it would give clones the
+        // old generation's memory under the current vCPU and device state, and
+        // they panic or hang on the first page that changed since.
+        #[cfg(all(target_os = "linux", fork_continue_supported, feature = "blk"))]
+        let needs_materialization = !layered
+            && snapshot::guest_memory_has_private_backing(&self.guest_memory)
+                .map_err(|e| Error::Snapshot(format!("inspect fork RAM backing: {e}")))?;
         #[cfg(target_os = "linux")]
         let mut memory = ForkMemory::Mapped(descs);
         #[cfg(not(target_os = "linux"))]
@@ -1829,6 +1838,22 @@ impl Vmm {
             #[cfg(target_os = "linux")]
             if let Some(generation) = self.capture_layered_ram()? {
                 memory = ForkMemory::Layered(generation);
+            }
+            // The source stays frozen, so copy its current RAM into a fresh
+            // generation right here, as a continuing branch does, and keep the
+            // files open in this process for clones to map.
+            #[cfg(all(target_os = "linux", fork_continue_supported, feature = "blk"))]
+            if needs_materialization && matches!(memory, ForkMemory::Mapped(_)) {
+                let copy = snapshot::start_fork_generation_copy_with_windows(
+                    &self.guest_memory,
+                    Some(self.device_windows_start()),
+                )
+                .map_err(|e| Error::Snapshot(format!("start RAM generation worker: {e}")))?;
+                let (descs, files) = copy
+                    .finish()
+                    .map_err(|e| Error::Snapshot(format!("finish RAM generation worker: {e}")))?;
+                self.retained_generation_files = files;
+                memory = ForkMemory::Mapped(descs);
             }
             #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
             let ioapic = self.intc.lock().unwrap().save_state();
