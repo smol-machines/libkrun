@@ -1557,6 +1557,9 @@ impl Vmm {
         // Only Linux can fall back to reading a held VM's RAM in place.
         #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] held: bool,
     ) -> Result<(VmCheckpoint, snapshot::DeferredMemorySave)> {
+        // Only Linux can hold a save it cannot retain as a generation.
+        #[cfg(not(target_os = "linux"))]
+        let _ = held;
         self.pause()?;
         let capture = (|| {
             self.quiesce_devices()?;
