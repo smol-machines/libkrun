@@ -492,7 +492,9 @@ impl FileReadWriteAtVolatile for File {
                 break;
             }
             let n = slice.len().min(total - copied);
-            slice.subslice(0, n).map_err(|e| Error::new(ErrorKind::InvalidInput, format!("{e:?}")))?
+            slice
+                .subslice(0, n)
+                .map_err(|e| Error::new(ErrorKind::InvalidInput, format!("{e:?}")))?
                 .copy_from(&tmp[copied..copied + n]);
             copied += n;
         }
@@ -550,8 +552,7 @@ impl FileReadWriteAtVolatile for DiskProperties {
         if bufs.len() > 1 {
             let len: usize = bufs.iter().map(|b| b.len()).sum();
             let mut tmp = vec![0u8; len];
-            self.file
-                .readv(IoVectorMut::from(&mut tmp), offset)?;
+            self.file.readv(IoVectorMut::from(&mut tmp), offset)?;
             let mut at = 0;
             for slice in bufs {
                 slice.copy_from(&tmp[at..at + slice.len()]);
@@ -588,8 +589,7 @@ impl FileReadWriteAtVolatile for DiskProperties {
                 slice.copy_to(&mut tmp[at..at + slice.len()]);
                 at += slice.len();
             }
-            self.file
-                .writev(IoVector::from(&tmp), offset)?;
+            self.file.writev(IoVector::from(&tmp), offset)?;
             return Ok(len);
         }
 

@@ -1959,8 +1959,9 @@ impl FileSystem for PassthroughFs {
         // is a CreateFile on the host, so read it only when this request
         // changes ownership, mode or size, and write it back only if the
         // values actually change (tar and cp re-apply what create already set).
-        let touches_override = valid
-            .intersects(SetattrValid::MODE | SetattrValid::UID | SetattrValid::GID | SetattrValid::SIZE);
+        let touches_override = valid.intersects(
+            SetattrValid::MODE | SetattrValid::UID | SetattrValid::GID | SetattrValid::SIZE,
+        );
         let original = if touches_override {
             read_override_stat(&path).unwrap_or((Some(u32::MAX), Some(u32::MAX), None))
         } else {

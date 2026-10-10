@@ -172,7 +172,11 @@ impl Vm {
         // keeps sharing pages with its checkpoint.
         let anonymous = guest_mem.iter().all(|r| r.file_offset().is_none());
         let mode = std::env::var("SMOLVM_WHP_PREFILL").unwrap_or_else(|_| {
-            if anonymous { "advise-read".into() } else { String::new() }
+            if anonymous {
+                "advise-read".into()
+            } else {
+                String::new()
+            }
         });
         if mode != "off" {
             self.prefill(&mode);

@@ -11,15 +11,6 @@ use std::sync::Arc;
 use log::{debug, error};
 use windows_sys::Win32::Foundation::{S_OK, WHV_E_INSUFFICIENT_BUFFER};
 use windows_sys::Win32::System::Hypervisor::{
-    WHvCapabilityCodeSyntheticProcessorFeaturesBanks, WHvGetVirtualProcessorState, WHvRegisterGuestOsId, WHvRegisterReferenceTsc,
-    WHvRegisterScontrol, WHvRegisterSiefp, WHvRegisterSimp, WHvRegisterSint0, WHvRegisterSint1,
-    WHvRegisterSint10, WHvRegisterSint11, WHvRegisterSint12, WHvRegisterSint13,
-    WHvRegisterSint14, WHvRegisterSint15, WHvRegisterSint2, WHvRegisterSint3, WHvRegisterSint4,
-    WHvRegisterSint5, WHvRegisterSint6, WHvRegisterSint7, WHvRegisterSint8, WHvRegisterSint9,
-    WHvRegisterVpAssistPage, WHvSetVirtualProcessorState,
-    WHvVirtualProcessorStateTypeSynicTimerState, WHvX64RegisterHypercall,
-};
-use windows_sys::Win32::System::Hypervisor::{
     WHV_CAPABILITY, WHV_EMULATOR_CALLBACKS, WHV_EMULATOR_STATUS, WHV_MEMORY_ACCESS_CONTEXT,
     WHV_PARTITION_HANDLE, WHV_PARTITION_PROPERTY, WHV_PARTITION_PROPERTY_CODE,
     WHV_PROCESSOR_FEATURES_BANKS, WHV_REGISTER_NAME, WHV_REGISTER_VALUE, WHV_RUN_VP_EXIT_CONTEXT,
@@ -49,6 +40,15 @@ use windows_sys::Win32::System::Hypervisor::{
 use windows_sys::Win32::System::Hypervisor::{
     WHV_EMULATOR_IO_ACCESS_INFO, WHV_EMULATOR_MEMORY_ACCESS_INFO, WHV_TRANSLATE_GVA_FLAGS,
     WHV_TRANSLATE_GVA_RESULT, WHV_TRANSLATE_GVA_RESULT_CODE, WHvTranslateGva,
+};
+use windows_sys::Win32::System::Hypervisor::{
+    WHvCapabilityCodeSyntheticProcessorFeaturesBanks, WHvGetVirtualProcessorState,
+    WHvRegisterGuestOsId, WHvRegisterReferenceTsc, WHvRegisterScontrol, WHvRegisterSiefp,
+    WHvRegisterSimp, WHvRegisterSint0, WHvRegisterSint1, WHvRegisterSint2, WHvRegisterSint3,
+    WHvRegisterSint4, WHvRegisterSint5, WHvRegisterSint6, WHvRegisterSint7, WHvRegisterSint8,
+    WHvRegisterSint9, WHvRegisterSint10, WHvRegisterSint11, WHvRegisterSint12, WHvRegisterSint13,
+    WHvRegisterSint14, WHvRegisterSint15, WHvRegisterVpAssistPage, WHvSetVirtualProcessorState,
+    WHvVirtualProcessorStateTypeSynicTimerState, WHvX64RegisterHypercall,
 };
 // Register names + state APIs used for checkpoint/restore (snapshot & fork).
 use windows_sys::Win32::System::Hypervisor::{
@@ -271,8 +271,7 @@ fn srso_user_kernel_no_leaf() -> Option<WHV_X64_CPUID_RESULT> {
     if std::env::var_os("SMOLVM_WHP_NO_SRSO_HINT").is_some() {
         return None;
     }
-    // SAFETY: CPUID is always available on x86_64.
-    let (vendor, sig, max_ext) = unsafe {
+    let (vendor, sig, max_ext) = {
         let v = core::arch::x86_64::__cpuid(0);
         (
             [v.ebx, v.edx, v.ecx],
@@ -286,8 +285,8 @@ fn srso_user_kernel_no_leaf() -> Option<WHV_X64_CPUID_RESULT> {
     if !is_amd || family < 0x1a || max_ext < 0x8000_0021 {
         return None;
     }
-    // SAFETY: leaf checked against the maximum extended leaf above.
-    let host = unsafe { core::arch::x86_64::__cpuid(0x8000_0021) };
+    // Leaf checked against the maximum extended leaf above.
+    let host = core::arch::x86_64::__cpuid(0x8000_0021);
     Some(WHV_X64_CPUID_RESULT {
         Function: 0x8000_0021,
         Reserved: [0; 3],
@@ -351,7 +350,8 @@ const SYNTH_BASE: u64 = 0xB8F;
 /// synthetic timers (5) with direct mode (22), APIC access MSRs and the VP
 /// assist page for lazy EOI (6), extended processor masks (24), TLB-flush
 /// hypercalls (25) and cluster-IPI hypercalls (26).
-const SYNTH_ENLIGHTENED: u64 = SYNTH_BASE | 1 << 4 | 1 << 5 | 1 << 6 | 1 << 22 | 1 << 24 | 1 << 25 | 1 << 26;
+const SYNTH_ENLIGHTENED: u64 =
+    SYNTH_BASE | 1 << 4 | 1 << 5 | 1 << 6 | 1 << 22 | 1 << 24 | 1 << 25 | 1 << 26;
 
 static ENLIGHTENED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 

@@ -600,14 +600,13 @@ impl BlockWorker {
             let req_bytes = reader.available_bytes() + writer.available_bytes();
             let processed = self.process_request(request_header, &mut reader, &mut writer);
             blk_stats::finish(req_type, req_bytes, req_started);
-            let (status, len): (u8, usize) =
-                match processed {
-                    Ok(l) => (VIRTIO_BLK_S_OK.try_into().unwrap(), l),
-                    Err(e) => {
-                        error!("error processing request: {e:?}");
-                        (VIRTIO_BLK_S_IOERR.try_into().unwrap(), 0)
-                    }
-                };
+            let (status, len): (u8, usize) = match processed {
+                Ok(l) => (VIRTIO_BLK_S_OK.try_into().unwrap(), l),
+                Err(e) => {
+                    error!("error processing request: {e:?}");
+                    (VIRTIO_BLK_S_IOERR.try_into().unwrap(), 0)
+                }
+            };
 
             if let Err(e) = writer.write_obj(status) {
                 error!("Failed to write virtio block status: {e:?}")
@@ -671,7 +670,9 @@ impl BlockWorker {
             } else {
                 (p.reader.available_bytes(), Some(()))
             };
-            if !len.is_multiple_of(512) || off.saturating_add(len as u64) > nsectors.saturating_mul(512) {
+            if !len.is_multiple_of(512)
+                || off.saturating_add(len as u64) > nsectors.saturating_mul(512)
+            {
                 return (err, 0);
             }
             let r = match res {
@@ -752,7 +753,10 @@ impl BlockWorker {
 
         while let Some(head) = self.device_queue.queue.pop(mem) {
             let index = head.index;
-            let (mut reader, writer) = match (Reader::new(mem, head.clone()), Writer::new(mem, head.clone())) {
+            let (mut reader, writer) = match (
+                Reader::new(mem, head.clone()),
+                Writer::new(mem, head.clone()),
+            ) {
                 (Ok(r), Ok(w)) => (r, w),
                 _ => {
                     error!("invalid descriptor chain");
@@ -767,7 +771,12 @@ impl BlockWorker {
                 }
             };
             if header.request_type == VIRTIO_BLK_T_IN || header.request_type == VIRTIO_BLK_T_OUT {
-                batch.push(Pending { index, header, reader, writer });
+                batch.push(Pending {
+                    index,
+                    header,
+                    reader,
+                    writer,
+                });
                 continue;
             }
             // Barrier: finish everything before it, then run it in order.
