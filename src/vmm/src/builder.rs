@@ -2234,6 +2234,25 @@ fn memfd_backed_ram_enabled() -> bool {
         && std::env::var_os("SMOLVM_FORKABLE").is_some_and(|v| v == "1")
 }
 
+/// Ask for transparent huge pages on memfd-backed guest RAM. Anonymous RAM gets
+/// them by default, shared memory only when advised, so without this a
+/// branchable machine would run on 4 KiB pages. Best-effort: a kernel that
+/// refuses keeps 4 KiB pages.
+#[cfg(target_os = "linux")]
+fn advise_huge_pages(memory: &GuestMemoryMmap) {
+    use vm_memory::GuestMemoryRegion;
+    for region in memory.iter() {
+        if let Ok(host) = memory.get_host_address(region.start_addr()) {
+            // Safety: `host` and the region length describe a live mapping
+            // owned by `memory`; MADV_HUGEPAGE changes no contents.
+            unsafe { libc::madvise(host.cast(), region.len() as usize, libc::MADV_HUGEPAGE) };
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn advise_huge_pages(_memory: &GuestMemoryMmap) {}
+
 /// Create an anonymous, RAM-backed `memfd` of `size` bytes to back a guest-RAM
 /// region. Being a real file object, it can later be CoW-cloned with
 /// `mmap(MAP_PRIVATE)` for fast, dense VM fork.
@@ -2251,6 +2270,7 @@ pub(crate) fn create_guest_ram_memfd(size: usize) -> std::result::Result<File, S
     let file = unsafe { File::from_raw_fd(fd) };
     file.set_len(size as u64)
         .map_err(|e| format!("sizing guest-RAM memfd to {size}: {e}"))?;
+    devices::virtio::balloon::register_owned_guest_ram_file(&file);
     Ok(file)
 }
 
@@ -2337,6 +2357,7 @@ pub(crate) fn create_guest_ram_memfd(size: usize) -> std::result::Result<File, S
     let file = unsafe { File::from_raw_fd(fd) };
     file.set_len(size as u64)
         .map_err(|e| format!("sizing guest-RAM file to {size}: {e}"))?;
+    devices::virtio::balloon::register_owned_guest_ram_file(&file);
     Ok(file)
 }
 
@@ -2628,8 +2649,10 @@ pub fn create_guest_memory(
         let _ = ram_region_count;
         let ranges = build_memfd_backed_ranges(&arch_mem_regions, arch_mem_regions.len())
             .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("memfd backing: {e}")))?;
-        GuestMemoryMmap::from_ranges_with_files(ranges)
-            .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?
+        let memory = GuestMemoryMmap::from_ranges_with_files(ranges)
+            .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?;
+        advise_huge_pages(&memory);
+        memory
     } else {
         GuestMemoryMmap::from_ranges(&arch_mem_regions)
             .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?

@@ -1,8 +1,10 @@
 mod device;
 mod event_handler;
+mod owned_ram;
 
 pub use self::defs::uapi::VIRTIO_ID_BALLOON as TYPE_BALLOON;
 pub use self::device::{Balloon, BalloonState};
+pub use self::owned_ram::{mark_guest_ram_shared, register_owned_guest_ram_file};
 
 mod defs {
     use super::super::QueueConfig;
