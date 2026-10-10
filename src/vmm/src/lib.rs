@@ -737,9 +737,12 @@ impl Vmm {
     ) -> std::io::Result<()> {
         self.layered_exports
             .retain(|service| !service.is_finished());
-        if self.layered_exports.len() >= 128 {
+        // One idle service per live branch generation; each is a sleeping
+        // thread with a small stack and no CPU cost, so this bound only guards
+        // against a runaway caller rather than sizing a realistic fan-out.
+        if self.layered_exports.len() >= 1024 {
             return Err(std::io::Error::other(
-                "too many retained RAM handoffs; remove unused branch generations",
+                "more than 1024 live branch generations retained for handoff; delete branches whose generation nothing else will branch from",
             ));
         }
         self.layered_exports.push(service);
