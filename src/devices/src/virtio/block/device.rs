@@ -246,7 +246,7 @@ impl DiskProperties {
     /// failure just leaves the serialized path in place.
     #[cfg(target_os = "windows")]
     fn with_parallel_handles(mut self, path: &str, writable: bool) -> Self {
-        const HANDLES: usize = 4;
+        const HANDLES: usize = 8;
         let handles: io::Result<Vec<File>> = (0..HANDLES)
             .map(|_| OpenOptions::new().read(true).write(writable).open(path))
             .collect();

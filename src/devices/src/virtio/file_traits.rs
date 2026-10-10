@@ -442,6 +442,19 @@ impl FileReadWriteVolatile for File {
     }
 }
 
+
+/// True when the slices are back to back in host memory, so one host call can
+/// fill or drain them in place without a bounce buffer.
+#[cfg(windows)]
+fn host_contiguous(bufs: &[VolatileSlice]) -> bool {
+    bufs.windows(2).all(|w| {
+        // SAFETY: only addresses are compared; nothing is dereferenced.
+        let a = w[0].ptr_guard().as_ptr() as usize;
+        let b = w[1].ptr_guard().as_ptr() as usize;
+        a + w[0].len() == b
+    })
+}
+
 #[cfg(windows)]
 impl FileReadWriteAtVolatile for File {
     fn read_at_volatile(&self, slice: VolatileSlice, offset: u64) -> Result<usize> {
@@ -473,6 +486,14 @@ impl FileReadWriteAtVolatile for File {
             return self.read_at_volatile(bufs[0], offset);
         }
         let len: usize = bufs.iter().map(|b| b.len()).sum();
+        if host_contiguous(bufs) {
+            // SAFETY: the slices are adjacent and together span `len` bytes of
+            // live guest memory.
+            let whole = unsafe {
+                VolatileSlice::new(bufs[0].ptr_guard_mut().as_ptr(), len)
+            };
+            return self.read_at_volatile(whole, offset);
+        }
         let mut tmp = vec![0u8; len];
         let mut total = 0;
         {
@@ -508,6 +529,13 @@ impl FileReadWriteAtVolatile for File {
             return self.write_at_volatile(bufs[0], offset);
         }
         let len: usize = bufs.iter().map(|b| b.len()).sum();
+        if host_contiguous(bufs) {
+            // SAFETY: see read_vectored_at_volatile.
+            let whole = unsafe {
+                VolatileSlice::new(bufs[0].ptr_guard_mut().as_ptr(), len)
+            };
+            return self.write_at_volatile(whole, offset);
+        }
         let mut tmp = vec![0u8; len];
         let mut at = 0;
         for slice in bufs {
