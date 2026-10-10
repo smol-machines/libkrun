@@ -24,7 +24,7 @@ use std::time::Duration;
 
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 use arch::aarch64::sysreg::{SYSREG_MASK, sys_reg_name};
-use log::debug;
+use log::{debug, warn};
 
 unsafe extern "C" {
     pub fn mach_absolute_time() -> u64;
@@ -91,6 +91,9 @@ const CNTHCTL_EL2_BITS: u64 = CNTHCTL_EL0VCTEN | CNTHCTL_EL0PCTEN;
 const AA64PFR0_EL1_EL2EN: u64 = 1 << 8;
 const AA64PFR0_EL1_GIC3EN: u64 = 1 << 24;
 const AA64PFR1_EL1_SMEMASK: u64 = 3 << 24;
+
+/// PSCI and SMCCC's NOT_SUPPORTED (-1) as the guest reads it in X0.
+const PSCI_RET_NOT_SUPPORTED: u64 = u64::MAX;
 
 const EC_WFX_TRAP: u64 = 0x1;
 const EC_AA64_HVC: u64 = 0x16;
@@ -1252,7 +1255,15 @@ impl HvfVcpu<'_> {
                 self.write_reg(hv_reg_t_HV_REG_X0, 0)?;
                 Ok(VcpuExit::CpuOn(mpidr, entry, context_id))
             }
-            val => panic!("Unexpected val={val}")
+            // Any other PSCI or SMCCC function (an SMCCC_VERSION or
+            // ARCH_FEATURES probe, say) is not implemented here. Both
+            // specifications answer that with NOT_SUPPORTED, and the guest
+            // carries on; panicking let any guest bring down its VMM.
+            val => {
+                warn!("vcpu[{}]: unsupported PSCI/SMCCC function {val:#x}", self.vcpuid);
+                self.write_reg(hv_reg_t_HV_REG_X0, PSCI_RET_NOT_SUPPORTED)?;
+                Ok(VcpuExit::PsciHandled)
+            }
         }
     }
 
