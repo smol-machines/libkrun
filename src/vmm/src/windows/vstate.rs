@@ -32,6 +32,7 @@ use std::sync::Arc;
 use std::thread;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
+use log::warn;
 use whp::{VcpuExitReason, WhpEmulator, WhpVcpu, WhpVm};
 
 use crate::vmm_config::machine_config::CpuFeaturesTemplate;
@@ -163,7 +164,63 @@ impl Vm {
                 region.len(),
             ));
         }
+        // A guest's first touch of each 4 KiB page costs ~20 us on WHP (a
+        // nested-paging fault the hypervisor resolves one page at a time),
+        // which made a fresh VM spend ~5 s per GiB of newly used RAM. Ask the
+        // hypervisor to back anonymous RAM in bulk instead, off the boot path.
+        // File-backed RAM (restored and branched machines) is left lazy so it
+        // keeps sharing pages with its checkpoint.
+        let anonymous = guest_mem.iter().all(|r| r.file_offset().is_none());
+        let mode = std::env::var("SMOLVM_WHP_PREFILL").unwrap_or_else(|_| {
+            if anonymous { "advise-read".into() } else { String::new() }
+        });
+        if mode != "off" {
+            self.prefill(&mode);
+        }
         Ok(())
+    }
+
+    /// Experimental: back guest RAM ahead of the guest touching it.
+    fn prefill(&self, mode: &str) {
+        if mode.is_empty() {
+            return;
+        }
+        let regions = self.regions.clone();
+        let vm = self.whp_vm.clone();
+        let mode = mode.to_string();
+        let _ = std::thread::Builder::new()
+            .name("whp-prefill".into())
+            .spawn(move || {
+                let t = std::time::Instant::now();
+                const CHUNK: u64 = 64 << 20;
+                for (gpa, host, len) in regions {
+                    let mut off = 0;
+                    while off < len {
+                        let n = CHUNK.min(len - off);
+                        if mode == "advise" || mode == "advise-read" {
+                            if let Err(e) = vm.populate(gpa + off, n, mode == "advise") {
+                                warn!("prefill advise failed: {e:?}");
+                                return;
+                            }
+                        } else {
+                            // A locked add of zero commits the host page without
+                            // changing its contents, even if the guest is
+                            // writing it concurrently.
+                            let mut p = host + off;
+                            while p < host + off + n {
+                                // SAFETY: p lies inside the live guest mapping.
+                                unsafe {
+                                    (*(p as *const std::sync::atomic::AtomicU8))
+                                        .fetch_add(0, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                p += 4096;
+                            }
+                        }
+                        off += n;
+                    }
+                }
+                log::debug!("whp prefill ({mode}) done in {:?}", t.elapsed());
+            });
     }
 
     /// Point a guest-physical range at new host memory. WHP binds a GPA range

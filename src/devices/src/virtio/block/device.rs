@@ -87,6 +87,12 @@ pub(crate) struct DiskProperties {
     pub(crate) file: Arc<DiskBackend>,
     nsectors: u64,
     image_id: Vec<u8>,
+    /// Windows, raw images only: independent handles to the image so queued
+    /// reads and writes run concurrently. A synchronous Windows handle
+    /// serializes its own I/O, and the format accessor sits behind one mutex,
+    /// so without these the guest's queue drains one request at a time.
+    #[cfg(target_os = "windows")]
+    pub(crate) parallel: Option<Arc<Vec<File>>>,
 }
 
 /// Format-aware disk accessor selected when the device is created.
@@ -231,7 +237,24 @@ impl DiskProperties {
             nsectors: disk_size >> SECTOR_SHIFT,
             image_id: disk_image_id,
             file: disk_image,
+            #[cfg(target_os = "windows")]
+            parallel: None,
         })
+    }
+
+    /// Open the parallel I/O handles for a raw, buffered Windows image. Any
+    /// failure just leaves the serialized path in place.
+    #[cfg(target_os = "windows")]
+    fn with_parallel_handles(mut self, path: &str, writable: bool) -> Self {
+        const HANDLES: usize = 4;
+        let handles: io::Result<Vec<File>> = (0..HANDLES)
+            .map(|_| OpenOptions::new().read(true).write(writable).open(path))
+            .collect();
+        match handles {
+            Ok(h) => self.parallel = Some(Arc::new(h)),
+            Err(e) => warn!("parallel block handles unavailable for {path}: {e}"),
+        }
+        self
     }
 
     pub fn nsectors(&self) -> u64 {
@@ -563,6 +586,15 @@ impl Block {
 
         let disk_properties =
             DiskProperties::new(disk_image.clone(), disk_image_id.clone(), cache_type)?;
+        #[cfg(target_os = "windows")]
+        let disk_properties = if disk_image_format == ImageType::Raw
+            && !direct_io
+            && std::env::var_os("SMOLVM_BLK_SERIAL").is_none()
+        {
+            disk_properties.with_parallel_handles(&disk_image_path, !is_disk_read_only)
+        } else {
+            disk_properties
+        };
 
         let mut avail_features = (1u64 << VIRTIO_F_VERSION_1)
             | (1u64 << VIRTIO_BLK_F_SEG_MAX)

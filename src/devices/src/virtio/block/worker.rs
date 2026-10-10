@@ -1,4 +1,6 @@
 use crate::virtio::descriptor_utils::{Reader, Writer};
+#[cfg(target_os = "windows")]
+use std::fs::File;
 
 use super::super::DeviceQueue;
 use super::BlockIoEngine;
@@ -564,6 +566,11 @@ impl BlockWorker {
             self.process_queue_async(mem);
             return;
         }
+        #[cfg(target_os = "windows")]
+        if let Some(handles) = self.disk.parallel.clone() {
+            self.process_queue_parallel(mem, &handles);
+            return;
+        }
         let mut signal_needed = false;
         while let Some(head) = self.device_queue.queue.pop(mem) {
             let mut reader = match Reader::new(mem, head.clone()) {
@@ -588,8 +595,13 @@ impl BlockWorker {
                 }
             };
 
+            let req_started = blk_stats::start();
+            let req_type = request_header.request_type;
+            let req_bytes = reader.available_bytes() + writer.available_bytes();
+            let processed = self.process_request(request_header, &mut reader, &mut writer);
+            blk_stats::finish(req_type, req_bytes, req_started);
             let (status, len): (u8, usize) =
-                match self.process_request(request_header, &mut reader, &mut writer) {
+                match processed {
                     Ok(l) => (VIRTIO_BLK_S_OK.try_into().unwrap(), l),
                     Err(e) => {
                         error!("error processing request: {e:?}");
@@ -616,6 +628,173 @@ impl BlockWorker {
         // Signal once after draining all block requests rather than per-request,
         // avoiding redundant IRQ signals when multiple descriptors complete in
         // a single epoll wake-up.
+        if signal_needed && let Err(e) = self.interrupt.try_signal_used_queue() {
+            error!("error signalling queue: {e:?}");
+        }
+    }
+
+    /// Windows raw-image path: drain the ring, run consecutive reads and
+    /// writes concurrently across independent file handles, and keep flush,
+    /// discard, write-zeroes and every other request as an ordered barrier
+    /// through the regular path. Completions are published in ring order.
+    #[cfg(target_os = "windows")]
+    fn process_queue_parallel(&mut self, mem: &GuestMemoryMmap, handles: &[File]) {
+        struct Pending<'a> {
+            index: u16,
+            header: RequestHeader,
+            reader: Reader<'a>,
+            writer: Writer<'a>,
+        }
+
+        let mut batch: Vec<Pending> = Vec::new();
+        let mut signal_needed = false;
+        let nsectors = self.disk.nsectors();
+
+        // Run one request against a raw handle. Bounds are checked here
+        // because a plain file handle, unlike the format accessor, would
+        // happily extend the image past its advertised size.
+        fn run_data(file: &File, p: &mut Pending, nsectors: u64) -> (u8, usize) {
+            let started = blk_stats::start();
+            let bytes = p.reader.available_bytes() + p.writer.available_bytes();
+            let ty = p.header.request_type;
+            let r = run_data_inner(file, p, nsectors);
+            blk_stats::finish(ty, bytes, started);
+            r
+        }
+        fn run_data_inner(file: &File, p: &mut Pending, nsectors: u64) -> (u8, usize) {
+            let ok = VIRTIO_BLK_S_OK as u8;
+            let err = VIRTIO_BLK_S_IOERR as u8;
+            let off = p.header.sector.saturating_mul(512);
+            let (len, res) = if p.header.request_type == VIRTIO_BLK_T_IN {
+                let len = p.writer.available_bytes().saturating_sub(1);
+                (len, None)
+            } else {
+                (p.reader.available_bytes(), Some(()))
+            };
+            if !len.is_multiple_of(512) || off.saturating_add(len as u64) > nsectors.saturating_mul(512) {
+                return (err, 0);
+            }
+            let r = match res {
+                None => p.writer.write_from_at(file, len, off),
+                Some(()) => p.reader.read_to_at(file, len, off),
+            };
+            match r {
+                Ok(n) => (ok, n),
+                Err(e) => {
+                    error!("parallel block request failed: {e:?}");
+                    (err, 0)
+                }
+            }
+        }
+
+        fn flush_batch(
+            batch: &mut Vec<Pending<'_>>,
+            worker: &mut BlockWorker,
+            mem: &GuestMemoryMmap,
+            handles: &[File],
+            nsectors: u64,
+            signal: &mut bool,
+        ) {
+            if batch.is_empty() {
+                return;
+            }
+            let mut results = vec![(0u8, 0usize); batch.len()];
+            if batch.len() == 1 {
+                results[0] = run_data(&handles[0], &mut batch[0], nsectors);
+            } else {
+                let lanes = handles.len().min(batch.len());
+                // Each request's descriptor reader/writer holds raw pointers
+                // into guest memory, which is mapped for the whole scope, and
+                // each request is handed to exactly one lane.
+                struct Lane<'b, 'a>(Vec<(usize, &'b mut Pending<'a>)>);
+                unsafe impl Send for Lane<'_, '_> {}
+                let mut per_lane: Vec<Lane> = (0..lanes).map(|_| Lane(Vec::new())).collect();
+                for (i, p) in batch.iter_mut().enumerate() {
+                    per_lane[i % lanes].0.push((i, p));
+                }
+                let lane_results: Vec<Vec<(usize, (u8, usize))>> = std::thread::scope(|scope| {
+                    let joins: Vec<_> = per_lane
+                        .into_iter()
+                        .enumerate()
+                        .map(|(lane, items)| {
+                            let file = &handles[lane];
+                            scope.spawn(move || {
+                                let items = items;
+                                items
+                                    .0
+                                    .into_iter()
+                                    .map(|(i, p)| (i, run_data(file, p, nsectors)))
+                                    .collect::<Vec<_>>()
+                            })
+                        })
+                        .collect();
+                    joins.into_iter().map(|j| j.join().unwrap()).collect()
+                });
+                for lane in lane_results {
+                    for (i, r) in lane {
+                        results[i] = r;
+                    }
+                }
+            }
+            for (p, (status, len)) in batch.iter_mut().zip(results) {
+                if let Err(e) = p.writer.write_obj(status) {
+                    error!("Failed to write virtio block status: {e:?}");
+                }
+                if let Err(e) = worker.device_queue.queue.add_used(mem, p.index, len as u32) {
+                    error!("failed to add used elements to the queue: {e:?}");
+                }
+                if worker.device_queue.queue.needs_notification(mem).unwrap() {
+                    *signal = true;
+                }
+            }
+            batch.clear();
+        }
+
+        while let Some(head) = self.device_queue.queue.pop(mem) {
+            let index = head.index;
+            let (mut reader, writer) = match (Reader::new(mem, head.clone()), Writer::new(mem, head.clone())) {
+                (Ok(r), Ok(w)) => (r, w),
+                _ => {
+                    error!("invalid descriptor chain");
+                    continue;
+                }
+            };
+            let header: RequestHeader = match reader.read_obj() {
+                Ok(h) => h,
+                Err(e) => {
+                    error!("invalid request header: {e:?}");
+                    continue;
+                }
+            };
+            if header.request_type == VIRTIO_BLK_T_IN || header.request_type == VIRTIO_BLK_T_OUT {
+                batch.push(Pending { index, header, reader, writer });
+                continue;
+            }
+            // Barrier: finish everything before it, then run it in order.
+            flush_batch(&mut batch, self, mem, handles, nsectors, &mut signal_needed);
+            let mut writer = writer;
+            let started = blk_stats::start();
+            let processed = self.process_request(header, &mut reader, &mut writer);
+            blk_stats::finish(header.request_type, 0, started);
+            let (status, len): (u8, usize) = match processed {
+                Ok(l) => (VIRTIO_BLK_S_OK as u8, l),
+                Err(e) => {
+                    error!("error processing request: {e:?}");
+                    (VIRTIO_BLK_S_IOERR as u8, 0)
+                }
+            };
+            if let Err(e) = writer.write_obj(status) {
+                error!("Failed to write virtio block status: {e:?}");
+            }
+            if let Err(e) = self.device_queue.queue.add_used(mem, index, len as u32) {
+                error!("failed to add used elements to the queue: {e:?}");
+            }
+            if self.device_queue.queue.needs_notification(mem).unwrap() {
+                signal_needed = true;
+            }
+        }
+        flush_batch(&mut batch, self, mem, handles, nsectors, &mut signal_needed);
+
         if signal_needed && let Err(e) = self.interrupt.try_signal_used_queue() {
             error!("error signalling queue: {e:?}");
         }
@@ -1087,5 +1266,64 @@ mod tests {
         .unwrap();
         assert!(!disk.supports_async_io());
         std::fs::remove_file(overlay).unwrap();
+    }
+}
+
+/// Opt-in per-request-type accounting (`SMOLVM_BLK_STATS=<dir>`): count, total
+/// bytes and total host time, written to `<dir>/blk-<pid>.txt` while running.
+mod blk_stats {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+
+    struct Stats {
+        dir: std::path::PathBuf,
+        types: [(u64, u64, u64, u64); 32],
+        n: u64,
+    }
+
+    fn stats() -> Option<&'static Mutex<Stats>> {
+        static S: OnceLock<Option<Mutex<Stats>>> = OnceLock::new();
+        S.get_or_init(|| {
+            std::env::var_os("SMOLVM_BLK_STATS").map(|d| {
+                Mutex::new(Stats {
+                    dir: d.into(),
+                    types: [(0, 0, 0, 0); 32],
+                    n: 0,
+                })
+            })
+        })
+        .as_ref()
+    }
+
+    pub fn start() -> Option<Instant> {
+        stats().map(|_| Instant::now())
+    }
+
+    pub fn finish(req_type: u32, bytes: usize, started: Option<Instant>) {
+        let (Some(t), Some(m)) = (started, stats()) else {
+            return;
+        };
+        let us = t.elapsed().as_micros() as u64;
+        let mut s = m.lock().unwrap();
+        let e = &mut s.types[(req_type as usize).min(31)];
+        e.0 += 1;
+        e.1 += bytes as u64;
+        e.2 += us;
+        e.3 = e.3.max(us);
+        s.n += 1;
+        if s.n % 50 == 0 {
+            let mut out = String::new();
+            for (ty, (c, b, us, max)) in s.types.iter().enumerate() {
+                if *c > 0 {
+                    out.push_str(&format!(
+                        "type{ty} count {c} MiB {} host_ms {} max_us {max}\n",
+                        b >> 20,
+                        us / 1000
+                    ));
+                }
+            }
+            let _ = std::fs::create_dir_all(&s.dir);
+            let _ = std::fs::write(s.dir.join(format!("blk-{}.txt", std::process::id())), out);
+        }
     }
 }

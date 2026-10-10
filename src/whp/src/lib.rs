@@ -981,6 +981,36 @@ impl WhpVm {
         }
     }
 
+    /// Ask the hypervisor to back `[gpa, gpa+size)` now instead of on first
+    /// guest touch (`WHvAdviseGpaRange` populate).
+    pub fn populate(&self, gpa: u64, size: u64, write: bool) -> Result<(), Error> {
+        use windows_sys::Win32::System::Hypervisor::{
+            WHV_MEMORY_RANGE_ENTRY, WHvAdviseGpaRange, WHvAdviseGpaRangeCodePopulate,
+        };
+        let range = WHV_MEMORY_RANGE_ENTRY {
+            GuestAddress: gpa,
+            SizeInBytes: size,
+        };
+        // WHV_ADVISE_GPA_RANGE_POPULATE: flags (u32) + access type (u32 = write).
+        let advice: [u32; 2] = [0, write as u32];
+        // SAFETY: valid partition handle, one range entry, correctly sized buffer.
+        let hr = unsafe {
+            WHvAdviseGpaRange(
+                self.handle,
+                &range,
+                1,
+                WHvAdviseGpaRangeCodePopulate,
+                advice.as_ptr() as *const _,
+                8,
+            )
+        };
+        if hr != S_OK {
+            Err(Error::MapGpaRange(hr))
+        } else {
+            Ok(())
+        }
+    }
+
     /// Injects an interrupt into a virtual processor's local APIC.
     /// http://learn.microsoft.com/en-us/virtualization/api/hypervisor-platform/funcs/whvrequestinterrupt
     pub fn request_interrupt(&self, req: &InterruptRequest) -> Result<(), Error> {

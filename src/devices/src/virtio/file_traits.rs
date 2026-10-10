@@ -466,18 +466,63 @@ impl FileReadWriteAtVolatile for File {
     }
 
     fn read_vectored_at_volatile(&self, bufs: &[VolatileSlice], offset: u64) -> Result<usize> {
-        // Fill every buffer in order (the default impl only fills the first),
-        // so a single FUSE read that spans multiple descriptors returns the
-        // full requested length rather than a short read.
-        let mut total = 0u64;
-        for slice in bufs {
-            let n = self.read_at_volatile(*slice, offset + total)?;
-            total += n as u64;
-            if n < slice.len() {
-                break; // short read / EOF: stop, the guest re-reads from here
+        // A FUSE read arrives as one descriptor per guest page. Issue a single
+        // ReadFile for the whole request and scatter it, instead of one
+        // ReadFile per 4 KiB page; filter drivers make each call costly.
+        if bufs.len() == 1 {
+            return self.read_at_volatile(bufs[0], offset);
+        }
+        let len: usize = bufs.iter().map(|b| b.len()).sum();
+        let mut tmp = vec![0u8; len];
+        let mut total = 0;
+        {
+            use std::os::windows::fs::FileExt;
+            while total < len {
+                match self.seek_read(&mut tmp[total..], offset + total as u64) {
+                    Ok(0) => break, // EOF
+                    Ok(n) => total += n,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
+                }
             }
         }
-        Ok(total as usize)
+        let mut copied = 0;
+        for slice in bufs {
+            if copied >= total {
+                break;
+            }
+            let n = slice.len().min(total - copied);
+            slice.subslice(0, n).map_err(|e| Error::new(ErrorKind::InvalidInput, format!("{e:?}")))?
+                .copy_from(&tmp[copied..copied + n]);
+            copied += n;
+        }
+        Ok(total)
+    }
+
+    fn write_vectored_at_volatile(&self, bufs: &[VolatileSlice], offset: u64) -> Result<usize> {
+        // Gather the per-page descriptors into one buffer and write it with a
+        // single WriteFile (see read_vectored_at_volatile).
+        if bufs.len() == 1 {
+            return self.write_at_volatile(bufs[0], offset);
+        }
+        let len: usize = bufs.iter().map(|b| b.len()).sum();
+        let mut tmp = vec![0u8; len];
+        let mut at = 0;
+        for slice in bufs {
+            slice.copy_to(&mut tmp[at..at + slice.len()]);
+            at += slice.len();
+        }
+        use std::os::windows::fs::FileExt;
+        let mut total = 0;
+        while total < len {
+            match self.seek_write(&tmp[total..], offset + total as u64) {
+                Ok(0) => break,
+                Ok(n) => total += n,
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(total)
     }
 
     fn write_at_volatile(&self, slice: VolatileSlice, offset: u64) -> Result<usize> {
@@ -498,6 +543,23 @@ impl FileReadWriteAtVolatile for DiskProperties {
             return Ok(0);
         }
 
+        // imago's Windows backend issues one ReadFile per buffer, and a
+        // virtio-blk request arrives as one buffer per guest page. Bounce the
+        // request through one contiguous buffer so it is a single host call.
+        #[cfg(windows)]
+        if bufs.len() > 1 {
+            let len: usize = bufs.iter().map(|b| b.len()).sum();
+            let mut tmp = vec![0u8; len];
+            self.file
+                .readv(IoVectorMut::from(&mut tmp), offset)?;
+            let mut at = 0;
+            for slice in bufs {
+                slice.copy_from(&tmp[at..at + slice.len()]);
+                at += slice.len();
+            }
+            return Ok(len);
+        }
+
         let (iovec, _guard) = IoVectorMut::from_volatile_slice(bufs);
         let full_length = iovec
             .len()
@@ -514,6 +576,21 @@ impl FileReadWriteAtVolatile for DiskProperties {
     fn write_vectored_at_volatile(&self, bufs: &[VolatileSlice], offset: u64) -> Result<usize> {
         if bufs.is_empty() {
             return Ok(0);
+        }
+
+        // See read_vectored_at_volatile: one host WriteFile per request.
+        #[cfg(windows)]
+        if bufs.len() > 1 {
+            let len: usize = bufs.iter().map(|b| b.len()).sum();
+            let mut tmp = vec![0u8; len];
+            let mut at = 0;
+            for slice in bufs {
+                slice.copy_to(&mut tmp[at..at + slice.len()]);
+                at += slice.len();
+            }
+            self.file
+                .writev(IoVector::from(&tmp), offset)?;
+            return Ok(len);
         }
 
         let (iovec, _guard) = IoVector::from_volatile_slice(bufs);
