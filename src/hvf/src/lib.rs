@@ -903,18 +903,16 @@ pub enum VcpuExit<'a> {
 // about its contents afterwards, so the purge is safe. Remapping before the
 // acknowledgement also keeps vCPUs from ever observing an unmapped RAM range.
 //
-// Safety gates: opt-in via SMOLVM_BALLOON_RECLAIM=1 and hard-disabled for
-// forkable VMs (SMOLVM_FORKABLE=1), whose file-backed CoW RAM must never be
-// hole-punched or unmapped underneath clones.
+// Safety gate: opt-in via SMOLVM_BALLOON_RECLAIM=1. A branchable machine's
+// file-backed RAM is released by punching the range out of the file, which the
+// caller allows only for a RAM file this VMM owns and has not shared with a
+// frozen-golden fork's clones; checkpoint generations are APFS clones that a
+// punch cannot reach.
 
-/// Balloon reclaim is opt-in and never coexists with forkable (CoW-shared)
-/// guest RAM.
+/// Balloon reclaim is opt-in.
 pub fn balloon_reclaim_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var_os("SMOLVM_BALLOON_RECLAIM").is_some_and(|v| v == "1")
-            && std::env::var_os("SMOLVM_FORKABLE").is_none_or(|v| v != "1")
-    })
+    *ENABLED.get_or_init(|| std::env::var_os("SMOLVM_BALLOON_RECLAIM").is_some_and(|v| v == "1"))
 }
 
 fn host_page_size() -> u64 {
@@ -963,7 +961,11 @@ where
 /// Called from the balloon device thread; must complete before the report is
 /// acked to the guest. Ranges are shrunk inward to host-page alignment (the
 /// guest reports in multiples of at least 4 MiB, so edge loss is negligible).
-pub fn balloon_reclaim_range(gpa: u64, host_addr: u64, len: u64) {
+///
+/// `backing` is the RAM file and the offset of `gpa` in it when the pages live
+/// in a file this VMM owns: they are punched out of it, since dropping the
+/// mapping alone leaves them allocated in the file.
+pub fn balloon_reclaim_range(gpa: u64, host_addr: u64, len: u64, backing: Option<(i32, u64)>) {
     let ps = host_page_size();
     let start = (gpa + ps - 1) & !(ps - 1);
     let end = (gpa + len) & !(ps - 1);
@@ -989,6 +991,20 @@ pub fn balloon_reclaim_range(gpa: u64, host_addr: u64, len: u64) {
     let result = reclaim_range_with_ops(
         || unsafe { hv_vm_unmap(start, alen as usize) },
         || {
+            #[cfg(target_os = "macos")]
+            if let Some((fd, offset)) = backing {
+                let hole = libc::fpunchhole_t {
+                    fp_flags: 0,
+                    reserved: 0,
+                    fp_offset: (offset + (start - gpa)) as libc::off_t,
+                    fp_length: alen as libc::off_t,
+                };
+                if unsafe { libc::fcntl(fd, libc::F_PUNCHHOLE, &hole) } != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = backing;
             let ret = unsafe { libc::madvise(host as *mut libc::c_void, alen as usize, advice) };
             if ret == 0 {
                 Ok(())
@@ -1011,7 +1027,7 @@ pub fn balloon_reclaim_range(gpa: u64, host_addr: u64, len: u64) {
             error!("balloon reclaim: hv_vm_unmap(0x{start:x}, {alen}) failed: {ret:x}");
         }
         Err(BalloonReclaimError::Purge(error)) => {
-            error!("balloon reclaim: madvise(0x{host:x}, {alen}) failed: {error}");
+            error!("balloon reclaim: releasing 0x{host:x}+{alen} failed: {error}");
         }
         Err(BalloonReclaimError::Remap(ret)) => {
             panic!("balloon reclaim: hv_vm_map(0x{start:x}, {alen}) failed after unmap: {ret:x}");

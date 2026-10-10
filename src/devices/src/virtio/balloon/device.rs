@@ -422,8 +422,12 @@ impl Balloon {
 /// inflate): unmap+purge on macOS when reclaim is enabled, otherwise the
 /// per-OS madvise/discard fallback. Sub-host-page runs are silently skipped
 /// by the reclaim path's inward alignment.
+///
+/// File-backed RAM this VMM owns (a branchable machine's) keeps a released
+/// page alive in the file, so its pages are also removed from the file; see
+/// [`super::owned_ram`].
 fn release_guest_range(mem: &GuestMemoryMmap, gpa: u64, len: u64) {
-    use vm_memory::GuestAddress;
+    use vm_memory::{GuestAddress, GuestMemoryRegion};
     let host_addr = match mem.get_host_address(GuestAddress(gpa)) {
         Ok(p) => p,
         Err(e) => {
@@ -431,11 +435,44 @@ fn release_guest_range(mem: &GuestMemoryMmap, gpa: u64, len: u64) {
             return;
         }
     };
+    // The backing file and the offset of `gpa` in it, when the whole range
+    // lies in one file-backed region.
+    let backing = mem.find_region(GuestAddress(gpa)).and_then(|region| {
+        let start = region.start_addr().raw_value();
+        if gpa.checked_add(len)? > start.checked_add(region.len())? {
+            return None;
+        }
+        let file_offset = region.file_offset()?;
+        Some((file_offset.file(), file_offset.start() + (gpa - start)))
+    });
     #[cfg(target_os = "macos")]
     if hvf::balloon_reclaim_enabled() {
-        hvf::balloon_reclaim_range(gpa, host_addr as u64, len);
+        use std::os::fd::AsRawFd;
+        if let Some((file, offset)) = backing {
+            let punched = super::owned_ram::with_owned_backing(file, || {
+                hvf::balloon_reclaim_range(gpa, host_addr as u64, len, Some((file.as_raw_fd(), offset)))
+            });
+            if punched.is_some() {
+                return;
+            }
+        }
+        hvf::balloon_reclaim_range(gpa, host_addr as u64, len, None);
         return;
     }
+    #[cfg(target_os = "linux")]
+    if let Some((file, _)) = backing {
+        // MADV_REMOVE frees the pages from the memfd. The kernel refuses it on
+        // a private view and on a write-sealed generation, which then fall
+        // through to MADV_DONTNEED as before.
+        let removed = super::owned_ram::with_owned_backing(file, || unsafe {
+            libc::madvise(host_addr as *mut libc::c_void, len as usize, libc::MADV_REMOVE) == 0
+        });
+        if removed == Some(true) {
+            return;
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let _ = backing;
     #[cfg(target_os = "linux")]
     let advice = libc::MADV_DONTNEED;
     #[cfg(target_os = "macos")]

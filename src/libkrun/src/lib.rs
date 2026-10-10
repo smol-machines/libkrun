@@ -1311,6 +1311,9 @@ fn handle_fork(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
     if let Err(e) = std::fs::create_dir_all(dir) {
         return format!("ERR EIO create {}: {e}\n", dir.display());
     }
+    // Clones will map this VMM's live RAM files, so no balloon release may
+    // punch them from here on, even when this fork fails.
+    devices::virtio::balloon::mark_guest_ram_shared();
     // Capture + freeze (the VM stays paused as the CoW base).
     let (checkpoint, memory) = match vmm.lock().unwrap().checkpoint_for_fork() {
         Ok(v) => v,
