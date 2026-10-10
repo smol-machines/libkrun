@@ -278,6 +278,45 @@ impl Generation {
         Self::from_descriptions_with_files(std::process::id() as i32, &descriptions, files)
     }
 
+    /// Adopt a running source's own memfd regions as its first generation
+    /// without copying a byte. Every region must map a file that already
+    /// carries the write seal ([`crate::snapshot::rebase_guest_memory_private`]
+    /// seals and remaps the source privately): from then on the files hold the
+    /// generation and the mappings hold only private writes, which later
+    /// captures copy as deltas.
+    pub fn from_sealed_memory(memory: &GuestMemoryMmap) -> io::Result<Self> {
+        use vm_memory::{Address, GuestMemoryRegion};
+        let mut descriptions = Vec::new();
+        let mut files = std::collections::HashMap::new();
+        for region in memory.iter() {
+            let Some(file_offset) = region.file_offset() else {
+                return Err(invalid("guest RAM region has no file backing to adopt"));
+            };
+            let fd = file_offset.file().as_raw_fd();
+            let seals = unsafe { libc::fcntl(fd, libc::F_GET_SEALS) };
+            if seals < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if seals & libc::F_SEAL_WRITE == 0 {
+                return Err(invalid("guest RAM backing is not sealed against writes"));
+            }
+            if let std::collections::hash_map::Entry::Vacant(entry) = files.entry(fd) {
+                entry.insert(Arc::new(file_offset.file().try_clone()?));
+            }
+            descriptions.push(RegionDescription {
+                gpa: region.start_addr().raw_value(),
+                len: region.len(),
+                extents: vec![ExtentDescription {
+                    start: 0,
+                    len: region.len(),
+                    fd,
+                    offset: file_offset.start(),
+                }],
+            });
+        }
+        Self::from_descriptions_with_files(std::process::id() as i32, &descriptions, files)
+    }
+
     /// Import immutable handles from a trusted, authenticated generation owner.
     /// Validate the complete layout before creating any guest mapping.
     pub fn from_descriptions(owner: i32, descriptions: &[RegionDescription]) -> io::Result<Self> {
@@ -2897,4 +2936,108 @@ fn arm_kvm_writes_are_preserved_in_nested_layers() {
         assert_eq!(third.memory.read_obj::<u8>(address).unwrap(), 0x91);
         assert_eq!(sibling.memory.read_obj::<u8>(address).unwrap(), 0x5a);
     }
+}
+
+#[test]
+fn sealed_memfd_source_adopts_its_files_without_copying() {
+    use vm_memory::FileOffset;
+    let page = host_page_size();
+    let len = 8 * page;
+    // Two memfd-backed regions on separate files, laid out like a branchable
+    // source's RAM, and written through their shared mappings as a running
+    // guest would write them.
+    let files: Vec<File> = (0..2)
+        .map(|_| crate::builder::create_guest_ram_memfd(len).unwrap())
+        .collect();
+    let memory = GuestMemoryMmap::from_ranges_with_files(vec![
+        (
+            GuestAddress(0),
+            len,
+            Some(FileOffset::new(files[0].try_clone().unwrap(), 0)),
+        ),
+        (
+            GuestAddress(len as u64),
+            len,
+            Some(FileOffset::new(files[1].try_clone().unwrap(), 0)),
+        ),
+    ])
+    .unwrap();
+    memory
+        .write_slice(&vec![0x11; page], GuestAddress(0))
+        .unwrap();
+    memory
+        .write_slice(&vec![0x22; page], GuestAddress((len + page) as u64))
+        .unwrap();
+    // Shared, unsealed RAM is not a generation yet.
+    assert!(Generation::from_sealed_memory(&memory).is_err());
+
+    crate::snapshot::rebase_guest_memory_private(&memory).unwrap();
+    let base = Generation::from_sealed_memory(&memory).unwrap();
+    let (first, copied) = base.capture_quiesced(&memory).unwrap();
+    assert_eq!(copied, 0, "adopting the source's own files copies nothing");
+    first.rebase_quiesced(&memory).unwrap();
+    let child = first.restore().unwrap();
+    assert_eq!(child.read_obj::<u8>(GuestAddress(0)).unwrap(), 0x11);
+
+    // A source that was already remapped privately by an earlier capture keeps
+    // its private writes through a repeated rebase, and adopting it captures
+    // exactly those writes.
+    memory
+        .write_slice(&vec![0x44; page], GuestAddress((2 * page) as u64))
+        .unwrap();
+    crate::snapshot::rebase_guest_memory_private(&memory).unwrap();
+    assert_eq!(
+        memory
+            .read_obj::<u8>(GuestAddress((2 * page) as u64))
+            .unwrap(),
+        0x44
+    );
+    let (adopted_private, copied) = Generation::from_sealed_memory(&memory)
+        .unwrap()
+        .capture_quiesced(&memory)
+        .unwrap();
+    assert_eq!(copied, page);
+    assert_eq!(
+        adopted_private
+            .restore()
+            .unwrap()
+            .read_obj::<u8>(GuestAddress((2 * page) as u64))
+            .unwrap(),
+        0x44
+    );
+    let (first, copied) = first.capture_quiesced(&memory).unwrap();
+    assert_eq!(copied, page);
+    first.rebase_quiesced(&memory).unwrap();
+    assert_eq!(
+        child
+            .read_obj::<u8>(GuestAddress((len + page) as u64))
+            .unwrap(),
+        0x22
+    );
+
+    // The source keeps running on private pages. The next capture copies
+    // exactly the page it wrote, the sealed base file never changes, and the
+    // earlier child never sees the write.
+    memory
+        .write_slice(&vec![0x33; page], GuestAddress(page as u64))
+        .unwrap();
+    let (second, copied) = first.capture_quiesced(&memory).unwrap();
+    assert_eq!(copied, page);
+    second.rebase_quiesced(&memory).unwrap();
+    let mut buffer = vec![0xff; page];
+    files[0].read_exact_at(&mut buffer, page as u64).unwrap();
+    assert!(buffer.iter().all(|byte| *byte == 0));
+    assert_eq!(child.read_obj::<u8>(GuestAddress(page as u64)).unwrap(), 0);
+    assert_eq!(
+        memory.read_obj::<u8>(GuestAddress(page as u64)).unwrap(),
+        0x33
+    );
+    let grandchild = second.restore().unwrap();
+    assert_eq!(grandchild.read_obj::<u8>(GuestAddress(0)).unwrap(), 0x11);
+    assert_eq!(
+        grandchild
+            .read_obj::<u8>(GuestAddress(page as u64))
+            .unwrap(),
+        0x33
+    );
 }
