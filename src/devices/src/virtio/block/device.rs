@@ -248,7 +248,7 @@ impl DiskProperties {
     /// failure just leaves the serialized path in place.
     #[cfg(target_os = "windows")]
     fn with_parallel_handles(mut self, path: &str, writable: bool) -> Self {
-        const HANDLES: usize = 8;
+        const HANDLES: usize = 16;
         let handles: io::Result<Vec<File>> = (0..HANDLES)
             .map(|_| OpenOptions::new().read(true).write(writable).open(path))
             .collect();
@@ -609,6 +609,10 @@ impl Block {
             // Report a 4 MiB optimal I/O size; Linux sizes read-ahead from it.
             | (1u64 << VIRTIO_BLK_F_TOPOLOGY);
 
+        if cfg!(target_os = "windows") {
+            avail_features |= 1u64 << VIRTIO_BLK_F_SIZE_MAX;
+        }
+
         if sync_mode != SyncMode::None {
             avail_features |= 1u64 << VIRTIO_BLK_F_FLUSH;
         }
@@ -619,7 +623,12 @@ impl Block {
 
         let config = VirtioBlkConfig {
             capacity: disk_properties.nsectors(),
-            size_max: 0,
+            // Windows serves requests on several host lanes, so cap each
+            // request near 1 MiB (254 segments of at most 4 KiB): the guest's
+            // 8 MiB read-ahead window then keeps every lane busy instead of
+            // two 4 MiB requests. Other hosts take requests as large as the
+            // guest builds them.
+            size_max: if cfg!(target_os = "windows") { 4096 } else { 0 },
             // QUEUE_SIZE - 2
             seg_max: 254,
             max_discard_sectors: u32::MAX,
