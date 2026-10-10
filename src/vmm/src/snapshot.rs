@@ -1105,6 +1105,11 @@ pub fn materialize_guest_memory(
 /// only the data extents of each backing file skips its never-written holes and
 /// leaves them as holes in the new memory. Regions without a backing file, or
 /// whose file cannot report extents, fall back to the page scan.
+///
+/// The copy runs on several threads: a clone does not start until it is done,
+/// and one thread moved a few GiB in seconds. Each piece is read from the
+/// backing file straight into the new mapping, one kernel copy per byte;
+/// writing the new files instead would serialize on their inode lock.
 #[cfg(target_os = "linux")]
 pub fn materialize_guest_memory_from_backing(
     src: &GuestMemoryMmap,
@@ -1121,59 +1126,273 @@ pub fn materialize_guest_memory_from_backing(
             ),
         ));
     }
-    let mut copied = Vec::with_capacity(src.num_regions());
     let ranges = src
         .iter()
         .zip(fork_backed_regions.iter().copied())
-        .enumerate()
-        .map(|(index, (region, file_backed))| {
+        .map(|(region, file_backed)| {
             let size = region.len() as usize;
-            if !file_backed {
-                copied.push(false);
-                return Ok((region.start_addr(), size, None));
-            }
-            let mut file =
-                crate::builder::create_guest_ram_memfd(size).map_err(io::Error::other)?;
-            let done = match backing.get(index).and_then(Option::as_ref) {
-                Some((source, offset)) => {
-                    copy_file_extents(source, *offset, region.len(), &mut file, 0)?
-                }
-                None => false,
+            let file = if file_backed {
+                Some(FileOffset::new(
+                    crate::builder::create_guest_ram_memfd(size).map_err(io::Error::other)?,
+                    0,
+                ))
+            } else {
+                None
             };
-            copied.push(done);
-            Ok((region.start_addr(), size, Some(FileOffset::new(file, 0))))
+            Ok((region.start_addr(), size, file))
         })
         .collect::<io::Result<Vec<_>>>()?;
     let dst = GuestMemoryMmap::from_ranges_with_files(ranges)
         .map_err(|error| io::Error::other(format!("materialize guest memory: {error:?}")))?;
-    const ZERO_PAGE: [u8; 4096] = [0; 4096];
-    for (region, done) in src.iter().zip(copied) {
-        if done {
-            continue;
-        }
+
+    let mut work = Vec::new();
+    for (index, region) in src.iter().enumerate() {
         let address = region.start_addr();
         let source = src
             .get_host_address(address)
-            .map_err(|error| io::Error::other(format!("source address: {error:?}")))?;
+            .map_err(|error| io::Error::other(format!("source address: {error:?}")))?
+            as usize;
         let destination = dst
             .get_host_address(address)
-            .map_err(|error| io::Error::other(format!("destination address: {error:?}")))?;
-        // SAFETY: the restored image is quiescent, the entire region is mapped,
-        // and the newly allocated destination cannot overlap the source.
-        let bytes = unsafe { std::slice::from_raw_parts(source, region.len() as usize) };
-        for (page_index, page) in bytes.chunks(ZERO_PAGE.len()).enumerate() {
-            if page != &ZERO_PAGE[..page.len()] {
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        page.as_ptr(),
-                        destination.add(page_index * ZERO_PAGE.len()),
-                        page.len(),
-                    );
+            .map_err(|error| io::Error::other(format!("destination address: {error:?}")))?
+            as usize;
+        let len = region.len();
+        let extents = match backing.get(index).and_then(Option::as_ref) {
+            Some((file, offset)) => file_data_extents(file, *offset, len)?
+                .map(|extents| (file.as_raw_fd(), *offset, extents)),
+            None => None,
+        };
+        match extents {
+            Some((fd, offset, extents)) => {
+                for (start, end) in extents {
+                    push_pieces(&mut work, start, end, |at, piece| PromotionPiece::Read {
+                        fd,
+                        file_offset: offset + at,
+                        destination: destination + at as usize,
+                        len: piece,
+                    });
                 }
             }
+            None => push_pieces(&mut work, 0, len, |at, piece| PromotionPiece::Scan {
+                source: source + at as usize,
+                destination: destination + at as usize,
+                len: piece,
+            }),
         }
     }
+    run_promotion_pieces(&work)?;
     Ok(dst)
+}
+
+/// One bounded unit of promotion work, by address so it can cross threads.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+enum PromotionPiece {
+    /// Read `len` bytes of a backing file into the new mapping.
+    Read {
+        fd: RawFd,
+        file_offset: u64,
+        destination: usize,
+        len: u64,
+    },
+    /// Copy the nonzero pages of `len` bytes of the source mapping.
+    Scan {
+        source: usize,
+        destination: usize,
+        len: u64,
+    },
+}
+
+/// Largest piece one thread takes at a time: small enough to balance a few
+/// large extents across threads, large enough that scheduling costs nothing.
+#[cfg(target_os = "linux")]
+const PROMOTION_PIECE: u64 = 64 * 1024 * 1024;
+
+#[cfg(target_os = "linux")]
+fn push_pieces(
+    work: &mut Vec<PromotionPiece>,
+    start: u64,
+    end: u64,
+    piece: impl Fn(u64, u64) -> PromotionPiece,
+) {
+    let mut at = start;
+    while at < end {
+        let len = (end - at).min(PROMOTION_PIECE);
+        work.push(piece(at, len));
+        at += len;
+    }
+}
+
+/// Run `work` on up to four threads. Every piece writes a distinct range of
+/// freshly allocated memory and reads a source nothing writes meanwhile. Four
+/// threads copied 2 GiB in 0.22 s against 0.49 s for the buffered
+/// single-thread copy this replaces on x86_64, and 0.2 s against 1.2 s on
+/// arm64; more gained little, and a worker shares its memory bandwidth with
+/// the machines already running on it.
+#[cfg(target_os = "linux")]
+fn run_promotion_pieces(work: &[PromotionPiece]) -> io::Result<()> {
+    let threads = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .clamp(1, 4);
+    run_promotion_pieces_on(work, threads)
+}
+
+#[cfg(target_os = "linux")]
+fn run_promotion_pieces_on(work: &[PromotionPiece], threads: usize) -> io::Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let threads = threads.max(1).min(work.len().max(1));
+    let next = AtomicUsize::new(0);
+    let run = || -> io::Result<()> {
+        loop {
+            let index = next.fetch_add(1, Ordering::Relaxed);
+            let Some(piece) = work.get(index) else {
+                return Ok(());
+            };
+            promote_piece(*piece)?;
+        }
+    };
+    if threads == 1 {
+        return run();
+    }
+    std::thread::scope(|scope| {
+        let workers = (0..threads).map(|_| scope.spawn(run)).collect::<Vec<_>>();
+        workers
+            .into_iter()
+            .map(|worker| {
+                worker
+                    .join()
+                    .unwrap_or_else(|_| Err(io::Error::other("promotion thread panicked")))
+            })
+            .collect::<io::Result<Vec<_>>>()
+            .map(|_| ())
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn promote_piece(piece: PromotionPiece) -> io::Result<()> {
+    match piece {
+        PromotionPiece::Read {
+            fd,
+            file_offset,
+            destination,
+            len,
+        } => {
+            let mut done = 0u64;
+            while done < len {
+                let offset = i64::try_from(file_offset + done).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "memory backing offset exceeds the host off_t range",
+                    )
+                })?;
+                // SAFETY: the destination range lies inside a mapping this
+                // promotion just allocated and no other piece covers, and the
+                // backing fd stays open for the duration of the call.
+                let read = unsafe {
+                    libc::pread(
+                        fd,
+                        (destination + done as usize) as *mut libc::c_void,
+                        (len - done) as usize,
+                        offset,
+                    )
+                };
+                if read < 0 {
+                    let error = io::Error::last_os_error();
+                    if error.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(error);
+                }
+                if read == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "memory backing changed during promotion",
+                    ));
+                }
+                done += read as u64;
+            }
+            Ok(())
+        }
+        PromotionPiece::Scan {
+            source,
+            destination,
+            len,
+        } => {
+            // The new mapping starts zeroed, so only nonzero pages are copied
+            // and the rest stays unallocated.
+            const ZERO_PAGE: [u8; 4096] = [0; 4096];
+            // SAFETY: the source is quiescent and mapped for this whole range.
+            let bytes = unsafe { std::slice::from_raw_parts(source as *const u8, len as usize) };
+            for (index, page) in bytes.chunks(ZERO_PAGE.len()).enumerate() {
+                if page != &ZERO_PAGE[..page.len()] {
+                    // SAFETY: the destination range is this piece's own.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            page.as_ptr(),
+                            (destination + index * ZERO_PAGE.len()) as *mut u8,
+                            page.len(),
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// The data extents of `len` bytes of `file` from `start`, relative to
+/// `start`, or `None` when the file cannot report them.
+#[cfg(target_os = "linux")]
+fn file_data_extents(file: &File, start: u64, len: u64) -> io::Result<Option<Vec<(u64, u64)>>> {
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "memory region too large"))?;
+    let mut extents = Vec::new();
+    let mut cursor = start;
+    while cursor < end {
+        let seek = i64::try_from(cursor).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "memory backing offset exceeds the host off_t range",
+            )
+        })?;
+        // SAFETY: the fd is owned by the live region and `seek` fits off_t.
+        let data = unsafe { libc::lseek(file.as_raw_fd(), seek, libc::SEEK_DATA) };
+        if data < 0 {
+            let error = io::Error::last_os_error();
+            match error.raw_os_error() {
+                Some(libc::ENXIO) => break,
+                Some(libc::EINVAL) | Some(libc::ENOTSUP) => return Ok(None),
+                _ => return Err(error),
+            }
+        }
+        let data = data as u64;
+        if data >= end {
+            break;
+        }
+        if data < cursor {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "memory backing data extent moved backwards",
+            ));
+        }
+        // SAFETY: `data` came from lseek and is a valid off_t.
+        let hole = unsafe { libc::lseek(file.as_raw_fd(), data as i64, libc::SEEK_HOLE) };
+        if hole < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let extent_end = (hole as u64).min(end);
+        if extent_end <= data {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "memory backing extent did not advance",
+            ));
+        }
+        extents.push((data - start, extent_end - start));
+        cursor = extent_end;
+    }
+    Ok(Some(extents))
 }
 
 /// Return whether a restored guest-memory mapping must be copied into fresh
@@ -5454,6 +5673,116 @@ mod tests {
         view.read_slice(&mut expected, GuestAddress(0)).unwrap();
         promoted.read_slice(&mut actual, GuestAddress(0)).unwrap();
         assert_eq!(actual, expected);
+    }
+
+    // Data spread over many pieces, with extents that straddle piece
+    // boundaries, comes back exact and keeps the holes between it unallocated.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn promotion_from_backing_is_exact_across_many_pieces() {
+        use crate::builder::create_guest_ram_memfd;
+        use std::os::unix::fs::{FileExt, MetadataExt};
+
+        const LEN: usize = 300 * 1024 * 1024;
+        let backing = create_guest_ram_memfd(LEN).unwrap();
+        let mut written = 0u64;
+        for (index, at) in (0..LEN as u64).step_by(37 * 1024 * 1024).enumerate() {
+            // 3 MiB extents, the first starting just before a piece boundary.
+            let at = if index == 2 {
+                PROMOTION_PIECE - 4096
+            } else {
+                at
+            };
+            let fill = vec![(index as u8).wrapping_add(1); 3 * 1024 * 1024];
+            let len = fill.len().min(LEN - at as usize);
+            backing.write_all_at(&fill[..len], at).unwrap();
+            written += len as u64;
+        }
+        let view = GuestMemoryMmap::from_ranges_with_files([(
+            GuestAddress(0),
+            LEN,
+            Some(FileOffset::new(backing.try_clone().unwrap(), 0)),
+        )])
+        .unwrap();
+        let promoted =
+            materialize_guest_memory_from_backing(&view, &[true], &[Some((backing, 0))]).unwrap();
+        let allocated = promoted
+            .iter()
+            .next()
+            .unwrap()
+            .file_offset()
+            .unwrap()
+            .file()
+            .metadata()
+            .unwrap()
+            .blocks()
+            * 512;
+        assert!(
+            allocated <= written + 4 * 1024 * 1024,
+            "promotion allocated {allocated} bytes for {written} written"
+        );
+        let mut expected = vec![0; LEN];
+        let mut actual = vec![0; LEN];
+        view.read_slice(&mut expected, GuestAddress(0)).unwrap();
+        promoted.read_slice(&mut actual, GuestAddress(0)).unwrap();
+        assert!(
+            actual == expected,
+            "promoted memory differs from its source"
+        );
+    }
+
+    // Timing, not correctness: how long promoting 2 GiB of written RAM takes on
+    // one thread and on several. Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn promotion_parallel_speedup() {
+        use crate::builder::create_guest_ram_memfd;
+        use std::os::unix::fs::FileExt;
+
+        const LEN: usize = 2 * 1024 * 1024 * 1024;
+        let backing = create_guest_ram_memfd(LEN).unwrap();
+        let chunk = vec![0x5Au8; 64 * 1024 * 1024];
+        for at in (0..LEN as u64).step_by(chunk.len()) {
+            backing.write_all_at(&chunk, at).unwrap();
+        }
+        // The copy this replaces: one thread, through a buffer, into the file.
+        let old = |label: &str| {
+            let mut dst = create_guest_ram_memfd(LEN).unwrap();
+            let started = std::time::Instant::now();
+            copy_file_extents(&backing, 0, LEN as u64, &mut dst, 0).unwrap();
+            let secs = started.elapsed().as_secs_f64();
+            eprintln!(
+                "promote 2 GiB {label}: {secs:.2} s ({:.1} GiB/s)",
+                2.0 / secs
+            );
+        };
+        old("warm-up (old copy)");
+        old("old copy");
+        for threads in [1, 2, 4, 8, 1, 4] {
+            let dst = create_guest_ram_memfd(LEN).unwrap();
+            let map: GuestMemoryMmap = GuestMemoryMmap::from_ranges_with_files([(
+                GuestAddress(0),
+                LEN,
+                Some(FileOffset::new(dst, 0)),
+            )])
+            .unwrap();
+            let destination = map.get_host_address(GuestAddress(0)).unwrap() as usize;
+            let mut work = Vec::new();
+            push_pieces(&mut work, 0, LEN as u64, |at, len| PromotionPiece::Read {
+                fd: backing.as_raw_fd(),
+                file_offset: at,
+                destination: destination + at as usize,
+                len,
+            });
+            let started = std::time::Instant::now();
+            run_promotion_pieces_on(&work, threads).unwrap();
+            let secs = started.elapsed().as_secs_f64();
+            eprintln!(
+                "promote 2 GiB on {threads} thread(s): {secs:.2} s ({:.1} GiB/s)",
+                2.0 / secs
+            );
+        }
     }
 
     // A region with no backing file (an anonymous or demand-paged view) must
