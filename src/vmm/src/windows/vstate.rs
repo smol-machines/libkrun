@@ -166,17 +166,19 @@ impl Vm {
         }
         // A guest's first touch of each 4 KiB page costs ~20 us on WHP (a
         // nested-paging fault the hypervisor resolves one page at a time), so
-        // a fresh VM spends ~5 s per GiB of newly used RAM. Populating RAM in
-        // bulk up front makes later first touches ~4x cheaper, but the guest
-        // then reports that memory free and the host discards it again over
-        // the next ~30 s, which slows the guest meanwhile and leaves ~0.5 GiB
-        // more resident. It is opt-in (`SMOLVM_WHP_PREFILL=advise-read`), and
-        // only for anonymous RAM: file-backed RAM (restored and branched
-        // machines) keeps sharing pages with its checkpoint.
+        // a fresh VM spent ~5 s per GiB of newly used RAM. Populating anonymous
+        // RAM in bulk at boot makes those first touches ~4x cheaper for the
+        // life of the VM, even after the guest reports free memory and the
+        // host discards it (which it does over the next ~30 s: resident
+        // memory briefly reaches the VM's size, then settles near WSL2's idle
+        // footprint). `SMOLVM_WHP_PREFILL=off` keeps RAM lazy. File-backed RAM
+        // (restored and branched machines) is never prefilled, so it keeps
+        // sharing pages with its checkpoint.
         let anonymous = guest_mem.iter().all(|r| r.file_offset().is_none());
         let mode = match std::env::var("SMOLVM_WHP_PREFILL") {
-            Ok(m) if anonymous => m,
-            _ => String::new(),
+            _ if !anonymous => String::new(),
+            Ok(m) => m,
+            Err(_) => "advise-read".into(),
         };
         if !mode.is_empty() && mode != "off" {
             self.prefill(&mode);
