@@ -424,30 +424,36 @@ impl Balloon {
 /// by the reclaim path's inward alignment.
 fn release_guest_range(mem: &GuestMemoryMmap, gpa: u64, len: u64) {
     use vm_memory::GuestAddress;
-    let host_addr = match mem.get_host_address(GuestAddress(gpa)) {
-        Ok(p) => p,
-        Err(e) => {
-            error!("balloon: inflate range outside guest memory: 0x{gpa:x}+{len}: {e:?}");
-            return;
-        }
-    };
-    #[cfg(target_os = "macos")]
-    if hvf::balloon_reclaim_enabled() {
-        hvf::balloon_reclaim_range(gpa, host_addr as u64, len);
+    // Both ends are guest-chosen: the whole range must be guest memory, and it
+    // is released per region since adjacent regions need not be host-adjacent.
+    if !mem.check_range(GuestAddress(gpa), len as usize) {
+        error!("balloon: inflate range outside guest memory: 0x{gpa:x}+{len}");
         return;
     }
-    #[cfg(target_os = "linux")]
-    let advice = libc::MADV_DONTNEED;
-    #[cfg(target_os = "macos")]
-    let advice = libc::MADV_FREE_REUSABLE;
-    #[cfg(unix)]
-    unsafe {
-        libc::madvise(host_addr as *mut libc::c_void, len as usize, advice)
-    };
-    #[cfg(target_os = "windows")]
-    unsafe {
-        DiscardVirtualMemory(host_addr as *mut core::ffi::c_void, len as usize)
-    };
+    let mut next_gpa = gpa;
+    for slice in mem.get_slices(GuestAddress(gpa), len as usize).flatten() {
+        // Only the macOS reclaim path needs the slice's guest address.
+        #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+        let (gpa, host_addr, len) = (next_gpa, slice.ptr_guard_mut().as_ptr(), slice.len());
+        next_gpa += len as u64;
+        #[cfg(target_os = "macos")]
+        if hvf::balloon_reclaim_enabled() {
+            hvf::balloon_reclaim_range(gpa, host_addr as u64, len as u64);
+            continue;
+        }
+        #[cfg(target_os = "linux")]
+        let advice = libc::MADV_DONTNEED;
+        #[cfg(target_os = "macos")]
+        let advice = libc::MADV_FREE_REUSABLE;
+        #[cfg(unix)]
+        unsafe {
+            libc::madvise(host_addr as *mut libc::c_void, len, advice)
+        };
+        #[cfg(target_os = "windows")]
+        unsafe {
+            DiscardVirtualMemory(host_addr as *mut core::ffi::c_void, len)
+        };
+    }
 }
 
 impl VirtioDevice for Balloon {
@@ -859,5 +865,40 @@ mod checkpoint_quiescence_tests {
             }
             assert_eq!(rings[index].used.idx.get(), 1, "queue {index}");
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod guest_range_tests {
+    use super::*;
+    use vm_memory::{GuestAddress, GuestRegionMmap, MmapRegion};
+
+    /// The guest picks both ends of a released range. One running past the
+    /// end of guest memory must not reach whatever the host mapped next.
+    #[test]
+    fn a_release_past_guest_memory_leaves_the_next_host_mapping_alone() {
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let prot = libc::PROT_READ | libc::PROT_WRITE;
+        let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
+        let host = unsafe { libc::mmap(std::ptr::null_mut(), 3 * page, prot, flags, -1, 0) };
+        assert_ne!(host, libc::MAP_FAILED);
+        let host = host as *mut u8;
+        let beyond = unsafe { std::slice::from_raw_parts_mut(host.add(2 * page), page) };
+        beyond.fill(0xa5);
+        // Guest memory is the first two pages; the third is a neighbouring host mapping.
+        let region = unsafe { MmapRegion::build_raw(host, 2 * page, prot, flags) }.unwrap();
+        let mem = GuestMemoryMmap::from_regions(vec![
+            GuestRegionMmap::new(region, GuestAddress(0)).unwrap(),
+        ])
+        .unwrap();
+
+        release_guest_range(&mem, page as u64, 2 * page as u64);
+
+        assert!(
+            beyond.iter().all(|&b| b == 0xa5),
+            "madvise reached past the end of guest memory"
+        );
+        drop(mem);
+        unsafe { libc::munmap(host as *mut libc::c_void, 3 * page) };
     }
 }
