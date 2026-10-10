@@ -1955,35 +1955,56 @@ impl FileSystem for PassthroughFs {
     ) -> io::Result<(stat64, Duration)> {
         let path = self.inode_path(inode)?;
 
-        // Extract or read current cached state cleanly to avoid overwriting conflicts
-        let (mut current_uid, mut current_gid, mut current_mode) =
-            read_override_stat(&path).unwrap_or((Some(u32::MAX), Some(u32::MAX), None));
+        // Ownership and mode live in an alternate data stream. Each touch of it
+        // is a CreateFile on the host, so read it only when this request
+        // changes ownership, mode or size, and write it back only if the
+        // values actually change (tar and cp re-apply what create already set).
+        let touches_override = valid.intersects(
+            SetattrValid::MODE | SetattrValid::UID | SetattrValid::GID | SetattrValid::SIZE,
+        );
+        let original = if touches_override {
+            read_override_stat(&path).unwrap_or((Some(u32::MAX), Some(u32::MAX), None))
+        } else {
+            (Some(u32::MAX), Some(u32::MAX), None)
+        };
+        let (mut current_uid, mut current_gid, mut current_mode) = original;
 
         let mut override_changed = false;
 
-        if valid.contains(SetattrValid::MODE) {
+        if valid.contains(SetattrValid::MODE) && current_mode != Some(attr.st_mode) {
             current_mode = Some(attr.st_mode);
             override_changed = true;
         }
 
         if valid.intersects(SetattrValid::UID | SetattrValid::GID) {
-            if valid.contains(SetattrValid::UID) {
-                current_uid = Some(attr.st_uid);
-            }
-            if valid.contains(SetattrValid::GID) {
-                current_gid = Some(attr.st_gid);
+            let new_uid = if valid.contains(SetattrValid::UID) {
+                Some(attr.st_uid)
+            } else {
+                current_uid
             };
-
+            let new_gid = if valid.contains(SetattrValid::GID) {
+                Some(attr.st_gid)
+            } else {
+                current_gid
+            };
+            // Like Linux, chown always drops file capabilities and the
+            // suid/sgid bits, even to the same owner; only the stream rewrite
+            // is skipped when that leaves every value as it was.
             remove_security_capability(&path);
-
             if !valid.contains(SetattrValid::MODE) {
                 if let Some(mode) = current_mode {
                     let new_mode = clear_suid_sgid(mode);
-                    current_mode = Some(new_mode);
+                    if new_mode != mode {
+                        current_mode = Some(new_mode);
+                        override_changed = true;
+                    }
                 }
             }
-
-            override_changed = true;
+            if new_uid != current_uid || new_gid != current_gid {
+                current_uid = new_uid;
+                current_gid = new_gid;
+                override_changed = true;
+            }
         }
 
         if valid.contains(SetattrValid::SIZE) {
@@ -2455,15 +2476,13 @@ impl FileSystem for PassthroughFs {
         handle: Handle,
         _lock_owner: u64,
     ) -> io::Result<()> {
-        // On Windows, to perform a flush we need to have a file handle with write access.
-        // If the file has been open as read-only, there is nothing to flush
-        if self.handle_is_read_only(handle) {
-            return Ok(());
-        }
-
-        let file = self.reopen_inode(inode, handle, GENERIC_READ | GENERIC_WRITE)?;
-
-        file.sync_all().map_err(win_err_to_linux)
+        // FUSE_FLUSH is sent on every close(2) of a guest fd. It is not a
+        // durability request (that is FUSE_FSYNC); Linux virtiofsd answers it
+        // with close(dup(fd)). Writes already reached the host file through
+        // WriteFile, so there is nothing to push here, and a FlushFileBuffers
+        // per close made every small-file workload wait on the disk.
+        let _ = (inode, handle);
+        Ok(())
     }
 
     fn fsync(&self, _ctx: Context, inode: Inode, datasync: bool, handle: Handle) -> io::Result<()> {

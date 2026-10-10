@@ -78,6 +78,10 @@ pub struct Balloon {
     stats_pending_ack: Option<u16>,
     /// When the parked buffer was last acked, so refreshes stay rate-limited.
     stats_last_request: Option<std::time::Instant>,
+    /// When the host last asked for (or released) a balloon target. Free-page
+    /// reports right after a reclaim pulse are handed back even where they
+    /// would otherwise stay resident (see `release_reported_pages`).
+    last_reclaim: Option<std::time::Instant>,
 }
 
 /// A stats entry is a packed le16 tag followed by a le64 value. `repr(C)` would
@@ -131,6 +135,7 @@ impl Balloon {
             stats: None,
             stats_pending_ack: None,
             stats_last_request: None,
+            last_reclaim: None,
         })
     }
 
@@ -173,6 +178,9 @@ impl Balloon {
             self.deferred_target_pages = Some(pages);
             return;
         }
+        if pages > 0 || self.config.num_pages > 0 {
+            self.last_reclaim = Some(std::time::Instant::now());
+        }
         self.config.num_pages = pages;
         if let DeviceState::Activated(_, ref interrupt) = self.device_state {
             interrupt.signal_config_change();
@@ -201,9 +209,17 @@ impl Balloon {
 
         while let Some(head) = queues[FRQ_INDEX].queue.pop(mem) {
             let index = head.index;
-            for desc in head.into_iter() {
-                // Must happen before this report is acked via add_used below.
-                release_guest_range(mem, desc.addr.0, desc.len as u64);
+            // A reclaim pulse (inflate then deflate) makes the guest free and
+            // re-report its idle memory; give that back whatever the host's
+            // memory pressure, for two minutes after the last target change.
+            let reclaiming = self
+                .last_reclaim
+                .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(120));
+            if reclaiming || release_reported_pages() {
+                for desc in head.into_iter() {
+                    // Must happen before this report is acked via add_used below.
+                    release_guest_range(mem, desc.addr.0, desc.len as u64);
+                }
             }
 
             have_used = true;
@@ -357,32 +373,40 @@ impl Balloon {
 
         while let Some(head) = queues[IFQ_INDEX].queue.pop(mem) {
             let index = head.index;
+            // Release the pages as sorted, coalesced runs: the guest hands
+            // them over in allocation order, and on some hosts (Windows) each
+            // release call is costly however small the range.
+            let mut pfns: Vec<u32> = Vec::new();
             for desc in head.into_iter() {
                 let count = desc.len as usize / 4;
-                let mut run_start: u64 = 0;
-                let mut run_len: u64 = 0;
                 for i in 0..count {
-                    let pfn: u32 = match mem.read_obj(desc.addr.unchecked_add(i as u64 * 4)) {
-                        Ok(v) => v,
+                    match mem.read_obj::<u32>(desc.addr.unchecked_add(i as u64 * 4)) {
+                        Ok(v) => pfns.push(v),
                         Err(e) => {
                             error!("balloon: bad inflate pfn buffer: {e:?}");
                             break;
                         }
-                    };
-                    let gpa = u64::from(pfn) << 12;
-                    if run_len > 0 && gpa == run_start + run_len {
-                        run_len += 4096;
-                    } else {
-                        if run_len > 0 {
-                            release_guest_range(mem, run_start, run_len);
-                        }
-                        run_start = gpa;
-                        run_len = 4096;
                     }
                 }
-                if run_len > 0 {
-                    release_guest_range(mem, run_start, run_len);
+            }
+            pfns.sort_unstable();
+            pfns.dedup();
+            let mut run_start: u64 = 0;
+            let mut run_len: u64 = 0;
+            for pfn in pfns {
+                let gpa = u64::from(pfn) << 12;
+                if run_len > 0 && gpa == run_start + run_len {
+                    run_len += 4096;
+                } else {
+                    if run_len > 0 {
+                        release_guest_range(mem, run_start, run_len);
+                    }
+                    run_start = gpa;
+                    run_len = 4096;
                 }
+            }
+            if run_len > 0 {
+                release_guest_range(mem, run_start, run_len);
             }
             have_used = true;
             if let Err(e) = queues[IFQ_INDEX].queue.add_used(mem, index, 0) {
@@ -485,6 +509,39 @@ fn release_guest_range(mem: &GuestMemoryMmap, gpa: u64, len: u64) {
     unsafe {
         DiscardVirtualMemory(host_addr as *mut core::ffi::c_void, len as usize)
     };
+}
+
+/// Whether free-page reports should give their pages back to the host now.
+///
+/// On Windows a discarded page costs the guest ~5 us to fault back in (about
+/// 1.4 s per GiB of memory it reuses), against ~0.1 s per GiB when the page was
+/// kept. Like Hyper-V's own dynamic memory, keep freed guest memory resident
+/// while the host has RAM to spare and hand it back once the host is under
+/// pressure; idle reclaim still shrinks a VM that sits idle. Override with
+/// `SMOLVM_WHP_RECLAIM=discard` (always) or `keep` (never). Other hosts
+/// refault cheaply and always discard.
+fn release_reported_pages() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        match std::env::var("SMOLVM_WHP_RECLAIM").as_deref() {
+            Ok("discard") => return true,
+            Ok("keep") => return false,
+            _ => {}
+        }
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        let mut st: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+        st.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        // SAFETY: correctly sized and initialized out-struct.
+        if unsafe { GlobalMemoryStatusEx(&mut st) } == 0 {
+            return true;
+        }
+        // Discard once a quarter of physical memory or less is available.
+        st.ullAvailPhys.saturating_mul(4) <= st.ullTotalPhys
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        true
+    }
 }
 
 impl VirtioDevice for Balloon {
