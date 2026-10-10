@@ -31,7 +31,9 @@ use imago::{
 use log::{error, warn};
 use utils::eventfd::{EFD_NONBLOCK, EventFd};
 use virtio_bindings::{
-    virtio_blk::*, virtio_config::VIRTIO_F_VERSION_1, virtio_ring::VIRTIO_RING_F_EVENT_IDX,
+    virtio_blk::*,
+    virtio_config::VIRTIO_F_VERSION_1,
+    virtio_ring::{VIRTIO_RING_F_EVENT_IDX, VIRTIO_RING_F_INDIRECT_DESC},
 };
 use vm_memory::{ByteValued, GuestMemoryMmap};
 
@@ -600,7 +602,12 @@ impl Block {
             | (1u64 << VIRTIO_BLK_F_SEG_MAX)
             | (1u64 << VIRTIO_BLK_F_DISCARD)
             | (1u64 << VIRTIO_BLK_F_WRITE_ZEROES)
-            | (1u64 << VIRTIO_RING_F_EVENT_IDX);
+            | (1u64 << VIRTIO_RING_F_EVENT_IDX)
+            // One ring slot per request however many pages it spans, so the
+            // guest can keep many large requests in flight.
+            | (1u64 << VIRTIO_RING_F_INDIRECT_DESC)
+            // Report a 4 MiB optimal I/O size; Linux sizes read-ahead from it.
+            | (1u64 << VIRTIO_BLK_F_TOPOLOGY);
 
         if sync_mode != SyncMode::None {
             avail_features |= 1u64 << VIRTIO_BLK_F_FLUSH;
@@ -621,6 +628,11 @@ impl Block {
             max_write_zeroes_sectors: u32::MAX,
             max_write_zeroes_seg: 1,
             write_zeroes_may_unmap: 1,
+            topology: VirtioBlkTopology {
+                min_io_size: 8,    // 4 KiB in 512-byte sectors
+                opt_io_size: 8192, // 4 MiB in 512-byte sectors
+                ..Default::default()
+            },
             ..Default::default()
         };
 

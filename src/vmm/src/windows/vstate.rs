@@ -224,6 +224,14 @@ impl Vm {
                     }
                 }
                 log::debug!("whp prefill ({mode}) done in {:?}", t.elapsed());
+                if let Some(dir) = std::env::var_os("SMOLVM_WHP_STATS") {
+                    let dir = std::path::PathBuf::from(dir);
+                    let _ = std::fs::create_dir_all(&dir);
+                    let _ = std::fs::write(
+                        dir.join(format!("prefill-{}.txt", std::process::id())),
+                        format!("{mode} {:?}\n", t.elapsed()),
+                    );
+                }
             });
     }
 
