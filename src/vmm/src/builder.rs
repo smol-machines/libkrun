@@ -2515,9 +2515,13 @@ pub fn create_guest_memory(
         };
         #[cfg(not(target_os = "linux"))]
         let layered = false;
-        // A clone normally keeps its inherited raw MAP_PRIVATE mappings and is
-        // therefore a cheap leaf. When explicitly launched forkable, give it
-        // fresh file-backed memory containing its current state. This one-time
+        // A clone of a layered generation, which is what every current source
+        // publishes, needs nothing here even when it is forkable: it is already
+        // a private view of sealed files and captures deltas like its source.
+        // A clone of a raw memfd manifest from an older source keeps its
+        // inherited raw MAP_PRIVATE mappings and is therefore a cheap leaf.
+        // When such a clone is explicitly launched forkable, give it fresh
+        // file-backed memory containing its current state. This one-time
         // materialization makes the restored machine a stable source for its
         // own descendants without mutating the ancestor's backing files.
         // Linux portable restores are promoted from their sparse image into

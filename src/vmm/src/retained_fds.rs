@@ -15,10 +15,16 @@ use std::sync::{
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+use utils::eventfd::{EFD_NONBLOCK, EventFd};
 
 const TOKEN_LEN: usize = 32;
 const TIMEOUT: Duration = Duration::from_millis(500);
 const HANDOFF_DEADLINE: Duration = Duration::from_secs(2);
+/// How long an idle service sleeps between checks that its socket path still
+/// exists. A dropped service is woken immediately through its eventfd.
+const IDLE_WAIT_MS: libc::c_int = 1000;
+/// The worker only accepts, reads a token and sends descriptors.
+const WORKER_STACK: usize = 256 * 1024;
 
 // Linux pathname sockets have a short sockaddr_un limit, even when their
 // containing directory is otherwise valid. Resolve long paths through a pinned
@@ -58,6 +64,7 @@ fn remaining(deadline: Instant) -> io::Result<Duration> {
 
 pub struct RetainedFiles {
     stop: Arc<AtomicBool>,
+    wake: EventFd,
     worker: Option<JoinHandle<()>>,
     path: PathBuf,
     identity: (u64, u64),
@@ -146,8 +153,11 @@ impl RetainedFiles {
         let listener = UnixListener::bind(address)?;
         let id = identity(path)?;
         let stop = Arc::new(AtomicBool::new(false));
+        let wake = EventFd::new(EFD_NONBLOCK)?;
+        let wake_fd = wake.try_clone()?;
         let mut service = Self {
             stop: stop.clone(),
+            wake,
             worker: None,
             path: path.into(),
             identity: id,
@@ -156,73 +166,100 @@ impl RetainedFiles {
         listener.set_nonblocking(true)?;
         let path = path.to_path_buf();
         let uid = unsafe { libc::geteuid() };
-        service.worker = Some(thread::Builder::new().name("checkpoint-fds".into()).spawn(
-            move || {
-                while !stop.load(Ordering::Acquire) && identity(&path).ok() == Some(id) {
-                    match listener.accept() {
-                        Ok((mut stream, _)) => {
-                            let result = (|| -> io::Result<()> {
-                                if peer(&stream)?.uid != uid {
-                                    return Err(io::Error::new(
-                                        io::ErrorKind::PermissionDenied,
-                                        "checkpoint peer UID mismatch",
-                                    ));
-                                }
-                                let deadline = Instant::now() + HANDOFF_DEADLINE;
-                                let mut supplied = [0; TOKEN_LEN];
-                                let mut offset = 0;
-                                while offset < supplied.len() {
-                                    stream.set_read_timeout(Some(remaining(deadline)?))?;
-                                    match stream.read(&mut supplied[offset..]) {
-                                        Ok(0) => {
-                                            return Err(io::Error::new(
-                                                io::ErrorKind::UnexpectedEof,
-                                                "checkpoint client disconnected",
-                                            ));
-                                        }
-                                        Ok(count) => offset += count,
-                                        Err(error)
-                                            if error.kind() == io::ErrorKind::Interrupted =>
-                                        {
-                                            continue;
-                                        }
-                                        Err(error) => return Err(error),
-                                    }
-                                }
-                                if !supplied
-                                    .iter()
-                                    .zip(token)
-                                    .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-                                    .eq(&0)
-                                {
-                                    return Err(io::Error::new(
-                                        io::ErrorKind::PermissionDenied,
-                                        "checkpoint token mismatch",
-                                    ));
-                                }
-                                for file in files.values() {
-                                    if stop.load(Ordering::Acquire) {
-                                        break;
-                                    }
-                                    send_fd(&stream, file.as_raw_fd(), deadline)?;
-                                }
-                                Ok(())
-                            })();
-                            if let Err(error) = result {
-                                log::debug!(
-                                    "checkpoint descriptor handoff did not complete: {error}"
-                                );
+        service.worker = Some(
+            thread::Builder::new()
+                .name("checkpoint-fds".into())
+                .stack_size(WORKER_STACK)
+                .spawn(move || {
+                    while !stop.load(Ordering::Acquire) && identity(&path).ok() == Some(id) {
+                        // Sleep until a client connects or the service is dropped.
+                        // A source retains one service per live branch generation,
+                        // so an idle service must cost no CPU; the timeout only
+                        // bounds how long a removed socket path keeps the thread.
+                        let mut wait = [
+                            libc::pollfd {
+                                fd: listener.as_raw_fd(),
+                                events: libc::POLLIN,
+                                revents: 0,
+                            },
+                            libc::pollfd {
+                                fd: wake_fd.as_raw_fd(),
+                                events: libc::POLLIN,
+                                revents: 0,
+                            },
+                        ];
+                        let ready = unsafe { libc::poll(wait.as_mut_ptr(), 2, IDLE_WAIT_MS) };
+                        if ready < 0 {
+                            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                                continue;
                             }
+                            break;
                         }
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                            thread::sleep(Duration::from_millis(5))
+                        if ready == 0 || wait[1].revents != 0 || wait[0].revents == 0 {
+                            continue;
                         }
-                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                        Err(_) => break,
+                        match listener.accept() {
+                            Ok((mut stream, _)) => {
+                                let result = (|| -> io::Result<()> {
+                                    if peer(&stream)?.uid != uid {
+                                        return Err(io::Error::new(
+                                            io::ErrorKind::PermissionDenied,
+                                            "checkpoint peer UID mismatch",
+                                        ));
+                                    }
+                                    let deadline = Instant::now() + HANDOFF_DEADLINE;
+                                    let mut supplied = [0; TOKEN_LEN];
+                                    let mut offset = 0;
+                                    while offset < supplied.len() {
+                                        stream.set_read_timeout(Some(remaining(deadline)?))?;
+                                        match stream.read(&mut supplied[offset..]) {
+                                            Ok(0) => {
+                                                return Err(io::Error::new(
+                                                    io::ErrorKind::UnexpectedEof,
+                                                    "checkpoint client disconnected",
+                                                ));
+                                            }
+                                            Ok(count) => offset += count,
+                                            Err(error)
+                                                if error.kind() == io::ErrorKind::Interrupted =>
+                                            {
+                                                continue;
+                                            }
+                                            Err(error) => return Err(error),
+                                        }
+                                    }
+                                    if !supplied
+                                        .iter()
+                                        .zip(token)
+                                        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                                        .eq(&0)
+                                    {
+                                        return Err(io::Error::new(
+                                            io::ErrorKind::PermissionDenied,
+                                            "checkpoint token mismatch",
+                                        ));
+                                    }
+                                    for file in files.values() {
+                                        if stop.load(Ordering::Acquire) {
+                                            break;
+                                        }
+                                        send_fd(&stream, file.as_raw_fd(), deadline)?;
+                                    }
+                                    Ok(())
+                                })();
+                                if let Err(error) = result {
+                                    log::debug!(
+                                        "checkpoint descriptor handoff did not complete: {error}"
+                                    );
+                                }
+                            }
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                            Err(_) => break,
+                        }
                     }
-                }
-            },
-        )?);
+                })?,
+        );
         Ok((service, token))
     }
 
@@ -236,6 +273,7 @@ impl RetainedFiles {
 impl Drop for RetainedFiles {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        let _ = self.wake.write(1);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -523,6 +561,19 @@ mod tests {
         drop(service);
         assert_eq!(fs::read(&path).unwrap(), b"replacement");
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn dropping_an_idle_service_wakes_it_instead_of_waiting_out_its_poll() {
+        let path = path("idle-drop");
+        let (service, _) =
+            RetainedFiles::start(&path, BTreeMap::from([(1, Arc::new(retained_file()))])).unwrap();
+        // Let the worker reach its idle wait before dropping it.
+        thread::sleep(Duration::from_millis(50));
+        let start = Instant::now();
+        drop(service);
+        assert!(start.elapsed() < Duration::from_millis(IDLE_WAIT_MS as u64 / 2));
+        assert!(!path.exists());
     }
 
     #[test]

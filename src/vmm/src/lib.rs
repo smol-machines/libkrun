@@ -737,9 +737,12 @@ impl Vmm {
     ) -> std::io::Result<()> {
         self.layered_exports
             .retain(|service| !service.is_finished());
-        if self.layered_exports.len() >= 128 {
+        // One idle service per live branch generation; each is a sleeping
+        // thread with a small stack and no CPU cost, so this bound only guards
+        // against a runaway caller rather than sizing a realistic fan-out.
+        if self.layered_exports.len() >= 1024 {
             return Err(std::io::Error::other(
-                "too many retained RAM handoffs; remove unused branch generations",
+                "more than 1024 live branch generations retained for handoff; delete branches whose generation nothing else will branch from",
             ));
         }
         self.layered_exports.push(service);
@@ -769,6 +772,29 @@ impl Vmm {
         log::debug!("captured layered RAM generation: {copied} private bytes copied");
         self.layered_ram = Some(next.clone());
         Ok(Some(next))
+    }
+    /// Make a memfd-backed source a layered instance in place: seal its RAM
+    /// files as the base generation and remap it privately over them. Nothing
+    /// is copied; from here on a capture copies only the pages the source has
+    /// written since the previous one, and a clone restored from such a
+    /// generation stays a copy-on-write view even when it is branchable
+    /// itself. The VM must be paused with its devices quiesced. Gated like
+    /// `replay_fs_dax_maps`: only builds with the live-fork path remap RAM.
+    #[cfg(all(target_os = "linux", fork_continue_supported, feature = "blk"))]
+    fn adopt_layered_ram(&mut self) -> Result<()> {
+        self.ensure_ram_mapping_valid()?;
+        if self.layered_ram.is_some() {
+            return Ok(());
+        }
+        snapshot::rebase_guest_memory_private(&self.guest_memory)
+            .map_err(|error| Error::Snapshot(format!("seal guest RAM generation: {error}")))?;
+        // The rebase replaced every file-backed host mapping, including the
+        // virtio-fs DAX windows the guest still has page-table entries for.
+        self.mmio_device_manager.replay_fs_dax_maps();
+        let base = layered_restore::Generation::from_sealed_memory(&self.guest_memory)
+            .map_err(|error| Error::Snapshot(format!("adopt guest RAM generation: {error}")))?;
+        self.layered_ram = Some(base);
+        Ok(())
     }
     #[cfg(snapshot_supported)]
     fn validate_restore_cpus(&self, checkpoint: &VmCheckpoint) -> Result<()> {
@@ -1812,6 +1838,11 @@ impl Vmm {
         if !has_memfd_backed_memory(&descs) && !layered {
             return Err(Error::ForkRequiresMemfd);
         }
+        // Same adoption as a continuing branch: the frozen source's sealed
+        // files become the base generation and nothing is copied, now or when
+        // a branchable clone of it is branched in turn.
+        #[cfg(all(target_os = "linux", fork_continue_supported, feature = "blk"))]
+        let adopt_layered = !layered && has_memfd_backed_memory(&descs);
         // A source that continued past an earlier generation runs on private
         // copy-on-write pages over that generation's memfd, so the memfd no
         // longer holds its current RAM. Publishing it would give clones the
@@ -1829,6 +1860,10 @@ impl Vmm {
         self.pause()?;
         let checkpoint = (|| {
             self.quiesce_devices()?;
+            #[cfg(all(target_os = "linux", fork_continue_supported, feature = "blk"))]
+            if adopt_layered {
+                self.adopt_layered_ram()?;
+            }
             #[cfg(target_os = "windows")]
             snapshot::flush_guest_memory_backing(&self.guest_memory)
                 .map_err(|error| Error::Snapshot(format!("flush fork RAM: {error}")))?;
@@ -1902,7 +1937,14 @@ impl Vmm {
         if !has_memfd_backing && guardian_socket.is_none() && !layered {
             return Err(Error::ForkRequiresMemfd);
         }
-        let needs_materialization = if layered {
+        // A memfd-backed source that has never captured a layered generation
+        // adopts its own sealed RAM files as the base now, so this capture and
+        // every later one copy only the pages written since, never a whole
+        // generation, and the clones they restore stay cheap even when they
+        // are branchable themselves. Guardian-paged branches keep their own
+        // protocol.
+        let adopt_layered = !layered && has_memfd_backing && guardian_socket.is_none();
+        let needs_materialization = if layered || adopt_layered {
             false
         } else if has_memfd_backing {
             snapshot::guest_memory_has_private_backing(&self.guest_memory).map_err(|error| {
@@ -1915,6 +1957,9 @@ impl Vmm {
         self.pause()?;
         let capture = (|| {
             self.quiesce_devices()?;
+            if adopt_layered {
+                self.adopt_layered_ram()?;
+            }
             if has_memfd_backing
                 && needs_materialization
                 && !snapshot::guest_memory_backing_is_immutable(&self.guest_memory)
@@ -1967,6 +2012,7 @@ impl Vmm {
                 .map_err(|error| Error::Snapshot(format!("pivot source disks: {error}")))?;
             if !needs_materialization
                 && !layered
+                && !adopt_layered
                 && let Err(error) = snapshot::rebase_guest_memory_private(&self.guest_memory)
             {
                 let rollback = self
