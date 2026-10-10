@@ -528,9 +528,7 @@ fn release_reported_pages() -> bool {
             Ok("keep") => return false,
             _ => {}
         }
-        use windows_sys::Win32::System::SystemInformation::{
-            GlobalMemoryStatusEx, MEMORYSTATUSEX,
-        };
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
         let mut st: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
         st.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
         // SAFETY: correctly sized and initialized out-struct.
