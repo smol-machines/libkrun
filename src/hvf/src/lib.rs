@@ -91,6 +91,7 @@ const CNTHCTL_EL2_BITS: u64 = CNTHCTL_EL0VCTEN | CNTHCTL_EL0PCTEN;
 const AA64PFR0_EL1_EL2EN: u64 = 1 << 8;
 const AA64PFR0_EL1_GIC3EN: u64 = 1 << 24;
 const AA64PFR1_EL1_SMEMASK: u64 = 3 << 24;
+const AA64PFR1_EL1_SSBSMASK: u64 = 0xf << 4;
 
 const EC_WFX_TRAP: u64 = 0x1;
 const EC_AA64_HVC: u64 = 0x16;
@@ -1066,6 +1067,32 @@ impl HvfVcpu<'_> {
         // We write vcpuid to Aff1 as otherwise it won't match the redistributor ID
         // when using HVF in-kernel GICv3.
         let ret = unsafe { hv_vcpu_set_sys_reg(vcpuid, hv_sys_reg_t_HV_SYS_REG_MPIDR_EL1, mpidr) };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuCreate);
+        }
+
+        // Hide SSBS from every guest, so a checkpoint taken on this Mac can
+        // resume on hosts that do not offer it: the M4 lacks it, and Linux hides
+        // it on cores with erratum 3194386 (Neoverse V2, such as Google Axion).
+        // A guest without it never relies on it, as M4 guests already show.
+        let val: u64 = 0;
+        let ret = unsafe {
+            hv_vcpu_get_sys_reg(
+                vcpuid,
+                hv_sys_reg_t_HV_SYS_REG_ID_AA64PFR1_EL1,
+                &val as *const _ as *mut _,
+            )
+        };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuCreate);
+        }
+        let ret = unsafe {
+            hv_vcpu_set_sys_reg(
+                vcpuid,
+                hv_sys_reg_t_HV_SYS_REG_ID_AA64PFR1_EL1,
+                val & !AA64PFR1_EL1_SSBSMASK,
+            )
+        };
         if ret != HV_SUCCESS {
             return Err(Error::VcpuCreate);
         }
