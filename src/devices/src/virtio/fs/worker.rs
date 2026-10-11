@@ -467,24 +467,30 @@ impl FsWorker {
         let mut processed = false;
         while let Some(head) = queue.pop(mem) {
             processed = true;
-            let reader = Reader::new(mem, head.clone())
-                .map_err(FsError::QueueReader)
-                .unwrap();
-            let writer = Writer::new(mem, head.clone())
-                .map_err(FsError::QueueWriter)
-                .unwrap();
-
-            let len = match server.handle_message(
-                reader,
-                writer,
-                shm_region,
-                exit_code,
-                #[cfg(any(target_os = "macos", target_os = "windows"))]
-                map_sender,
+            let len = match (
+                Reader::new(mem, head.clone()).map_err(FsError::QueueReader),
+                Writer::new(mem, head.clone()).map_err(FsError::QueueWriter),
             ) {
-                Ok(len) => len,
-                Err(e) => {
-                    error!("error handling message: {e:?}");
+                (Ok(reader), Ok(writer)) => match server.handle_message(
+                    reader,
+                    writer,
+                    shm_region,
+                    exit_code,
+                    #[cfg(any(target_os = "macos", target_os = "windows"))]
+                    map_sender,
+                ) {
+                    Ok(len) => len,
+                    Err(e) => {
+                        error!("error handling message: {e:?}");
+                        0
+                    }
+                },
+                (reader, writer) => {
+                    error!(
+                        "invalid descriptor chain: {:?} {:?}",
+                        reader.err(),
+                        writer.err()
+                    );
                     0
                 }
             };
@@ -504,5 +510,36 @@ impl FsWorker {
             interrupt.signal_used_queue();
         }
         processed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::legacy::DummyIrqChip;
+    use crate::virtio::queue::tests::VirtQueue;
+    use vm_memory::GuestAddress;
+
+    #[test]
+    fn a_request_outside_guest_memory_is_completed_not_fatal() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        let ring = VirtQueue::new(GuestAddress(0x1000), &mem, 8);
+        ring.dtable[0].set(0x10_0000, 64, 0, 0);
+        ring.avail.ring[0].set(0);
+        ring.avail.idx.set(1);
+        let mut queue = ring.create_queue();
+        let server = FsWorker::new_server(None, None, false, Vec::new(), None).unwrap();
+
+        FsWorker::process_queue(
+            &mut queue,
+            &server,
+            &mem,
+            &None,
+            &InterruptTransport::new(DummyIrqChip::new().into(), "fs test".into()).unwrap(),
+            &Arc::new(AtomicI32::new(0)),
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            &None,
+        );
+        assert_eq!(ring.used.idx.get(), 1);
     }
 }
