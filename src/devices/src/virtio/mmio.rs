@@ -364,10 +364,19 @@ impl MmioTransport {
         // . Do not reset config_generation and keep it monotonically increasing
     }
 
-    fn activate(&mut self) {
+    fn activate(&mut self) -> std::result::Result<(), String> {
         let Some(queues) = self.queues.take() else {
-            return;
+            return Ok(());
         };
+        // Devices read the rings without bounds checks, so a ready queue must
+        // lie in guest memory before any device sees it.
+        if let Some(i) = queues
+            .iter()
+            .position(|q| q.ready && !q.is_valid(&self.mem))
+        {
+            self.queues = Some(queues);
+            return Err(format!("queue {i} is not valid"));
+        }
 
         let mut device_queues: Vec<DeviceQueue> = queues
             .into_iter()
@@ -384,6 +393,7 @@ impl MmioTransport {
         locked_device
             .activate(self.mem.clone(), self.interrupt.clone(), device_queues)
             .expect("Failed to activate device");
+        Ok(())
     }
 
     /// Re-activate this device from a checkpoint, **bypassing the guest's
@@ -416,7 +426,7 @@ impl MmioTransport {
             | device_status::DRIVER_OK;
 
         if !self.locked_device().is_activated() {
-            self.activate();
+            self.activate()?;
         }
         Ok(())
     }
@@ -445,8 +455,9 @@ impl MmioTransport {
             DRIVER_OK if self.device_status == (ACKNOWLEDGE | DRIVER | FEATURES_OK) => {
                 self.device_status = status;
                 let device_activated = self.locked_device().is_activated();
-                if !device_activated {
-                    self.activate();
+                if !device_activated && let Err(e) = self.activate() {
+                    error!("refusing to activate virtio device: {e}");
+                    self.device_status |= FAILED;
                 }
             }
             _ if (status & FAILED) != 0 => {
@@ -946,6 +957,11 @@ pub(crate) mod tests {
         d.write(0, 0xa4, &buf[..]);
         assert_eq!(d.queues.as_ref().unwrap()[0].used_ring.0, 125 + (125 << 32));
 
+        // Point the rings back inside guest memory, or DRIVER_OK refuses activation.
+        let queue = &mut d.queues.as_mut().unwrap()[0];
+        (queue.desc_table, queue.avail_ring, queue.used_ring) =
+            (GuestAddress(0), GuestAddress(0), GuestAddress(0));
+
         set_device_status(
             &mut d,
             device_status::ACKNOWLEDGE
@@ -1057,6 +1073,44 @@ pub(crate) mod tests {
                 | device_status::DRIVER_OK
         );
         assert!(d.locked_device().is_activated());
+    }
+
+    #[test]
+    fn a_ring_outside_guest_memory_refuses_activation() {
+        let m = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let mut d = MmioTransport::new(
+            m,
+            DummyIrqChip::new().into(),
+            Arc::new(Mutex::new(DummyDevice::new())),
+        )
+        .unwrap();
+        set_device_status(&mut d, device_status::ACKNOWLEDGE);
+        set_device_status(&mut d, device_status::ACKNOWLEDGE | device_status::DRIVER);
+        set_device_status(
+            &mut d,
+            device_status::ACKNOWLEDGE | device_status::DRIVER | device_status::FEATURES_OK,
+        );
+        let mut buf = [0; 4];
+        for q in 0..2 {
+            d.queue_select = q;
+            write_le_u32(&mut buf[..], 16);
+            d.write(0, 0x38, &buf[..]);
+            write_le_u32(&mut buf[..], 1);
+            d.write(0, 0x44, &buf[..]);
+        }
+        // Queue 1's available ring lies past the end of guest memory.
+        write_le_u32(&mut buf[..], 0x10_0000);
+        d.write(0, 0x90, &buf[..]);
+
+        set_device_status(
+            &mut d,
+            device_status::ACKNOWLEDGE
+                | device_status::DRIVER
+                | device_status::FEATURES_OK
+                | device_status::DRIVER_OK,
+        );
+        assert!(!d.locked_device().is_activated());
+        assert_ne!(d.device_status & device_status::FAILED, 0);
     }
 
     fn activate_device(d: &mut MmioTransport) {
