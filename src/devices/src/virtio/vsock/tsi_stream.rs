@@ -938,11 +938,24 @@ impl Proxy for TsiStreamProxy {
         // Accept the whole buffer from the guest (a vsock data packet is
         // all-or-nothing — there is no way to tell the guest we took only part),
         // then drain as much as the host socket will take right now.
-        if let Some(buf) = pkt.buf() {
-            self.tx_buf.extend(buf.iter().copied());
-        }
+        // A guest honouring the window we advertise (buf_alloc = CONN_TX_BUF_SIZE,
+        // fwd_cnt = flushed bytes) never has more than that unflushed.
+        let accepted = match pkt.data() {
+            Some(buf) if self.tx_buf.len() + buf.len() > defs::CONN_TX_BUF_SIZE => {
+                warn!(
+                    "sendmsg: guest overran its tx window, resetting id={}",
+                    self.id
+                );
+                Err(())
+            }
+            Some(buf) => {
+                self.tx_buf.extend(buf.iter().copied());
+                Ok(())
+            }
+            None => Ok(()),
+        };
 
-        match self.flush_tx() {
+        match accepted.and_then(|()| self.flush_tx()) {
             Ok(advanced) => {
                 if advanced && self.maybe_send_credit_update() {
                     update.signal_queue = true;

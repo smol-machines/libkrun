@@ -362,13 +362,13 @@ impl Proxy for TsiDgramProxy {
         // Connected DNS socket: route the query to the worker; the worker pushes
         // the response and signals the guest asynchronously.
         if self.connected_dns {
-            if let Some(buf) = pkt.buf() {
+            if let Some(buf) = pkt.data() {
                 self.send_dns_query(buf);
             }
             return ProxyUpdate::default();
         }
 
-        let ret = if let Some(buf) = pkt.buf() {
+        let ret = if let Some(buf) = pkt.data() {
             #[cfg(target_os = "linux")]
             let send_res = self.sock.send_with_flags(buf, libc::MSG_NOSIGNAL);
             #[cfg(not(target_os = "linux"))]
@@ -416,7 +416,7 @@ impl Proxy for TsiDgramProxy {
         self.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
 
         if let Some(addr) = self.sendto_addr.clone() {
-            if let Some(buf) = pkt.buf() {
+            if let Some(buf) = pkt.data() {
                 // Unconnected DNS query (sendto a resolver:53): route to the
                 // worker instead of the host socket.
                 if self.dns_sender.is_some() && sockaddr_port(&addr) == Some(DNS_PORT) {
