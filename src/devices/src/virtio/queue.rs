@@ -29,6 +29,7 @@ pub(crate) const VIRTQ_AVAIL_ELEMENT_SIZE: u64 = 2;
 
 pub(super) const VIRTQ_DESC_F_NEXT: u16 = 0x1;
 pub(super) const VIRTQ_DESC_F_WRITE: u16 = 0x2;
+pub(super) const VIRTQ_DESC_F_INDIRECT: u16 = 0x4;
 
 /// Virtio Queue related errors.
 #[allow(clippy::enum_variant_names)]
@@ -171,12 +172,34 @@ impl<'a> Iterator for DescIter<'a> {
     type Item = DescriptorChain<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(current) = self.next.take() {
+        let current = self.next.take()?;
+        if current.flags & VIRTQ_DESC_F_INDIRECT == 0 {
             self.next = current.next_descriptor();
-            Some(current)
-        } else {
-            None
+            return Some(current);
         }
+        // Indirect descriptor (only offered by devices that negotiate
+        // VIRTIO_RING_F_INDIRECT_DESC): its buffer is a table of descriptors
+        // that replaces the rest of the chain. A table may not itself contain
+        // indirect descriptors, and the chain ends with the table.
+        let len = current.len as usize;
+        if len == 0 || !len.is_multiple_of(16) || len / 16 > u16::MAX as usize {
+            error!("{}", Error::InvalidIndirectDescriptorTable);
+            return None;
+        }
+        let entries = (len / 16) as u16;
+        let first = DescriptorChain::checked_new(current.mem, current.addr, entries, 0)?;
+        if first.flags & VIRTQ_DESC_F_INDIRECT != 0 {
+            error!("{}", Error::InvalidIndirectDescriptor);
+            return None;
+        }
+        self.next = first.next_descriptor().filter(|d| {
+            let nested = d.flags & VIRTQ_DESC_F_INDIRECT != 0;
+            if nested {
+                error!("{}", Error::InvalidIndirectDescriptor);
+            }
+            !nested
+        });
+        Some(first)
     }
 }
 
@@ -1099,6 +1122,74 @@ pub(crate) mod tests {
 
             assert!(c.next_descriptor().unwrap().next_descriptor().is_none());
         }
+    }
+
+    #[test]
+    fn test_indirect_descriptor_chain() {
+        use vm_memory::Bytes;
+        let m = &GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let vq = VirtQueue::new(GuestAddress(0), m, 16);
+
+        // Head 0 points at a 3-entry indirect table at 0x3000.
+        vq.dtable[0].set(0x3000, 3 * 16, VIRTQ_DESC_F_INDIRECT, 0);
+        let table = [
+            Descriptor {
+                addr: 0x4000,
+                len: 16,
+                flags: VIRTQ_DESC_F_NEXT,
+                next: 1,
+            },
+            Descriptor {
+                addr: 0x5000,
+                len: 0x1000,
+                flags: VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE,
+                next: 2,
+            },
+            Descriptor {
+                addr: 0x6000,
+                len: 1,
+                flags: VIRTQ_DESC_F_WRITE,
+                next: 0,
+            },
+        ];
+        for (i, d) in table.iter().enumerate() {
+            m.write_obj(*d, GuestAddress(0x3000 + 16 * i as u64))
+                .unwrap();
+        }
+
+        let head = DescriptorChain::checked_new(m, vq.dtable_start(), 16, 0).unwrap();
+        assert_eq!(head.index, 0);
+        let got: Vec<(u64, u32, bool)> = head
+            .into_iter()
+            .map(|d| (d.addr.0, d.len, d.is_write_only()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (0x4000, 16, false),
+                (0x5000, 0x1000, true),
+                (0x6000, 1, true)
+            ]
+        );
+
+        // A table entry that is itself indirect is rejected.
+        m.write_obj(
+            Descriptor {
+                addr: 0x3000,
+                len: 16,
+                flags: VIRTQ_DESC_F_INDIRECT,
+                next: 0,
+            },
+            GuestAddress(0x3000 + 16),
+        )
+        .unwrap();
+        let head = DescriptorChain::checked_new(m, vq.dtable_start(), 16, 0).unwrap();
+        assert_eq!(head.into_iter().count(), 1);
+
+        // A table whose length is not a whole number of descriptors is rejected.
+        vq.dtable[0].set(0x3000, 20, VIRTQ_DESC_F_INDIRECT, 0);
+        let head = DescriptorChain::checked_new(m, vq.dtable_start(), 16, 0).unwrap();
+        assert_eq!(head.into_iter().count(), 0);
     }
 
     #[test]

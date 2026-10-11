@@ -41,6 +41,15 @@ use windows_sys::Win32::System::Hypervisor::{
     WHV_EMULATOR_IO_ACCESS_INFO, WHV_EMULATOR_MEMORY_ACCESS_INFO, WHV_TRANSLATE_GVA_FLAGS,
     WHV_TRANSLATE_GVA_RESULT, WHV_TRANSLATE_GVA_RESULT_CODE, WHvTranslateGva,
 };
+use windows_sys::Win32::System::Hypervisor::{
+    WHvCapabilityCodeSyntheticProcessorFeaturesBanks, WHvGetVirtualProcessorState,
+    WHvRegisterGuestOsId, WHvRegisterReferenceTsc, WHvRegisterScontrol, WHvRegisterSiefp,
+    WHvRegisterSimp, WHvRegisterSint0, WHvRegisterSint1, WHvRegisterSint2, WHvRegisterSint3,
+    WHvRegisterSint4, WHvRegisterSint5, WHvRegisterSint6, WHvRegisterSint7, WHvRegisterSint8,
+    WHvRegisterSint9, WHvRegisterSint10, WHvRegisterSint11, WHvRegisterSint12, WHvRegisterSint13,
+    WHvRegisterSint14, WHvRegisterSint15, WHvRegisterVpAssistPage, WHvSetVirtualProcessorState,
+    WHvVirtualProcessorStateTypeSynicTimerState, WHvX64RegisterHypercall,
+};
 // Register names + state APIs used for checkpoint/restore (snapshot & fork).
 use windows_sys::Win32::System::Hypervisor::{
     WHvGetVirtualProcessorInterruptControllerState, WHvGetVirtualProcessorXsaveState,
@@ -179,6 +188,115 @@ impl Display for Error {
 }
 
 /// Verifies that the Windows Hypervisor Platform is available.
+/// Experimental tuning override read from the environment as hex (with or
+/// without a 0x prefix). Used to evaluate Hyper-V enlightenments on real hosts.
+pub fn tuning_knob(name: &str) -> Option<u64> {
+    let v = std::env::var(name).ok()?;
+    let v = v.trim().trim_start_matches("0x");
+    let parsed = u64::from_str_radix(v, 16).ok();
+    if parsed.is_some() {
+        log::warn!("WHP tuning knob {name}={v}");
+    }
+    parsed
+}
+
+/// Opt the VMM process out of Windows power throttling (EcoQoS).
+///
+/// Windows throttles windowless background processes to efficiency clocks, and
+/// the VM process is one: guest compute ran ~1.5x slower than the same work in
+/// WSL2 until the process asked for full execution speed. Per-thread calls in
+/// the vCPU loop cover threads created before this runs.
+pub fn disable_power_throttling() {
+    if std::env::var_os("SMOLVM_WHP_ECOQOS").is_some() {
+        return;
+    }
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        PROCESS_POWER_THROTTLING_STATE, ProcessPowerThrottling, SetProcessInformation,
+    };
+    let state = PROCESS_POWER_THROTTLING_STATE {
+        Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        // Control both knobs and leave both off: full clocks, and honor the
+        // timer resolution the process asks for.
+        ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+            | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        StateMask: 0,
+    };
+    // SAFETY: valid pseudo-handle and a correctly sized, initialized struct.
+    let ok = unsafe {
+        SetProcessInformation(
+            GetCurrentProcess(),
+            ProcessPowerThrottling,
+            &state as *const _ as *const _,
+            mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+        )
+    };
+    if ok == 0 {
+        log::warn!("could not opt the VM process out of power throttling");
+    }
+}
+
+/// Opt the calling thread out of Windows power throttling (see
+/// [`disable_power_throttling`]). Call from each vCPU thread.
+pub fn disable_thread_power_throttling() {
+    if std::env::var_os("SMOLVM_WHP_ECOQOS").is_some() {
+        return;
+    }
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentThread, SetThreadInformation, THREAD_POWER_THROTTLING_CURRENT_VERSION,
+        THREAD_POWER_THROTTLING_EXECUTION_SPEED, THREAD_POWER_THROTTLING_STATE,
+        ThreadPowerThrottling,
+    };
+    let state = THREAD_POWER_THROTTLING_STATE {
+        Version: THREAD_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: THREAD_POWER_THROTTLING_EXECUTION_SPEED,
+        StateMask: 0,
+    };
+    // SAFETY: valid pseudo-handle and a correctly sized, initialized struct.
+    let ok = unsafe {
+        SetThreadInformation(
+            GetCurrentThread(),
+            ThreadPowerThrottling,
+            &state as *const _ as *const _,
+            mem::size_of::<THREAD_POWER_THROTTLING_STATE>() as u32,
+        )
+    };
+    if ok == 0 {
+        log::warn!("could not opt a vCPU thread out of power throttling");
+    }
+}
+
+fn srso_user_kernel_no_leaf() -> Option<WHV_X64_CPUID_RESULT> {
+    if std::env::var_os("SMOLVM_WHP_NO_SRSO_HINT").is_some() {
+        return None;
+    }
+    let (vendor, sig, max_ext) = {
+        let v = core::arch::x86_64::__cpuid(0);
+        (
+            [v.ebx, v.edx, v.ecx],
+            core::arch::x86_64::__cpuid(1).eax,
+            core::arch::x86_64::__cpuid(0x8000_0000).eax,
+        )
+    };
+    // "AuthenticAMD"
+    let is_amd = vendor == [0x6874_7541, 0x6974_6E65, 0x444D_4163];
+    let family = ((sig >> 8) & 0xf) + ((sig >> 20) & 0xff);
+    if !is_amd || family < 0x1a || max_ext < 0x8000_0021 {
+        return None;
+    }
+    // Leaf checked against the maximum extended leaf above.
+    let host = core::arch::x86_64::__cpuid(0x8000_0021);
+    Some(WHV_X64_CPUID_RESULT {
+        Function: 0x8000_0021,
+        Reserved: [0; 3],
+        Eax: host.eax | (1 << 30),
+        Ebx: host.ebx,
+        Ecx: host.ecx,
+        Edx: host.edx,
+    })
+}
+
 pub fn check_hypervisor() -> Result<(), Error> {
     let mut capability = MaybeUninit::<WHV_CAPABILITY>::uninit();
     let mut written_size: u32 = 0;
@@ -221,6 +339,49 @@ fn get_processor_features_banks() -> Result<WHV_PROCESSOR_FEATURES_BANKS, Error>
         }
 
         Ok(capability.assume_init().ProcessorFeaturesBanks)
+    }
+}
+
+/// Synthetic features smolvm always exposes (hypervisor present, Hv1, VP
+/// runtime, reference counter, hypercalls, VP index, reference TSC page,
+/// frequency MSRs).
+const SYNTH_BASE: u64 = 0xB8F;
+/// Enlightenments that remove most interrupt-path exits: SynIC (4) and
+/// synthetic timers (5) with direct mode (22), APIC access MSRs and the VP
+/// assist page for lazy EOI (6), extended processor masks (24), TLB-flush
+/// hypercalls (25) and cluster-IPI hypercalls (26).
+const SYNTH_ENLIGHTENED: u64 =
+    SYNTH_BASE | 1 << 4 | 1 << 5 | 1 << 6 | 1 << 22 | 1 << 24 | 1 << 25 | 1 << 26;
+
+static ENLIGHTENED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the partition exposes direct-mode synthetic timers, in which case
+/// the guest has a working per-CPU clockevent and needs no PIT fallback.
+pub fn enlightened() -> bool {
+    ENLIGHTENED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Synthetic features this host's WHP can expose, or 0 on hosts that predate
+/// the capability.
+fn supported_synthetic_features() -> u64 {
+    let mut capability = MaybeUninit::<WHV_CAPABILITY>::zeroed();
+    let mut written_size: u32 = 0;
+    // SAFETY: the buffer is a zeroed WHV_CAPABILITY of the advertised size.
+    unsafe {
+        let hr = WHvGetCapability(
+            WHvCapabilityCodeSyntheticProcessorFeaturesBanks,
+            capability.as_mut_ptr().cast(),
+            mem::size_of::<WHV_CAPABILITY>() as u32,
+            &mut written_size,
+        );
+        if hr != S_OK {
+            return 0;
+        }
+        let banks = capability.assume_init().SyntheticProcessorFeaturesBanks;
+        if banks.BanksCount < 1 {
+            return 0;
+        }
+        banks.Anonymous.AsUINT64[0]
     }
 }
 
@@ -345,6 +506,7 @@ impl WhpVm {
     /// WHvSetupPartition — finalizes the partition. After this call, configuration is locked and you can start creating vCPUs.
     ///                     You cannot change the config (like processor count) after this call.
     pub fn new(vcpu_count: u32) -> Result<Self, Error> {
+        disable_power_throttling();
         let handle = unsafe {
             let mut h: WHV_PARTITION_HANDLE = 0;
             let hr = WHvCreatePartition(&mut h);
@@ -438,6 +600,20 @@ impl WhpVm {
             }
         }
 
+        // Enlighten the guest the way Hyper-V's own Linux guests (WSL2) are
+        // when the host supports it; older hosts keep the minimal set and the
+        // emulated PIT tick.
+        let enlighten = std::env::var_os("SMOLVM_WHP_LEGACY_TIMERS").is_none()
+            && supported_synthetic_features() & SYNTH_ENLIGHTENED == SYNTH_ENLIGHTENED;
+        let synth = tuning_knob("SMOLVM_WHP_SYNTH").unwrap_or(if enlighten {
+            SYNTH_ENLIGHTENED
+        } else {
+            SYNTH_BASE
+        });
+        let enlighten = synth & SYNTH_ENLIGHTENED == SYNTH_ENLIGHTENED;
+        ENLIGHTENED.store(enlighten, std::sync::atomic::Ordering::Relaxed);
+        debug!("WHP synthetic features {synth:#x} (enlightened: {enlighten})");
+
         // This unlocks the MSRs you are advertising in CPUID.
         Self::set_property_optional(
             handle,
@@ -454,7 +630,7 @@ impl WhpVm {
                 // Bit 9: AccessPartitionReferenceTsc
                 // Bit 11: AccessFrequencyRegs
                 unsafe {
-                    p.SyntheticProcessorFeaturesBanks.Anonymous.AsUINT64[0] = 0xB8F;
+                    p.SyntheticProcessorFeaturesBanks.Anonymous.AsUINT64[0] = synth;
                 }
             },
         )?;
@@ -508,16 +684,36 @@ impl WhpVm {
                 | ACCESS_HYPERCALLS
                 | ACCESS_VP_INDEX
                 | ACCESS_REF_TSC
-                | ACCESS_FREQ_REGS,
+                | ACCESS_FREQ_REGS
+                | tuning_knob("SMOLVM_WHP_FEAT_EAX").unwrap_or(if enlighten {
+                    // Synthetic timers (3) and APIC access MSRs (4).
+                    1 << 3 | 1 << 4
+                } else {
+                    0
+                }) as u32,
             Ebx: 0,
             Ecx: 0,
-            Edx: 0,
+            // Frequency MSRs available (8): the guest reads the TSC and APIC
+            // timer rates instead of calibrating against a PIT. Direct-mode
+            // synthetic timers (19).
+            Edx: tuning_knob("SMOLVM_WHP_FEAT_EDX").unwrap_or(if enlighten {
+                1 << 8 | 1 << 19
+            } else {
+                0
+            }) as u32,
         });
         // 0x40000004 — Recommendations
         cpuid_results.push(WHV_X64_CPUID_RESULT {
             Function: 0x40000004,
             Reserved: [0; 3],
-            Eax: 1 << 5, // RelaxedTiming
+            // RelaxedTiming (5); when enlightened also remote TLB flush (2),
+            // APIC access MSRs (3), cluster IPIs (10) and extended processor
+            // masks (11).
+            Eax: tuning_knob("SMOLVM_WHP_HINTS").unwrap_or(if enlighten {
+                1 << 2 | 1 << 3 | 1 << 5 | 1 << 10 | 1 << 11
+            } else {
+                1 << 5
+            }) as u32,
             Ebx: 0,
             Ecx: 0,
             Edx: 0,
@@ -558,6 +754,17 @@ impl WhpVm {
             Ecx: 0,
             Edx: 0x100, // bit 8 (Invariant TSC / nonstop_tsc)
         });
+
+        // AMD Zen 5 and later (family 0x1a+) are not affected by SRSO across the
+        // user/kernel boundary and reports that in CPUID 0x8000_0021 EAX[30]
+        // (SRSO_USER_KERNEL_NO), but the Windows hypervisor filters the bit out
+        // of the leaf it hands us. Without it the guest kernel falls back to
+        // the "Safe RET" mitigation, which made every syscall ~4x slower. Put
+        // the architectural bit back; the guest still mitigates everything the
+        // part is actually exposed to, and Hyper-V owns the guest/host boundary.
+        if let Some(leaf) = srso_user_kernel_no_leaf() {
+            cpuid_results.push(leaf);
+        }
 
         // Standard Intel CPUID leaves (Intel's SDM Vol. 2A)
         if tsc_freq_hz > 0 {
@@ -765,6 +972,36 @@ impl WhpVm {
                 guest_start_addr,
                 size,
                 WHvMapGpaRangeFlagRead | WHvMapGpaRangeFlagWrite | WHvMapGpaRangeFlagExecute,
+            )
+        };
+        if hr != S_OK {
+            Err(Error::MapGpaRange(hr))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Ask the hypervisor to back `[gpa, gpa+size)` now instead of on first
+    /// guest touch (`WHvAdviseGpaRange` populate).
+    pub fn populate(&self, gpa: u64, size: u64, write: bool) -> Result<(), Error> {
+        use windows_sys::Win32::System::Hypervisor::{
+            WHV_MEMORY_RANGE_ENTRY, WHvAdviseGpaRange, WHvAdviseGpaRangeCodePopulate,
+        };
+        let range = WHV_MEMORY_RANGE_ENTRY {
+            GuestAddress: gpa,
+            SizeInBytes: size,
+        };
+        // WHV_ADVISE_GPA_RANGE_POPULATE: flags (u32) + access type (u32 = write).
+        let advice: [u32; 2] = [0, write as u32];
+        // SAFETY: valid partition handle, one range entry, correctly sized buffer.
+        let hr = unsafe {
+            WHvAdviseGpaRange(
+                self.handle,
+                &range,
+                1,
+                WHvAdviseGpaRangeCodePopulate,
+                advice.as_ptr() as *const _,
+                8,
             )
         };
         if hr != S_OK {
@@ -1486,6 +1723,33 @@ const CHECKPOINT_REGS: &[WHV_REGISTER_NAME] = &[
     WHvX64RegisterTsc,
     WHvX64RegisterTscDeadline,
     WHvX64RegisterTscAux,
+    // Hyper-V enlightenment state. The guest OS id must precede the hypercall
+    // MSR (the hypervisor refuses to enable the hypercall page without it).
+    // A host or partition without these synthetic features rejects them; the
+    // per-register fallbacks in save/restore skip them there.
+    WHvRegisterGuestOsId,
+    WHvX64RegisterHypercall,
+    WHvRegisterVpAssistPage,
+    WHvRegisterReferenceTsc,
+    WHvRegisterSiefp,
+    WHvRegisterSimp,
+    WHvRegisterSint0,
+    WHvRegisterSint1,
+    WHvRegisterSint2,
+    WHvRegisterSint3,
+    WHvRegisterSint4,
+    WHvRegisterSint5,
+    WHvRegisterSint6,
+    WHvRegisterSint7,
+    WHvRegisterSint8,
+    WHvRegisterSint9,
+    WHvRegisterSint10,
+    WHvRegisterSint11,
+    WHvRegisterSint12,
+    WHvRegisterSint13,
+    WHvRegisterSint14,
+    WHvRegisterSint15,
+    WHvRegisterScontrol,
     // Pending events and interrupt shadow survive a halted vCPU. Restoring
     // registers without them can strand a guest waiting for its next tick.
     WHvRegisterPendingInterruption,
@@ -1505,6 +1769,9 @@ pub struct WhpVcpuState {
     reg_values: Vec<[u8; 16]>,
     lapic: Vec<u8>,
     xsave: Vec<u8>,
+    /// Opaque synthetic-timer state (direct-mode stimers). Empty when the
+    /// partition has no synthetic timers or the checkpoint predates it.
+    synic_timers: Vec<u8>,
 }
 
 impl WhpVcpuState {
@@ -1521,6 +1788,11 @@ impl WhpVcpuState {
         out.extend_from_slice(&self.lapic);
         out.extend_from_slice(&(self.xsave.len() as u32).to_le_bytes());
         out.extend_from_slice(&self.xsave);
+        // Optional trailer: older readers stop after xsave and ignore it.
+        if !self.synic_timers.is_empty() {
+            out.extend_from_slice(&(self.synic_timers.len() as u32).to_le_bytes());
+            out.extend_from_slice(&self.synic_timers);
+        }
         out
     }
 
@@ -1555,11 +1827,18 @@ impl WhpVcpuState {
         let lapic = take(&mut cur, lapic_len)?.to_vec();
         let xsave_len = take_u32(&mut cur)? as usize;
         let xsave = take(&mut cur, xsave_len)?.to_vec();
+        let synic_timers = if cur.is_empty() {
+            Vec::new()
+        } else {
+            let len = take_u32(&mut cur)? as usize;
+            take(&mut cur, len)?.to_vec()
+        };
         Ok(WhpVcpuState {
             reg_names,
             reg_values,
             lapic,
             xsave,
+            synic_timers,
         })
     }
 }
@@ -1640,12 +1919,27 @@ impl WhpVcpu {
                 WHvGetVirtualProcessorXsaveState(part, self.index, buf as *mut c_void, len, written)
             })
             .map_err(Error::GetXsaveState)?;
+        // Only partitions with synthetic timers have this state; elsewhere the
+        // query fails and the checkpoint simply carries none.
+        let synic_timers = self
+            .get_state_blob(|buf, len, written| unsafe {
+                WHvGetVirtualProcessorState(
+                    part,
+                    self.index,
+                    WHvVirtualProcessorStateTypeSynicTimerState,
+                    buf as *mut c_void,
+                    len,
+                    written,
+                )
+            })
+            .unwrap_or_default();
 
         Ok(WhpVcpuState {
             reg_names,
             reg_values,
             lapic,
             xsave,
+            synic_timers,
         })
     }
 
@@ -1736,6 +2030,24 @@ impl WhpVcpu {
         };
         if hr != S_OK {
             return Err(Error::SetInterruptControllerState(hr));
+        }
+
+        // After SCONTROL/SINTs (registers above): re-arm the synthetic timers,
+        // or a guest whose clockevent is a direct-mode stimer never ticks again.
+        if !state.synic_timers.is_empty() && state.synic_timers.len() <= 1 << 20 {
+            let hr = unsafe {
+                WHvSetVirtualProcessorState(
+                    part,
+                    self.index,
+                    WHvVirtualProcessorStateTypeSynicTimerState,
+                    state.synic_timers.as_ptr() as *const c_void,
+                    state.synic_timers.len() as u32,
+                )
+            };
+            if hr != S_OK {
+                error!("restoring synthetic timer state failed: HRESULT 0x{hr:08x}");
+                return Err(Error::SetInterruptControllerState(hr));
+            }
         }
 
         Ok(())

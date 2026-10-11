@@ -442,6 +442,62 @@ impl FileReadWriteVolatile for File {
     }
 }
 
+
+/// Per-thread bounce buffer for gathered host I/O. Allocating a fresh zeroed
+/// buffer per request made Windows fault in and zero every page of it each
+/// time; reusing one keeps the cost to the copy itself.
+#[cfg(windows)]
+fn with_bounce<R>(len: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
+    thread_local! {
+        static BOUNCE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    BOUNCE.with(|b| {
+        let mut b = b.borrow_mut();
+        if b.len() < len {
+            b.resize(len, 0);
+        }
+        f(&mut b[..len])
+    })
+}
+
+/// Merge slices that are back to back in host memory into (ptr, len) runs.
+#[cfg(windows)]
+fn host_runs(bufs: &[VolatileSlice]) -> Vec<(*mut u8, usize)> {
+    let mut runs: Vec<(*mut u8, usize)> = Vec::new();
+    for b in bufs {
+        let p = b.ptr_guard_mut().as_ptr();
+        match runs.last_mut() {
+            Some((rp, rl)) if (*rp as usize) + *rl == p as usize => *rl += b.len(),
+            _ => runs.push((p, b.len())),
+        }
+    }
+    runs
+}
+
+/// Use per-run host calls instead of a bounce copy once runs average this much.
+#[cfg(windows)]
+fn direct_run_bytes() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("SMOLVM_WHP_DIRECT_RUN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64 << 10)
+    })
+}
+
+/// True when the slices are back to back in host memory, so one host call can
+/// fill or drain them in place without a bounce buffer.
+#[cfg(windows)]
+fn host_contiguous(bufs: &[VolatileSlice]) -> bool {
+    bufs.windows(2).all(|w| {
+        // SAFETY: only addresses are compared; nothing is dereferenced.
+        let a = w[0].ptr_guard().as_ptr() as usize;
+        let b = w[1].ptr_guard().as_ptr() as usize;
+        a + w[0].len() == b
+    })
+}
+
 #[cfg(windows)]
 impl FileReadWriteAtVolatile for File {
     fn read_at_volatile(&self, slice: VolatileSlice, offset: u64) -> Result<usize> {
@@ -466,18 +522,133 @@ impl FileReadWriteAtVolatile for File {
     }
 
     fn read_vectored_at_volatile(&self, bufs: &[VolatileSlice], offset: u64) -> Result<usize> {
-        // Fill every buffer in order (the default impl only fills the first),
-        // so a single FUSE read that spans multiple descriptors returns the
-        // full requested length rather than a short read.
-        let mut total = 0u64;
-        for slice in bufs {
-            let n = self.read_at_volatile(*slice, offset + total)?;
-            total += n as u64;
-            if n < slice.len() {
-                break; // short read / EOF: stop, the guest re-reads from here
-            }
+        // A FUSE read arrives as one descriptor per guest page. Issue a single
+        // ReadFile for the whole request and scatter it, instead of one
+        // ReadFile per 4 KiB page; filter drivers make each call costly.
+        if bufs.len() == 1 {
+            return self.read_at_volatile(bufs[0], offset);
         }
-        Ok(total as usize)
+        let len: usize = bufs.iter().map(|b| b.len()).sum();
+        if host_contiguous(bufs) {
+            // SAFETY: the slices are adjacent and together span `len` bytes of
+            // live guest memory.
+            let whole = unsafe {
+                VolatileSlice::new(bufs[0].ptr_guard_mut().as_ptr(), len)
+            };
+            return self.read_at_volatile(whole, offset);
+        }
+        use std::os::windows::fs::FileExt;
+        let runs = host_runs(bufs);
+        if len / runs.len() >= direct_run_bytes() {
+            // Long runs: read each straight into guest memory.
+            let mut total = 0;
+            for (p, rl) in runs {
+                // SAFETY: each run spans adjacent, live guest memory slices.
+                let dst = unsafe { std::slice::from_raw_parts_mut(p, rl) };
+                let mut done = 0;
+                while done < rl {
+                    match self.seek_read(&mut dst[done..], offset + (total + done) as u64) {
+                        Ok(0) => return Ok(total + done), // EOF
+                        Ok(n) => done += n,
+                        Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+                total += rl;
+            }
+            return Ok(total);
+        }
+        with_bounce(len, |tmp| {
+            let mut total = 0;
+            while total < len {
+                match self.seek_read(&mut tmp[total..], offset + total as u64) {
+                    Ok(0) => break, // EOF
+                    Ok(n) => total += n,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            // Plain copies: vm-memory's volatile copy routine is several
+            // times slower than memcpy, and no other agent writes these
+            // guest buffers while the request is outstanding.
+            let mut copied = 0;
+            for slice in bufs {
+                if copied >= total {
+                    break;
+                }
+                let n = slice.len().min(total - copied);
+                // SAFETY: `slice` is live guest memory of at least `n` bytes.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        tmp[copied..].as_ptr(),
+                        slice.ptr_guard_mut().as_ptr(),
+                        n,
+                    )
+                };
+                copied += n;
+            }
+            Ok(total)
+        })
+    }
+
+    fn write_vectored_at_volatile(&self, bufs: &[VolatileSlice], offset: u64) -> Result<usize> {
+        // Gather the per-page descriptors into one buffer and write it with a
+        // single WriteFile (see read_vectored_at_volatile).
+        if bufs.len() == 1 {
+            return self.write_at_volatile(bufs[0], offset);
+        }
+        let len: usize = bufs.iter().map(|b| b.len()).sum();
+        if host_contiguous(bufs) {
+            // SAFETY: see read_vectored_at_volatile.
+            let whole = unsafe {
+                VolatileSlice::new(bufs[0].ptr_guard_mut().as_ptr(), len)
+            };
+            return self.write_at_volatile(whole, offset);
+        }
+        use std::os::windows::fs::FileExt;
+        let runs = host_runs(bufs);
+        if len / runs.len() >= direct_run_bytes() {
+            let mut total = 0;
+            for (p, rl) in runs {
+                // SAFETY: each run spans adjacent, live guest memory slices.
+                let src = unsafe { std::slice::from_raw_parts(p as *const u8, rl) };
+                let mut done = 0;
+                while done < rl {
+                    match self.seek_write(&src[done..], offset + (total + done) as u64) {
+                        Ok(0) => return Ok(total + done),
+                        Ok(n) => done += n,
+                        Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+                total += rl;
+            }
+            return Ok(total);
+        }
+        with_bounce(len, |tmp| {
+            let mut at = 0;
+            for slice in bufs {
+                // SAFETY: `slice` is live guest memory; see the read path.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        slice.ptr_guard().as_ptr(),
+                        tmp[at..].as_mut_ptr(),
+                        slice.len(),
+                    )
+                };
+                at += slice.len();
+            }
+            let mut total = 0;
+            while total < len {
+                match self.seek_write(&tmp[total..], offset + total as u64) {
+                    Ok(0) => break,
+                    Ok(n) => total += n,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(total)
+        })
     }
 
     fn write_at_volatile(&self, slice: VolatileSlice, offset: u64) -> Result<usize> {
@@ -498,6 +669,22 @@ impl FileReadWriteAtVolatile for DiskProperties {
             return Ok(0);
         }
 
+        // imago's Windows backend issues one ReadFile per buffer, and a
+        // virtio-blk request arrives as one buffer per guest page. Bounce the
+        // request through one contiguous buffer so it is a single host call.
+        #[cfg(windows)]
+        if bufs.len() > 1 {
+            let len: usize = bufs.iter().map(|b| b.len()).sum();
+            let mut tmp = vec![0u8; len];
+            self.file.readv(IoVectorMut::from(&mut tmp), offset)?;
+            let mut at = 0;
+            for slice in bufs {
+                slice.copy_from(&tmp[at..at + slice.len()]);
+                at += slice.len();
+            }
+            return Ok(len);
+        }
+
         let (iovec, _guard) = IoVectorMut::from_volatile_slice(bufs);
         let full_length = iovec
             .len()
@@ -514,6 +701,20 @@ impl FileReadWriteAtVolatile for DiskProperties {
     fn write_vectored_at_volatile(&self, bufs: &[VolatileSlice], offset: u64) -> Result<usize> {
         if bufs.is_empty() {
             return Ok(0);
+        }
+
+        // See read_vectored_at_volatile: one host WriteFile per request.
+        #[cfg(windows)]
+        if bufs.len() > 1 {
+            let len: usize = bufs.iter().map(|b| b.len()).sum();
+            let mut tmp = vec![0u8; len];
+            let mut at = 0;
+            for slice in bufs {
+                slice.copy_to(&mut tmp[at..at + slice.len()]);
+                at += slice.len();
+            }
+            self.file.writev(IoVector::from(&tmp), offset)?;
+            return Ok(len);
         }
 
         let (iovec, _guard) = IoVector::from_volatile_slice(bufs);

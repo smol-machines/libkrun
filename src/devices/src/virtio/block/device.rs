@@ -31,7 +31,9 @@ use imago::{
 use log::{error, warn};
 use utils::eventfd::{EFD_NONBLOCK, EventFd};
 use virtio_bindings::{
-    virtio_blk::*, virtio_config::VIRTIO_F_VERSION_1, virtio_ring::VIRTIO_RING_F_EVENT_IDX,
+    virtio_blk::*,
+    virtio_config::VIRTIO_F_VERSION_1,
+    virtio_ring::{VIRTIO_RING_F_EVENT_IDX, VIRTIO_RING_F_INDIRECT_DESC},
 };
 use vm_memory::{ByteValued, GuestMemoryMmap};
 
@@ -87,6 +89,12 @@ pub(crate) struct DiskProperties {
     pub(crate) file: Arc<DiskBackend>,
     nsectors: u64,
     image_id: Vec<u8>,
+    /// Windows, raw images only: independent handles to the image so queued
+    /// reads and writes run concurrently. A synchronous Windows handle
+    /// serializes its own I/O, and the format accessor sits behind one mutex,
+    /// so without these the guest's queue drains one request at a time.
+    #[cfg(target_os = "windows")]
+    pub(crate) parallel: Option<Arc<Vec<File>>>,
 }
 
 /// Format-aware disk accessor selected when the device is created.
@@ -231,7 +239,24 @@ impl DiskProperties {
             nsectors: disk_size >> SECTOR_SHIFT,
             image_id: disk_image_id,
             file: disk_image,
+            #[cfg(target_os = "windows")]
+            parallel: None,
         })
+    }
+
+    /// Open the parallel I/O handles for a raw, buffered Windows image. Any
+    /// failure just leaves the serialized path in place.
+    #[cfg(target_os = "windows")]
+    fn with_parallel_handles(mut self, path: &str, writable: bool) -> Self {
+        const HANDLES: usize = 16;
+        let handles: io::Result<Vec<File>> = (0..HANDLES)
+            .map(|_| OpenOptions::new().read(true).write(writable).open(path))
+            .collect();
+        match handles {
+            Ok(h) => self.parallel = Some(Arc::new(h)),
+            Err(e) => warn!("parallel block handles unavailable for {path}: {e}"),
+        }
+        self
     }
 
     pub fn nsectors(&self) -> u64 {
@@ -563,12 +588,30 @@ impl Block {
 
         let disk_properties =
             DiskProperties::new(disk_image.clone(), disk_image_id.clone(), cache_type)?;
+        #[cfg(target_os = "windows")]
+        let disk_properties = if disk_image_format == ImageType::Raw
+            && !direct_io
+            && std::env::var_os("SMOLVM_BLK_SERIAL").is_none()
+        {
+            disk_properties.with_parallel_handles(&disk_image_path, !is_disk_read_only)
+        } else {
+            disk_properties
+        };
 
         let mut avail_features = (1u64 << VIRTIO_F_VERSION_1)
             | (1u64 << VIRTIO_BLK_F_SEG_MAX)
             | (1u64 << VIRTIO_BLK_F_DISCARD)
             | (1u64 << VIRTIO_BLK_F_WRITE_ZEROES)
-            | (1u64 << VIRTIO_RING_F_EVENT_IDX);
+            | (1u64 << VIRTIO_RING_F_EVENT_IDX)
+            // One ring slot per request however many pages it spans, so the
+            // guest can keep many large requests in flight.
+            | (1u64 << VIRTIO_RING_F_INDIRECT_DESC)
+            // Report a 4 MiB optimal I/O size; Linux sizes read-ahead from it.
+            | (1u64 << VIRTIO_BLK_F_TOPOLOGY);
+
+        if cfg!(target_os = "windows") {
+            avail_features |= 1u64 << VIRTIO_BLK_F_SIZE_MAX;
+        }
 
         if sync_mode != SyncMode::None {
             avail_features |= 1u64 << VIRTIO_BLK_F_FLUSH;
@@ -580,7 +623,12 @@ impl Block {
 
         let config = VirtioBlkConfig {
             capacity: disk_properties.nsectors(),
-            size_max: 0,
+            // Windows serves requests on several host lanes, so cap each
+            // request near 1 MiB (254 segments of at most 4 KiB): the guest's
+            // 8 MiB read-ahead window then keeps every lane busy instead of
+            // two 4 MiB requests. Other hosts take requests as large as the
+            // guest builds them.
+            size_max: if cfg!(target_os = "windows") { 4096 } else { 0 },
             // QUEUE_SIZE - 2
             seg_max: 254,
             max_discard_sectors: u32::MAX,
@@ -589,6 +637,11 @@ impl Block {
             max_write_zeroes_sectors: u32::MAX,
             max_write_zeroes_seg: 1,
             write_zeroes_may_unmap: 1,
+            topology: VirtioBlkTopology {
+                min_io_size: 8,    // 4 KiB in 512-byte sectors
+                opt_io_size: 8192, // 4 MiB in 512-byte sectors
+                ..Default::default()
+            },
             ..Default::default()
         };
 

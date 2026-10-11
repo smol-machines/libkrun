@@ -1,4 +1,6 @@
 use crate::virtio::descriptor_utils::{Reader, Writer};
+#[cfg(target_os = "windows")]
+use std::fs::File;
 
 use super::super::DeviceQueue;
 use super::BlockIoEngine;
@@ -392,6 +394,8 @@ pub struct BlockWorker {
     async_io: Option<AsyncIo>,
     in_flight: usize,
     in_flight_bytes: usize,
+    #[cfg(target_os = "windows")]
+    pipeline: Option<win_pipeline::Pipeline>,
 }
 
 impl BlockWorker {
@@ -421,6 +425,8 @@ impl BlockWorker {
             async_io,
             in_flight: 0,
             in_flight_bytes: 0,
+            #[cfg(target_os = "windows")]
+            pipeline: None,
         })
     }
 
@@ -494,10 +500,55 @@ impl BlockWorker {
             &EpollEvent::new(EventSet::IN, stop_ev_fd as u64),
         );
 
+        #[cfg(target_os = "windows")]
+        if self.pipeline.is_none()
+            && let Some(handles) = self.disk.parallel.clone()
+        {
+            match win_pipeline::Pipeline::new(handles) {
+                Ok(p) => self.pipeline = Some(p),
+                Err(e) => error!("parallel block lanes unavailable: {e}"),
+            }
+        }
+        #[cfg(target_os = "windows")]
+        let pipeline_fd = self.pipeline.as_ref().map(|p| p.done_fd.as_raw_fd());
+        #[cfg(not(target_os = "windows"))]
+        let pipeline_fd: Option<i32> = None;
+        if let Some(fd) = pipeline_fd {
+            let _ = epoll.ctl(
+                ControlOperation::Add,
+                fd,
+                &EpollEvent::new(EventSet::IN, fd as u64),
+            );
+        }
+
         let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
+        // Windows: a queue kick can occasionally go unseen by the event shim,
+        // leaving requests in the ring until some later kick (seconds, in
+        // practice). While the disk is busy, also look at the ring every few
+        // milliseconds; once it has been idle for a second, sleep until kicked.
+        #[cfg(target_os = "windows")]
+        let mut last_activity = std::time::Instant::now();
         loop {
-            match epoll.wait(epoll_events.len(), -1, epoll_events.as_mut_slice()) {
+            #[cfg(target_os = "windows")]
+            let timeout = if last_activity.elapsed() < std::time::Duration::from_secs(1) {
+                5
+            } else {
+                -1
+            };
+            #[cfg(not(target_os = "windows"))]
+            let timeout = -1;
+            match epoll.wait(epoll_events.len(), timeout, epoll_events.as_mut_slice()) {
+                #[cfg(target_os = "windows")]
+                Ok(0) => {
+                    if self.poll_ring() {
+                        last_activity = std::time::Instant::now();
+                    }
+                }
                 Ok(ev_cnt) => {
+                    #[cfg(target_os = "windows")]
+                    {
+                        last_activity = std::time::Instant::now();
+                    }
                     for event in &epoll_events[0..ev_cnt] {
                         let source = event.fd();
                         let event_set = event.event_set();
@@ -513,7 +564,13 @@ impl BlockWorker {
                                 // queue at a clean boundary (no in-flight I/O).
                                 self.process_virtio_queues();
                                 self.drain_async();
+                                #[cfg(target_os = "windows")]
+                                self.pipeline_drain();
                                 return self;
+                            }
+                            #[cfg(target_os = "windows")]
+                            EventSet::IN if Some(source) == pipeline_fd => {
+                                self.pipeline_complete();
                             }
                             EventSet::IN if Some(source) == async_ev_fd => {
                                 self.process_async_completions();
@@ -531,6 +588,18 @@ impl BlockWorker {
                 }
             }
         }
+    }
+
+    /// Process the ring without a kick. Returns whether anything was waiting.
+    #[cfg(target_os = "windows")]
+    fn poll_ring(&mut self) -> bool {
+        let mem = self.mem.clone();
+        let pending = !self.device_queue.queue.is_empty(&mem);
+        if pending {
+            blk_stats::note_rescue();
+            self.process_virtio_queues();
+        }
+        pending
     }
 
     fn process_queue_event(&mut self) {
@@ -564,6 +633,11 @@ impl BlockWorker {
             self.process_queue_async(mem);
             return;
         }
+        #[cfg(target_os = "windows")]
+        if self.pipeline.is_some() {
+            self.process_queue_pipelined(mem);
+            return;
+        }
         let mut signal_needed = false;
         while let Some(head) = self.device_queue.queue.pop(mem) {
             let mut reader = match Reader::new(mem, head.clone()) {
@@ -588,14 +662,18 @@ impl BlockWorker {
                 }
             };
 
-            let (status, len): (u8, usize) =
-                match self.process_request(request_header, &mut reader, &mut writer) {
-                    Ok(l) => (VIRTIO_BLK_S_OK.try_into().unwrap(), l),
-                    Err(e) => {
-                        error!("error processing request: {e:?}");
-                        (VIRTIO_BLK_S_IOERR.try_into().unwrap(), 0)
-                    }
-                };
+            let req_started = blk_stats::start();
+            let req_type = request_header.request_type;
+            let req_bytes = reader.available_bytes() + writer.available_bytes();
+            let processed = self.process_request(request_header, &mut reader, &mut writer);
+            blk_stats::finish(req_type, req_bytes, req_started);
+            let (status, len): (u8, usize) = match processed {
+                Ok(l) => (VIRTIO_BLK_S_OK.try_into().unwrap(), l),
+                Err(e) => {
+                    error!("error processing request: {e:?}");
+                    (VIRTIO_BLK_S_IOERR.try_into().unwrap(), 0)
+                }
+            };
 
             if let Err(e) = writer.write_obj(status) {
                 error!("Failed to write virtio block status: {e:?}")
@@ -617,6 +695,138 @@ impl BlockWorker {
         // avoiding redundant IRQ signals when multiple descriptors complete in
         // a single epoll wake-up.
         if signal_needed && let Err(e) = self.interrupt.try_signal_used_queue() {
+            error!("error signalling queue: {e:?}");
+        }
+    }
+
+    /// Windows raw-image path: hand each read/write to a lane as soon as it is
+    /// popped, publish completions as lanes finish them, and run flush,
+    /// discard, write-zeroes and the rest in order once nothing is in flight.
+    #[cfg(target_os = "windows")]
+    fn process_queue_pipelined(&mut self, mem: &GuestMemoryMmap) {
+        let nsectors = self.disk.nsectors();
+        let mut signal_needed = false;
+        while let Some(head) = self.device_queue.queue.pop(mem) {
+            let index = head.index;
+            let (mut reader, mut writer) = match (
+                Reader::new(mem, head.clone()),
+                Writer::new(mem, head.clone()),
+            ) {
+                (Ok(r), Ok(w)) => (r, w),
+                _ => {
+                    error!("invalid descriptor chain");
+                    continue;
+                }
+            };
+            let header: RequestHeader = match reader.read_obj() {
+                Ok(h) => h,
+                Err(e) => {
+                    error!("invalid request header: {e:?}");
+                    continue;
+                }
+            };
+            if header.request_type == VIRTIO_BLK_T_IN || header.request_type == VIRTIO_BLK_T_OUT {
+                // SAFETY: the readers only hold slices of the guest mapping,
+                // which this worker keeps alive, and every job is drained
+                // before the worker returns (stop) or runs a barrier.
+                let job = unsafe {
+                    win_pipeline::Job {
+                        index,
+                        header,
+                        reader: std::mem::transmute::<Reader<'_>, Reader<'static>>(reader),
+                        writer: std::mem::transmute::<Writer<'_>, Writer<'static>>(writer),
+                        nsectors,
+                    }
+                };
+                self.pipeline.as_mut().unwrap().submit(job);
+                continue;
+            }
+            // Barrier: everything before it must finish first.
+            signal_needed |= self.pipeline_wait_all(mem);
+            let started = blk_stats::start();
+            let processed = self.process_request(header, &mut reader, &mut writer);
+            blk_stats::finish(header.request_type, 0, started);
+            let (status, len): (u8, usize) = match processed {
+                Ok(l) => (VIRTIO_BLK_S_OK as u8, l),
+                Err(e) => {
+                    error!("error processing request: {e:?}");
+                    (VIRTIO_BLK_S_IOERR as u8, 0)
+                }
+            };
+            if let Err(e) = writer.write_obj(status) {
+                error!("Failed to write virtio block status: {e:?}");
+            }
+            if let Err(e) = self.device_queue.queue.add_used(mem, index, len as u32) {
+                error!("failed to add used elements to the queue: {e:?}");
+            }
+            if self.device_queue.queue.needs_notification(mem).unwrap() {
+                signal_needed = true;
+            }
+        }
+        // Publish anything that already finished while we were dispatching.
+        signal_needed |= self.pipeline_publish(mem, false);
+        if signal_needed && let Err(e) = self.interrupt.try_signal_used_queue() {
+            error!("error signalling queue: {e:?}");
+        }
+    }
+
+    /// Move finished jobs onto the used ring. With `block`, wait until no job
+    /// is in flight. Returns whether the guest needs an interrupt.
+    #[cfg(target_os = "windows")]
+    fn pipeline_publish(&mut self, mem: &GuestMemoryMmap, block: bool) -> bool {
+        let mut signal = false;
+        loop {
+            let Some(p) = self.pipeline.as_mut() else {
+                return signal;
+            };
+            let done = if block && p.in_flight > 0 {
+                match p.done_rx.recv() {
+                    Ok(d) => d,
+                    Err(_) => return signal,
+                }
+            } else {
+                match p.done_rx.try_recv() {
+                    Ok(d) => d,
+                    Err(_) => return signal,
+                }
+            };
+            p.in_flight -= 1;
+            if let Err(e) = self.device_queue.queue.add_used(mem, done.index, done.len) {
+                error!("failed to add used elements to the queue: {e:?}");
+            }
+            if self.device_queue.queue.needs_notification(mem).unwrap() {
+                signal = true;
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn pipeline_wait_all(&mut self, mem: &GuestMemoryMmap) -> bool {
+        self.pipeline_publish(mem, true)
+    }
+
+    /// Completion event from a lane.
+    #[cfg(target_os = "windows")]
+    fn pipeline_complete(&mut self) {
+        if let Some(p) = self.pipeline.as_ref() {
+            let _ = p.done_fd.read();
+        }
+        let mem = self.mem.clone();
+        if self.pipeline_publish(&mem, false)
+            && let Err(e) = self.interrupt.try_signal_used_queue()
+        {
+            error!("error signalling queue: {e:?}");
+        }
+    }
+
+    /// Stop/quiesce: complete every in-flight job so the queue is yielded at a
+    /// clean boundary.
+    #[cfg(target_os = "windows")]
+    fn pipeline_drain(&mut self) {
+        let mem = self.mem.clone();
+        if self.pipeline_publish(&mem, true)
+            && let Err(e) = self.interrupt.try_signal_used_queue()
+        {
             error!("error signalling queue: {e:?}");
         }
     }
@@ -1087,5 +1297,195 @@ mod tests {
         .unwrap();
         assert!(!disk.supports_async_io());
         std::fs::remove_file(overlay).unwrap();
+    }
+}
+
+/// Opt-in per-request-type accounting (`SMOLVM_BLK_STATS=<dir>`): count, total
+/// bytes and total host time, written to `<dir>/blk-<pid>.txt` while running.
+mod blk_stats {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+
+    struct Stats {
+        dir: std::path::PathBuf,
+        types: [(u64, u64, u64, u64); 32],
+        n: u64,
+    }
+
+    fn stats() -> Option<&'static Mutex<Stats>> {
+        static S: OnceLock<Option<Mutex<Stats>>> = OnceLock::new();
+        S.get_or_init(|| {
+            std::env::var_os("SMOLVM_BLK_STATS").map(|d| {
+                Mutex::new(Stats {
+                    dir: d.into(),
+                    types: [(0, 0, 0, 0); 32],
+                    n: 0,
+                })
+            })
+        })
+        .as_ref()
+    }
+
+    pub fn start() -> Option<Instant> {
+        stats().map(|_| Instant::now())
+    }
+
+    /// Count requests found by the safety poll rather than a kick (slot 31).
+    #[allow(dead_code)]
+    pub fn note_rescue() {
+        if let Some(m) = stats() {
+            m.lock().unwrap().types[31].0 += 1;
+        }
+    }
+
+    pub fn finish(req_type: u32, bytes: usize, started: Option<Instant>) {
+        let (Some(t), Some(m)) = (started, stats()) else {
+            return;
+        };
+        let us = t.elapsed().as_micros() as u64;
+        let mut s = m.lock().unwrap();
+        let e = &mut s.types[(req_type as usize).min(31)];
+        e.0 += 1;
+        e.1 += bytes as u64;
+        e.2 += us;
+        e.3 = e.3.max(us);
+        s.n += 1;
+        if s.n % 50 == 0 {
+            let mut out = String::new();
+            for (ty, (c, b, us, max)) in s.types.iter().enumerate() {
+                if *c > 0 {
+                    out.push_str(&format!(
+                        "type{ty} count {c} MiB {} host_ms {} max_us {max}\n",
+                        b >> 20,
+                        us / 1000
+                    ));
+                }
+            }
+            let _ = std::fs::create_dir_all(&s.dir);
+            let _ = std::fs::write(s.dir.join(format!("blk-{}.txt", std::process::id())), out);
+        }
+    }
+}
+
+/// Persistent I/O lanes for the Windows raw-image path: one thread and one
+/// file handle per lane, completions reported back over a channel plus an
+/// eventfd the worker polls.
+#[cfg(target_os = "windows")]
+mod win_pipeline {
+    use super::{RequestHeader, VIRTIO_BLK_S_IOERR, VIRTIO_BLK_S_OK, VIRTIO_BLK_T_IN};
+    use crate::virtio::descriptor_utils::{Reader, Writer};
+    use log::error;
+    use std::fs::File;
+    use std::io;
+    use std::sync::Arc;
+    use std::sync::mpsc::{Receiver, Sender, channel};
+    use utils::eventfd::{EFD_NONBLOCK, EventFd};
+
+    pub struct Job {
+        pub index: u16,
+        pub header: RequestHeader,
+        pub reader: Reader<'static>,
+        pub writer: Writer<'static>,
+        pub nsectors: u64,
+    }
+    // SAFETY: a job is owned by exactly one lane at a time; its slices point
+    // into guest memory the worker keeps mapped until every job is drained.
+    unsafe impl Send for Job {}
+
+    pub struct Done {
+        pub index: u16,
+        pub len: u32,
+    }
+
+    pub struct Pipeline {
+        lanes: Vec<Sender<Job>>,
+        next: usize,
+        pub in_flight: usize,
+        pub done_rx: Receiver<Done>,
+        pub done_fd: EventFd,
+    }
+
+    fn run(file: &File, job: &mut Job) -> (u8, usize) {
+        let started = super::blk_stats::start();
+        let bytes = job.reader.available_bytes() + job.writer.available_bytes();
+        let off = job.header.sector.saturating_mul(512);
+        let is_read = job.header.request_type == VIRTIO_BLK_T_IN;
+        let len = if is_read {
+            job.writer.available_bytes().saturating_sub(1)
+        } else {
+            job.reader.available_bytes()
+        };
+        // A plain handle, unlike the format accessor, would extend the image
+        // past its advertised size, so bound every request here.
+        let r = if !len.is_multiple_of(512)
+            || off.saturating_add(len as u64) > job.nsectors.saturating_mul(512)
+        {
+            (VIRTIO_BLK_S_IOERR as u8, 0)
+        } else {
+            let res = if is_read {
+                job.writer.write_from_at(file, len, off)
+            } else {
+                job.reader.read_to_at(file, len, off)
+            };
+            match res {
+                Ok(n) => (VIRTIO_BLK_S_OK as u8, n),
+                Err(e) => {
+                    error!("block lane request failed: {e:?}");
+                    (VIRTIO_BLK_S_IOERR as u8, 0)
+                }
+            }
+        };
+        super::blk_stats::finish(job.header.request_type, bytes, started);
+        r
+    }
+
+    impl Pipeline {
+        pub fn new(handles: Arc<Vec<File>>) -> io::Result<Self> {
+            let done_fd = EventFd::new(EFD_NONBLOCK)?;
+            let (done_tx, done_rx) = channel::<Done>();
+            let mut lanes = Vec::with_capacity(handles.len());
+            for lane in 0..handles.len() {
+                let (tx, rx) = channel::<Job>();
+                let handles = handles.clone();
+                let done_tx = done_tx.clone();
+                let wake = done_fd.try_clone()?;
+                std::thread::Builder::new()
+                    .name(format!("blk-lane-{lane}"))
+                    .spawn(move || {
+                        for mut job in rx {
+                            let (status, len) = run(&handles[lane], &mut job);
+                            if let Err(e) = job.writer.write_obj(status) {
+                                error!("Failed to write virtio block status: {e:?}");
+                            }
+                            if done_tx
+                                .send(Done {
+                                    index: job.index,
+                                    len: len as u32,
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                            let _ = wake.write(1);
+                        }
+                    })?;
+                lanes.push(tx);
+            }
+            Ok(Pipeline {
+                lanes,
+                next: 0,
+                in_flight: 0,
+                done_rx,
+                done_fd,
+            })
+        }
+
+        pub fn submit(&mut self, job: Job) {
+            let lane = self.next;
+            self.next = (self.next + 1) % self.lanes.len();
+            if self.lanes[lane].send(job).is_ok() {
+                self.in_flight += 1;
+            }
+        }
     }
 }

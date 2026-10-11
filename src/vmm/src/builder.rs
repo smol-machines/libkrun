@@ -1637,8 +1637,18 @@ pub fn build_microvm(
     // the guest onto its i8253 (PIT) clockevent — which we emulate (see the
     // `Pit` device) — instead of the dead LAPIC timer. Without this the guest
     // calibrates and selects the LAPIC timer and then never ticks.
+    //
+    // When the partition exposes direct-mode Hyper-V synthetic timers the
+    // guest uses those per-CPU clockevents instead and keeps its LAPIC timer
+    // as a fallback, so the PIT broadcast tick is not needed.
     #[cfg(target_os = "windows")]
-    vmm.kernel_cmdline.insert_str("nolapic_timer")?;
+    if !whp::enlightened() && std::env::var_os("SMOLVM_WHP_LAPIC_TIMER").is_none() {
+        vmm.kernel_cmdline.insert_str("nolapic_timer")?;
+    }
+    #[cfg(target_os = "windows")]
+    if let Ok(extra) = std::env::var("SMOLVM_WHP_CMDLINE") {
+        vmm.kernel_cmdline.insert_str(&extra)?;
+    }
 
     #[cfg(feature = "net")]
     attach_net_devices(&mut vmm, &vm_resources.net, intc.clone())?;

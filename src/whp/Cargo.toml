@@ -17,4 +17,5 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_Hypervisor",
     "Win32_System_Memory",
     "Win32_System_Performance",
+    "Win32_System_Threading",
 ] }

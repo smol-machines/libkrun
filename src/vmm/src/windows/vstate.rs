@@ -32,6 +32,7 @@ use std::sync::Arc;
 use std::thread;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
+use log::warn;
 use whp::{VcpuExitReason, WhpEmulator, WhpVcpu, WhpVm};
 
 use crate::vmm_config::machine_config::CpuFeaturesTemplate;
@@ -163,7 +164,77 @@ impl Vm {
                 region.len(),
             ));
         }
+        // A guest's first touch of each 4 KiB page costs ~20 us on WHP (a
+        // nested-paging fault the hypervisor resolves one page at a time), so
+        // a fresh VM spent ~5 s per GiB of newly used RAM. Populating anonymous
+        // RAM in bulk at boot makes those first touches ~4x cheaper for the
+        // life of the VM, even after the guest reports free memory and the
+        // host discards it (which it does over the next ~30 s: resident
+        // memory briefly reaches the VM's size, then settles near WSL2's idle
+        // footprint). `SMOLVM_WHP_PREFILL=off` keeps RAM lazy. File-backed RAM
+        // (restored and branched machines) is never prefilled, so it keeps
+        // sharing pages with its checkpoint.
+        let anonymous = guest_mem.iter().all(|r| r.file_offset().is_none());
+        let mode = match std::env::var("SMOLVM_WHP_PREFILL") {
+            _ if !anonymous => String::new(),
+            Ok(m) => m,
+            Err(_) => "advise-read".into(),
+        };
+        if !mode.is_empty() && mode != "off" {
+            self.prefill(&mode);
+        }
         Ok(())
+    }
+
+    /// Experimental: back guest RAM ahead of the guest touching it.
+    fn prefill(&self, mode: &str) {
+        if mode.is_empty() {
+            return;
+        }
+        let regions = self.regions.clone();
+        let vm = self.whp_vm.clone();
+        let mode = mode.to_string();
+        let _ = std::thread::Builder::new()
+            .name("whp-prefill".into())
+            .spawn(move || {
+                let t = std::time::Instant::now();
+                const CHUNK: u64 = 64 << 20;
+                for (gpa, host, len) in regions {
+                    let mut off = 0;
+                    while off < len {
+                        let n = CHUNK.min(len - off);
+                        if mode == "advise" || mode == "advise-read" {
+                            if let Err(e) = vm.populate(gpa + off, n, mode == "advise") {
+                                warn!("prefill advise failed: {e:?}");
+                                return;
+                            }
+                        } else {
+                            // A locked add of zero commits the host page without
+                            // changing its contents, even if the guest is
+                            // writing it concurrently.
+                            let mut p = host + off;
+                            while p < host + off + n {
+                                // SAFETY: p lies inside the live guest mapping.
+                                unsafe {
+                                    (*(p as *const std::sync::atomic::AtomicU8))
+                                        .fetch_add(0, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                p += 4096;
+                            }
+                        }
+                        off += n;
+                    }
+                }
+                log::debug!("whp prefill ({mode}) done in {:?}", t.elapsed());
+                if let Some(dir) = std::env::var_os("SMOLVM_WHP_STATS") {
+                    let dir = std::path::PathBuf::from(dir);
+                    let _ = std::fs::create_dir_all(&dir);
+                    let _ = std::fs::write(
+                        dir.join(format!("prefill-{}.txt", std::process::id())),
+                        format!("{mode} {:?}\n", t.elapsed()),
+                    );
+                }
+            });
     }
 
     /// Point a guest-physical range at new host memory. WHP binds a GPA range
@@ -234,6 +305,30 @@ pub struct VcpuConfig {
 }
 
 /// A WHP virtual-processor wrapper, analogous to the KVM/HVF `Vcpu`.
+/// Opt-in VM-exit accounting (`SMOLVM_WHP_STATS=<dir>`), written per vCPU when
+/// it stops. Used to see which exits dominate a workload.
+#[derive(Default)]
+struct ExitStats {
+    dir: std::path::PathBuf,
+    reasons: std::collections::BTreeMap<String, u64>,
+    keys: std::collections::BTreeMap<String, u64>,
+    total: u64,
+}
+
+impl ExitStats {
+    fn dump(&self, id: u8) {
+        let _ = std::fs::create_dir_all(&self.dir);
+        let mut out = format!("vcpu {id} total {}\n", self.total);
+        for (k, v) in self.reasons.iter().chain(self.keys.iter()) {
+            out.push_str(&format!("{v:>12} {k}\n"));
+        }
+        let path = self
+            .dir
+            .join(format!("whp-{}-vcpu{id}.txt", std::process::id()));
+        let _ = std::fs::write(path, out);
+    }
+}
+
 pub struct Vcpu {
     id: u8,
     whp_vcpu: WhpVcpu,
@@ -339,6 +434,7 @@ impl Vcpu {
         let vcpu_thread = thread::Builder::new()
             .name(format!("fc_vcpu {}", self.cpu_index()))
             .spawn(move || {
+                whp::disable_thread_power_throttling();
                 self.run();
             })
             .map_err(Error::VcpuSpawn)?;
@@ -558,11 +654,45 @@ impl Vcpu {
             return;
         }
         let mut exit_code = 0;
+        let mut stats = std::env::var_os("SMOLVM_WHP_STATS").map(|d| ExitStats {
+            dir: d.into(),
+            ..Default::default()
+        });
         loop {
             if !self.service_events() {
                 break;
             }
-            match self.whp_vcpu.run() {
+            let result = self.whp_vcpu.run();
+            if let Some(st) = stats.as_mut() {
+                if let Ok(r) = &result {
+                    let name = format!("{r:?}");
+                    *st.reasons.entry(name).or_default() += 1;
+                    let key = match r {
+                        VcpuExitReason::IoPortAccess => {
+                            Some(format!("io {:#x}", self.whp_vcpu.io_port_exit_info().port))
+                        }
+                        VcpuExitReason::MsrAccess => {
+                            let m = self.whp_vcpu.msr_exit_info();
+                            Some(format!("msr {:#x} w={}", m.msr_number, m.is_write))
+                        }
+                        VcpuExitReason::MemoryAccess => {
+                            let gpa = unsafe { (*self.whp_vcpu.memory_access_context()).Gpa };
+                            Some(format!("mmio {:#x}", gpa & !0xfff))
+                        }
+                        _ => None,
+                    };
+                    if let Some(k) = key {
+                        *st.keys.entry(k).or_default() += 1;
+                    }
+                    st.total += 1;
+                    // The VM process can be torn down without this loop
+                    // returning, so persist the counters as we go.
+                    if st.total % 500 == 0 {
+                        st.dump(self.id);
+                    }
+                }
+            }
+            match result {
                 Ok(reason) => match self.handle_exit(reason) {
                     Ok(true) => continue,
                     Ok(false) => break,
@@ -578,6 +708,9 @@ impl Vcpu {
                     break;
                 }
             }
+        }
+        if let Some(st) = stats.as_ref() {
+            st.dump(self.id);
         }
         let _ = self.response_sender.send(VcpuResponse::Exited(exit_code));
     }

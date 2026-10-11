@@ -107,7 +107,9 @@ impl<F: FileSystem + Sync> Server<F> {
             );
         }
         debug!("opcode: {}", in_header.opcode);
-        match in_header.opcode {
+        let op_started = op_stats::start();
+        let opcode = in_header.opcode;
+        let result = match in_header.opcode {
             x if x == Opcode::Lookup as u32 => self.lookup(in_header, r, w),
             x if x == Opcode::Forget as u32 => self.forget(in_header, r), // No reply.
             x if x == Opcode::Getattr as u32 => self.getattr(in_header, r, w),
@@ -196,7 +198,9 @@ impl<F: FileSystem + Sync> Server<F> {
                 in_header.unique,
                 w,
             ),
-        }
+        };
+        op_stats::finish(opcode, op_started);
+        result
     }
 
     fn lookup(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
@@ -1739,6 +1743,60 @@ mod tests {
                 "rejected valid name: {:?}",
                 ok
             );
+        }
+    }
+}
+
+/// Opt-in per-opcode latency accounting (`SMOLVM_FS_STATS=<dir>`), dumped to
+/// `<dir>/fs-<pid>.txt` as `count total_us opcode` lines while running.
+mod op_stats {
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    struct Stats {
+        dir: std::path::PathBuf,
+        ops: [(u64, u64); 64],
+        n: u64,
+    }
+
+    fn stats() -> Option<&'static Mutex<Stats>> {
+        static S: OnceLock<Option<Mutex<Stats>>> = OnceLock::new();
+        S.get_or_init(|| {
+            std::env::var_os("SMOLVM_FS_STATS").map(|d| {
+                Mutex::new(Stats {
+                    dir: d.into(),
+                    ops: [(0, 0); 64],
+                    n: 0,
+                })
+            })
+        })
+        .as_ref()
+    }
+
+    pub fn start() -> Option<Instant> {
+        stats().map(|_| Instant::now())
+    }
+
+    pub fn finish(opcode: u32, started: Option<Instant>) {
+        let (Some(t), Some(m)) = (started, stats()) else {
+            return;
+        };
+        let us = t.elapsed().as_micros() as u64;
+        let mut s = m.lock().unwrap();
+        let slot = (opcode as usize).min(63);
+        s.ops[slot].0 += 1;
+        s.ops[slot].1 += us;
+        s.n += 1;
+        if s.n % 500 == 0 {
+            let mut out = String::new();
+            for (op, (c, total)) in s.ops.iter().enumerate() {
+                if *c > 0 {
+                    out.push_str(&format!("{c:>10} {total:>12}us op{op}\n"));
+                }
+            }
+            let _ = std::fs::create_dir_all(&s.dir);
+            let _ = std::fs::write(s.dir.join(format!("fs-{}.txt", std::process::id())), out);
         }
     }
 }
