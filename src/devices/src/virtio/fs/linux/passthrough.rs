@@ -60,6 +60,15 @@ struct HandleData {
     exported: AtomicBool,
 }
 
+// Runs inside setattr once it holds the handle's fd, so a test can race a
+// RELEASE against the fd syscalls deterministically.
+#[cfg(test)]
+thread_local! {
+    #[allow(clippy::type_complexity)]
+    static SETATTR_FD_HOOK: std::cell::Cell<Option<Box<dyn FnOnce(&PassthroughFs)>>> =
+        const { std::cell::Cell::new(None) };
+}
+
 #[repr(C, packed)]
 #[derive(Clone, Copy, Debug, Default)]
 struct LinuxDirent64 {
@@ -1782,8 +1791,11 @@ impl FileSystem for PassthroughFs {
         }
 
         // If we have a handle then use it otherwise get a new fd from the inode.
+        // `hd` outlives every use of the raw fd: a concurrent release would
+        // otherwise close it and a newly opened file could reuse the number.
+        let hd;
         let data = if let Some(handle) = handle {
-            let hd = self
+            hd = self
                 .handles
                 .read()
                 .unwrap()
@@ -1799,6 +1811,11 @@ impl FileSystem for PassthroughFs {
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             Data::ProcPath(pathname)
         };
+
+        #[cfg(test)]
+        if let Some(hook) = SETATTR_FD_HOOK.take() {
+            hook(self);
+        }
 
         if self.cfg.override_stat
             && valid.intersects(SetattrValid::MODE | SetattrValid::UID | SetattrValid::GID)
@@ -3161,5 +3178,102 @@ mod tests {
              the server uid (the scoped_cred Drop regressed to restoring euid 0)"
         );
         Ok(())
+    }
+
+    // A RELEASE racing a setattr must not close the handle's fd before the
+    // fd syscalls run: a file opened in between would reuse the number and
+    // the truncate would land on it instead.
+    #[test]
+    fn setattr_keeps_its_handle_open_across_a_concurrent_release() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "libkrun-setattr-release-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("a"), b"aaaa").unwrap();
+        fs::write(root.join("b"), b"bbbb").unwrap();
+
+        let filesystem = PassthroughFs::new(
+            Config {
+                root_dir: root.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        FileSystem::init(&filesystem, FsOptions::empty()).unwrap();
+        let context = Context {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        };
+        let a = CString::new("a").unwrap();
+        let entry = FileSystem::lookup(&filesystem, context, fuse::ROOT_ID, &a).unwrap();
+        let (handle, _) = FileSystem::open(
+            &filesystem,
+            context,
+            entry.inode,
+            false,
+            libc::O_RDWR as u32,
+        )
+        .unwrap();
+        let handle = handle.unwrap();
+        let a_fd = filesystem.handles.read().unwrap()[&handle]
+            .file
+            .read()
+            .unwrap()
+            .as_raw_fd();
+
+        let (opened, reopened) = std::sync::mpsc::channel();
+        let b_path = root.join("b");
+        let inode = entry.inode;
+        SETATTR_FD_HOOK.set(Some(Box::new(move |filesystem: &PassthroughFs| {
+            FileSystem::release(filesystem, context, inode, 0, handle, false, false, None).unwrap();
+            let b = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(b_path)
+                .unwrap();
+            opened.send(b).unwrap();
+        })));
+
+        let mut attr: libc::stat64 = unsafe { mem::zeroed() };
+        attr.st_size = 0;
+        let result = FileSystem::setattr(
+            &filesystem,
+            context,
+            entry.inode,
+            attr,
+            Some(handle),
+            SetattrValid::SIZE,
+        );
+        let b = reopened.recv().unwrap();
+        eprintln!(
+            "released fd {a_fd}, then b opened as fd {}{}",
+            b.as_raw_fd(),
+            if b.as_raw_fd() == a_fd {
+                " (number reused)"
+            } else {
+                ""
+            }
+        );
+        result.unwrap();
+        assert_eq!(
+            fs::read(root.join("b")).unwrap(),
+            b"bbbb",
+            "b was truncated"
+        );
+        assert_eq!(
+            fs::read(root.join("a")).unwrap(),
+            b"",
+            "a was not truncated"
+        );
+
+        drop(b);
+        fs::remove_dir_all(root).unwrap();
     }
 }
