@@ -245,6 +245,9 @@ pub enum Error {
     /// Cannot run the VCPUs.
     VcpuRun(kvm_ioctls::Error),
     #[cfg(target_arch = "x86_64")]
+    /// The checkpoint's guest CPU needs features or immunities this host lacks.
+    CpuIncompatible(String),
+    #[cfg(target_arch = "x86_64")]
     /// Failed to set KVM vcpu cpuid.
     VcpuSetCpuid(kvm_ioctls::Error),
     #[cfg(target_arch = "x86_64")]
@@ -458,6 +461,11 @@ impl Display for Error {
             VcpuGetTscKhz(e) => write!(f, "Failed to get KVM vcpu TSC frequency: {e}"),
             #[cfg(target_arch = "x86_64")]
             VcpuGetTscOffset(e) => write!(f, "Failed to get KVM vcpu TSC offset: {e}"),
+            #[cfg(target_arch = "x86_64")]
+            CpuIncompatible(missing) => write!(
+                f,
+                "this host's CPU lacks what the checkpoint's guest was given: {missing}"
+            ),
             #[cfg(target_arch = "x86_64")]
             VcpuSetCpuid(e) => write!(f, "Failed to set KVM vcpu cpuid: {e}"),
             #[cfg(target_arch = "x86_64")]
@@ -2342,8 +2350,14 @@ impl Vcpu {
                 // AVX-512, PKU, and XSAVE extensions) that cannot safely cross
                 // CPU generations in a live checkpoint while retaining the
                 // broadly available AVX2 baseline.
+                // On AMD the guest keeps the host's own features (the host
+                // profile); restore then requires a destination that has all of
+                // them, see `check_restore_compatible`.
                 CpuFeaturesTemplate::PortableV1 => {
-                    t2::set_cpuid_entries(&mut self.cpuid, &cpuid_vm_spec).map_err(Error::CpuId)?
+                    if cpuid_vm_spec.cpu_vendor_id() == b"GenuineIntel" {
+                        t2::set_cpuid_entries(&mut self.cpuid, &cpuid_vm_spec)
+                            .map_err(Error::CpuId)?
+                    }
                 }
             }
             self.portable_cpu = template == CpuFeaturesTemplate::PortableV1;
@@ -2552,6 +2566,42 @@ impl Vcpu {
         })
     }
 
+    /// Refuse a checkpoint whose guest was told about CPU features or
+    /// speculation immunities that a fresh guest on this host would not get.
+    /// The guest acted on them at boot, so continuing here would fault on a
+    /// missing instruction or run without a mitigation it now needs. Must run
+    /// before `set_cpuid2`, while `self.cpuid` still holds this host's profile.
+    #[cfg(target_arch = "x86_64")]
+    fn check_restore_compatible(&self, state: &VcpuState) -> Result<()> {
+        use cpuid::compat::{
+            MSR_IA32_ARCH_CAPABILITIES, arch_capabilities_conflicts, missing_features,
+        };
+        let mut missing = missing_features(&state.cpuid, &self.cpuid);
+        let saved_caps = state
+            .msrs
+            .as_slice()
+            .iter()
+            .find(|msr| msr.index == MSR_IA32_ARCH_CAPABILITIES)
+            .map(|msr| msr.data);
+        if let Some(saved_caps) = saved_caps {
+            // A vCPU starts with KVM's value for this host.
+            let mut msrs = Msrs::new(1).unwrap();
+            msrs.as_mut_slice()[0].index = MSR_IA32_ARCH_CAPABILITIES;
+            let read = self.fd.get_msrs(&mut msrs).map_err(Error::VcpuGetMsrs)?;
+            let host_caps = if read == 1 {
+                msrs.as_slice()[0].data
+            } else {
+                0
+            };
+            missing.extend(arch_capabilities_conflicts(saved_caps, host_caps));
+        }
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::CpuIncompatible(missing.join(", ")))
+        }
+    }
+
     #[allow(unused)]
     #[cfg(target_arch = "x86_64")]
     fn restore_state(&mut self, state: VcpuState) -> Result<()> {
@@ -2583,6 +2633,7 @@ impl Vcpu {
         if let Some(tsc) = state.tsc_migration {
             self.fd.set_tsc_khz(tsc.khz).map_err(Error::VcpuSetTscKhz)?;
         }
+        self.check_restore_compatible(&state)?;
         self.fd
             .set_cpuid2(&state.cpuid)
             .map_err(Error::VcpuSetCpuid)?;
@@ -3872,6 +3923,55 @@ mod tests {
         assert_eq!(brand_word(&installed), expected_brand);
         let resaved = vcpu.save_state().expect("checkpoint restored CPU profile");
         assert_eq!(brand_word(&resaved.cpuid), expected_brand);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn restore_refuses_a_feature_the_host_lacks() {
+        let (_vm, mut vcpu, _mem) = setup_vcpu(0x1000);
+        let mut state = vcpu.save_state().expect("capture CPU profile");
+        let leaf = state
+            .cpuid
+            .as_mut_slice()
+            .iter_mut()
+            .find(|entry| entry.function == 0x7 && entry.index == 0)
+            .expect("test host must expose leaf 7");
+        let bit = (0..32)
+            .find(|bit| leaf.edx & (1 << bit) == 0)
+            .expect("leaf 7 EDX has a clear bit");
+        leaf.edx |= 1 << bit;
+        match vcpu.restore_state(state) {
+            Err(Error::CpuIncompatible(missing)) => assert!(!missing.is_empty()),
+            other => panic!("expected CpuIncompatible, got {:?}", other.err()),
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn restore_refuses_an_immunity_the_host_lacks() {
+        use cpuid::compat::MSR_IA32_ARCH_CAPABILITIES;
+        let (_vm, mut vcpu, _mem) = setup_vcpu(0x1000);
+        let mut state = vcpu.save_state().expect("capture CPU profile");
+        let Some(caps) = state
+            .msrs
+            .as_mut_slice()
+            .iter_mut()
+            .find(|msr| msr.index == MSR_IA32_ARCH_CAPABILITIES)
+        else {
+            return;
+        };
+        // MDS_NO, TAA_NO, BHI_NO, GDS_NO, RFDS_NO, ITS_NO: claim one the host lacks.
+        let Some(bit) = [5, 8, 20, 26, 27, 62]
+            .into_iter()
+            .find(|bit| caps.data & (1 << bit) == 0)
+        else {
+            return;
+        };
+        caps.data |= 1 << bit;
+        match vcpu.restore_state(state) {
+            Err(Error::CpuIncompatible(missing)) => assert!(missing.contains("_NO")),
+            other => panic!("expected CpuIncompatible, got {:?}", other.err()),
+        }
     }
 
     #[cfg(target_arch = "x86_64")]
