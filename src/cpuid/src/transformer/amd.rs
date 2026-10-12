@@ -40,11 +40,21 @@ pub fn update_largest_extended_fn_entry(
 ) -> Result<(), Error> {
     use crate::cpu_leaf::leaf_0x80000000::*;
 
-    // KVM sets the largest extended function to 0x80000000. Change it to 0x8000001f
-    // Since we also use the leaf 0x8000001d (Extended Cache Topology).
+    // Raise the largest extended function to at least 0x8000001f, since we also
+    // use the leaf 0x8000001d (Extended Cache Topology). Never lower what KVM
+    // reports: leaf 0x80000021 carries the CPU's speculation immunities
+    // (AutoIBRS, SRSO_NO, SRSO_USER_KERNEL_NO, IBPB_BRTYPE, SBPB). Hiding it
+    // makes the guest assume it is vulnerable and turn on Safe RET and
+    // retpolines on parts that do not need them. Exposing it is safe for
+    // checkpoints because AMD hosts only restore on an identical CPU; a future
+    // cross-CPU AMD profile must clear these bits to a common baseline.
+    let largest = entry
+        .eax
+        .read_bits_in_range(&eax::LARGEST_EXTENDED_FN_BITRANGE)
+        .max(LARGEST_EXTENDED_FN);
     entry
         .eax
-        .write_bits_in_range(&eax::LARGEST_EXTENDED_FN_BITRANGE, LARGEST_EXTENDED_FN);
+        .write_bits_in_range(&eax::LARGEST_EXTENDED_FN_BITRANGE, largest);
 
     Ok(())
 }
@@ -209,6 +219,16 @@ mod tests {
                 .eax
                 .read_bits_in_range(&eax::LARGEST_EXTENDED_FN_BITRANGE),
             LARGEST_EXTENDED_FN
+        );
+
+        // A higher value from KVM is kept, so leaf 0x80000021 stays visible.
+        entry.eax = 0x8000_0021;
+        assert!(update_largest_extended_fn_entry(&mut entry, &vm_spec).is_ok());
+        assert_eq!(
+            entry
+                .eax
+                .read_bits_in_range(&eax::LARGEST_EXTENDED_FN_BITRANGE),
+            0x8000_0021
         );
     }
 
