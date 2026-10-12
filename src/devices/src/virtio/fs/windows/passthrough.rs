@@ -77,6 +77,14 @@ const SYNCHRONIZE: u32 = 0x0010_0000;
 const DELETE: u32 = 0x0001_0000;
 const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
 const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
+/// WSL's symlink: the target is stored as raw bytes, so it can be any Linux
+/// path, and creating one needs no privilege.
+const IO_REPARSE_TAG_LX_SYMLINK: u32 = 0xA000_001D;
+const FSCTL_SET_REPARSE_POINT: u32 = 0x0009_00A4;
+const FSCTL_GET_REPARSE_POINT: u32 = 0x0009_00A8;
+const MAXIMUM_REPARSE_DATA_BUFFER_SIZE: usize = 16 * 1024;
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 
 const S_ISUID: u32 = 0o04_000;
 const S_IXGRP: u32 = 0o00_010;
@@ -377,6 +385,100 @@ pub fn is_handle_read_only(handle: u64) -> bool {
     }
 }
 
+/// Create a WSL-style symlink at `link_path` pointing at `target`.
+///
+/// Native Windows symlinks need Developer Mode or an elevated process and
+/// cannot hold an absolute Linux path. WSL's own format has neither limit, and
+/// WSL reads links made this way.
+fn create_lx_symlink(link_path: &Path, target: &[u8]) -> io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    // Header (tag, data length, reserved), then a version word of 2.
+    let data_len = 4 + target.len();
+    if 8 + data_len > MAXIMUM_REPARSE_DATA_BUFFER_SIZE {
+        return Err(io::Error::from_raw_os_error(linux_errno_raw(
+            libc::ENAMETOOLONG,
+        )));
+    }
+    let mut buf = Vec::with_capacity(8 + data_len);
+    buf.extend_from_slice(&IO_REPARSE_TAG_LX_SYMLINK.to_le_bytes());
+    buf.extend_from_slice(&(data_len as u16).to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes());
+    buf.extend_from_slice(&2u32.to_le_bytes());
+    buf.extend_from_slice(target);
+
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(link_path)?;
+    let mut returned = 0u32;
+    let ok = unsafe {
+        DeviceIoControl(
+            file.as_raw_handle() as HANDLE,
+            FSCTL_SET_REPARSE_POINT,
+            buf.as_ptr().cast(),
+            buf.len() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        let err = io::Error::last_os_error();
+        drop(file);
+        let _ = fs::remove_file(link_path);
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// A symlink's target as the guest sees it: Windows separators turned into
+/// '/', or the raw bytes of a WSL-style link.
+fn read_symlink_target(path: &Path) -> io::Result<Vec<u8>> {
+    match fs::read_link(path) {
+        Ok(target) => Ok(target.to_string_lossy().replace('\\', "/").into_bytes()),
+        // A WSL-style link, which std does not parse.
+        Err(native) => read_lx_symlink(path).map_err(|_| native),
+    }
+}
+
+/// The target of a WSL-style symlink, or an error if `path` is not one.
+fn read_lx_symlink(path: &Path) -> io::Result<Vec<u8>> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    let file = fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    let mut buf = vec![0u8; MAXIMUM_REPARSE_DATA_BUFFER_SIZE];
+    let mut returned = 0u32;
+    let ok = unsafe {
+        DeviceIoControl(
+            file.as_raw_handle() as HANDLE,
+            FSCTL_GET_REPARSE_POINT,
+            std::ptr::null(),
+            0,
+            buf.as_mut_ptr().cast(),
+            buf.len() as u32,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let tag = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+    let data_len = u16::from_le_bytes(buf[4..6].try_into().unwrap()) as usize;
+    if tag != IO_REPARSE_TAG_LX_SYMLINK || data_len < 4 || 8 + data_len > returned as usize {
+        return Err(io::Error::from_raw_os_error(linux_errno_raw(libc::EINVAL)));
+    }
+    Ok(buf[12..8 + data_len].to_vec())
+}
+
 fn get_reparse_tag(path: &Path) -> u32 {
     let wide = path_to_wide(path);
     let mut data: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };
@@ -418,7 +520,13 @@ fn metadata_to_stat64(meta: &fs::Metadata, ino: u64, path: &Path, n_link: u32) -
         (libc::S_IFREG | 0o755, n_link)
     };
 
-    let size = meta.len() as i64;
+    // lstat on a symlink reports the length of its target; git reads a
+    // zero-sized link as empty and then sees every symlink as modified.
+    let size = if is_symlink {
+        read_symlink_target(path).map_or(0, |target| target.len() as i64)
+    } else {
+        meta.len() as i64
+    };
 
     let creation = meta.creation_time();
     let access = meta.last_access_time();
@@ -443,7 +551,14 @@ fn metadata_to_stat64(meta: &fs::Metadata, ino: u64, path: &Path, n_link: u32) -
         st_blocks: (size + 511) / 512,
     };
 
-    if let Ok((uid, gid, mode)) = read_override_stat(path) {
+    // Opening the ownership stream by path follows a symlink, so for a link
+    // it would describe the target (and report the wrong file type).
+    let stream = if is_symlink {
+        Ok((None, None, None))
+    } else {
+        read_override_stat(path)
+    };
+    if let Ok((uid, gid, mode)) = stream {
         if let Some(uid) = uid {
             st.st_uid = uid;
         }
@@ -1317,6 +1432,28 @@ impl PassthroughFs {
         Ok(self.inode_data(inode)?.get_path())
     }
 
+    /// Point every inode at or under `from` to the same place under `to`.
+    ///
+    /// Inodes remember their host path, and the guest keeps using an inode
+    /// after a rename without looking the new name up again (it moves its own
+    /// dentry). Without this, `rename(config.lock, config)` followed by
+    /// `open(config)` and `fstat` reached the host under the old name and
+    /// failed with ENOENT, which broke git on shared folders.
+    fn rename_inode_paths(&self, from: &Path, to: &Path) {
+        let map = self.inodes.read().unwrap();
+        for (_, data) in map.iter() {
+            let path = data.get_path();
+            if let Ok(rest) = path.strip_prefix(from) {
+                let moved = if rest.as_os_str().is_empty() {
+                    to.to_path_buf()
+                } else {
+                    to.join(rest)
+                };
+                data.update_path_if_changed(&moved);
+            }
+        }
+    }
+
     fn do_lookup(&self, parent: Inode, name: &CStr) -> io::Result<Entry> {
         let parent_data = self.inode_data(parent)?;
         let child_name = cstr_to_path(name);
@@ -1610,7 +1747,8 @@ impl PassthroughFs {
                 if name_bytes != b"." && name_bytes != b".." {
                     let attrs = entry.FileAttributes;
                     let d_type = if attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0
-                        && entry.EaSize == IO_REPARSE_TAG_SYMLINK
+                        && (entry.EaSize == IO_REPARSE_TAG_SYMLINK
+                            || entry.EaSize == IO_REPARSE_TAG_LX_SYMLINK)
                     {
                         DT_LNK
                     } else if attrs & FILE_ATTRIBUTE_DIRECTORY != 0 {
@@ -2090,12 +2228,7 @@ impl FileSystem for PassthroughFs {
 
         let path = data.get_path();
 
-        let target = fs::read_link(&*path).map_err(win_err_to_linux)?;
-
-        // Convert Windows path formatting back to a Linux-friendly format.
-        // Windows symlinks use '\', but the FUSE Linux guest expects '/'
-        let unix_path = target.to_string_lossy().replace('\\', "/");
-        let mut buf = unix_path.into_bytes();
+        let mut buf = read_symlink_target(&path).map_err(win_err_to_linux)?;
 
         // Cap to PATH_MAX (4096) to match Linux parity exactly.
         // While Windows NT paths can be 32k, FUSE/Linux expects a max of 4096 bytes.
@@ -2111,15 +2244,13 @@ impl FileSystem for PassthroughFs {
      * The Limitation is that absolute paths from the guest (e.g., "/etc/passwd") are treated as drive-relative
      * on Windows, causing `symlink_file` to fail with EINVAL.
      *
-     * TODO:
-     * To support true absolute guest symlinks, we need to bypass the Win32 API
-     * and manually set an IO_REPARSE_TAG_LX_SYMLINK reparse point using
-     * DeviceIoControl. This will allow storing arbitrary Linux-style paths
-     * without host-side resolution.
+     * When that fails (an absolute target, or no symlink privilege), the link
+     * is stored as an IO_REPARSE_TAG_LX_SYMLINK reparse point instead; see
+     * `create_lx_symlink`.
      */
     fn symlink(
         &self,
-        ctx: Context,
+        _ctx: Context,
         linkname: &CStr,
         parent: Inode,
         name: &CStr,
@@ -2137,19 +2268,30 @@ impl FileSystem for PassthroughFs {
         // Windows requires knowing if a symlink target is a file or a directory.
         // FUSE doesn't provide this distinction upfront, so we try file first,
         // and safely fall back to directory if it fails.
-        std::os::windows::fs::symlink_file(&target, &link_path)
-            .or_else(|_| std::os::windows::fs::symlink_dir(&target, &link_path))
-            .map_err(win_err_to_linux)?;
-
-        if let Some(secctx) = extensions.secctx {
-            write_secctx(&link_path, secctx, true)?;
+        // A native link keeps the target usable from Windows, but cannot hold an
+        // absolute Linux path and needs Developer Mode or elevation. Fall back
+        // to a WSL-style link for those.
+        let absolute = linkname.to_bytes().first() == Some(&b'/');
+        let native = if absolute {
+            Err(io::Error::from_raw_os_error(linux_errno_raw(libc::EINVAL)))
+        } else {
+            std::os::windows::fs::symlink_file(&target, &link_path)
+                .or_else(|_| std::os::windows::fs::symlink_dir(&target, &link_path))
+        };
+        match native {
+            Ok(()) => {
+                if let Some(secctx) = extensions.secctx {
+                    write_secctx(&link_path, secctx, true)?;
+                }
+            }
+            Err(_) => {
+                create_lx_symlink(&link_path, linkname.to_bytes()).map_err(win_err_to_linux)?
+            }
         }
-
-        write_override_stat(
-            &link_path,
-            Some((ctx.uid, ctx.gid)),
-            Some(S_IFLNK as u32 | 0o777),
-        )?;
+        // No ownership stream: writing it opens the path, which follows the
+        // link and fails while the target does not exist yet (git creates links
+        // before their targets). A symlink's mode is always 0777, and its owner
+        // reads back as the default.
 
         self.do_lookup(parent, name)
     }
@@ -2277,6 +2419,9 @@ impl FileSystem for PassthroughFs {
                 return Err(win_err_to_linux(e));
             }
             fs::rename(&tmp, &old_path).map_err(win_err_to_linux)?;
+            self.rename_inode_paths(&new_path, &tmp);
+            self.rename_inode_paths(&old_path, &new_path);
+            self.rename_inode_paths(&tmp, &old_path);
             return Ok(());
         }
 
@@ -2292,10 +2437,13 @@ impl FileSystem for PassthroughFs {
             if res == 0 {
                 return Err(win_err_to_linux(io::Error::last_os_error()));
             }
+            self.rename_inode_paths(&old_path, &new_path);
             return Ok(());
         }
 
-        fs::rename(&old_path, &new_path).map_err(win_err_to_linux)
+        fs::rename(&old_path, &new_path).map_err(win_err_to_linux)?;
+        self.rename_inode_paths(&old_path, &new_path);
+        Ok(())
     }
 
     fn link(
