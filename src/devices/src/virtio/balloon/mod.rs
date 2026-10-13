@@ -3,7 +3,7 @@ mod event_handler;
 mod owned_ram;
 
 pub use self::defs::uapi::VIRTIO_ID_BALLOON as TYPE_BALLOON;
-pub use self::device::{Balloon, BalloonState};
+pub use self::device::{Balloon, BalloonState, FreePageHintProgress};
 pub use self::owned_ram::{mark_guest_ram_shared, register_owned_guest_ram_file};
 
 mod defs {
@@ -21,6 +21,10 @@ mod defs {
         pub const VIRTIO_BALLOON_F_DEFLATE_ON_OOM: u32 = 2;
         pub const VIRTIO_BALLOON_F_FREE_PAGE_HINT: u32 = 3;
         pub const VIRTIO_BALLOON_F_REPORTING: u32 = 5;
+        /// Free page hinting command ids the device writes to config space.
+        /// Any other value starts a hinting round with that id.
+        pub const VIRTIO_BALLOON_CMD_ID_STOP: u32 = 0;
+        pub const VIRTIO_BALLOON_CMD_ID_DONE: u32 = 1;
 
         /// Tags for the entries the guest writes on the stats queue. Values are
         /// little-endian u64 and, for the memory tags, are in bytes.
