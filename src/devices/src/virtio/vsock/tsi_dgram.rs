@@ -270,6 +270,13 @@ impl Proxy for TsiDgramProxy {
         } else {
             self.connected_dns = false;
             let addr: std::io::Result<socket2::SockAddr> = match req.addr.inet() {
+                _ if !req.addr.suits_family(self.family) => {
+                    warn!(
+                        "connect: id={} refused address {} for its family",
+                        self.id, req.addr
+                    );
+                    Err(std::io::Error::from_raw_os_error(libc::EINVAL))
+                }
                 Some(inet) => Ok(inet.into()),
                 #[cfg(target_os = "linux")]
                 None => match req.addr.unix_path() {
@@ -395,6 +402,14 @@ impl Proxy for TsiDgramProxy {
 
         let mut update = ProxyUpdate::default();
 
+        if !req.addr.suits_family(self.family) {
+            warn!(
+                "sendto: id={} refused address {} for its family",
+                self.id, req.addr
+            );
+            self.sendto_addr = None;
+            return update;
+        }
         self.sendto_addr = Some(req.addr);
         if !self.listening {
             match self.bind_unspecified() {

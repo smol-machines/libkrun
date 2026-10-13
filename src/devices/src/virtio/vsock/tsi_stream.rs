@@ -243,6 +243,13 @@ impl TsiStreamProxy {
         if self.status == ProxyStatus::Listening || self.status == ProxyStatus::WaitingOnAccept {
             return 0;
         }
+        if !req.addr.suits_family(self.family) {
+            warn!(
+                "listen: id={} refused address {} for its family",
+                self.id, req.addr
+            );
+            return -libc::EINVAL;
+        }
 
         // Resolve the bind address, applying the host port map for INET listeners.
         let mapped: Option<SocketAddr> = match req.addr.inet() {
@@ -305,15 +312,14 @@ impl TsiStreamProxy {
         }
     }
 
-    /// Bind an AF_UNIX listener (Linux only). Unlinks any stale socket node first
-    /// so we can take ownership, and records the path for unlink-on-drop.
+    /// Bind an AF_UNIX listener (Linux only). Removes a stale socket node first
+    /// so we can take ownership, refusing anything else at the guest-chosen path,
+    /// and records the path for unlink-on-drop.
     #[cfg(target_os = "linux")]
     fn bind_unix(&mut self, req: &TsiListenReq) -> std::io::Result<()> {
         let path = req.addr.unix_path();
-        if let Some(p) = &path
-            && let Err(e) = fs::remove_file(p)
-        {
-            debug!("error removing socket: {e}");
+        if let Some(p) = &path {
+            super::vsock_addr::remove_stale_unix_socket(p)?;
         }
         let addr = match &path {
             Some(p) => socket2::SockAddr::unix(p)?,
@@ -324,12 +330,7 @@ impl TsiStreamProxy {
         self.sock.bind(&addr)?;
         // Track for unlink on Drop if it is a real on-disk socket path.
         if let Some(p) = path
-            && fs::metadata(&p)
-                .map(|m| {
-                    use std::os::unix::fs::FileTypeExt;
-                    m.file_type().is_socket()
-                })
-                .unwrap_or(false)
+            && super::vsock_addr::is_unix_socket_node(&p)
         {
             self.unixsock_path = Some(p);
         }
@@ -773,6 +774,13 @@ impl Proxy for TsiStreamProxy {
     }
 
     fn connect(&mut self, _pkt: &VsockPacket, req: TsiConnectReq) -> ProxyUpdate {
+        if !req.addr.suits_family(self.family) {
+            warn!(
+                "connect: id={} refused address {} for its family",
+                self.id, req.addr
+            );
+            return self.dial(Err(std::io::Error::from_raw_os_error(libc::EINVAL)));
+        }
         let connect_addr: std::io::Result<socket2::SockAddr> = match req.addr.inet() {
             Some(inet) => Ok(inet.into()),
             #[cfg(target_os = "linux")]
@@ -1316,7 +1324,11 @@ impl Proxy for TsiStreamProxy {
 #[cfg(target_os = "linux")]
 impl Drop for TsiStreamProxy {
     fn drop(&mut self) {
-        if let Some(path) = &self.unixsock_path {
+        // The guest can replace what is at the path while we listen; remove it
+        // only if it is still a socket node.
+        if let Some(path) = &self.unixsock_path
+            && super::vsock_addr::is_unix_socket_node(path)
+        {
             _ = fs::remove_file(path);
         }
     }
