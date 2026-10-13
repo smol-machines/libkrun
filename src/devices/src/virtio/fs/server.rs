@@ -199,6 +199,13 @@ impl<F: FileSystem + Sync> Server<F> {
                 w,
             ),
         };
+        // The reply reaches the guest only after this returns. Before it can
+        // tell the guest a file grew, map that file back over the zero pages
+        // past its old end.
+        #[cfg(target_os = "linux")]
+        if let Some(shm) = shm_region {
+            self.fs.heal_dax_window(shm.host_addr);
+        }
         op_stats::finish(opcode, op_started);
         result
     }

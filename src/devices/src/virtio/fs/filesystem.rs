@@ -1143,6 +1143,10 @@ pub trait FileSystem {
         Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
     }
 
+    /// Bring the DAX window in line with the size of the files mapped into it,
+    /// before a reply goes to the guest.
+    fn heal_dax_window(&self, _host_shm_base: u64) {}
+
     /// Setup a mapping so that guest can access files in DAX style.
     #[allow(clippy::too_many_arguments)]
     fn setupmapping(

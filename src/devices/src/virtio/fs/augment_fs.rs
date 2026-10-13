@@ -639,6 +639,10 @@ impl<T: FileSystem<Inode = Inode, Handle = Handle>> FileSystem for AugmentFs<T> 
         )
     }
 
+    fn heal_dax_window(&self, host_shm_base: u64) {
+        self.inner.heal_dax_window(host_shm_base)
+    }
+
     fn setupmapping(
         &self,
         ctx: Context,
