@@ -292,7 +292,7 @@ impl Balloon {
                     // Only discard blocks for the round the host asked for; a
                     // stale round's blocks are acked and left alone.
                     if self.hint.started && !self.hint.finished {
-                        release_guest_range(mem, desc.addr.0, desc.len as u64);
+                        clear_hinted_range(mem, desc.addr.0, desc.len as u64);
                         self.hint.bytes += desc.len as u64;
                     }
                 } else if desc.len >= 4 {
@@ -632,6 +632,55 @@ fn release_guest_range(mem: &GuestMemoryMmap, gpa: u64, len: u64) {
     unsafe {
         DiscardVirtualMemory(host_addr as *mut core::ffi::c_void, len as usize)
     };
+}
+
+/// Make a hinted block read back as zeros, which is what lets a checkpoint
+/// skip it, and hand it back to the host where that is cheap. The guest holds
+/// the block until the round is done, so nothing races with this.
+fn clear_hinted_range(mem: &GuestMemoryMmap, gpa: u64, len: u64) {
+    // Linux's MADV_DONTNEED zeroes as it releases.
+    #[cfg(target_os = "linux")]
+    release_guest_range(mem, gpa, len);
+
+    // MADV_FREE_REUSABLE leaves the old contents readable until macOS takes
+    // the pages back, so zero them first. MADV_ZERO clears resident pages
+    // without faulting in the rest; without it (older macOS) the block just
+    // keeps its contents.
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(host_addr) = mem.get_host_address(vm_memory::GuestAddress(gpa))
+            && unsafe {
+                libc::madvise(host_addr as *mut libc::c_void, len as usize, libc::MADV_ZERO)
+            } != 0
+        {
+            debug!("balloon: MADV_ZERO unavailable: {}", std::io::Error::last_os_error());
+        }
+        release_guest_range(mem, gpa, len);
+    }
+
+    // DiscardVirtualMemory costs about 1.1 s per GiB here, so the hint path
+    // does not use it. Follow the free-page-report policy instead: with RAM to
+    // spare keep the pages and write zeros (resident, so this is fast); under
+    // pressure decommit and recommit, which frees them and leaves zero pages.
+    // A file-backed view refuses the decommit and is cleared by writing.
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_DECOMMIT, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        let Ok(host_addr) = mem.get_host_address(vm_memory::GuestAddress(gpa)) else {
+            return;
+        };
+        let addr = host_addr as *mut core::ffi::c_void;
+        let released = release_reported_pages()
+            && unsafe {
+                VirtualFree(addr, len as usize, MEM_DECOMMIT) != 0
+                    && !VirtualAlloc(addr, len as usize, MEM_COMMIT, PAGE_READWRITE).is_null()
+            };
+        if !released {
+            unsafe { std::ptr::write_bytes(host_addr, 0, len as usize) };
+        }
+    }
 }
 
 /// Whether free-page reports should give their pages back to the host now.
