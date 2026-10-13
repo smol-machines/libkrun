@@ -24,6 +24,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::path::PathBuf;
 
 use super::defs;
+use super::proxy::Family;
 
 /// Length of a Linux `struct sockaddr_in`.
 const LINUX_SOCKADDR_IN_LEN: usize = 16;
@@ -146,6 +147,49 @@ impl VsockAddr {
     }
 }
 
+impl VsockAddr {
+    /// Whether this guest-supplied address may be used on a proxy of `family`.
+    ///
+    /// The family is fixed when the proxy is created, and that is where the TSI
+    /// flags gate AF_UNIX. An address arrives later, in a listen, connect or
+    /// sendto, and must not switch an INET proxy over to host filesystem paths.
+    /// INET addresses are allowed on either INET family: the host socket decides
+    /// whether a v4 address suits a v6 socket, as Linux does for the guest.
+    pub fn suits_family(&self, family: Family) -> bool {
+        match self {
+            VsockAddr::Inet(_) => matches!(family, Family::Inet | Family::Inet6),
+            #[cfg(target_os = "linux")]
+            VsockAddr::Unix(_) => family == Family::Unix,
+        }
+    }
+}
+
+/// Clear the way for binding an AF_UNIX listener at a guest-chosen host path.
+///
+/// Only a stale socket node is removed. Anything else at the path, whether a
+/// file, a directory or a symlink, is refused with `EADDRINUSE`, as `bind(2)`
+/// itself would, so a guest can never use a listen to delete a host file.
+#[cfg(target_os = "linux")]
+pub fn remove_stale_unix_socket(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_socket() => match std::fs::remove_file(path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        },
+        Ok(_) => Err(std::io::Error::from_raw_os_error(libc::EADDRINUSE)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether `path` is still a socket node, without following a symlink.
+#[cfg(target_os = "linux")]
+pub fn is_unix_socket_node(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_socket())
+}
+
 impl From<SocketAddr> for VsockAddr {
     fn from(addr: SocketAddr) -> Self {
         VsockAddr::Inet(addr)
@@ -250,5 +294,57 @@ mod tests {
         assert_eq!(addr.unix_path().unwrap(), PathBuf::from("/tmp/sock"));
         assert_eq!(addr.inet(), None);
         assert_eq!(addr.to_linux_bytes(), buf);
+    }
+
+    #[test]
+    fn an_inet_address_cannot_switch_a_proxy_to_another_family() {
+        let v4 = VsockAddr::from("127.0.0.1:80".parse::<SocketAddr>().unwrap());
+        assert!(v4.suits_family(Family::Inet));
+        assert!(v4.suits_family(Family::Inet6));
+        #[cfg(target_os = "linux")]
+        {
+            assert!(!v4.suits_family(Family::Unix));
+            let mut buf = vec![1, 0];
+            buf.extend_from_slice(b"/home/someone/notes\0");
+            let unix = VsockAddr::parse_linux(&buf, buf.len() as u32).unwrap();
+            assert!(!unix.suits_family(Family::Inet));
+            assert!(!unix.suits_family(Family::Inet6));
+            assert!(unix.suits_family(Family::Unix));
+        }
+    }
+
+    /// A guest's listen names a host path; only a stale socket there may go.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_listen_path_removes_only_a_stale_socket() {
+        let dir = std::env::temp_dir().join(format!("tsi-unlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let file = dir.join("notes");
+        std::fs::write(&file, "keep").unwrap();
+        let err = remove_stale_unix_socket(&file).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EADDRINUSE));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "keep");
+
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert!(remove_stale_unix_socket(&link).is_err());
+        assert!(std::fs::symlink_metadata(&link).is_ok());
+        assert!(!is_unix_socket_node(&link));
+
+        let sub = dir.join("dir");
+        std::fs::create_dir(&sub).unwrap();
+        assert!(remove_stale_unix_socket(&sub).is_err());
+        assert!(sub.is_dir());
+
+        let sock = dir.join("sock");
+        drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
+        assert!(is_unix_socket_node(&sock));
+        remove_stale_unix_socket(&sock).unwrap();
+        assert!(std::fs::symlink_metadata(&sock).is_err());
+
+        remove_stale_unix_socket(&dir.join("missing")).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
