@@ -36,6 +36,14 @@ impl Vmm {
                     .with_zero_region(base + mapped, size)
                     .map_err(|error| format!("prepare added RAM generation: {error}"))?;
                 (Some(next), region)
+            } else if !builder::memfd_backed_ram_enabled() {
+                // Shared memory never gets huge pages where `shmem_enabled` is
+                // `never`, the default on most distributions; only branchable
+                // machines need a file their clones can map.
+                let gpa = GuestAddress(base + mapped);
+                let region = GuestRegionMmap::new(builder::map_aligned_guest_ram(gpa, size)?, gpa)
+                    .ok_or("added RAM region overflows")?;
+                (None, Arc::new(region))
             } else {
                 let backing = builder::create_guest_ram_memfd(size)?;
                 let region = Arc::new(

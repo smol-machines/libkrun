@@ -2099,9 +2099,28 @@ fn load_payload(
                 }
                 region
             } else {
+                // A view of libkrunfw's buffer sits wherever the library was
+                // loaded, so KVM maps it 4 KiB at a time. Copy the image into
+                // RAM aligned like the rest of the guest's.
+                #[cfg(target_os = "linux")]
+                let region = {
+                    let region =
+                        map_aligned_guest_ram(GuestAddress(kernel_guest_addr), kernel_size)
+                            .map_err(StartMicrovmError::GuestMemoryMmap)?;
+                    // Safety: both are `kernel_size` bytes; the destination was
+                    // just mapped and cannot overlap libkrunfw's buffer.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            kernel_host_addr as *const u8,
+                            region.as_ptr(),
+                            kernel_size,
+                        );
+                    }
+                    region
+                };
                 // SAFETY: kernel_host_addr points to valid kernel data of size kernel_size.
                 // The memory region is managed by the kernel bundle and remains valid.
-                #[cfg(not(target_os = "windows"))]
+                #[cfg(not(any(target_os = "windows", target_os = "linux")))]
                 let region = unsafe {
                     MmapRegion::build_raw(kernel_host_addr as *mut u8, kernel_size, 0, 0)
                         .map_err(StartMicrovmError::InvalidKernelBundle)?
@@ -2239,15 +2258,15 @@ pub struct PayloadConfig {
 /// (for fast VM fork): a `memfd` on Linux, a regular temp file on macOS (which
 /// has no `memfd`, but a file mmap'd `MAP_PRIVATE` gives the same cross-process
 /// CoW — validated against HVF). Gated on the per-VM `SMOLVM_FORKABLE` opt-in.
-fn memfd_backed_ram_enabled() -> bool {
+pub(crate) fn memfd_backed_ram_enabled() -> bool {
     (cfg!(target_os = "linux") || cfg!(target_os = "macos") || cfg!(target_os = "windows"))
         && std::env::var_os("SMOLVM_FORKABLE").is_some_and(|v| v == "1")
 }
 
-/// Ask for transparent huge pages on memfd-backed guest RAM. Anonymous RAM gets
-/// them by default, shared memory only when advised, so without this a
-/// branchable machine would run on 4 KiB pages. Best-effort: a kernel that
-/// refuses keeps 4 KiB pages.
+/// Ask for transparent huge pages on memfd-backed guest RAM, which shared
+/// memory only gets when advised (and never where `shmem_enabled` is `never`).
+/// Anonymous RAM is mapped by `map_aligned_guest_ram` instead. Best-effort: a
+/// kernel that refuses keeps 4 KiB pages.
 #[cfg(target_os = "linux")]
 fn advise_huge_pages(memory: &GuestMemoryMmap) {
     use vm_memory::GuestMemoryRegion;
@@ -2262,6 +2281,80 @@ fn advise_huge_pages(memory: &GuestMemoryMmap) {
 
 #[cfg(not(target_os = "linux"))]
 fn advise_huge_pages(_memory: &GuestMemoryMmap) {}
+
+/// Anonymous guest RAM whose host address agrees with its guest address modulo
+/// 2 MiB.
+///
+/// KVM maps a memslot with 2 MiB pages only where
+/// `(userspace_addr ^ guest_phys_addr) & (2 MiB - 1) == 0`. A plain anonymous
+/// mmap lands on any 4 KiB boundary on older kernels (RHEL 9 among them), and
+/// the RAM after the kernel image starts at a guest address that is not 2 MiB
+/// aligned anyway, so without this every guest page is mapped 4 KiB at a time
+/// even where the host backs it with a huge page. Over-map by 2 MiB and trim
+/// both ends, as QEMU does.
+///
+/// No `MADV_HUGEPAGE`: with the common `defrag=madvise` setting an advised
+/// fault compacts host memory synchronously, which made a guest's first touch
+/// of 3 GiB 4-7x slower on a host with a busy page cache. Hosts with THP set to
+/// `always` (RHEL and its rebuilds) back aligned RAM with huge pages anyway.
+#[cfg(target_os = "linux")]
+pub(crate) fn map_aligned_guest_ram(
+    gpa: GuestAddress,
+    size: usize,
+) -> std::result::Result<vm_memory::mmap::MmapRegion, String> {
+    const HUGE: usize = 2 << 20;
+    let prot = libc::PROT_READ | libc::PROT_WRITE;
+    let flags = libc::MAP_ANONYMOUS | libc::MAP_NORESERVE | libc::MAP_PRIVATE;
+    let span = size
+        .checked_add(HUGE)
+        .ok_or("guest RAM size overflows the host address space")?;
+    // Safety: a fresh anonymous mapping; nothing else refers to it.
+    let base = unsafe { libc::mmap(std::ptr::null_mut(), span, prot, flags, -1, 0) };
+    if base == libc::MAP_FAILED {
+        return Err(format!("map guest RAM: {}", io::Error::last_os_error()));
+    }
+    let base = base as usize;
+    let lead = ((gpa.raw_value() as usize % HUGE) + HUGE - base % HUGE) % HUGE;
+    let start = base + lead;
+    let end = start + size.next_multiple_of(4096);
+    // Safety: both trims are inside the mapping created above and outside the
+    // range kept for the guest.
+    unsafe {
+        if lead > 0 {
+            libc::munmap(base as *mut libc::c_void, lead);
+        }
+        if base + span > end {
+            libc::munmap(end as *mut libc::c_void, base + span - end);
+        }
+    }
+    // Safety: `start..start + size` is a live anonymous mapping created above,
+    // owned by nothing else from here on.
+    unsafe { vm_memory::mmap::MmapRegion::build_raw_owned(start as *mut u8, size, prot, flags) }
+        .map_err(|error| format!("wrap guest RAM: {error:?}"))
+}
+
+/// Guest memory for a machine that is not branchable: RAM regions from
+/// `map_aligned_guest_ram`, device windows (virtio-fs DAX, GPU) as before.
+#[cfg(target_os = "linux")]
+fn create_aligned_guest_memory(
+    regions: &[(GuestAddress, usize)],
+    ram_region_count: usize,
+) -> std::result::Result<GuestMemoryMmap, String> {
+    let regions = regions
+        .iter()
+        .enumerate()
+        .map(|(i, &(addr, size))| {
+            if i < ram_region_count {
+                vm_memory::GuestRegionMmap::new(map_aligned_guest_ram(addr, size)?, addr)
+                    .ok_or_else(|| "guest RAM region overflows".to_string())
+            } else {
+                vm_memory::GuestRegionMmap::from_range(addr, size, None)
+                    .map_err(|e| format!("{e:?}"))
+            }
+        })
+        .collect::<std::result::Result<Vec<_>, String>>()?;
+    GuestMemoryMmap::from_regions(regions).map_err(|e| format!("{e:?}"))
+}
 
 /// Create an anonymous, RAM-backed `memfd` of `size` bytes to back a guest-RAM
 /// region. Being a real file object, it can later be CoW-cloned with
@@ -2664,8 +2757,13 @@ pub fn create_guest_memory(
         advise_huge_pages(&memory);
         memory
     } else {
-        GuestMemoryMmap::from_ranges(&arch_mem_regions)
-            .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?
+        #[cfg(target_os = "linux")]
+        let memory = create_aligned_guest_memory(&arch_mem_regions, ram_region_count)
+            .map_err(StartMicrovmError::GuestMemoryMmap)?;
+        #[cfg(not(target_os = "linux"))]
+        let memory = GuestMemoryMmap::from_ranges(&arch_mem_regions)
+            .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?;
+        memory
     };
 
     let LoadedPayload {
@@ -3909,6 +4007,35 @@ fn attach_input_devices(
 
 #[cfg(test)]
 pub mod tests {
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn guest_ram_is_2mib_congruent_with_its_guest_address() {
+        use vm_memory::GuestMemoryRegion;
+        const HUGE: u64 = 2 << 20;
+        // RAM right after a 64 KiB-aligned kernel image starts mid-2 MiB.
+        for gpa in [0, 0x1000, 0x10_0000, 0x1A3_0000, 0x1_0000_0000] {
+            for size in [4096usize, 3 << 20, (64 << 20) + 4096] {
+                let region = map_aligned_guest_ram(GuestAddress(gpa), size).unwrap();
+                assert_eq!(region.size(), size);
+                assert_eq!(
+                    region.as_ptr() as u64 % HUGE,
+                    gpa % HUGE,
+                    "gpa {gpa:#x} size {size}"
+                );
+                let guest = vm_memory::GuestRegionMmap::new(region, GuestAddress(gpa)).unwrap();
+                assert_eq!(guest.len() as usize, size);
+                // Writable end to end.
+                unsafe {
+                    guest
+                        .get_host_address(vm_memory::MemoryRegionAddress(size as u64 - 1))
+                        .unwrap()
+                        .write(7)
+                };
+            }
+        }
+    }
+
     use super::*;
     use crate::vmm_config::kernel_bundle::KernelBundle;
 
