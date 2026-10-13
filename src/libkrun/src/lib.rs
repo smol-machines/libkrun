@@ -548,6 +548,34 @@ fn checkpoint_failure_reply(
     format!("ERR EIO checkpoint failed: {error}\n")
 }
 
+/// One free page hinting round for the `HINT_FREE` control command.
+#[cfg(not(feature = "tee"))]
+fn hint_free_pages(balloon: &Arc<Mutex<devices::virtio::Balloon>>, timeout_ms: u64) -> String {
+    let start = std::time::Instant::now();
+    if let Err(e) = balloon.lock().unwrap().start_free_page_hint() {
+        return format!("ERR ENOTSUP {e}\n");
+    }
+    let deadline = start + std::time::Duration::from_millis(timeout_ms);
+    let progress = loop {
+        let progress = balloon.lock().unwrap().free_page_hint_progress();
+        if progress.finished || std::time::Instant::now() >= deadline {
+            break progress;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    };
+    balloon.lock().unwrap().finish_free_page_hint();
+    format!(
+        "OK hinted {} bytes in {} ms{}\n",
+        progress.bytes,
+        start.elapsed().as_millis(),
+        if progress.finished {
+            ""
+        } else {
+            " (timed out)"
+        }
+    )
+}
+
 #[cfg(snapshot_supported)]
 fn handle_checkpoint(vmm: &Arc<Mutex<vmm::Vmm>>, id: &str) -> String {
     if id.is_empty() {
@@ -1906,6 +1934,24 @@ fn handle_control_stream(mut stream: ControlStream, vmm: &Arc<Mutex<vmm::Vmm>>) 
                             },
                             Err(_) => "ERR EINVAL balloon target must be MiB\n".to_string(),
                         }
+                    }
+                }
+                // HINT_FREE [timeout_ms]: have the guest hand its free memory
+                // to the balloon so the host discards it, then let the guest
+                // reuse it. A checkpoint taken right after skips that memory
+                // instead of saving whatever it last held. Waits up to
+                // timeout_ms (default 2000) for the guest to finish.
+                #[cfg(not(feature = "tee"))]
+                "HINT_FREE" => {
+                    let timeout = if _arg.is_empty() {
+                        Ok(2000)
+                    } else {
+                        _arg.parse::<u64>()
+                    };
+                    match (timeout, vmm.lock().unwrap().balloon()) {
+                        (Err(_), _) => "ERR EINVAL timeout must be milliseconds\n".to_string(),
+                        (_, None) => "ERR ENODEV no balloon device\n".to_string(),
+                        (Ok(ms), Some(balloon)) => hint_free_pages(&balloon, ms),
                     }
                 }
                 // CHECKPOINT <id>: capture VM/vCPU/device state + guest memory

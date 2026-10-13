@@ -1024,6 +1024,13 @@ impl Vmm {
         Ok(b.pages())
     }
 
+    /// The balloon device, for callers that must wait on the guest without
+    /// holding the VMM lock.
+    #[cfg(not(feature = "tee"))]
+    pub fn balloon(&self) -> Option<Arc<Mutex<devices::virtio::Balloon>>> {
+        self.balloon.clone()
+    }
+
     /// Current balloon `(target_pages, actual_pages)`.
     #[cfg(not(feature = "tee"))]
     pub fn balloon_pages(&self) -> std::result::Result<(u32, u32), &'static str> {

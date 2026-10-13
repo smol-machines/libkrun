@@ -82,6 +82,41 @@ pub struct Balloon {
     /// reports right after a reclaim pulse are handed back even where they
     /// would otherwise stay resident (see `release_reported_pages`).
     last_reclaim: Option<std::time::Instant>,
+    /// Free page hinting round in progress, see `start_free_page_hint`.
+    hint: FreePageHint,
+}
+
+/// One free page hinting round. The guest driver allocates every free block it
+/// can (4 MiB each on x86), hands them over on the hinting queue and holds them
+/// until the device writes `CMD_ID_DONE`. While it holds them nothing in the
+/// guest can write to them, so the host discards each block on receipt: the
+/// memory reads back as zeros and is no longer resident on the host.
+#[derive(Debug, Default)]
+struct FreePageHint {
+    /// Id of the round the device asked for; 0 when none was ever started.
+    cmd_id: u32,
+    /// The guest acknowledged `cmd_id` on the queue.
+    started: bool,
+    /// The guest sent `CMD_ID_STOP`: it has handed over all it could.
+    finished: bool,
+    /// Bytes discarded in this round.
+    bytes: u64,
+}
+
+/// The id for the next hinting round: never `CMD_ID_STOP` or `CMD_ID_DONE`,
+/// which the guest reads as commands rather than as a new round.
+fn next_hint_cmd_id(previous: u32) -> u32 {
+    match previous.wrapping_add(1) {
+        id if id <= uapi::VIRTIO_BALLOON_CMD_ID_DONE => uapi::VIRTIO_BALLOON_CMD_ID_DONE + 1,
+        id => id,
+    }
+}
+
+/// Progress of the current free page hinting round.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FreePageHintProgress {
+    pub finished: bool,
+    pub bytes: u64,
 }
 
 /// A stats entry is a packed le16 tag followed by a le64 value. `repr(C)` would
@@ -136,6 +171,7 @@ impl Balloon {
             stats_pending_ack: None,
             stats_last_request: None,
             last_reclaim: None,
+            hint: FreePageHint::default(),
         })
     }
 
@@ -191,6 +227,93 @@ impl Balloon {
     /// host and guest respectively.
     pub fn pages(&self) -> (u32, u32) {
         (self.config.num_pages, self.config.actual)
+    }
+
+    /// Ask the guest to hand over its free memory so the host can discard it.
+    ///
+    /// Freed guest memory keeps whatever it last held, so without this a
+    /// checkpoint hashes, compresses and ships it. Free page reporting misses
+    /// most of it: it only covers free blocks of 2 MiB or more and runs on the
+    /// guest's own schedule. Poll `free_page_hint_progress`, then call
+    /// `finish_free_page_hint` to let the guest reuse the blocks.
+    pub fn start_free_page_hint(&mut self) -> Result<u32, &'static str> {
+        if self.acked_features & (1 << uapi::VIRTIO_BALLOON_F_FREE_PAGE_HINT) == 0 {
+            return Err("the guest did not negotiate free page hinting");
+        }
+        if self.snapshot_quiesced {
+            return Err("the device is quiesced for a snapshot");
+        }
+        let DeviceState::Activated(_, ref interrupt) = self.device_state else {
+            return Err("the device is not active");
+        };
+        let cmd_id = next_hint_cmd_id(self.hint.cmd_id);
+        self.hint = FreePageHint {
+            cmd_id,
+            ..FreePageHint::default()
+        };
+        self.config.free_page_report_cmd_id = cmd_id;
+        interrupt.signal_config_change();
+        Ok(cmd_id)
+    }
+
+    pub fn free_page_hint_progress(&self) -> FreePageHintProgress {
+        FreePageHintProgress {
+            finished: self.hint.finished,
+            bytes: self.hint.bytes,
+        }
+    }
+
+    /// Let the guest free the blocks it is holding for the current round.
+    pub fn finish_free_page_hint(&mut self) {
+        self.config.free_page_report_cmd_id = uapi::VIRTIO_BALLOON_CMD_ID_DONE;
+        if let DeviceState::Activated(_, ref interrupt) = self.device_state {
+            interrupt.signal_config_change();
+        }
+    }
+
+    /// Hinting queue: an out buffer carries a command id (the round's id when
+    /// the guest starts, `CMD_ID_STOP` when it is done); an in buffer is one
+    /// free block the guest now holds, which the host discards.
+    pub(crate) fn process_phq(&mut self) -> bool {
+        let mem = match self.device_state {
+            DeviceState::Activated(ref mem, _) => mem,
+            DeviceState::Inactive => return false,
+        };
+        let queues = self
+            .queues
+            .as_mut()
+            .expect("queues should exist when activated");
+        let mut have_used = false;
+
+        while let Some(head) = queues[PHQ_INDEX].queue.pop(mem) {
+            let index = head.index;
+            for desc in head.into_iter() {
+                if desc.is_write_only() {
+                    // Only discard blocks for the round the host asked for; a
+                    // stale round's blocks are acked and left alone.
+                    if self.hint.started && !self.hint.finished {
+                        clear_hinted_range(mem, desc.addr.0, desc.len as u64);
+                        self.hint.bytes += desc.len as u64;
+                    }
+                } else if desc.len >= 4 {
+                    match mem.read_obj::<u32>(desc.addr) {
+                        Ok(id) if id == self.hint.cmd_id && self.hint.cmd_id != 0 => {
+                            self.hint.started = true;
+                        }
+                        Ok(uapi::VIRTIO_BALLOON_CMD_ID_STOP) if self.hint.started => {
+                            self.hint.finished = true;
+                        }
+                        Ok(_) => {}
+                        Err(e) => error!("balloon: unreadable hint command id: {e:?}"),
+                    }
+                }
+            }
+            have_used = true;
+            if let Err(e) = queues[PHQ_INDEX].queue.add_used(mem, index, 0) {
+                error!("failed to add used elements to the hinting queue: {e:?}");
+            }
+        }
+        have_used
     }
 
     pub fn process_frq(&mut self) -> bool {
@@ -511,6 +634,55 @@ fn release_guest_range(mem: &GuestMemoryMmap, gpa: u64, len: u64) {
     };
 }
 
+/// Make a hinted block read back as zeros, which is what lets a checkpoint
+/// skip it, and hand it back to the host where that is cheap. The guest holds
+/// the block until the round is done, so nothing races with this.
+fn clear_hinted_range(mem: &GuestMemoryMmap, gpa: u64, len: u64) {
+    // Linux's MADV_DONTNEED zeroes as it releases.
+    #[cfg(target_os = "linux")]
+    release_guest_range(mem, gpa, len);
+
+    // MADV_FREE_REUSABLE leaves the old contents readable until macOS takes
+    // the pages back, so zero them first. MADV_ZERO clears resident pages
+    // without faulting in the rest; without it (older macOS) the block just
+    // keeps its contents.
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(host_addr) = mem.get_host_address(vm_memory::GuestAddress(gpa))
+            && unsafe {
+                libc::madvise(host_addr as *mut libc::c_void, len as usize, libc::MADV_ZERO)
+            } != 0
+        {
+            debug!("balloon: MADV_ZERO unavailable: {}", std::io::Error::last_os_error());
+        }
+        release_guest_range(mem, gpa, len);
+    }
+
+    // DiscardVirtualMemory costs about 1.1 s per GiB here, so the hint path
+    // does not use it. Follow the free-page-report policy instead: with RAM to
+    // spare keep the pages and write zeros (resident, so this is fast); under
+    // pressure decommit and recommit, which frees them and leaves zero pages.
+    // A file-backed view refuses the decommit and is cleared by writing.
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_DECOMMIT, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        let Ok(host_addr) = mem.get_host_address(vm_memory::GuestAddress(gpa)) else {
+            return;
+        };
+        let addr = host_addr as *mut core::ffi::c_void;
+        let released = release_reported_pages()
+            && unsafe {
+                VirtualFree(addr, len as usize, MEM_DECOMMIT) != 0
+                    && !VirtualAlloc(addr, len as usize, MEM_COMMIT, PAGE_READWRITE).is_null()
+            };
+        if !released {
+            unsafe { std::ptr::write_bytes(host_addr, 0, len as usize) };
+        }
+    }
+}
+
 /// Whether free-page reports should give their pages back to the host now.
 ///
 /// On Windows a discarded page costs the guest ~5 us to fault back in (about
@@ -576,8 +748,18 @@ impl VirtioDevice for Balloon {
         // Eventfd notifications do not survive a portable restore. The saved
         // available ring can still contain reports awaiting acknowledgment.
         self.notify_pending_queues(
-            (1 << IFQ_INDEX) | (1 << DFQ_INDEX) | (1 << STQ_INDEX) | (1 << FRQ_INDEX),
+            (1 << IFQ_INDEX)
+                | (1 << DFQ_INDEX)
+                | (1 << STQ_INDEX)
+                | (1 << PHQ_INDEX)
+                | (1 << FRQ_INDEX),
         );
+        // A checkpoint taken while the guest still held hinted blocks must not
+        // leave them held forever: tell the driver the round is done, which
+        // frees any it holds and is a no-op otherwise.
+        if self.acked_features & (1 << uapi::VIRTIO_BALLOON_F_FREE_PAGE_HINT) != 0 {
+            self.finish_free_page_hint();
+        }
     }
 
     fn avail_features(&self) -> u64 {
@@ -684,6 +866,27 @@ impl Balloon {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod hint_tests {
+    use super::*;
+
+    #[test]
+    fn hint_ids_skip_the_command_values() {
+        assert_eq!(next_hint_cmd_id(0), 2);
+        assert_eq!(next_hint_cmd_id(2), 3);
+        assert_eq!(next_hint_cmd_id(u32::MAX), 2);
+    }
+
+    #[test]
+    fn hinting_needs_the_negotiated_feature() {
+        let mut balloon = Balloon::new().unwrap();
+        assert!(balloon.start_free_page_hint().is_err());
+        balloon.set_acked_features(1 << uapi::VIRTIO_BALLOON_F_FREE_PAGE_HINT);
+        // Negotiated but not yet activated.
+        assert!(balloon.start_free_page_hint().is_err());
     }
 }
 
