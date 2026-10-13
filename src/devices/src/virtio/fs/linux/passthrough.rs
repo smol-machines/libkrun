@@ -29,6 +29,7 @@ use super::super::fuse;
 use super::super::inode_alloc::InodeAllocator;
 use super::super::multikey::MultikeyBTreeMap;
 use super::super::{FuseDaxMapSnap, FuseHandleSnap, FuseInodeSnap, FuseServerState};
+use super::dax_window::DaxWindow;
 
 const CURRENT_DIR: &[u8] = b".";
 const PARENT_DIR: &[u8] = b"..";
@@ -412,10 +413,9 @@ pub struct PassthroughFs {
     my_gid: Option<libc::gid_t>,
     cap_fowner: bool,
 
-    // Active DAX window mappings, keyed by window offset. Serialized in the
-    // fork snapshot so a clone can replay them into its window (the window is
-    // anonymous memory and does not survive a cross-process fork).
-    dax_maps: RwLock<BTreeMap<u64, FuseDaxMapSnap>>,
+    // Active DAX window mappings, and their coherence with the mapped files'
+    // sizes.
+    dax: Arc<DaxWindow>,
 
     cfg: Config,
 }
@@ -658,7 +658,7 @@ impl PassthroughFs {
             my_uid,
             my_gid,
             cap_fowner,
-            dax_maps: RwLock::new(BTreeMap::new()),
+            dax: DaxWindow::new(),
             cfg,
         };
 
@@ -772,7 +772,7 @@ impl PassthroughFs {
             writeback: self.writeback.load(Ordering::Relaxed),
             announce_submounts: self.announce_submounts.load(Ordering::Relaxed),
             zero_message_opendir: self.zero_message_opendir.load(Ordering::Relaxed),
-            dax_maps: self.dax_maps.read().unwrap().values().copied().collect(),
+            dax_maps: self.dax.maps.read().unwrap().values().copied().collect(),
         }
     }
 
@@ -862,7 +862,7 @@ impl PassthroughFs {
         }
 
         {
-            let mut maps = self.dax_maps.write().unwrap();
+            let mut maps = self.dax.maps.write().unwrap();
             maps.clear();
             for m in &state.dax_maps {
                 maps.insert(m.moffset, *m);
@@ -879,7 +879,7 @@ impl PassthroughFs {
     /// the guest resumes. A mapping whose file has vanished is skipped with a
     /// warning — that chunk reads as zeros, as it would without replay.
     pub fn replay_dax_maps(&self, host_shm_base: u64, shm_size: u64) {
-        let maps: Vec<FuseDaxMapSnap> = self.dax_maps.read().unwrap().values().copied().collect();
+        let maps: Vec<FuseDaxMapSnap> = self.dax.maps.read().unwrap().values().copied().collect();
         for m in maps {
             if let Err(e) = FileSystem::setupmapping(
                 self,
@@ -2600,6 +2600,10 @@ impl FileSystem for PassthroughFs {
         }
     }
 
+    fn heal_dax_window(&self, host_shm_base: u64) {
+        self.dax.heal(host_shm_base);
+    }
+
     fn setupmapping(
         &self,
         _ctx: Context,
@@ -2640,6 +2644,7 @@ impl FileSystem for PassthroughFs {
         let file = self.open_inode(inode, open_flags)?;
         let fd = file.as_raw_fd();
 
+        let mut window = self.dax.lock();
         let ret = unsafe {
             libc::mmap(
                 addr as *mut libc::c_void,
@@ -2654,20 +2659,20 @@ impl FileSystem for PassthroughFs {
             return Err(io::Error::last_os_error());
         }
 
-        {
-            let mut maps = self.dax_maps.write().unwrap();
-            maps.retain(|_, m| m.moffset + m.len <= moffset || m.moffset >= end);
-            maps.insert(
+        window.mapped(
+            &self.dax,
+            inode,
+            file,
+            prot_flags & libc::PROT_WRITE != 0,
+            FuseDaxMapSnap {
                 moffset,
-                FuseDaxMapSnap {
-                    moffset,
-                    nodeid: inode,
-                    foffset,
-                    len,
-                    flags,
-                },
-            );
-        }
+                nodeid: inode,
+                foffset,
+                len,
+                flags,
+            },
+            host_shm_base,
+        );
 
         Ok(())
     }
@@ -2679,6 +2684,7 @@ impl FileSystem for PassthroughFs {
         host_shm_base: u64,
         shm_size: u64,
     ) -> io::Result<()> {
+        let mut window = self.dax.lock();
         for req in requests {
             // Reject wrapping offsets before computing the mmap target (see
             // setupmapping): a wrapped addr would MAP_FIXED outside the window.
@@ -2701,10 +2707,7 @@ impl FileSystem for PassthroughFs {
             if std::ptr::eq(ret, libc::MAP_FAILED) {
                 return Err(io::Error::last_os_error());
             }
-            self.dax_maps
-                .write()
-                .unwrap()
-                .retain(|_, m| m.moffset + m.len <= req.moffset || m.moffset >= end);
+            window.unmapped(req.moffset, end);
         }
 
         Ok(())

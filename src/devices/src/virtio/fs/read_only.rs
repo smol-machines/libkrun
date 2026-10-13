@@ -272,6 +272,10 @@ impl FileSystem for PassthroughFsRo {
         self.inner.lseek(ctx, inode, handle, offset, whence)
     }
 
+    fn heal_dax_window(&self, host_shm_base: u64) {
+        self.inner.heal_dax_window(host_shm_base)
+    }
+
     fn setupmapping(
         &self,
         ctx: Context,
