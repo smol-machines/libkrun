@@ -20,7 +20,7 @@ use windows_sys::Win32::Foundation::EXCEPTION_ACCESS_VIOLATION;
 use windows_sys::Win32::System::Diagnostics::Debug::{
     AddVectoredExceptionHandler, EXCEPTION_POINTERS,
 };
-use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, PAGE_READWRITE};
+use windows_sys::Win32::System::Memory::{MEM_COMMIT, PAGE_READWRITE, VirtualAlloc};
 
 /// Commit granularity: one allocation-granularity block per fault keeps the
 /// exit count low (16 pages per exit) without committing much the guest did
@@ -76,10 +76,7 @@ fn commit(range: &Range, offset: u64) -> bool {
 /// retries the instruction. False means the access is not ours (MMIO).
 pub fn commit_gpa(gpa: u64) -> bool {
     let ranges = RANGES.read().unwrap();
-    match ranges
-        .iter()
-        .find(|r| gpa >= r.gpa && gpa - r.gpa < r.size)
-    {
+    match ranges.iter().find(|r| gpa >= r.gpa && gpa - r.gpa < r.size) {
         Some(range) => commit(range, gpa - range.gpa),
         None => false,
     }
