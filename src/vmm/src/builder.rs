@@ -2356,6 +2356,35 @@ fn create_aligned_guest_memory(
     GuestMemoryMmap::from_regions(regions).map_err(|e| format!("{e:?}"))
 }
 
+/// Guest memory on Windows: RAM committed as before, device windows (virtio-fs
+/// DAX) only reserved. Windows charges committed memory against the commit
+/// limit whether or not it is touched, and on WHP a DAX window's file data lives
+/// in views mapped over the window, never in the window's own pages, so
+/// committing the window cost its full size per VM for nothing. A page that is
+/// touched anyway is committed on demand by `lazy_mem`.
+#[cfg(target_os = "windows")]
+fn create_windows_guest_memory(
+    regions: &[(GuestAddress, usize)],
+    ram_region_count: usize,
+) -> std::result::Result<GuestMemoryMmap, String> {
+    let regions = regions
+        .iter()
+        .enumerate()
+        .map(|(i, &(addr, size))| {
+            if i < ram_region_count {
+                return vm_memory::GuestRegionMmap::from_range(addr, size, None)
+                    .map_err(|e| format!("{e:?}"));
+            }
+            let mapping = vm_memory::MmapRegion::new_reserved(size)
+                .map_err(|e| format!("reserve device window at {addr:?}: {e}"))?;
+            crate::windows::lazy_mem::register(addr.0, mapping.as_ptr(), size);
+            vm_memory::GuestRegionMmap::new(mapping, addr)
+                .ok_or_else(|| "device window region overflows".to_string())
+        })
+        .collect::<std::result::Result<Vec<_>, String>>()?;
+    GuestMemoryMmap::from_regions(regions).map_err(|e| format!("{e:?}"))
+}
+
 /// Create an anonymous, RAM-backed `memfd` of `size` bytes to back a guest-RAM
 /// region. Being a real file object, it can later be CoW-cloned with
 /// `mmap(MAP_PRIVATE)` for fast, dense VM fork.
@@ -2760,7 +2789,10 @@ pub fn create_guest_memory(
         #[cfg(target_os = "linux")]
         let memory = create_aligned_guest_memory(&arch_mem_regions, ram_region_count)
             .map_err(StartMicrovmError::GuestMemoryMmap)?;
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "windows")]
+        let memory = create_windows_guest_memory(&arch_mem_regions, ram_region_count)
+            .map_err(StartMicrovmError::GuestMemoryMmap)?;
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
         let memory = GuestMemoryMmap::from_ranges(&arch_mem_regions)
             .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?;
         memory

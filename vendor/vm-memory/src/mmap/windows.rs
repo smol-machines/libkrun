@@ -55,6 +55,7 @@ extern "system" {
 const MM_HIGHEST_VAD_ADDRESS: u64 = 0x000007FFFFFDFFFF;
 
 const MEM_COMMIT: u32 = 0x00001000;
+const MEM_RESERVE: u32 = 0x00002000;
 const MEM_RELEASE: u32 = 0x00008000;
 const FILE_MAP_ALL_ACCESS: u32 = 0xf001f;
 const PAGE_READWRITE: u32 = 0x04;
@@ -104,6 +105,29 @@ impl<B: NewBitmap> MmapRegion<B> {
         // This is safe because we are creating an anonymous mapping in a place not already used by
         // any other area in this process.
         let addr = unsafe { VirtualAlloc(0 as *mut c_void, size, MEM_COMMIT, PAGE_READWRITE) };
+        if addr == MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self {
+            addr: addr as *mut u8,
+            size,
+            bitmap: B::with_len(size),
+            file_offset: None,
+            is_view: false,
+        })
+    }
+
+    /// Reserves `size` bytes of address space without committing them, so the
+    /// region costs no commit charge until pages are committed (`VirtualAlloc`
+    /// with `MEM_COMMIT`) by whoever first needs them. Touching an uncommitted
+    /// page faults; the caller owns committing on demand.
+    pub fn new_reserved(size: usize) -> io::Result<Self> {
+        if (size == 0) || (size > MM_HIGHEST_VAD_ADDRESS as usize) {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        // SAFETY: an anonymous reservation in a place not already used by any
+        // other area in this process.
+        let addr = unsafe { VirtualAlloc(0 as *mut c_void, size, MEM_RESERVE, PAGE_READWRITE) };
         if addr == MAP_FAILED {
             return Err(io::Error::last_os_error());
         }

@@ -1412,6 +1412,18 @@ impl WhpVcpu {
         unsafe { &self.exit_context.Anonymous.MemoryAccess }
     }
 
+    /// The GPA of a `MemoryAccess` exit when that GPA is mapped, which is how
+    /// WHP reports a touch of host memory that is reserved but not committed.
+    /// `None` for an unmapped GPA, the MMIO case. Only valid after a
+    /// `MemoryAccess` exit.
+    pub fn mapped_memory_access_gpa(&self) -> Option<u64> {
+        // SAFETY: the caller observed a MemoryAccess exit, so this union arm is live.
+        let ctx = unsafe { &self.exit_context.Anonymous.MemoryAccess };
+        // AccessInfo bit 2 is GpaUnmapped.
+        let gpa_unmapped = unsafe { ctx.AccessInfo.AsUINT32 } & (1 << 2) != 0;
+        (!gpa_unmapped).then_some(ctx.Gpa)
+    }
+
     /// Returns parsed CPUID exit info. Only valid after a `CpuidAccess` exit.
     pub fn cpuid_exit_info(&self) -> CpuidExitInfo {
         let ctx = unsafe { &self.exit_context.Anonymous.CpuidAccess };

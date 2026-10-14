@@ -13,4 +13,5 @@
 //! Windows host with the Windows Hypervisor Platform enabled. Items that need
 //! such a host to validate are marked with `TODO(whp-host)`.
 
+pub mod lazy_mem;
 pub mod vstate;
