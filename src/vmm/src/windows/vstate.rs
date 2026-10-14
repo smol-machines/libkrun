@@ -473,6 +473,15 @@ impl Vcpu {
                 Ok(true)
             }
             VcpuExitReason::MemoryAccess => {
+                // A touch of reserved guest memory: commit it and retry the
+                // instruction, which WHP re-executes on resume.
+                if self
+                    .whp_vcpu
+                    .mapped_memory_access_gpa()
+                    .is_some_and(super::lazy_mem::commit_gpa)
+                {
+                    return Ok(true);
+                }
                 // WHP does not decode the faulting instruction, so run it through
                 // the WHP instruction emulator, routing the device-side access to
                 // the MMIO bus. The emulator advances RIP / updates registers via
