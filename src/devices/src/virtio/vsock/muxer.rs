@@ -528,6 +528,15 @@ impl VsockMuxer {
         }
     }
 
+    // Never hold the registry guard while processing an update: Immediate
+    // removal needs the same registry's write lock.
+    fn with_proxy<R>(&self, id: u64, action: impl FnOnce(&mut dyn Proxy) -> R) -> Option<R> {
+        let map = self.proxy_map.read().unwrap();
+        let proxy = map.get(&id)?;
+        let mut proxy = proxy.lock().unwrap();
+        Some(action(proxy.as_mut()))
+    }
+
     fn process_proxy_update(&self, id: u64, update: ProxyUpdate) {
         if let Some(polling) = update.polling {
             self.update_polling(polling.0, polling.1, polling.2);
@@ -659,34 +668,41 @@ impl VsockMuxer {
         if let Some(req) = pkt.read_connect_req() {
             let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
             debug!("proxy connect request: id={id}");
-            match self.proxy_map.read().unwrap().get(&id) {
-                Some(proxy) => {
-                    let update = {
-                        let mut proxy = proxy.lock().unwrap();
-                        // A DGRAM connect to a resolver (port 53) is allowed so
-                        // it can be intercepted; any other destination must pass
-                        // the egress policy (CIDR or learned IP).
-                        let dns = proxy.is_dgram() && self.is_dns_dest(&req.addr);
-                        if !dns && !self.is_ip_allowed(&req.addr) {
-                            warn!("egress policy denied connect to {}", req.addr);
-                            self.push_packet(MuxerRx::ConnResponse {
-                                local_port: pkt.dst_port(),
-                                peer_port: pkt.src_port(),
-                                result: -libc::EACCES,
+            let update = {
+                let map = self.proxy_map.read().unwrap();
+                match map.get(&id) {
+                    Some(proxy) => {
+                        let update = {
+                            let mut proxy = proxy.lock().unwrap();
+                            // A DGRAM connect to a resolver (port 53) is allowed so
+                            // it can be intercepted; any other destination must pass
+                            // the egress policy (CIDR or learned IP).
+                            let dns = proxy.is_dgram() && self.is_dns_dest(&req.addr);
+                            if !dns && !self.is_ip_allowed(&req.addr) {
+                                warn!("egress policy denied connect to {}", req.addr);
+                                self.push_packet(MuxerRx::ConnResponse {
+                                    local_port: pkt.dst_port(),
+                                    peer_port: pkt.src_port(),
+                                    result: -libc::EACCES,
+                                });
+                                return;
+                            }
+                            let redirected = self.stream_intercept.as_ref().filter(|intercept| {
+                                !proxy.is_dgram()
+                                    && req.addr.inet().is_some_and(|a| a.port() == intercept.port)
                             });
-                            return;
-                        }
-                        let redirected = self.stream_intercept.as_ref().filter(|intercept| {
-                            !proxy.is_dgram()
-                                && req.addr.inet().is_some_and(|a| a.port() == intercept.port)
-                        });
-                        match redirected {
-                            Some(intercept) => proxy.connect_intercepted(pkt, req, intercept),
-                            None => proxy.connect(pkt, req),
-                        }
-                    };
-                    self.process_proxy_update(id, update);
+                            match redirected {
+                                Some(intercept) => proxy.connect_intercepted(pkt, req, intercept),
+                                None => proxy.connect(pkt, req),
+                            }
+                        };
+                        Some(update)
+                    }
+                    None => None,
                 }
+            };
+            match update {
+                Some(update) => self.process_proxy_update(id, update),
                 None => self.push_packet(MuxerRx::ConnResponse {
                     local_port: pkt.dst_port(),
                     peer_port: pkt.src_port(),
@@ -758,11 +774,8 @@ impl VsockMuxer {
         if let Some(req) = pkt.read_listen_req() {
             let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
             debug!("DGRAM listen request: id={id}");
-            match self.proxy_map.read().unwrap().get(&id) {
-                Some(proxy) => self.process_proxy_update(
-                    id,
-                    proxy.lock().unwrap().listen(pkt, req, &self.host_port_map),
-                ),
+            match self.with_proxy(id, |proxy| proxy.listen(pkt, req, &self.host_port_map)) {
+                Some(update) => self.process_proxy_update(id, update),
                 None => self.push_packet(MuxerRx::ListenResponse {
                     local_port: pkt.dst_port(),
                     peer_port: pkt.src_port(),
@@ -777,8 +790,8 @@ impl VsockMuxer {
         if let Some(req) = pkt.read_accept_req() {
             let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
             debug!("DGRAM accept request: id={id}");
-            match self.proxy_map.read().unwrap().get(&id) {
-                Some(proxy) => self.process_proxy_update(id, proxy.lock().unwrap().accept(req)),
+            match self.with_proxy(id, |proxy| proxy.accept(req)) {
+                Some(update) => self.process_proxy_update(id, update),
                 None => self.push_packet(MuxerRx::AcceptResponse {
                     local_port: pkt.dst_port(),
                     peer_port: pkt.src_port(),
@@ -821,10 +834,8 @@ impl VsockMuxer {
         debug!("DGRAM OP_RW");
         let id = ((pkt.src_port() as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
 
-        if let Some(proxy_lock) = self.proxy_map.read().unwrap().get(&id) {
+        if let Some(update) = self.with_proxy(id, |proxy| proxy.sendmsg(pkt)) {
             debug!("DGRAM allowing OP_RW for {}", pkt.src_port());
-            let mut proxy = proxy_lock.lock().unwrap();
-            let update = proxy.sendmsg(pkt);
             self.process_proxy_update(id, update);
         } else {
             debug!("DGRAM ignoring OP_RW for {}", pkt.src_port());
@@ -880,7 +891,9 @@ impl VsockMuxer {
         let mut proxy_map = self.proxy_map.write().unwrap();
 
         if let Some(proxy) = proxy_map.get(&id) {
-            if let Some(update) = proxy.lock().unwrap().confirm_connect(pkt) {
+            let update = proxy.lock().unwrap().confirm_connect(pkt);
+            drop(proxy_map);
+            if let Some(update) = update {
                 self.process_proxy_update(id, update);
             }
         } else {
@@ -952,6 +965,7 @@ impl VsockMuxer {
                 }
                 unix.confirm_connect(pkt);
                 proxy_map.insert(id, Mutex::new(Box::new(unix)));
+                drop(proxy_map);
                 self.process_proxy_update(id, update);
             }
         }
@@ -1046,14 +1060,12 @@ impl VsockMuxer {
     fn process_stream_rw(&self, pkt: &VsockPacket) {
         debug!("OP_RW");
         let id: u64 = ((pkt.src_port() as u64) << 32) | (pkt.dst_port() as u64);
-        if let Some(proxy_lock) = self.proxy_map.read().unwrap().get(&id) {
+        if let Some(update) = self.with_proxy(id, |proxy| proxy.sendmsg(pkt)) {
             debug!(
                 "allowing OP_RW: src={} dst={}",
                 pkt.src_port(),
                 pkt.dst_port()
             );
-            let mut proxy = proxy_lock.lock().unwrap();
-            let update = proxy.sendmsg(pkt);
             self.process_proxy_update(id, update);
         } else {
             debug!("invalid OP_RW for {}, sending reset", pkt.src_port());
@@ -1090,15 +1102,13 @@ impl VsockMuxer {
             pkt.src_port(),
             pkt.dst_port()
         );
-        if let Some(proxy_lock) = self.proxy_map.read().unwrap().get(&id) {
+        if let Some(update) = self.with_proxy(id, |proxy| proxy.release()) {
             debug!(
                 "[VSOCK_TIMING] OP_RST: releasing proxy id={:#x} src={} dst={}",
                 id,
                 pkt.src_port(),
                 pkt.dst_port()
             );
-            let mut proxy = proxy_lock.lock().unwrap();
-            let update = proxy.release();
             self.process_proxy_update(id, update);
         } else {
             debug!("[VSOCK_TIMING] OP_RST: no proxy found for id={:#x}", id);
