@@ -2916,7 +2916,7 @@ impl Vcpu {
 
         #[cfg(target_arch = "x86_64")]
         {
-            let ret = unsafe { libc::ioctl(self.fd.as_raw_fd(), KVM_KVMCLOCK_CTRL) };
+            let ret = unsafe { libc::ioctl(self.fd.as_raw_fd(), KVM_KVMCLOCK_CTRL as _) };
             if ret < 0 {
                 let error = io::Error::last_os_error();
                 // CPU hot-unplug disables the per-CPU pvclock MSR. KVM's

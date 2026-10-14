@@ -377,12 +377,12 @@ fn send_fd(stream: &UnixStream, fd: RawFd, deadline: Instant) -> io::Result<()> 
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = control.as_mut_ptr().cast();
-    msg.msg_controllen = space;
+    msg.msg_controllen = space as _;
     unsafe {
         let header = libc::CMSG_FIRSTHDR(&msg);
         (*header).cmsg_level = libc::SOL_SOCKET;
         (*header).cmsg_type = libc::SCM_RIGHTS;
-        (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as usize;
+        (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as _;
         std::ptr::write_unaligned(libc::CMSG_DATA(header).cast::<RawFd>(), fd);
     }
     loop {
@@ -415,7 +415,7 @@ fn receive_fd(stream: &UnixStream, deadline: Instant) -> io::Result<OwnedFd> {
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = control.as_mut_ptr().cast();
-    msg.msg_controllen = space;
+    msg.msg_controllen = space as _;
     let result = loop {
         stream.set_read_timeout(Some(remaining(deadline)?))?;
         let result = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) };
@@ -432,9 +432,8 @@ fn receive_fd(stream: &UnixStream, deadline: Instant) -> io::Result<OwnedFd> {
         let mut header = libc::CMSG_FIRSTHDR(&msg);
         while !header.is_null() {
             if (*header).cmsg_level == libc::SOL_SOCKET && (*header).cmsg_type == libc::SCM_RIGHTS {
-                let length = (*header)
-                    .cmsg_len
-                    .saturating_sub(libc::CMSG_LEN(0) as usize);
+                let length =
+                    ((*header).cmsg_len as usize).saturating_sub(libc::CMSG_LEN(0) as usize);
                 for offset in (0..length).step_by(std::mem::size_of::<RawFd>()) {
                     if offset + std::mem::size_of::<RawFd>() > length {
                         break;
