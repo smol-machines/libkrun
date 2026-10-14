@@ -208,8 +208,69 @@ fn stat(f: &File) -> io::Result<libc::stat64> {
     }
 }
 
+// The libc crate declares statx(2) for glibc only. musl has the system call
+// all the same, so declare its struct and call it directly there.
+#[cfg(target_env = "musl")]
+#[allow(non_camel_case_types)]
+#[repr(C)]
+struct statx_timestamp {
+    tv_sec: i64,
+    tv_nsec: u32,
+    __reserved: i32,
+}
+
+#[cfg(target_env = "musl")]
+#[allow(non_camel_case_types)]
+#[repr(C)]
+struct statx_t {
+    stx_mask: u32,
+    stx_blksize: u32,
+    stx_attributes: u64,
+    stx_nlink: u32,
+    stx_uid: u32,
+    stx_gid: u32,
+    stx_mode: u16,
+    __spare0: [u16; 1],
+    stx_ino: u64,
+    stx_size: u64,
+    stx_blocks: u64,
+    stx_attributes_mask: u64,
+    stx_atime: statx_timestamp,
+    stx_btime: statx_timestamp,
+    stx_ctime: statx_timestamp,
+    stx_mtime: statx_timestamp,
+    stx_rdev_major: u32,
+    stx_rdev_minor: u32,
+    stx_dev_major: u32,
+    stx_dev_minor: u32,
+    stx_mnt_id: u64,
+    __spare2: u64,
+    __spare3: [u64; 12],
+}
+
+#[cfg(target_env = "musl")]
+const STATX_BASIC_STATS: u32 = 0x07ff;
+#[cfg(target_env = "musl")]
+const STATX_MNT_ID: u32 = 0x1000;
+
+#[cfg(target_env = "musl")]
+unsafe fn sys_statx(
+    dirfd: libc::c_int,
+    pathname: *const libc::c_char,
+    flags: libc::c_int,
+    mask: u32,
+    statxbuf: *mut statx_t,
+) -> libc::c_int {
+    // SAFETY: the caller passes a valid path and a buffer large enough for
+    // `statx_t`, which matches the kernel's struct statx.
+    unsafe { libc::syscall(libc::SYS_statx, dirfd, pathname, flags, mask, statxbuf) as libc::c_int }
+}
+
+#[cfg(not(target_env = "musl"))]
+use libc::{STATX_BASIC_STATS, STATX_MNT_ID, statx as sys_statx, statx as statx_t};
+
 fn statx(f: &File) -> io::Result<(libc::stat64, u64)> {
-    let mut stx = MaybeUninit::<libc::statx>::zeroed();
+    let mut stx = MaybeUninit::<statx_t>::zeroed();
 
     // Safe because this is a constant value and a valid C string.
     let pathname = unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) };
@@ -217,11 +278,11 @@ fn statx(f: &File) -> io::Result<(libc::stat64, u64)> {
     // Safe because the kernel will only write data in `st` and we check the return
     // value.
     let res = unsafe {
-        libc::statx(
+        sys_statx(
             f.as_raw_fd(),
             pathname.as_ptr(),
             libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
-            libc::STATX_BASIC_STATS | libc::STATX_MNT_ID,
+            STATX_BASIC_STATS | STATX_MNT_ID,
             stx.as_mut_ptr(),
         )
     };

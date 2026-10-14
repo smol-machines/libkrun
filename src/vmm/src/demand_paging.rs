@@ -237,7 +237,7 @@ fn create_userfaultfd(mode: UserfaultfdMode) -> io::Result<OwnedFd> {
         {
             Ok(control) => {
                 let device_fd =
-                    unsafe { libc::ioctl(control.as_raw_fd(), USERFAULTFD_IOC_NEW, flags) };
+                    unsafe { libc::ioctl(control.as_raw_fd(), USERFAULTFD_IOC_NEW as _, flags) };
                 if device_fd >= 0 {
                     return initialize_userfaultfd(unsafe {
                         OwnedFd::from_raw_fd(device_fd as libc::c_int)
@@ -274,7 +274,7 @@ fn initialize_userfaultfd(fd: OwnedFd) -> io::Result<OwnedFd> {
         features: 0,
         ioctls: 0,
     };
-    if unsafe { libc::ioctl(fd.as_raw_fd(), UFFDIO_API, &mut api) } < 0 {
+    if unsafe { libc::ioctl(fd.as_raw_fd(), UFFDIO_API as _, &mut api) } < 0 {
         return Err(io::Error::last_os_error());
     }
     if api.api != UFFD_API {
@@ -292,7 +292,7 @@ fn register_range(uffd: RawFd, start: u64, len: u64) -> io::Result<()> {
         mode: UFFDIO_REGISTER_MODE_MISSING,
         ioctls: 0,
     };
-    if unsafe { libc::ioctl(uffd, UFFDIO_REGISTER, &mut registration) } < 0 {
+    if unsafe { libc::ioctl(uffd, UFFDIO_REGISTER as _, &mut registration) } < 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -395,7 +395,7 @@ fn resolve_fault(
         mode: 0,
         copy: 0,
     };
-    if unsafe { libc::ioctl(uffd, UFFDIO_COPY, &mut copy) } < 0 {
+    if unsafe { libc::ioctl(uffd, UFFDIO_COPY as _, &mut copy) } < 0 {
         let error = io::Error::last_os_error();
         // A page can be populated outside this pager only during teardown.
         // EEXIST still means the triggering fault is resolved and is safe to
