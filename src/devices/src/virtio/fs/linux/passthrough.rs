@@ -13,7 +13,7 @@ use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use caps::{CapSet, Capability, has_cap};
@@ -474,6 +474,10 @@ pub struct PassthroughFs {
     my_gid: Option<libc::gid_t>,
     cap_fowner: bool,
 
+    // Serializes read-modify-write updates of a directory's symlink owner
+    // record, so two links created at once in one directory both land.
+    symlink_owners_lock: Mutex<()>,
+
     // Active DAX window mappings, and their coherence with the mapped files'
     // sizes.
     dax: Arc<DaxWindow>,
@@ -508,6 +512,90 @@ fn parse_override(buf: &[u8]) -> (Option<u32>, Option<u32>, Option<u32>) {
     let gid = items.next().and_then(|item| override_item(item, 10));
     let mode = items.next().and_then(|item| override_item(item, 8));
     (uid, gid, mode)
+}
+
+/// Linux keeps `user.*` xattrs off symlinks (`EPERM`), so a symlink's recorded
+/// owner lives on its parent directory instead, as `name\0uid:gid\0` pairs.
+/// A symlink with no record presents as root's, which is what image layers
+/// almost always hold, rather than as the host user that unpacked it.
+const SYMLINK_OWNERS_KEY: &[u8] = b"user.krun.symlink_owners\0";
+
+fn symlink_owners_key() -> &'static CStr {
+    unsafe { CStr::from_bytes_with_nul_unchecked(SYMLINK_OWNERS_KEY) }
+}
+
+/// The recorded owner of `name` in a directory's symlink owner record.
+fn find_symlink_owner(records: &[u8], name: &[u8]) -> Option<(u32, u32)> {
+    let mut fields = records.split(|b| *b == 0);
+    while let (Some(entry), Some(owner)) = (fields.next(), fields.next()) {
+        if entry == name {
+            let (uid, gid, _) = parse_override(owner);
+            return Some((uid?, gid?));
+        }
+    }
+    None
+}
+
+/// `records` with `name`'s entry replaced by `owner`, or dropped when `owner`
+/// is root's (the default needs no entry).
+fn update_symlink_owners(records: &[u8], name: &[u8], owner: (u32, u32)) -> Vec<u8> {
+    let mut out = Vec::with_capacity(records.len() + name.len() + 24);
+    let mut fields = records.split(|b| *b == 0);
+    while let (Some(entry), Some(recorded)) = (fields.next(), fields.next()) {
+        if entry != name && !entry.is_empty() {
+            out.extend_from_slice(entry);
+            out.push(0);
+            out.extend_from_slice(recorded);
+            out.push(0);
+        }
+    }
+    if owner != (0, 0) {
+        out.extend_from_slice(name);
+        out.push(0);
+        out.extend_from_slice(format!("{}:{}", owner.0, owner.1).as_bytes());
+        out.push(0);
+    }
+    out
+}
+
+fn read_symlink_owners(dir: &CStr) -> Vec<u8> {
+    let key = symlink_owners_key();
+    let size = unsafe { libc::getxattr(dir.as_ptr(), key.as_ptr(), std::ptr::null_mut(), 0) };
+    if size <= 0 {
+        return Vec::new();
+    }
+    let mut buf = vec![0u8; size as usize];
+    let res = unsafe {
+        libc::getxattr(
+            dir.as_ptr(),
+            key.as_ptr(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    };
+    if res < 0 {
+        return Vec::new();
+    }
+    buf.truncate(res as usize);
+    buf
+}
+
+/// The parent directory and entry name of the symlink an `O_PATH` fd refers
+/// to. The fd's proc link names the link itself (not its target), so nothing
+/// needs keeping per inode and the answer survives renames and a checkpoint
+/// restore.
+fn symlink_location(fd: RawFd) -> Option<(CString, Vec<u8>)> {
+    use std::os::unix::ffi::OsStrExt;
+    let link = std::fs::read_link(format!("/proc/self/fd/{fd}")).ok()?;
+    let parent = CString::new(link.parent()?.as_os_str().as_bytes()).ok()?;
+    Some((parent, link.file_name()?.as_bytes().to_vec()))
+}
+
+/// The recorded owner of the symlink an `O_PATH` fd refers to, or root's.
+fn symlink_owner(fd: RawFd) -> (u32, u32) {
+    symlink_location(fd)
+        .and_then(|(dir, name)| find_symlink_owner(&read_symlink_owners(&dir), &name))
+        .unwrap_or((0, 0))
 }
 
 /// The proc magic link for an `O_PATH` fd resolves to its inode, which is
@@ -719,6 +807,7 @@ impl PassthroughFs {
             my_uid,
             my_gid,
             cap_fowner,
+            symlink_owners_lock: Mutex::new(()),
             dax: DaxWindow::new(),
             cfg,
         };
@@ -1016,14 +1105,50 @@ impl PassthroughFs {
         Ok(unsafe { File::from_raw_fd(fd) })
     }
 
-    /// Replace the host inode's owner and mode with the recorded ones. Symlink
-    /// inodes keep the host's: their proc link would resolve past them.
+    /// Replace the host inode's owner and mode with the recorded ones. A
+    /// symlink's owner comes from its parent directory's record instead: its
+    /// proc link would resolve past it, and it cannot hold the xattr anyway.
     fn override_stat(&self, fd: RawFd, st: &mut libc::stat64) {
-        if self.cfg.override_stat
-            && (st.st_mode & libc::S_IFMT) != libc::S_IFLNK
-            && let Some(recorded) = read_override(fd)
-        {
+        if !self.cfg.override_stat {
+            return;
+        }
+        if (st.st_mode & libc::S_IFMT) == libc::S_IFLNK {
+            (st.st_uid, st.st_gid) = symlink_owner(fd);
+        } else if let Some(recorded) = read_override(fd) {
             apply_override(st, recorded);
+        }
+    }
+
+    /// Record `owner` for the symlink `name` in directory `dir`'s owner record.
+    /// Best effort: the link already exists, and a full xattr block (a
+    /// directory with very many non-root links) only costs it its owner.
+    fn record_symlink_owner(&self, dir: &CStr, name: &[u8], owner: (u32, u32)) {
+        let _guard = self.symlink_owners_lock.lock().unwrap();
+        let records = read_symlink_owners(dir);
+        let updated = update_symlink_owners(&records, name, owner);
+        if updated == records {
+            return;
+        }
+        let key = symlink_owners_key();
+        let res = if updated.is_empty() {
+            unsafe { libc::removexattr(dir.as_ptr(), key.as_ptr()) }
+        } else {
+            unsafe {
+                libc::setxattr(
+                    dir.as_ptr(),
+                    key.as_ptr(),
+                    updated.as_ptr().cast(),
+                    updated.len(),
+                    0,
+                )
+            }
+        };
+        if res < 0 {
+            warn!(
+                "virtio-fs: cannot record the owner of symlink {:?}: {}",
+                String::from_utf8_lossy(name),
+                io::Error::last_os_error()
+            );
         }
     }
 
@@ -1052,6 +1177,9 @@ impl PassthroughFs {
         let file = unsafe { File::from_raw_fd(fd) };
         let st = stat(&file)?;
         if (st.st_mode & libc::S_IFMT) == libc::S_IFLNK {
+            if let Ok(dir) = proc_fd_path(parent_fd) {
+                self.record_symlink_owner(&dir, name.to_bytes(), (ctx.uid, ctx.gid));
+            }
             return Ok(());
         }
         write_override(file.as_raw_fd(), ctx.uid, ctx.gid, mode)
@@ -1866,7 +1994,26 @@ impl FileSystem for PassthroughFs {
         {
             let fd = inode_data.file.as_raw_fd();
             let host = stat(&inode_data.file)?;
-            if (host.st_mode & libc::S_IFMT) != libc::S_IFLNK {
+            if (host.st_mode & libc::S_IFMT) == libc::S_IFLNK {
+                // A link's mode is fixed; only its owner is recorded.
+                if valid.intersects(SetattrValid::UID | SetattrValid::GID)
+                    && let Some((dir, name)) = symlink_location(fd)
+                {
+                    let (uid, gid) =
+                        find_symlink_owner(&read_symlink_owners(&dir), &name).unwrap_or((0, 0));
+                    let uid = if valid.contains(SetattrValid::UID) {
+                        attr.st_uid
+                    } else {
+                        uid
+                    };
+                    let gid = if valid.contains(SetattrValid::GID) {
+                        attr.st_gid
+                    } else {
+                        gid
+                    };
+                    self.record_symlink_owner(&dir, &name, (uid, gid));
+                }
+            } else {
                 let current = read_override(fd).unwrap_or((None, None, None));
                 let uid = if valid.contains(SetattrValid::UID) {
                     attr.st_uid
@@ -3227,6 +3374,122 @@ mod tests {
              the server uid (the scoped_cred Drop regressed to restoring euid 0)"
         );
         Ok(())
+    }
+
+    #[test]
+    fn symlink_owner_records_round_trip() {
+        let records = update_symlink_owners(b"", b"a", (1234, 1234));
+        let records = update_symlink_owners(&records, b"b", (33, 33));
+        assert_eq!(find_symlink_owner(&records, b"a"), Some((1234, 1234)));
+        assert_eq!(find_symlink_owner(&records, b"b"), Some((33, 33)));
+        assert_eq!(find_symlink_owner(&records, b"c"), None);
+
+        let records = update_symlink_owners(&records, b"a", (7, 8));
+        assert_eq!(find_symlink_owner(&records, b"a"), Some((7, 8)));
+        // Root's is the default, so it drops the entry instead of storing it.
+        let records = update_symlink_owners(&records, b"a", (0, 0));
+        assert_eq!(find_symlink_owner(&records, b"a"), None);
+        assert_eq!(records, b"b\x0033:33\x00");
+        assert!(update_symlink_owners(&records, b"b", (0, 0)).is_empty());
+        // A truncated record yields what it can and never panics.
+        assert_eq!(find_symlink_owner(b"a\x001:2\x00b", b"b"), None);
+    }
+
+    // Linux has no user xattrs on symlinks, so an override share presents a
+    // symlink's owner from its parent directory's record, root's without one,
+    // and records the guest's own links and lchowns there.
+    #[test]
+    fn override_share_presents_symlink_owners_from_the_parent() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "libkrun-symlink-owner-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        std::os::unix::fs::symlink("target", root.join("owned")).unwrap();
+        std::os::unix::fs::symlink("target", root.join("plain")).unwrap();
+        let dir = CString::new(root.to_string_lossy().into_owned()).unwrap();
+        let record = update_symlink_owners(b"", b"owned", (1234, 4321));
+        let res = unsafe {
+            libc::setxattr(
+                dir.as_ptr(),
+                symlink_owners_key().as_ptr(),
+                record.as_ptr().cast(),
+                record.len(),
+                0,
+            )
+        };
+        if res != 0 {
+            eprintln!(
+                "SKIP override_share_presents_symlink_owners_from_the_parent: {}",
+                io::Error::last_os_error()
+            );
+            fs::remove_dir_all(root).unwrap();
+            return;
+        }
+
+        let filesystem = PassthroughFs::new(
+            Config {
+                root_dir: root.to_string_lossy().into_owned(),
+                override_stat: true,
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        FileSystem::init(&filesystem, FsOptions::empty()).unwrap();
+        let ctx = |uid| Context {
+            uid,
+            gid: uid,
+            pid: 0,
+        };
+        let lookup = |name: &str| {
+            let name = CString::new(name).unwrap();
+            FileSystem::lookup(&filesystem, ctx(0), fuse::ROOT_ID, &name).unwrap()
+        };
+        let owner = |inode| {
+            let (st, _) = FileSystem::getattr(&filesystem, ctx(0), inode, None).unwrap();
+            (st.st_uid, st.st_gid)
+        };
+
+        let owned = lookup("owned");
+        assert_eq!((owned.attr.st_uid, owned.attr.st_gid), (1234, 4321));
+        assert_eq!(owner(owned.inode), (1234, 4321));
+        // Not the host user that made the link.
+        let plain = lookup("plain");
+        assert_eq!((plain.attr.st_uid, plain.attr.st_gid), (0, 0));
+
+        let name = CString::new("made").unwrap();
+        let target = CString::new("target").unwrap();
+        let made = FileSystem::symlink(
+            &filesystem,
+            ctx(1000),
+            &target,
+            fuse::ROOT_ID,
+            &name,
+            Extensions::default(),
+        )
+        .unwrap();
+        assert_eq!((made.attr.st_uid, made.attr.st_gid), (1000, 1000));
+
+        let mut attr: libc::stat64 = unsafe { mem::zeroed() };
+        attr.st_uid = 55;
+        FileSystem::setattr(
+            &filesystem,
+            ctx(0),
+            plain.inode,
+            attr,
+            None,
+            SetattrValid::UID,
+        )
+        .unwrap();
+        assert_eq!(owner(plain.inode), (55, 0));
+        assert_eq!(owner(owned.inode), (1234, 4321));
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
