@@ -919,6 +919,9 @@ impl PassthroughFs {
             }
         }
 
+        // This path names the inode itself, which may be a symlink: every xattr
+        // call on it passes XATTR_NOFOLLOW, or a link's attributes are read
+        // from (and written to) whatever its target resolves to on the host.
         Ok(InodeHandle::Path(cstr))
     }
 
@@ -2344,7 +2347,7 @@ impl FileSystem for PassthroughFs {
                     value.as_ptr() as *const libc::c_void,
                     value.len(),
                     0,
-                    mflags as libc::c_int,
+                    mflags as libc::c_int | libc::XATTR_NOFOLLOW,
                 )
             },
             InodeHandle::Fd(fd) => unsafe {
@@ -2399,7 +2402,7 @@ impl FileSystem for PassthroughFs {
                         std::ptr::null_mut(),
                         size as libc::size_t,
                         0,
-                        0,
+                        libc::XATTR_NOFOLLOW,
                     )
                 } else {
                     libc::getxattr(
@@ -2408,7 +2411,7 @@ impl FileSystem for PassthroughFs {
                         buf.as_mut_ptr() as *mut libc::c_void,
                         size as libc::size_t,
                         0,
-                        0,
+                        libc::XATTR_NOFOLLOW,
                     )
                 }
             },
@@ -2460,7 +2463,7 @@ impl FileSystem for PassthroughFs {
                     c_path.as_ptr(),
                     buf.as_mut_ptr() as *mut libc::c_char,
                     512,
-                    0,
+                    libc::XATTR_NOFOLLOW,
                 )
             },
             InodeHandle::Fd(fd) => unsafe {
@@ -2525,7 +2528,7 @@ impl FileSystem for PassthroughFs {
         // Safe because this doesn't modify any memory and we check the return value.
         let res = match self.inode_to_handle(inode, true)? {
             InodeHandle::Path(c_path) => unsafe {
-                libc::removexattr(c_path.as_ptr(), name.as_ptr(), 0)
+                libc::removexattr(c_path.as_ptr(), name.as_ptr(), libc::XATTR_NOFOLLOW)
             },
             InodeHandle::Fd(fd) => unsafe { libc::fremovexattr(fd, name.as_ptr(), 0) },
         };
