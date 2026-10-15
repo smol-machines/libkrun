@@ -573,13 +573,17 @@ impl Balloon {
 /// File-backed RAM this VMM owns (a branchable machine's) keeps a released
 /// page alive in the file, so its pages are also removed from the file; see
 /// [`super::owned_ram`].
-fn release_guest_range(mem: &GuestMemoryMmap, gpa: u64, len: u64) {
+/// Returns whether the range now reads back as zeros. On Linux a file-backed
+/// range this VMM cannot punch (a checkpoint generation, a restored or
+/// branched machine's private view) keeps its contents: `MADV_DONTNEED` only
+/// drops the mapping, and the next read faults the file's page back in.
+fn release_guest_range(mem: &GuestMemoryMmap, gpa: u64, len: u64) -> bool {
     use vm_memory::{GuestAddress, GuestMemoryRegion};
     let host_addr = match mem.get_host_address(GuestAddress(gpa)) {
         Ok(p) => p,
         Err(e) => {
             error!("balloon: inflate range outside guest memory: 0x{gpa:x}+{len}: {e:?}");
-            return;
+            return false;
         }
     };
     // The backing file and the offset of `gpa` in it, when the whole range
@@ -600,11 +604,11 @@ fn release_guest_range(mem: &GuestMemoryMmap, gpa: u64, len: u64) {
                 hvf::balloon_reclaim_range(gpa, host_addr as u64, len, Some((file.as_raw_fd(), offset)))
             });
             if punched.is_some() {
-                return;
+                return true;
             }
         }
         hvf::balloon_reclaim_range(gpa, host_addr as u64, len, None);
-        return;
+        return true;
     }
     #[cfg(target_os = "linux")]
     if let Some((file, _)) = backing {
@@ -615,9 +619,13 @@ fn release_guest_range(mem: &GuestMemoryMmap, gpa: u64, len: u64) {
             libc::madvise(host_addr as *mut libc::c_void, len as usize, libc::MADV_REMOVE) == 0
         });
         if removed == Some(true) {
-            return;
+            return true;
         }
     }
+    #[cfg(target_os = "linux")]
+    let zeroed = backing.is_none();
+    #[cfg(not(target_os = "linux"))]
+    let zeroed = true;
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let _ = backing;
     #[cfg(target_os = "linux")]
@@ -632,15 +640,55 @@ fn release_guest_range(mem: &GuestMemoryMmap, gpa: u64, len: u64) {
     unsafe {
         DiscardVirtualMemory(host_addr as *mut core::ffi::c_void, len as usize)
     };
+    zeroed
+}
+
+/// Replace a hinted range of a file-backed private view with anonymous zero
+/// pages. They cost nothing until the guest writes them, a write becomes an
+/// ordinary private page that every capture keeps, and the capture writes the
+/// untouched rest as holes. Guest RAM is anonymous wherever it is not a file,
+/// so this is the same memory the rest of the RAM uses. The guest holds the
+/// range until the hinting round ends, so nothing reads or writes it while
+/// the mapping changes; KVM follows the new pages through its MMU notifier.
+#[cfg(target_os = "linux")]
+fn zero_hinted_private_range(mem: &GuestMemoryMmap, gpa: u64, len: u64) {
+    let Ok(host_addr) = mem.get_host_address(vm_memory::GuestAddress(gpa)) else {
+        return;
+    };
+    // Safety: the range lies inside a live guest-memory mapping this VMM owns
+    // and stays mapped (MAP_FIXED replaces it in place with the same
+    // protection); the guest is not using it while the round holds it.
+    let mapped = unsafe {
+        libc::mmap(
+            host_addr.cast(),
+            len as usize,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED | libc::MAP_NORESERVE,
+            -1,
+            0,
+        )
+    };
+    if mapped == libc::MAP_FAILED {
+        debug!(
+            "balloon: could not zero hinted range 0x{gpa:x}+{len}: {}",
+            std::io::Error::last_os_error()
+        );
+    }
 }
 
 /// Make a hinted block read back as zeros, which is what lets a checkpoint
 /// skip it, and hand it back to the host where that is cheap. The guest holds
 /// the block until the round is done, so nothing races with this.
 fn clear_hinted_range(mem: &GuestMemoryMmap, gpa: u64, len: u64) {
-    // Linux's MADV_DONTNEED zeroes as it releases.
+    // Linux's MADV_DONTNEED zeroes anonymous RAM as it releases, and punching
+    // RAM this VMM owns clears it from the file. A private view of a file
+    // (every machine after its first checkpoint, every restore and branch)
+    // keeps the file's contents, so a checkpoint saved that stale memory:
+    // 2.4 GB where 0.26 GB was in use. Map fresh zero pages over it instead.
     #[cfg(target_os = "linux")]
-    release_guest_range(mem, gpa, len);
+    if !release_guest_range(mem, gpa, len) {
+        zero_hinted_private_range(mem, gpa, len);
+    }
 
     // MADV_FREE_REUSABLE leaves the old contents readable until macOS takes
     // the pages back, so zero them first. MADV_ZERO clears resident pages
