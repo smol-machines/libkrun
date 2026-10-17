@@ -565,34 +565,107 @@ impl Balloon {
     }
 }
 
+/// Call `f(gpa, host, len)` for each part of the guest range `gpa..gpa+len` that
+/// lies in one guest memory region, in order. The range comes from the guest
+/// (a free-page report, hint or inflate run), and two regions next to each
+/// other in guest memory need not be next to each other on the host (x86 maps
+/// the kernel image as its own region between two RAM regions), so one host
+/// pointer plus the guest's length could run past a region into unrelated host
+/// memory. A part outside guest memory ends the walk: it is not ours to touch.
+fn for_each_region_part(
+    mem: &GuestMemoryMmap,
+    gpa: u64,
+    len: u64,
+    mut f: impl FnMut(u64, *mut u8, u64),
+) {
+    use vm_memory::{GuestAddress, GuestMemoryRegion};
+    let Some(end) = gpa.checked_add(len) else {
+        error!("balloon: range overflows guest memory: 0x{gpa:x}+{len}");
+        return;
+    };
+    let mut cur = gpa;
+    while cur < end {
+        let Some(region) = mem.find_region(GuestAddress(cur)) else {
+            error!("balloon: range outside guest memory: 0x{cur:x}..0x{end:x}");
+            return;
+        };
+        let start = region.start_addr().raw_value();
+        let region_end = start.saturating_add(region.len());
+        let part_end = end.min(region_end);
+        let Ok(host) = region.get_host_address(vm_memory::MemoryRegionAddress(cur - start)) else {
+            return;
+        };
+        f(cur, host, part_end - cur);
+        cur = part_end;
+    }
+}
+
+/// Shrink a part to whole host pages. `madvise`, discard and remapping act on
+/// whole host pages, which are larger than the guest's 4 KiB on macOS (16 KiB):
+/// releasing or zeroing a partial one would take neighbouring guest pages that
+/// are still in use with it. `None` when no whole host page is left.
+fn whole_host_pages(gpa: u64, host_addr: *mut u8, len: u64) -> Option<(u64, *mut u8, u64)> {
+    let page = host_page_size();
+    let start = host_addr as u64;
+    let aligned_start = start.checked_add(page - 1)? & !(page - 1);
+    let aligned_end = (start + len) & !(page - 1);
+    if aligned_end <= aligned_start {
+        return None;
+    }
+    let skip = aligned_start - start;
+    Some((
+        gpa + skip,
+        aligned_start as *mut u8,
+        aligned_end - aligned_start,
+    ))
+}
+
+fn host_page_size() -> u64 {
+    #[cfg(unix)]
+    {
+        (unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).max(4096) as u64
+    }
+    #[cfg(not(unix))]
+    {
+        4096
+    }
+}
+
 /// Release a guest range surrendered by the balloon (free-page report or
 /// inflate): unmap+purge on macOS when reclaim is enabled, otherwise the
 /// per-OS madvise/discard fallback. Sub-host-page runs are silently skipped
-/// by the reclaim path's inward alignment.
+/// by the reclaim path's inward alignment. Works region by region, see
+/// [`for_each_region_part`].
 ///
 /// File-backed RAM this VMM owns (a branchable machine's) keeps a released
 /// page alive in the file, so its pages are also removed from the file; see
 /// [`super::owned_ram`].
-/// Returns whether the range now reads back as zeros. On Linux a file-backed
-/// range this VMM cannot punch (a checkpoint generation, a restored or
-/// branched machine's private view) keeps its contents: `MADV_DONTNEED` only
+/// Returns whether the whole range now reads back as zeros. On Linux a
+/// file-backed range this VMM cannot punch (a checkpoint generation, a restored
+/// or branched machine's private view) keeps its contents: `MADV_DONTNEED` only
 /// drops the mapping, and the next read faults the file's page back in.
 fn release_guest_range(mem: &GuestMemoryMmap, gpa: u64, len: u64) -> bool {
-    use vm_memory::{GuestAddress, GuestMemoryRegion};
-    let host_addr = match mem.get_host_address(GuestAddress(gpa)) {
-        Ok(p) => p,
-        Err(e) => {
-            error!("balloon: inflate range outside guest memory: 0x{gpa:x}+{len}: {e:?}");
-            return false;
+    let mut zeroed = true;
+    let mut any = false;
+    for_each_region_part(mem, gpa, len, |gpa, host_addr, len| {
+        any = true;
+        match whole_host_pages(gpa, host_addr, len) {
+            Some((gpa, host_addr, whole)) => {
+                zeroed &= whole == len && release_region_part(mem, gpa, host_addr, whole);
+            }
+            None => zeroed = false,
         }
-    };
-    // The backing file and the offset of `gpa` in it, when the whole range
-    // lies in one file-backed region.
+    });
+    any && zeroed
+}
+
+/// [`release_guest_range`] for a part that lies in one region.
+fn release_region_part(mem: &GuestMemoryMmap, gpa: u64, host_addr: *mut u8, len: u64) -> bool {
+    use vm_memory::{GuestAddress, GuestMemoryRegion};
+    // The backing file and the offset of `gpa` in it, when the region is
+    // file-backed.
     let backing = mem.find_region(GuestAddress(gpa)).and_then(|region| {
         let start = region.start_addr().raw_value();
-        if gpa.checked_add(len)? > start.checked_add(region.len())? {
-            return None;
-        }
         let file_offset = region.file_offset()?;
         Some((file_offset.file(), file_offset.start() + (gpa - start)))
     });
@@ -601,7 +674,12 @@ fn release_guest_range(mem: &GuestMemoryMmap, gpa: u64, len: u64) -> bool {
         use std::os::fd::AsRawFd;
         if let Some((file, offset)) = backing {
             let punched = super::owned_ram::with_owned_backing(file, || {
-                hvf::balloon_reclaim_range(gpa, host_addr as u64, len, Some((file.as_raw_fd(), offset)))
+                hvf::balloon_reclaim_range(
+                    gpa,
+                    host_addr as u64,
+                    len,
+                    Some((file.as_raw_fd(), offset)),
+                )
             });
             if punched.is_some() {
                 return true;
@@ -616,7 +694,11 @@ fn release_guest_range(mem: &GuestMemoryMmap, gpa: u64, len: u64) -> bool {
         // a private view and on a write-sealed generation, which then fall
         // through to MADV_DONTNEED as before.
         let removed = super::owned_ram::with_owned_backing(file, || unsafe {
-            libc::madvise(host_addr as *mut libc::c_void, len as usize, libc::MADV_REMOVE) == 0
+            libc::madvise(
+                host_addr as *mut libc::c_void,
+                len as usize,
+                libc::MADV_REMOVE,
+            ) == 0
         });
         if removed == Some(true) {
             return true;
@@ -627,7 +709,7 @@ fn release_guest_range(mem: &GuestMemoryMmap, gpa: u64, len: u64) -> bool {
     #[cfg(not(target_os = "linux"))]
     let zeroed = true;
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    let _ = backing;
+    let _ = (backing, gpa);
     #[cfg(target_os = "linux")]
     let advice = libc::MADV_DONTNEED;
     #[cfg(target_os = "macos")]
@@ -643,19 +725,16 @@ fn release_guest_range(mem: &GuestMemoryMmap, gpa: u64, len: u64) -> bool {
     zeroed
 }
 
-/// Replace a hinted range of a file-backed private view with anonymous zero
-/// pages. They cost nothing until the guest writes them, a write becomes an
-/// ordinary private page that every capture keeps, and the capture writes the
-/// untouched rest as holes. Guest RAM is anonymous wherever it is not a file,
-/// so this is the same memory the rest of the RAM uses. The guest holds the
-/// range until the hinting round ends, so nothing reads or writes it while
+/// Replace a hinted part of a file-backed private view, inside one region, with
+/// anonymous zero pages. They cost nothing until the guest writes them, a write
+/// becomes an ordinary private page that every capture keeps, and the capture
+/// writes the untouched rest as holes. Guest RAM is anonymous wherever it is not
+/// a file, so this is the same memory the rest of the RAM uses. The guest holds
+/// the range until the hinting round ends, so nothing reads or writes it while
 /// the mapping changes; KVM follows the new pages through its MMU notifier.
 #[cfg(target_os = "linux")]
-fn zero_hinted_private_range(mem: &GuestMemoryMmap, gpa: u64, len: u64) {
-    let Ok(host_addr) = mem.get_host_address(vm_memory::GuestAddress(gpa)) else {
-        return;
-    };
-    // Safety: the range lies inside a live guest-memory mapping this VMM owns
+fn zero_hinted_private_part(gpa: u64, host_addr: *mut u8, len: u64) {
+    // Safety: the part lies inside one live guest-memory mapping this VMM owns
     // and stays mapped (MAP_FIXED replaces it in place with the same
     // protection); the guest is not using it while the round holds it.
     let mapped = unsafe {
@@ -678,16 +757,26 @@ fn zero_hinted_private_range(mem: &GuestMemoryMmap, gpa: u64, len: u64) {
 
 /// Make a hinted block read back as zeros, which is what lets a checkpoint
 /// skip it, and hand it back to the host where that is cheap. The guest holds
-/// the block until the round is done, so nothing races with this.
+/// the block until the round is done, so nothing races with this. Works region
+/// by region, see [`for_each_region_part`].
 fn clear_hinted_range(mem: &GuestMemoryMmap, gpa: u64, len: u64) {
+    for_each_region_part(mem, gpa, len, |gpa, host_addr, len| {
+        if let Some((gpa, host_addr, len)) = whole_host_pages(gpa, host_addr, len) {
+            clear_hinted_part(mem, gpa, host_addr, len)
+        }
+    });
+}
+
+/// [`clear_hinted_range`] for a part that lies in one region.
+fn clear_hinted_part(mem: &GuestMemoryMmap, gpa: u64, host_addr: *mut u8, len: u64) {
     // Linux's MADV_DONTNEED zeroes anonymous RAM as it releases, and punching
     // RAM this VMM owns clears it from the file. A private view of a file
     // (every machine after its first checkpoint, every restore and branch)
     // keeps the file's contents, so a checkpoint saved that stale memory:
     // 2.4 GB where 0.26 GB was in use. Map fresh zero pages over it instead.
     #[cfg(target_os = "linux")]
-    if !release_guest_range(mem, gpa, len) {
-        zero_hinted_private_range(mem, gpa, len);
+    if !release_region_part(mem, gpa, host_addr, len) {
+        zero_hinted_private_part(gpa, host_addr, len);
     }
 
     // MADV_FREE_REUSABLE leaves the old contents readable until macOS takes
@@ -696,14 +785,20 @@ fn clear_hinted_range(mem: &GuestMemoryMmap, gpa: u64, len: u64) {
     // keeps its contents.
     #[cfg(target_os = "macos")]
     {
-        if let Ok(host_addr) = mem.get_host_address(vm_memory::GuestAddress(gpa))
-            && unsafe {
-                libc::madvise(host_addr as *mut libc::c_void, len as usize, libc::MADV_ZERO)
-            } != 0
+        if unsafe {
+            libc::madvise(
+                host_addr as *mut libc::c_void,
+                len as usize,
+                libc::MADV_ZERO,
+            )
+        } != 0
         {
-            debug!("balloon: MADV_ZERO unavailable: {}", std::io::Error::last_os_error());
+            debug!(
+                "balloon: MADV_ZERO unavailable: {}",
+                std::io::Error::last_os_error()
+            );
         }
-        release_guest_range(mem, gpa, len);
+        release_region_part(mem, gpa, host_addr, len);
     }
 
     // DiscardVirtualMemory costs about 1.1 s per GiB here, so the hint path
@@ -716,9 +811,7 @@ fn clear_hinted_range(mem: &GuestMemoryMmap, gpa: u64, len: u64) {
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEM_DECOMMIT, PAGE_READWRITE, VirtualAlloc, VirtualFree,
         };
-        let Ok(host_addr) = mem.get_host_address(vm_memory::GuestAddress(gpa)) else {
-            return;
-        };
+        let _ = (mem, gpa);
         let addr = host_addr as *mut core::ffi::c_void;
         let released = release_reported_pages()
             && unsafe {
@@ -1204,5 +1297,109 @@ mod checkpoint_quiescence_tests {
             }
             assert_eq!(rings[index].used.idx.get(), 1, "queue {index}");
         }
+    }
+}
+
+#[cfg(test)]
+mod region_bounds_tests {
+    use super::*;
+    use vm_memory::{Bytes, GuestAddress};
+
+    // Whole host pages: 16 KiB on macOS, so the tests hold on every host.
+    fn page() -> usize {
+        host_page_size() as usize
+    }
+
+    /// Two guest regions next to each other in guest memory, each its own host
+    /// mapping, filled with 0xAA.
+    fn two_regions() -> GuestMemoryMmap {
+        let mem = GuestMemoryMmap::from_ranges(&[
+            (GuestAddress(0), 2 * page()),
+            (GuestAddress(2 * page() as u64), 2 * page()),
+        ])
+        .unwrap();
+        mem.write_slice(&vec![0xAA; 4 * page()], GuestAddress(0))
+            .unwrap();
+        mem
+    }
+
+    fn page_byte(mem: &GuestMemoryMmap, n: usize) -> u8 {
+        mem.read_obj::<u8>(GuestAddress((n * page()) as u64))
+            .unwrap()
+    }
+
+    // A range across a region boundary is walked region by region, each part
+    // through its own region's host mapping.
+    #[test]
+    fn a_range_across_regions_is_split_at_the_boundary() {
+        let mem = two_regions();
+        let mut parts = Vec::new();
+        for_each_region_part(&mem, page() as u64, 2 * page() as u64, |gpa, host, len| {
+            parts.push((gpa, host as usize, len))
+        });
+        assert_eq!(parts.len(), 2);
+        assert_eq!((parts[0].0, parts[0].2), (page() as u64, page() as u64));
+        assert_eq!((parts[1].0, parts[1].2), (2 * page() as u64, page() as u64));
+        let second = mem
+            .get_host_address(GuestAddress(2 * page() as u64))
+            .unwrap() as usize;
+        assert_eq!(
+            parts[1].1, second,
+            "the second part uses its own region's host address"
+        );
+    }
+
+    // Releasing across the boundary zeroes exactly the requested pages in
+    // both regions and nothing next to them.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn releasing_across_regions_zeroes_exactly_the_range() {
+        let mem = two_regions();
+        clear_hinted_range(&mem, page() as u64, 2 * page() as u64);
+        assert_eq!(page_byte(&mem, 0), 0xAA);
+        assert_eq!(page_byte(&mem, 1), 0);
+        assert_eq!(
+            page_byte(&mem, 2),
+            0,
+            "the part in the second region is cleared"
+        );
+        assert_eq!(page_byte(&mem, 3), 0xAA);
+    }
+
+    // A range that runs past guest memory touches only the guest part, and
+    // one wholly outside touches nothing.
+    #[test]
+    fn a_range_past_guest_memory_stops_at_its_end() {
+        let mem = two_regions();
+        let mut parts = Vec::new();
+        for_each_region_part(&mem, 3 * page() as u64, 1 << 20, |gpa, _, len| {
+            parts.push((gpa, len))
+        });
+        assert_eq!(parts, vec![(3 * page() as u64, page() as u64)]);
+        parts.clear();
+        for_each_region_part(&mem, 1 << 30, page() as u64, |gpa, _, len| {
+            parts.push((gpa, len))
+        });
+        assert!(parts.is_empty());
+        for_each_region_part(&mem, u64::MAX - 1, 4, |gpa, _, len| parts.push((gpa, len)));
+        assert!(parts.is_empty(), "an overflowing range is refused");
+    }
+
+    // A release smaller than a host page leaves that host page, and the guest
+    // pages sharing it, untouched; a whole host page inside it is released.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn partial_host_pages_are_left_alone() {
+        let mem = two_regions();
+        let quarter = (page() / 4) as u64;
+        clear_hinted_range(&mem, quarter, 2 * quarter);
+        assert_eq!(page_byte(&mem, 0), 0xAA, "no whole host page in the range");
+        assert!(
+            !release_guest_range(&mem, quarter, 2 * quarter),
+            "nothing is reported zeroed"
+        );
+        clear_hinted_range(&mem, quarter, page() as u64 + 3 * quarter);
+        assert_eq!(page_byte(&mem, 0), 0xAA, "the partial first page is kept");
+        assert_eq!(page_byte(&mem, 1), 0, "the whole second page is cleared");
     }
 }
