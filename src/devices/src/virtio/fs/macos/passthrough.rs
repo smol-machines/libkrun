@@ -167,6 +167,15 @@ struct HandleData {
     dirstream: Mutex<DirStream>,
 }
 
+// Runs inside setattr once it holds the handle's fd, so a test can race a
+// RELEASE against the fd syscalls deterministically.
+#[cfg(test)]
+thread_local! {
+    #[allow(clippy::type_complexity)]
+    static SETATTR_FD_HOOK: std::cell::Cell<Option<Box<dyn FnOnce(&PassthroughFs)>>> =
+        const { std::cell::Cell::new(None) };
+}
+
 fn ebadf() -> io::Error {
     linux_error(io::Error::from_raw_os_error(libc::EBADF))
 }
@@ -1610,14 +1619,10 @@ impl FileSystem for PassthroughFs {
         F: FnMut(DirEntry, Entry) -> io::Result<usize>,
     {
         self.do_readdir(inode, handle, size, offset, |dir_entry| {
-            // Safe because the kernel guarantees that the buffer is nul-terminated. Additionally,
-            // the kernel will pad the name with '\0' bytes up to 8-byte alignment and there's no
-            // way for us to know exactly how many padding bytes there are. This would cause
-            // `CStr::from_bytes_with_nul` to return an error because it would think there are
-            // interior '\0' bytes. We trust the kernel to provide us with properly formatted data
-            // so we'll just skip the checks here.
-            let name = unsafe { CStr::from_bytes_with_nul_unchecked(dir_entry.name) };
-            let entry = self.lookup(ctx, inode, name)?;
+            // The cached name is d_namlen bytes, without a NUL.
+            let name = CString::new(dir_entry.name)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let entry = self.lookup(ctx, inode, &name)?;
 
             add_entry(dir_entry, entry)
         })
@@ -1824,8 +1829,11 @@ impl FileSystem for PassthroughFs {
         valid: SetattrValid,
     ) -> io::Result<(bindings::stat64, Duration)> {
         // If we have a handle then use it otherwise get a new fd from the inode.
+        // `hd` outlives every use of the raw fd: a concurrent release would
+        // otherwise close it and a newly opened file could reuse the number.
+        let hd;
         let ihandle = if let Some(handle) = handle {
-            let hd = self
+            hd = self
                 .handles
                 .read()
                 .unwrap()
@@ -1839,6 +1847,11 @@ impl FileSystem for PassthroughFs {
         } else {
             self.inode_to_handle(inode, true)?
         };
+
+        #[cfg(test)]
+        if let Some(hook) = SETATTR_FD_HOOK.take() {
+            hook(self);
+        }
 
         if valid.contains(SetattrValid::MODE) {
             set_xattr_stat(&ihandle, None, None, Some(attr.st_mode as u32))?
@@ -2867,8 +2880,7 @@ fn is_terminal_ioctl(cmd: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::PassthroughFs;
-    use super::is_terminal_ioctl;
+    use super::*;
     use std::fs;
     use std::os::unix::fs::MetadataExt;
     use std::path::Path;
@@ -2937,5 +2949,157 @@ mod tests {
         const FS_IOC_SETFLAGS: u32 = 0x4008_6602;
         assert!(!is_terminal_ioctl(FS_IOC_GETFLAGS));
         assert!(!is_terminal_ioctl(FS_IOC_SETFLAGS));
+    }
+
+    #[test]
+    fn readdirplus_looks_up_each_entry_by_its_full_name() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "libkrun-readdirplus-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("abc"), b"data").unwrap();
+        fs::write(root.join("ab"), b"other").unwrap();
+
+        let filesystem = PassthroughFs::new(
+            Config {
+                root_dir: root.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        FileSystem::init(&filesystem, FsOptions::empty()).unwrap();
+        let context = Context {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        };
+        let (handle, _) =
+            FileSystem::opendir(&filesystem, context, fuse::ROOT_ID, libc::O_RDONLY as u32)
+                .unwrap();
+        let mut found = Vec::new();
+        FileSystem::readdirplus(
+            &filesystem,
+            context,
+            fuse::ROOT_ID,
+            handle.unwrap(),
+            4096,
+            0,
+            |dir_entry, entry| {
+                found.push((dir_entry.name.to_vec(), entry.attr.st_ino));
+                Ok(1)
+            },
+        )
+        .unwrap();
+        found.sort();
+        let ino = |name: &str| fs::metadata(root.join(name)).unwrap().ino();
+        assert_eq!(
+            found,
+            vec![(b"ab".to_vec(), ino("ab")), (b"abc".to_vec(), ino("abc"))]
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // A RELEASE racing a setattr must not close the handle's fd before the
+    // fd syscalls run: a file opened in between would reuse the number and
+    // the truncate would land on it instead.
+    #[test]
+    fn setattr_keeps_its_handle_open_across_a_concurrent_release() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "libkrun-setattr-release-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("a"), b"aaaa").unwrap();
+        fs::write(root.join("b"), b"bbbb").unwrap();
+
+        let filesystem = PassthroughFs::new(
+            Config {
+                root_dir: root.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        FileSystem::init(&filesystem, FsOptions::empty()).unwrap();
+        let context = Context {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        };
+        let a = CString::new("a").unwrap();
+        let entry = FileSystem::lookup(&filesystem, context, fuse::ROOT_ID, &a).unwrap();
+        let (handle, _) = FileSystem::open(
+            &filesystem,
+            context,
+            entry.inode,
+            false,
+            libc::O_RDWR as u32,
+        )
+        .unwrap();
+        let handle = handle.unwrap();
+        let a_fd = filesystem.handles.read().unwrap()[&handle]
+            .file
+            .read()
+            .unwrap()
+            .as_raw_fd();
+
+        let (opened, reopened) = std::sync::mpsc::channel();
+        let b_path = root.join("b");
+        let inode = entry.inode;
+        SETATTR_FD_HOOK.set(Some(Box::new(move |filesystem: &PassthroughFs| {
+            FileSystem::release(filesystem, context, inode, 0, handle, false, false, None).unwrap();
+            let b = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(b_path)
+                .unwrap();
+            opened.send(b).unwrap();
+        })));
+
+        let mut attr: bindings::stat64 = unsafe { std::mem::zeroed() };
+        attr.st_size = 0;
+        let result = FileSystem::setattr(
+            &filesystem,
+            context,
+            entry.inode,
+            attr,
+            Some(handle),
+            SetattrValid::SIZE,
+        );
+        let b = reopened.recv().unwrap();
+        eprintln!(
+            "released fd {a_fd}, then b opened as fd {}{}",
+            b.as_raw_fd(),
+            if b.as_raw_fd() == a_fd {
+                " (number reused)"
+            } else {
+                ""
+            }
+        );
+        result.unwrap();
+        assert_eq!(
+            fs::read(root.join("b")).unwrap(),
+            b"bbbb",
+            "b was truncated"
+        );
+        assert_eq!(
+            fs::read(root.join("a")).unwrap(),
+            b"",
+            "a was not truncated"
+        );
+
+        drop(b);
+        fs::remove_dir_all(root).unwrap();
     }
 }
