@@ -396,6 +396,8 @@ pub struct BlockWorker {
     in_flight_bytes: usize,
     #[cfg(target_os = "windows")]
     pipeline: Option<win_pipeline::Pipeline>,
+    #[cfg(not(target_os = "windows"))]
+    lanes: Option<read_lanes::Lanes>,
 }
 
 impl BlockWorker {
@@ -427,6 +429,8 @@ impl BlockWorker {
             in_flight_bytes: 0,
             #[cfg(target_os = "windows")]
             pipeline: None,
+            #[cfg(not(target_os = "windows"))]
+            lanes: None,
         })
     }
 
@@ -511,8 +515,18 @@ impl BlockWorker {
         }
         #[cfg(target_os = "windows")]
         let pipeline_fd = self.pipeline.as_ref().map(|p| p.done_fd.as_raw_fd());
+        // Reads run on lanes for every image format the io_uring path doesn't
+        // take. Created per run and dropped at stop, so a disk swapped while
+        // the worker is stopped is never read through an old accessor.
         #[cfg(not(target_os = "windows"))]
-        let pipeline_fd: Option<i32> = None;
+        if self.async_io.is_none() && self.lanes.is_none() {
+            match read_lanes::Lanes::new(self.disk.file.clone(), read_lanes::LANES) {
+                Ok(lanes) => self.lanes = Some(lanes),
+                Err(e) => error!("block read lanes unavailable: {e}"),
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        let pipeline_fd = self.lanes.as_ref().map(|l| l.done_fd.as_raw_fd());
         if let Some(fd) = pipeline_fd {
             let _ = epoll.ctl(
                 ControlOperation::Add,
@@ -566,11 +580,20 @@ impl BlockWorker {
                                 self.drain_async();
                                 #[cfg(target_os = "windows")]
                                 self.pipeline_drain();
+                                #[cfg(not(target_os = "windows"))]
+                                {
+                                    self.lanes_drain();
+                                    self.lanes = None;
+                                }
                                 return self;
                             }
                             #[cfg(target_os = "windows")]
                             EventSet::IN if Some(source) == pipeline_fd => {
                                 self.pipeline_complete();
+                            }
+                            #[cfg(not(target_os = "windows"))]
+                            EventSet::IN if Some(source) == pipeline_fd => {
+                                self.lanes_complete();
                             }
                             EventSet::IN if Some(source) == async_ev_fd => {
                                 self.process_async_completions();
@@ -631,6 +654,11 @@ impl BlockWorker {
     fn process_queue(&mut self, mem: &GuestMemoryMmap) {
         if self.async_io.is_some() {
             self.process_queue_async(mem);
+            return;
+        }
+        #[cfg(not(target_os = "windows"))]
+        if self.lanes.is_some() {
+            self.process_queue_lanes(mem);
             return;
         }
         #[cfg(target_os = "windows")]
@@ -695,6 +723,141 @@ impl BlockWorker {
         // avoiding redundant IRQ signals when multiple descriptors complete in
         // a single epoll wake-up.
         if signal_needed && let Err(e) = self.interrupt.try_signal_used_queue() {
+            error!("error signalling queue: {e:?}");
+        }
+    }
+
+    /// Hand queued reads to lanes so they reach the host disk together instead
+    /// of one at a time: a network disk answers each one only after a round
+    /// trip. A lone read with nothing in flight runs inline instead, because
+    /// the hand-off to a lane would only add latency to a reader that waits
+    /// for each result before asking for the next. Everything else (writes,
+    /// flush, discard) waits for every read in flight, then runs inline in
+    /// order, so a read the guest queued after a write sees it.
+    #[cfg(not(target_os = "windows"))]
+    fn process_queue_lanes(&mut self, mem: &GuestMemoryMmap) {
+        let mut signal_needed = false;
+        let mut batch = Vec::new();
+        while let Some(head) = self.device_queue.queue.pop(mem) {
+            let index = head.index;
+            let (mut reader, writer) = match (
+                Reader::new(mem, head.clone()),
+                Writer::new(mem, head.clone()),
+            ) {
+                (Ok(r), Ok(w)) => (r, w),
+                _ => {
+                    error!("invalid descriptor chain");
+                    continue;
+                }
+            };
+            let header: RequestHeader = match reader.read_obj() {
+                Ok(h) => h,
+                Err(e) => {
+                    error!("invalid request header: {e:?}");
+                    continue;
+                }
+            };
+            batch.push((index, header, reader, writer));
+        }
+        let reads = batch
+            .iter()
+            .filter(|(_, header, _, _)| header.request_type == VIRTIO_BLK_T_IN)
+            .count();
+        let use_lanes = reads > 1 || self.lanes.as_ref().is_some_and(|l| l.in_flight > 0);
+        for (index, header, mut reader, mut writer) in batch {
+            if use_lanes && header.request_type == VIRTIO_BLK_T_IN {
+                // SAFETY: the writer only holds slices of the guest mapping,
+                // which this worker keeps alive, and every job is drained
+                // before the worker returns (stop) or runs a barrier.
+                let job = read_lanes::Job {
+                    index,
+                    header,
+                    writer: unsafe { std::mem::transmute::<Writer<'_>, Writer<'static>>(writer) },
+                };
+                self.lanes.as_mut().unwrap().submit(job);
+                continue;
+            }
+            if header.request_type != VIRTIO_BLK_T_IN {
+                signal_needed |= self.lanes_publish(mem, true);
+            }
+            let started = blk_stats::start();
+            let processed = self.process_request(header, &mut reader, &mut writer);
+            blk_stats::finish(header.request_type, 0, started);
+            let (status, len): (u8, usize) = match processed {
+                Ok(l) => (VIRTIO_BLK_S_OK as u8, l),
+                Err(e) => {
+                    error!("error processing request: {e:?}");
+                    (VIRTIO_BLK_S_IOERR as u8, 0)
+                }
+            };
+            if let Err(e) = writer.write_obj(status) {
+                error!("Failed to write virtio block status: {e:?}");
+            }
+            if let Err(e) = self.device_queue.queue.add_used(mem, index, len as u32) {
+                error!("failed to add used elements to the queue: {e:?}");
+            }
+            if self.device_queue.queue.needs_notification(mem).unwrap() {
+                signal_needed = true;
+            }
+        }
+        signal_needed |= self.lanes_publish(mem, false);
+        if signal_needed && let Err(e) = self.interrupt.try_signal_used_queue() {
+            error!("error signalling queue: {e:?}");
+        }
+    }
+
+    /// Move finished reads onto the used ring. With `block`, wait until no read
+    /// is in flight. Returns whether the guest needs an interrupt.
+    #[cfg(not(target_os = "windows"))]
+    fn lanes_publish(&mut self, mem: &GuestMemoryMmap, block: bool) -> bool {
+        let mut signal = false;
+        loop {
+            let Some(lanes) = self.lanes.as_mut() else {
+                return signal;
+            };
+            let done = if block && lanes.in_flight > 0 {
+                match lanes.done_rx.recv() {
+                    Ok(d) => d,
+                    Err(_) => return signal,
+                }
+            } else {
+                match lanes.done_rx.try_recv() {
+                    Ok(d) => d,
+                    Err(_) => return signal,
+                }
+            };
+            lanes.in_flight -= 1;
+            if let Err(e) = self.device_queue.queue.add_used(mem, done.index, done.len) {
+                error!("failed to add used elements to the queue: {e:?}");
+            }
+            if self.device_queue.queue.needs_notification(mem).unwrap() {
+                signal = true;
+            }
+        }
+    }
+
+    /// Completion event from a read lane.
+    #[cfg(not(target_os = "windows"))]
+    fn lanes_complete(&mut self) {
+        if let Some(lanes) = self.lanes.as_ref() {
+            let _ = lanes.done_fd.read();
+        }
+        let mem = self.mem.clone();
+        if self.lanes_publish(&mem, false)
+            && let Err(e) = self.interrupt.try_signal_used_queue()
+        {
+            error!("error signalling queue: {e:?}");
+        }
+    }
+
+    /// Stop/quiesce: complete every read in flight so the queue is yielded at
+    /// a clean boundary.
+    #[cfg(not(target_os = "windows"))]
+    fn lanes_drain(&mut self) {
+        let mem = self.mem.clone();
+        if self.lanes_publish(&mem, true)
+            && let Err(e) = self.interrupt.try_signal_used_queue()
+        {
             error!("error signalling queue: {e:?}");
         }
     }
@@ -1363,6 +1526,151 @@ mod blk_stats {
             }
             let _ = std::fs::create_dir_all(&s.dir);
             let _ = std::fs::write(s.dir.join(format!("blk-{}.txt", std::process::id())), out);
+        }
+    }
+}
+
+/// Threads that run guest reads concurrently through the disk's shared
+/// accessor. The format layer resolves each read (backing chain, zero
+/// clusters) and the blocking host read runs on the lane's own thread.
+#[cfg(not(target_os = "windows"))]
+mod read_lanes {
+    use super::{RequestHeader, VIRTIO_BLK_S_IOERR, VIRTIO_BLK_S_OK};
+    use crate::virtio::block::device::DiskBackend;
+    use crate::virtio::descriptor_utils::Writer;
+    use crate::virtio::file_traits::FileReadWriteAtVolatile;
+    use imago::io_buffers::IoVectorMut;
+    use log::error;
+    use std::io::{self, Error, ErrorKind};
+    use std::sync::Arc;
+    use std::sync::mpsc::{Receiver, Sender, channel};
+    use utils::eventfd::{EFD_NONBLOCK, EventFd};
+    use vm_memory::VolatileSlice;
+
+    /// Reads in flight at once. A network disk scales with requests in flight
+    /// (256 MB/s with one, about 2 GB/s with 16 on our workers' hyperdisk).
+    pub const LANES: usize = 16;
+
+    pub struct Job {
+        pub index: u16,
+        pub header: RequestHeader,
+        pub writer: Writer<'static>,
+    }
+    // SAFETY: a job is owned by exactly one lane at a time; its slices point
+    // into guest memory the worker keeps mapped until every job is drained.
+    unsafe impl Send for Job {}
+
+    pub struct Done {
+        pub index: u16,
+        pub len: u32,
+    }
+
+    pub struct Lanes {
+        lanes: Vec<Sender<Job>>,
+        next: usize,
+        pub in_flight: usize,
+        pub done_rx: Receiver<Done>,
+        pub done_fd: EventFd,
+    }
+
+    /// The disk as a read-only target for `Writer::write_from_at`.
+    struct SharedDisk(Arc<DiskBackend>);
+
+    impl FileReadWriteAtVolatile for SharedDisk {
+        fn read_at_volatile(&self, slice: VolatileSlice, offset: u64) -> io::Result<usize> {
+            self.read_vectored_at_volatile(&[slice], offset)
+        }
+
+        fn read_vectored_at_volatile(
+            &self,
+            bufs: &[VolatileSlice],
+            offset: u64,
+        ) -> io::Result<usize> {
+            if bufs.is_empty() {
+                return Ok(0);
+            }
+            let (iovec, _guard) = IoVectorMut::from_volatile_slice(bufs);
+            let len = iovec
+                .len()
+                .try_into()
+                .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+            self.0.readv(iovec, offset)?;
+            Ok(len)
+        }
+
+        fn write_at_volatile(&self, _slice: VolatileSlice, _offset: u64) -> io::Result<usize> {
+            Err(Error::new(ErrorKind::Unsupported, "read lanes never write"))
+        }
+    }
+
+    fn run(disk: &SharedDisk, job: &mut Job) -> (u8, usize) {
+        let started = super::blk_stats::start();
+        let len = job.writer.available_bytes().saturating_sub(1);
+        let r = if !len.is_multiple_of(512) {
+            (VIRTIO_BLK_S_IOERR as u8, 0)
+        } else {
+            match job
+                .writer
+                .write_from_at(disk, len, job.header.sector.saturating_mul(512))
+            {
+                Ok(n) => (VIRTIO_BLK_S_OK as u8, n),
+                Err(e) => {
+                    error!("block read lane request failed: {e:?}");
+                    (VIRTIO_BLK_S_IOERR as u8, 0)
+                }
+            }
+        };
+        super::blk_stats::finish(job.header.request_type, len, started);
+        r
+    }
+
+    impl Lanes {
+        pub fn new(disk: Arc<DiskBackend>, count: usize) -> io::Result<Self> {
+            let done_fd = EventFd::new(EFD_NONBLOCK)?;
+            let (done_tx, done_rx) = channel::<Done>();
+            let mut lanes = Vec::with_capacity(count);
+            for lane in 0..count {
+                let (tx, rx) = channel::<Job>();
+                let disk = SharedDisk(disk.clone());
+                let done_tx = done_tx.clone();
+                let wake = done_fd.try_clone()?;
+                std::thread::Builder::new()
+                    .name(format!("blk-read-{lane}"))
+                    .spawn(move || {
+                        for mut job in rx {
+                            let (status, len) = run(&disk, &mut job);
+                            if let Err(e) = job.writer.write_obj(status) {
+                                error!("Failed to write virtio block status: {e:?}");
+                            }
+                            if done_tx
+                                .send(Done {
+                                    index: job.index,
+                                    len: len as u32,
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                            let _ = wake.write(1);
+                        }
+                    })?;
+                lanes.push(tx);
+            }
+            Ok(Lanes {
+                lanes,
+                next: 0,
+                in_flight: 0,
+                done_rx,
+                done_fd,
+            })
+        }
+
+        pub fn submit(&mut self, job: Job) {
+            let lane = self.next;
+            self.next = (self.next + 1) % self.lanes.len();
+            if self.lanes[lane].send(job).is_ok() {
+                self.in_flight += 1;
+            }
         }
     }
 }

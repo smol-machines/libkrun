@@ -15,7 +15,7 @@ use std::os::linux::fs::MetadataExt;
 use std::os::macos::fs::MetadataExt;
 use std::path::PathBuf;
 use std::result;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 
 use imago::{
@@ -100,13 +100,14 @@ pub(crate) struct DiskProperties {
 /// Format-aware disk accessor selected when the device is created.
 ///
 /// Both variants retain libkrun's original format wrapper for inline requests.
-/// Raw images can additionally use a restricted io_uring for queued reads;
-/// buffered writes and structured image formats stay synchronous so their
-/// metadata has one owner.
+/// Raw images can additionally use a restricted io_uring for queued reads.
+/// Reads share the accessor, so the worker's read lanes run them at once;
+/// writes and every other request hold it alone, so a format's metadata still
+/// has one writer.
 pub(crate) enum DiskBackend {
-    Sync(Mutex<SyncFormatAccess<Box<dyn DynStorage>>>),
+    Sync(RwLock<SyncFormatAccess<Box<dyn DynStorage>>>),
     AsyncRaw {
-        access: Mutex<SyncFormatAccess<Box<dyn DynStorage>>>,
+        access: RwLock<SyncFormatAccess<Box<dyn DynStorage>>>,
         prepared_async: Box<Mutex<Option<AsyncIo>>>,
     },
 }
@@ -131,44 +132,47 @@ impl DiskBackend {
 
     pub(crate) fn size(&self) -> u64 {
         match self {
-            Self::Sync(access) => access.lock().unwrap().size(),
-            Self::AsyncRaw { access, .. } => access.lock().unwrap().size(),
+            Self::Sync(access) => access.read().unwrap().size(),
+            Self::AsyncRaw { access, .. } => access.read().unwrap().size(),
         }
     }
 
     pub(crate) fn readv(&self, buf: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
         match self {
-            Self::Sync(access) => access.lock().unwrap().readv(buf, offset),
-            Self::AsyncRaw { access, .. } => access.lock().unwrap().readv(buf, offset),
+            Self::Sync(access) => access.read().unwrap().readv(buf, offset),
+            Self::AsyncRaw { access, .. } => access.read().unwrap().readv(buf, offset),
         }
     }
 
     pub(crate) fn writev(&self, buf: IoVector<'_>, offset: u64) -> io::Result<()> {
         match self {
-            Self::Sync(access) => access.lock().unwrap().writev(buf, offset),
-            Self::AsyncRaw { access, .. } => access.lock().unwrap().writev(buf, offset),
+            Self::Sync(access) => access.write().unwrap().writev(buf, offset),
+            Self::AsyncRaw { access, .. } => access.write().unwrap().writev(buf, offset),
         }
     }
 
     pub(crate) fn flush(&self) -> io::Result<()> {
         match self {
-            Self::Sync(access) => access.lock().unwrap().flush(),
-            Self::AsyncRaw { access, .. } => access.lock().unwrap().flush(),
+            Self::Sync(access) => access.write().unwrap().flush(),
+            Self::AsyncRaw { access, .. } => access.write().unwrap().flush(),
         }
     }
 
     pub(crate) fn sync(&self) -> io::Result<()> {
         match self {
-            Self::Sync(access) => access.lock().unwrap().sync(),
-            Self::AsyncRaw { access, .. } => access.lock().unwrap().sync(),
+            Self::Sync(access) => access.write().unwrap().sync(),
+            Self::AsyncRaw { access, .. } => access.write().unwrap().sync(),
         }
     }
 
+    // Exclusive although every call takes `&self`: a resize rewrites the
+    // image's metadata and must not overlap a read lane.
+    #[allow(clippy::readonly_write_lock)]
     fn grow(&self, bytes: u64) -> io::Result<()> {
         let access = match self {
             Self::Sync(access) | Self::AsyncRaw { access, .. } => access,
         };
-        let access = access.lock().unwrap();
+        let access = access.write().unwrap();
         access.resize_grow(bytes, imago::format::PreallocateMode::Zero)?;
         access.flush()?;
         access.sync()
@@ -176,22 +180,24 @@ impl DiskBackend {
 
     pub(crate) fn write_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
         match self {
-            Self::Sync(access) => access.lock().unwrap().write_zeroes(offset, length),
-            Self::AsyncRaw { access, .. } => access.lock().unwrap().write_zeroes(offset, length),
+            Self::Sync(access) => access.write().unwrap().write_zeroes(offset, length),
+            Self::AsyncRaw { access, .. } => access.write().unwrap().write_zeroes(offset, length),
         }
     }
 
     pub(crate) fn discard_to_zero(&self, offset: u64, length: u64) -> io::Result<()> {
         match self {
-            Self::Sync(access) => access.lock().unwrap().discard_to_zero(offset, length),
-            Self::AsyncRaw { access, .. } => access.lock().unwrap().discard_to_zero(offset, length),
+            Self::Sync(access) => access.write().unwrap().discard_to_zero(offset, length),
+            Self::AsyncRaw { access, .. } => {
+                access.write().unwrap().discard_to_zero(offset, length)
+            }
         }
     }
 
     pub(crate) fn discard_to_any(&self, offset: u64, length: u64) -> io::Result<()> {
         match self {
-            Self::Sync(access) => access.lock().unwrap().discard_to_any(offset, length),
-            Self::AsyncRaw { access, .. } => access.lock().unwrap().discard_to_any(offset, length),
+            Self::Sync(access) => access.write().unwrap().discard_to_any(offset, length),
+            Self::AsyncRaw { access, .. } => access.write().unwrap().discard_to_any(offset, length),
         }
     }
 }
@@ -205,13 +211,13 @@ where
     D: FormatDriverInstance<Storage = Box<dyn DynStorage>> + 'static,
 {
     let backend = match io_engine {
-        BlockIoEngine::Sync => DiskBackend::Sync(Mutex::new(SyncFormatAccess::new(driver)?)),
+        BlockIoEngine::Sync => DiskBackend::Sync(RwLock::new(SyncFormatAccess::new(driver)?)),
         BlockIoEngine::Async => match prepared_async {
             Some(prepared_async) => DiskBackend::AsyncRaw {
-                access: Mutex::new(SyncFormatAccess::new(driver)?),
+                access: RwLock::new(SyncFormatAccess::new(driver)?),
                 prepared_async: Box::new(Mutex::new(Some(prepared_async))),
             },
-            None => DiskBackend::Sync(Mutex::new(SyncFormatAccess::new(driver)?)),
+            None => DiskBackend::Sync(RwLock::new(SyncFormatAccess::new(driver)?)),
         },
     };
     Ok(Arc::new(backend))
@@ -1287,7 +1293,7 @@ mod overlay_tests {
                 helper: CommonStorageHelper::default(),
             });
             let raw = Raw::open_image_sync(storage, true).unwrap();
-            block.disk_image = Arc::new(DiskBackend::Sync(Mutex::new(
+            block.disk_image = Arc::new(DiskBackend::Sync(RwLock::new(
                 SyncFormatAccess::new(raw).unwrap(),
             )));
             control.operations.store(operations, Ordering::SeqCst);
