@@ -1,6 +1,6 @@
 use rand::{TryRngCore, rngs::OsRng};
 use utils::eventfd::EventFd;
-use vm_memory::{Bytes, GuestMemoryMmap};
+use vm_memory::{Bytes, GuestMemory, GuestMemoryMmap};
 
 use super::super::{
     ActivateError, ActivateResult, DeviceQueue, DeviceState, QueueConfig, RngError, VirtioDevice,
@@ -13,6 +13,9 @@ pub(crate) const REQ_INDEX: usize = 0;
 
 // Supported features.
 pub(crate) const AVAIL_FEATURES: u64 = 1 << uapi::VIRTIO_F_VERSION_1 as u64;
+
+// Linux's virtio-rng driver posts small, sub-page buffers.
+const MAX_REQUEST_LEN: u32 = 64 * 1024;
 
 pub struct Rng {
     pub(crate) queues: Option<Vec<DeviceQueue>>,
@@ -103,7 +106,15 @@ impl Rng {
             let index = head.index;
             let mut written = 0;
             for desc in head.into_iter() {
-                let mut rand_bytes = vec![0u8; desc.len as usize];
+                // The length is guest-chosen (up to 4 GiB) and the device may fill
+                // less than offered. Check the range before allocating: rewinding
+                // below would retry a bad descriptor forever.
+                let len = desc.len.min(MAX_REQUEST_LEN);
+                if !mem.check_range(desc.addr, len as usize) {
+                    error!("rng: request buffer outside guest memory");
+                    break;
+                }
+                let mut rand_bytes = vec![0u8; len as usize];
                 if let Err(e) = OsRng.try_fill_bytes(&mut rand_bytes) {
                     error!("Failed to fill buffer with random data: {e:?}");
                     queues[REQ_INDEX].queue.go_to_previous_position();
@@ -114,7 +125,7 @@ impl Rng {
                     queues[REQ_INDEX].queue.go_to_previous_position();
                     break;
                 }
-                written += desc.len;
+                written += len;
             }
 
             have_used = true;
@@ -343,5 +354,50 @@ mod checkpoint_tests {
         assert!(rng.reset());
         assert!(!rng.snapshot_quiesced);
         assert!(!rng.deferred_request);
+    }
+}
+
+#[cfg(test)]
+mod guest_range_tests {
+    use super::*;
+    use crate::legacy::DummyIrqChip;
+    use crate::virtio::queue::tests::VirtQueue;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use vm_memory::GuestAddress;
+
+    /// A request buffer outside guest memory must complete instead of being
+    /// retried forever, and its guest-chosen length must not size an
+    /// allocation first.
+    #[test]
+    fn an_out_of_range_request_completes_once() {
+        let (done, finished) = std::sync::mpsc::channel();
+        // Run on a thread: the failure mode is process_req never returning.
+        std::thread::spawn(move || {
+            let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+            let ring = VirtQueue::new(GuestAddress(0x1000), &memory, 8);
+            let mut rng = Rng::new().unwrap();
+            rng.activate(
+                memory.clone(),
+                InterruptTransport::new(DummyIrqChip::new().into(), "range test".into()).unwrap(),
+                vec![DeviceQueue::new(
+                    ring.create_queue(),
+                    Arc::new(EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap()),
+                )],
+            )
+            .unwrap();
+            ring.dtable[0].addr.set(0x10000);
+            ring.dtable[0].len.set(64 << 20);
+            ring.dtable[0].flags.set(2);
+            ring.avail.ring[0].set(0);
+            ring.avail.idx.set(1);
+            rng.process_req();
+            done.send(ring.used.idx.get()).unwrap();
+        });
+        assert_eq!(
+            finished.recv_timeout(Duration::from_secs(20)),
+            Ok(1),
+            "process_req did not complete the request"
+        );
     }
 }
