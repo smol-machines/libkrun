@@ -437,6 +437,18 @@ impl<'a> SparseFileWriter<'a> {
         })
     }
 
+    /// Leave `len` bytes as a hole without reading them.
+    fn skip(&mut self, len: u64) -> io::Result<()> {
+        let distance = i64::try_from(len)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "memory hole too large"))?;
+        self.file.seek(SeekFrom::Current(distance))?;
+        self.logical_offset = self
+            .logical_offset
+            .checked_add(len)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "memory image too large"))?;
+        Ok(())
+    }
+
     /// Publish the final logical length, including a trailing run of holes.
     pub fn finish(self) -> io::Result<()> {
         self.file.set_len(self.logical_offset)
@@ -574,7 +586,7 @@ pub fn write_guest_memory_sparse_with_windows(
                 // Safety: identical to `write_guest_memory`: this region owns
                 // `len` stable bytes and the caller has frozen the VM.
                 let bytes = unsafe { std::slice::from_raw_parts(host as *const u8, len as usize) };
-                sparse.write_all(bytes)?;
+                write_touched_pages(bytes, &mut sparse)?;
             }
             sparse.finish()?;
         }
@@ -590,6 +602,69 @@ pub fn write_guest_memory_sparse_with_windows(
     out.set_len(output_offset)?;
     out.seek(SeekFrom::Start(output_offset))?;
     Ok(descs)
+}
+
+/// Write `bytes` to `out`, leaving pages the guest never touched as holes.
+///
+/// Reading an untouched page of anonymous guest RAM faults in a zero page, so
+/// comparing every page of a default 8 GiB guest costs over a second while the
+/// source is paused. The kernel already knows which pages were never faulted:
+/// `mach_vm_page_range_query` reports no disposition for them, and such a page
+/// of anonymous memory can only read as zeros. A file-backed view reports
+/// `VM_PAGE_QUERY_PAGE_EXTERNAL` even for pages that are not resident, so its
+/// pages are always read.
+#[cfg(target_os = "macos")]
+fn write_touched_pages(bytes: &[u8], out: &mut SparseFileWriter<'_>) -> io::Result<()> {
+    const KERN_SUCCESS: i32 = 0;
+    const WINDOW_PAGES: usize = 64 * 1024;
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+    let base = bytes.as_ptr() as usize;
+    if !base.is_multiple_of(page) {
+        return out.write_all(bytes);
+    }
+    let mut dispositions = vec![0_i32; WINDOW_PAGES];
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let window = (bytes.len() - offset).min(WINDOW_PAGES * page);
+        let pages = window.div_ceil(page);
+        let mut count = pages as u64;
+        // Safety: `dispositions` holds at least `pages` entries and the range
+        // lies inside guest RAM that stays mapped for the whole save.
+        let result = unsafe {
+            mach_vm_page_range_query(
+                mach_task_self_,
+                (base + offset) as u64,
+                window as u64,
+                dispositions.as_mut_ptr() as u64,
+                &mut count,
+            )
+        };
+        if result != KERN_SUCCESS || count != pages as u64 {
+            return out.write_all(&bytes[offset..]);
+        }
+        let mut index = 0;
+        while index < pages {
+            let untouched = dispositions[index] == 0;
+            let run_start = index;
+            while index < pages && (dispositions[index] == 0) == untouched {
+                index += 1;
+            }
+            let start = offset + run_start * page;
+            let end = (offset + index * page).min(bytes.len());
+            if untouched {
+                out.skip((end - start) as u64)?;
+            } else {
+                out.write_all(&bytes[start..end])?;
+            }
+        }
+        offset += window;
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn write_touched_pages(bytes: &[u8], out: &mut SparseFileWriter<'_>) -> io::Result<()> {
+    out.write_all(bytes)
 }
 
 /// Copy a device window through `process_vm_readv` on this process, which
@@ -3344,6 +3419,13 @@ unsafe extern "C" {
         inheritance: i32,
     ) -> i32;
     fn mach_vm_deallocate(target_task: u32, address: u64, size: u64) -> i32;
+    fn mach_vm_page_range_query(
+        target_map: u32,
+        address: u64,
+        size: u64,
+        dispositions: u64,
+        dispositions_count: *mut u64,
+    ) -> i32;
 }
 
 #[cfg(target_os = "macos")]
@@ -5464,6 +5546,100 @@ mod tests {
 
         drop(file);
         fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sparse_snapshot_skips_untouched_anonymous_pages_but_reads_file_views() {
+        use std::os::fd::AsRawFd;
+
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let region_size = 256 * page;
+        let file_gpa = GuestAddress(0x100_0000);
+        let src = GuestMemoryMmap::from_ranges(&[
+            (GuestAddress(0), region_size),
+            (file_gpa, region_size),
+        ])
+        .unwrap();
+        src.write_slice(&vec![0xA5; page], GuestAddress(3 * page as u64))
+            .unwrap();
+        // Touched but zero again, the way freed guest memory usually looks.
+        src.write_slice(&vec![0x5A; page], GuestAddress(9 * page as u64))
+            .unwrap();
+        src.write_slice(&vec![0; page], GuestAddress(9 * page as u64))
+            .unwrap();
+
+        // Map a file over the second region the way a restore rebases guest
+        // RAM. None of its pages have been touched by this process, yet they
+        // hold the file's bytes, so they must not be mistaken for zero pages.
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base =
+            std::env::temp_dir().join(format!("libkrun-untouched-{}-{nonce}", std::process::id()));
+        let backing_path = base.with_extension("backing");
+        let backing = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&backing_path)
+            .unwrap();
+        backing.set_len(region_size as u64).unwrap();
+        std::os::unix::fs::FileExt::write_all_at(&backing, &vec![0x3C; page], 7 * page as u64)
+            .unwrap();
+        let file_host = src.get_host_address(file_gpa).unwrap();
+        let mapped = unsafe {
+            libc::mmap(
+                file_host.cast(),
+                region_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_FIXED,
+                backing.as_raw_fd(),
+                0,
+            )
+        };
+        assert_eq!(mapped, file_host.cast());
+
+        let output_path = base.with_extension("memory");
+        let mut output = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&output_path)
+            .unwrap();
+        let descs = write_guest_memory_sparse(&src, &mut output).unwrap();
+
+        // The save must not have faulted in the anonymous pages it skipped.
+        let anon = src.get_host_address(GuestAddress(0)).unwrap();
+        let mut dispositions = vec![0_i32; 256];
+        let mut count = 256_u64;
+        let result = unsafe {
+            mach_vm_page_range_query(
+                mach_task_self_,
+                anon as u64,
+                region_size as u64,
+                dispositions.as_mut_ptr() as u64,
+                &mut count,
+            )
+        };
+        assert_eq!(result, 0);
+        let touched: Vec<usize> = (0..256).filter(|&i| dispositions[i] != 0).collect();
+        assert_eq!(touched, vec![3, 9]);
+
+        let mut expected = Vec::new();
+        let expected_descs = write_guest_memory(&src, &mut expected).unwrap();
+        assert_eq!(descs, expected_descs);
+        output.seek(SeekFrom::Start(0)).unwrap();
+        let mut actual = Vec::new();
+        output.read_to_end(&mut actual).unwrap();
+        assert_eq!(actual.len(), expected.len());
+        assert!(actual == expected, "sparse image differs from a full read");
+        assert_eq!(actual[region_size + 7 * page], 0x3C);
+
+        drop(output);
+        fs::remove_file(output_path).unwrap();
+        fs::remove_file(backing_path).unwrap();
     }
 
     #[cfg(target_os = "linux")]
