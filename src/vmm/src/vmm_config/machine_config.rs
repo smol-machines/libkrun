@@ -78,7 +78,8 @@ impl fmt::Display for VmConfig {
 pub enum CpuFeaturesTemplate {
     /// C3 Template.
     C3,
-    /// Stable Intel feature baseline for portable live checkpoints.
+    /// Profile for live checkpoints that restore on other hosts: a stable
+    /// Haswell-era baseline on Intel, the host's own features on AMD.
     PortableV1,
     /// T2 Template.
     T2,
