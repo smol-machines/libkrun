@@ -57,6 +57,12 @@ pub struct BalloonState {
     pub num_pages: u32,
     pub actual: u32,
     pub queues: Vec<Option<crate::virtio::queue::QueueState>>,
+    /// Id of the last free page hinting round. The guest remembers the last
+    /// round it ran and ignores a request carrying that id again, so a
+    /// restored device must not start counting over. Absent in states saved
+    /// before it was recorded.
+    #[serde(default)]
+    pub free_page_hint_cmd_id: u32,
 }
 
 pub struct Balloon {
@@ -190,6 +196,7 @@ impl Balloon {
                 Some(qs) => qs.iter().map(|q| Some(q.queue.save_state())).collect(),
                 None => vec![None; defs::NUM_QUEUES],
             },
+            free_page_hint_cmd_id: self.hint.cmd_id,
         }
     }
 
@@ -202,6 +209,14 @@ impl Balloon {
         self.acked_features = state.acked_features;
         self.config.num_pages = state.num_pages;
         self.config.actual = state.actual;
+        // Continue after the guest's last hinting round. A state that did not
+        // record it may still come from a guest that ran one: starting over
+        // would reissue that id, which the guest ignores, and every hint would
+        // wait out its timeout having discarded nothing. Start anywhere else.
+        self.hint.cmd_id = match state.free_page_hint_cmd_id {
+            0 => rand::random(),
+            id => id,
+        };
         Ok(())
     }
 
@@ -1019,6 +1034,39 @@ mod hint_tests {
         assert_eq!(next_hint_cmd_id(0), 2);
         assert_eq!(next_hint_cmd_id(2), 3);
         assert_eq!(next_hint_cmd_id(u32::MAX), 2);
+    }
+
+    /// A restored device continues after the saved round, so its next request
+    /// is not the id the guest last ran and ignores.
+    #[test]
+    fn a_restored_device_continues_after_the_saved_hint_round() {
+        let mut source = Balloon::new().unwrap();
+        source.hint.cmd_id = 7;
+        let state = source.save_state();
+        assert_eq!(state.free_page_hint_cmd_id, 7);
+        let mut restored = Balloon::new().unwrap();
+        restored.restore_state(&state).unwrap();
+        assert_eq!(next_hint_cmd_id(restored.hint.cmd_id), 8);
+    }
+
+    /// A state saved before the round was recorded loads, and the restored
+    /// device does not reissue the first id a fresh device would use, which
+    /// is the one a guest that hinted once has already run.
+    #[test]
+    fn a_state_without_the_hint_round_does_not_start_over() {
+        let mut state = serde_json::to_value(Balloon::new().unwrap().save_state()).unwrap();
+        state.as_object_mut().unwrap().remove("free_page_hint_cmd_id");
+        let state: BalloonState = serde_json::from_value(state).unwrap();
+        assert_eq!(state.free_page_hint_cmd_id, 0);
+        let fresh_first = next_hint_cmd_id(0);
+        let collisions = (0..64)
+            .filter(|_| {
+                let mut restored = Balloon::new().unwrap();
+                restored.restore_state(&state).unwrap();
+                next_hint_cmd_id(restored.hint.cmd_id) == fresh_first
+            })
+            .count();
+        assert_eq!(collisions, 0);
     }
 
     #[test]
