@@ -632,7 +632,7 @@ impl PassthroughFs {
     /// between snapshot and restore, so an intermediate directory replaced by a
     /// symlink would yield an identity outside the export (later opened through
     /// volfs). Intermediates are opened `O_DIRECTORY | O_NOFOLLOW` (a symlink
-    /// fails with `ELOOP`); the final component is `fstatat`ed with
+    /// fails, with `ENOTDIR` on macOS); the final component is `fstatat`ed with
     /// `AT_SYMLINK_NOFOLLOW`, so a trailing symlink is the link itself. The root
     /// itself may be a symlink (as in `setup_root_inode`).
     fn identity_beneath(root: &Path, relative: &Path) -> io::Result<(i32, u64)> {
@@ -2914,11 +2914,15 @@ mod tests {
             PassthroughFs::identity_beneath(&root, Path::new("dir/file")).unwrap(),
             identity(&root.join("dir/file"))
         );
-        assert_eq!(
-            PassthroughFs::identity_beneath(&root, Path::new("linked/file"))
-                .unwrap_err()
-                .raw_os_error(),
-            Some(libc::ELOOP),
+        // macOS refuses the link with ENOTDIR (O_DIRECTORY is checked
+        // first), Linux with ELOOP; either way it is not followed.
+        assert!(
+            matches!(
+                PassthroughFs::identity_beneath(&root, Path::new("linked/file"))
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::ELOOP | libc::ENOTDIR)
+            ),
             "an intermediate symlink must not be followed"
         );
         assert_eq!(
