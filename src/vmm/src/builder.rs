@@ -2402,6 +2402,8 @@ pub(crate) fn create_guest_ram_memfd(size: usize) -> std::result::Result<File, S
     let file = unsafe { File::from_raw_fd(fd) };
     file.set_len(size as u64)
         .map_err(|e| format!("sizing guest-RAM memfd to {size}: {e}"))?;
+    // TEE builds have no balloon to release guest RAM through.
+    #[cfg(not(feature = "tee"))]
     devices::virtio::balloon::register_owned_guest_ram_file(&file);
     Ok(file)
 }
@@ -2489,6 +2491,8 @@ pub(crate) fn create_guest_ram_memfd(size: usize) -> std::result::Result<File, S
     let file = unsafe { File::from_raw_fd(fd) };
     file.set_len(size as u64)
         .map_err(|e| format!("sizing guest-RAM file to {size}: {e}"))?;
+    // TEE builds have no balloon to release guest RAM through.
+    #[cfg(not(feature = "tee"))]
     devices::virtio::balloon::register_owned_guest_ram_file(&file);
     Ok(file)
 }
