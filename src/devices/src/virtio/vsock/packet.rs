@@ -409,6 +409,13 @@ impl VsockPacket {
         }
     }
 
+    /// The packet payload: the first `len()` bytes of the data buffer, which the
+    /// guest may have made larger than the packet. Only valid for TX packets,
+    /// whose buffer was checked to hold `len()` bytes.
+    pub fn data(&self) -> Option<&[u8]> {
+        self.buf().map(|buf| &buf[..self.len() as usize])
+    }
+
     /// Provides in-place, byte-slice, mutable access to the vsock packet data buffer.
     ///
     /// Note: control packets (e.g. connection request or reset) have no data buffer associated.
