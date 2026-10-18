@@ -1341,6 +1341,7 @@ fn handle_fork(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
     }
     // Clones will map this VMM's live RAM files, so no balloon release may
     // punch them from here on, even when this fork fails.
+    #[cfg(not(feature = "tee"))]
     devices::virtio::balloon::mark_guest_ram_shared();
     // Capture + freeze (the VM stays paused as the CoW base).
     let (checkpoint, memory) = match vmm.lock().unwrap().checkpoint_for_fork() {
