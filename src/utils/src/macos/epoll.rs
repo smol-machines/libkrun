@@ -262,16 +262,19 @@ impl Epoll {
                         ));
                     }
                 }
-                let _ = unsafe {
-                    libc::kevent(
-                        self.queue,
-                        kevs.as_ptr() as *const libc::kevent,
-                        kevs.len() as i32,
-                        ptr::null_mut(),
-                        0,
-                        ptr::null(),
-                    )
-                };
+                // kevent() stops at the first change that fails, so each filter is deleted
+                // on its own: an unregistered READ (ENOENT) must not keep WRITE registered.
+                for kev in &kevs {
+                    let ret = unsafe {
+                        libc::kevent(self.queue, &kev.0, 1, ptr::null_mut(), 0, ptr::null())
+                    };
+                    if ret == -1 {
+                        let err = io::Error::last_os_error();
+                        if err.raw_os_error() != Some(libc::ENOENT) {
+                            debug!("remove fd {fd}: {err}");
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -380,6 +383,8 @@ impl AsRawFd for Epoll {
 mod tests {
     use super::*;
 
+    use std::os::unix::net::UnixStream;
+
     use crate::eventfd::{EFD_NONBLOCK, EventFd};
 
     #[test]
@@ -389,6 +394,32 @@ mod tests {
 
         assert!(epoll.ctl(ControlOperation::Add, -1, &event).is_err());
         assert!(epoll.ctl(ControlOperation::Modify, -1, &event).is_err());
+    }
+
+    #[test]
+    fn test_delete_removes_write_filter_when_read_is_not_registered() {
+        let mut epoll = Epoll::new().unwrap();
+        let (sock, peer) = UnixStream::pair().unwrap();
+        let fd = sock.as_raw_fd();
+        epoll
+            .ctl(
+                ControlOperation::Add,
+                fd,
+                &EpollEvent::new(EventSet::OUT, 7),
+            )
+            .unwrap();
+        drop(peer);
+
+        let mut events = vec![EpollEvent::default(); 4];
+        assert_eq!(epoll.wait(4, 0, &mut events).unwrap(), 1);
+        assert_eq!(events[0].event_set(), EventSet::OUT | EventSet::HANG_UP);
+        assert_eq!(events[0].data(), 7);
+
+        // A WRITE filter left behind would report EOF on every wait.
+        epoll
+            .ctl(ControlOperation::Delete, fd, &EpollEvent::default())
+            .unwrap();
+        assert_eq!(epoll.wait(4, 0, &mut events).unwrap(), 0);
     }
 
     #[test]
