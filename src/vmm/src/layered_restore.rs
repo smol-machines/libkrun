@@ -8,6 +8,8 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
 use vm_memory::mmap::MmapRegion;
 use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestRegionMmap};
 
@@ -860,23 +862,9 @@ impl Instance {
         } else {
             let delta =
                 crate::builder::create_guest_ram_memfd(self.image.len).map_err(io::Error::other)?;
-            let mut buffer = vec![0; 64 * 1024];
             // Folded runs are read through the current mapping, which shows the
             // backing file's bytes for pages the guest never wrote.
-            for &(start, end) in &copy {
-                for offset in (start..end).step_by(buffer.len()) {
-                    let len = (end - offset).min(buffer.len());
-                    self.memory
-                        .read_slice(
-                            &mut buffer[..len],
-                            GuestAddress(self.image.gpa + offset as u64),
-                        )
-                        .map_err(|error| {
-                            io::Error::other(format!("read private RAM: {error:?}"))
-                        })?;
-                    write_nonzero_pages(&delta, &buffer[..len], offset as u64)?;
-                }
-            }
+            copy_into_delta(&self.memory, self.image.gpa, &delta, &copy, COPY_CHUNK)?;
             let seals =
                 libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
             if unsafe { libc::fcntl(delta.as_raw_fd(), libc::F_ADD_SEALS, seals) } < 0 {
@@ -939,6 +927,68 @@ impl Instance {
             copied,
         ))
     }
+}
+
+/// Bytes of guest RAM one capture worker copies at a time.
+const COPY_CHUNK: usize = 64 << 20;
+
+/// The most threads a capture copies with. The copy is bound by memory
+/// bandwidth, which a few threads saturate; more would only take CPU from the
+/// host's other VMs while this one is paused.
+const MAX_COPY_THREADS: usize = 8;
+
+/// Copy the `ranges` of the region at `gpa` (offsets into the region) into
+/// `delta` at the same offsets, `chunk` bytes at a time across up to
+/// [`MAX_COPY_THREADS`] threads. The source stays paused for the whole copy,
+/// and on one thread a branch that had touched a few GB waited seconds on it.
+fn copy_into_delta(
+    memory: &GuestMemoryMmap,
+    gpa: u64,
+    delta: &File,
+    ranges: &[(usize, usize)],
+    chunk: usize,
+) -> io::Result<()> {
+    let chunks: Vec<(usize, usize)> = ranges
+        .iter()
+        .flat_map(|&(start, end)| {
+            (start..end)
+                .step_by(chunk)
+                .map(move |from| (from, (from + chunk).min(end)))
+        })
+        .collect();
+    let threads = thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(MAX_COPY_THREADS)
+        .min(chunks.len())
+        .max(1);
+    let next = AtomicUsize::new(0);
+    thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                scope.spawn(|| -> io::Result<()> {
+                    let mut buffer = vec![0; (1 << 20).min(chunk)];
+                    while let Some(&(start, end)) = chunks.get(next.fetch_add(1, Ordering::Relaxed))
+                    {
+                        for offset in (start..end).step_by(buffer.len()) {
+                            let len = (end - offset).min(buffer.len());
+                            memory
+                                .read_slice(&mut buffer[..len], GuestAddress(gpa + offset as u64))
+                                .map_err(|error| {
+                                    io::Error::other(format!("read private RAM: {error:?}"))
+                                })?;
+                            write_nonzero_pages(delta, &buffer[..len], offset as u64)?;
+                        }
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        workers.into_iter().try_for_each(|worker| {
+            worker
+                .join()
+                .unwrap_or_else(|_| Err(io::Error::other("RAM capture worker panicked")))
+        })
+    })
 }
 
 /// Write the non-zero pages of `bytes` at `offset`. A zero page stays a hole
@@ -1267,6 +1317,53 @@ fn capture_uses_the_embedder_pagemap_once_the_process_is_not_dumpable() {
     let (_, copied) = generation.capture_quiesced(&memory).unwrap();
     assert_eq!(copied, host_page_size());
     drop(pagemap);
+}
+
+#[test]
+fn a_capture_split_across_threads_copies_every_range_exactly() {
+    use crate::snapshot::MemoryRegionDesc;
+    let page = host_page_size();
+    let size = 64 * page;
+    let file = crate::builder::create_guest_ram_memfd(size).unwrap();
+    let generation = Generation::from_immutable_file(
+        &[MemoryRegionDesc {
+            gpa: 0,
+            len: size as u64,
+        }],
+        &file,
+    )
+    .unwrap();
+    let memory = generation.restore().unwrap();
+    // Every page gets its own byte, except a zero page in each range.
+    for index in 0..64 {
+        let byte = if index % 9 == 4 { 0 } else { index as u8 + 1 };
+        memory
+            .write_slice(&vec![byte; page], GuestAddress((index * page) as u64))
+            .unwrap();
+    }
+    let ranges = [
+        (0, 7 * page),
+        (10 * page, 11 * page),
+        (20 * page, 63 * page),
+    ];
+    let delta = crate::builder::create_guest_ram_memfd(size).unwrap();
+    // Two pages a chunk splits the ranges across many workers.
+    copy_into_delta(&memory, 0, &delta, &ranges, 2 * page).unwrap();
+    let mut got = vec![0; page];
+    for index in 0..64 {
+        delta
+            .read_exact_at(&mut got, (index * page) as u64)
+            .unwrap();
+        let copied = ranges
+            .iter()
+            .any(|&(start, end)| (start..end).contains(&(index * page)));
+        let want = if copied && index % 9 != 4 {
+            index as u8 + 1
+        } else {
+            0
+        };
+        assert!(got.iter().all(|byte| *byte == want), "page {index}");
+    }
 }
 
 #[test]
