@@ -9,8 +9,16 @@ use crate::bit_helper::BitHelper;
 use crate::cpu_leaf::*;
 use crate::transformer::common::use_host_cpuid_function;
 
-// Largest extended function. It has to be larger then 0x8000001d (Extended Cache Topology).
+// Smallest value we advertise for the largest extended function. It has to be larger than
+// 0x8000001d (Extended Cache Topology).
 const LARGEST_EXTENDED_FN: u32 = 0x8000_001f;
+// Largest extended function we are willing to expose. Leaf 0x80000021 (Extended Feature
+// Identification 2) carries AutoIBRS, SBPB, IBPB_BRTYPE and SRSO_NO; without it the guest kernel
+// falls back to retpolines and Safe RET on every kernel entry and return, which measured as a
+// 2-3x slowdown of syscall-heavy work (fork/exec, stat, loopback TCP) against the same cores on
+// the host. Leaves above it (perfmon, extended topology) stay hidden: the guest's topology is the
+// one libkrun builds in 0x8000001d/0x8000001e.
+const MAX_EXPOSED_EXTENDED_FN: u32 = 0x8000_0021;
 // This value allows at most 64 logical threads within a package.
 // See also the documentation for leaf_0x80000008::ecx::THREAD_ID_SIZE_BITRANGE
 const THREAD_ID_MAX_SIZE: u32 = 6;
@@ -40,11 +48,15 @@ pub fn update_largest_extended_fn_entry(
 ) -> Result<(), Error> {
     use crate::cpu_leaf::leaf_0x80000000::*;
 
-    // KVM sets the largest extended function to 0x80000000. Change it to 0x8000001f
-    // Since we also use the leaf 0x8000001d (Extended Cache Topology).
+    // Advertise what the host supports, never less than 0x8000001f (we also use leaf 0x8000001d,
+    // Extended Cache Topology) and never more than 0x80000021 (see MAX_EXPOSED_EXTENDED_FN).
+    let host_largest = entry
+        .eax
+        .read_bits_in_range(&eax::LARGEST_EXTENDED_FN_BITRANGE);
+    let largest = host_largest.clamp(LARGEST_EXTENDED_FN, MAX_EXPOSED_EXTENDED_FN);
     entry
         .eax
-        .write_bits_in_range(&eax::LARGEST_EXTENDED_FN_BITRANGE, LARGEST_EXTENDED_FN);
+        .write_bits_in_range(&eax::LARGEST_EXTENDED_FN_BITRANGE, largest);
 
     Ok(())
 }
