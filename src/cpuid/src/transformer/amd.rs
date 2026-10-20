@@ -225,6 +225,70 @@ mod tests {
     }
 
     #[test]
+    fn test_largest_extended_fn_preserves_supported_security_leaves() {
+        let vm_spec = VmSpec::new(0, 1, false, false).expect("Error creating vm_spec");
+        for (host_largest, expected) in [
+            (0, 0x8000_001f),
+            (0x8000_001d, 0x8000_001f),
+            (0x8000_001f, 0x8000_001f),
+            (0x8000_0020, 0x8000_0020),
+            (0x8000_0021, 0x8000_0021),
+            (0x8000_0026, 0x8000_0021),
+            (u32::MAX, 0x8000_0021),
+        ] {
+            let mut entry = kvm_cpuid_entry2 {
+                function: leaf_0x80000000::LEAF_NUM,
+                eax: host_largest,
+                ebx: 0x6874_7541,
+                ecx: 0x444d_4163,
+                edx: 0x6974_6e65,
+                ..Default::default()
+            };
+            let expected_entry = kvm_cpuid_entry2 {
+                eax: expected,
+                ..entry
+            };
+            update_largest_extended_fn_entry(&mut entry, &vm_spec).unwrap();
+            assert_eq!(entry, expected_entry);
+        }
+    }
+
+    #[test]
+    fn test_extended_security_features_are_not_fabricated() {
+        let vm_spec = VmSpec::new(0, 1, false, false).expect("Error creating vm_spec");
+        for features in [0, 1 << 8, (1 << 27) | (1 << 28) | (1 << 29), u32::MAX] {
+            let entry = kvm_cpuid_entry2 {
+                function: 0x8000_0021,
+                eax: features,
+                ebx: 0x1234_5678,
+                ecx: 0x8765_4321,
+                edx: u32::MAX,
+                ..Default::default()
+            };
+            let mut cpuid = CpuId::from_entries(&[entry]).unwrap();
+            AmdCpuidTransformer {}
+                .process_entries(&mut cpuid, &vm_spec)
+                .unwrap();
+            assert_eq!(cpuid.as_slice(), &[entry]);
+        }
+    }
+
+    #[test]
+    fn test_missing_extended_security_leaf_is_not_added() {
+        let vm_spec = VmSpec::new(0, 1, false, false).expect("Error creating vm_spec");
+        let entry = kvm_cpuid_entry2 {
+            function: leaf_0x80000000::LEAF_NUM,
+            eax: 0x8000_001f,
+            ..Default::default()
+        };
+        let mut cpuid = CpuId::from_entries(&[entry]).unwrap();
+        AmdCpuidTransformer {}
+            .process_entries(&mut cpuid, &vm_spec)
+            .unwrap();
+        assert_eq!(cpuid.as_slice(), &[entry]);
+    }
+
+    #[test]
     fn test_update_extended_feature_info_entry() {
         use crate::cpu_leaf::leaf_0x80000001::*;
 
