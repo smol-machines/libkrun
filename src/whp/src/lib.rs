@@ -267,7 +267,7 @@ pub fn disable_thread_power_throttling() {
     }
 }
 
-fn srso_user_kernel_no_leaf() -> Option<WHV_X64_CPUID_RESULT> {
+fn amd_speculation_leaf() -> Option<WHV_X64_CPUID_RESULT> {
     if std::env::var_os("SMOLVM_WHP_NO_SRSO_HINT").is_some() {
         return None;
     }
@@ -290,7 +290,10 @@ fn srso_user_kernel_no_leaf() -> Option<WHV_X64_CPUID_RESULT> {
     Some(WHV_X64_CPUID_RESULT {
         Function: 0x8000_0021,
         Reserved: [0; 3],
-        Eax: host.eax | (1 << 30),
+        // EAX[30] SRSO_USER_KERNEL_NO, EAX[28] IBPB_BRTYPE (IBPB also flushes
+        // return predictions). SBPB (EAX[27]) stays hidden: the guest would
+        // write it to PRED_CMD and we cannot confirm Hyper-V accepts that.
+        Eax: host.eax | (1 << 30) | (1 << 28),
         Ebx: host.ebx,
         Ecx: host.ecx,
         Edx: host.edx,
@@ -762,7 +765,11 @@ impl WhpVm {
         // the "Safe RET" mitigation, which made every syscall ~4x slower. Put
         // the architectural bit back; the guest still mitigates everything the
         // part is actually exposed to, and Hyper-V owns the guest/host boundary.
-        if let Some(leaf) = srso_user_kernel_no_leaf() {
+        // IBPB_BRTYPE is filtered the same way. Bare-metal Linux probes for it
+        // but skips the probe inside a VM, and KVM synthesizes it for its
+        // guests; without it the guest reports "IBPB-extending microcode not
+        // applied" although the hardware IBPB it issues is the full one.
+        if let Some(leaf) = amd_speculation_leaf() {
             cpuid_results.push(leaf);
         }
 

@@ -2601,15 +2601,16 @@ pub extern "C" fn krun_set_cpu_template(ctx_id: u32, cpu_template: u32) -> i32 {
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
-        // PortableV1 is an Intel architectural contract. Applying its model
-        // and MSR expectations to AMD would make a checkpoint look portable
-        // when it is not; leave those VMs on libkrun's host CPU contract.
+        // On Intel, PortableV1 masks CPUID to a Haswell-era baseline. On AMD
+        // the guest keeps the host's features. On both, the vCPU state carries
+        // what cross-host restore needs, and restore refuses a destination
+        // that lacks a feature or immunity the guest was given.
         let leaf = std::arch::x86_64::__cpuid(0);
         let mut vendor = [0_u8; 12];
         vendor[..4].copy_from_slice(&leaf.ebx.to_le_bytes());
         vendor[4..8].copy_from_slice(&leaf.edx.to_le_bytes());
         vendor[8..].copy_from_slice(&leaf.ecx.to_le_bytes());
-        if &vendor != b"GenuineIntel" {
+        if &vendor != b"GenuineIntel" && &vendor != b"AuthenticAMD" {
             return -libc::ENOTSUP;
         }
     }

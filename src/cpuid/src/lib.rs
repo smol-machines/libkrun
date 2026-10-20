@@ -18,6 +18,9 @@ use crate::common::*;
 /// Contains helper methods for bit operations.
 pub mod bit_helper;
 
+#[cfg(target_os = "linux")]
+pub mod compat;
+
 mod template;
 pub use crate::template::c3;
 pub use crate::template::t2;
