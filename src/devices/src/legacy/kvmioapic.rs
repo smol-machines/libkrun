@@ -2,14 +2,21 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::io;
+use std::os::fd::AsRawFd;
 
 use crate::Error as DeviceError;
 use crate::bus::BusDevice;
 use crate::legacy::irqchip::IrqChipT;
 
-use kvm_bindings::{KVM_PIT_SPEAKER_DUMMY, kvm_pit_config};
+use kvm_bindings::{KVM_PIT_SPEAKER_DUMMY, kvm_pit_config, kvm_reinject_control};
 use kvm_ioctls::{Error, VmFd};
 use utils::eventfd::EventFd;
+
+nix::ioctl_write_ptr_bad!(
+    set_pit_reinject,
+    nix::request_code_none!(0xae, 0x71),
+    kvm_reinject_control
+);
 
 pub struct KvmIoapic {}
 
@@ -23,6 +30,13 @@ impl KvmIoapic {
             ..Default::default()
         };
         vm.create_pit2(pit_config)?;
+
+        let reinject = kvm_reinject_control {
+            pit_reinject: 0,
+            ..Default::default()
+        };
+        unsafe { set_pit_reinject(vm.as_raw_fd(), &reinject) }
+            .map_err(|error| Error::new(error as i32))?;
 
         Ok(Self {})
     }
@@ -65,5 +79,20 @@ impl BusDevice for KvmIoapic {
 
     fn write(&mut self, _vcpuid: u64, _offset: u64, _data: &[u8]) {
         unreachable!("MMIO operations are managed in-kernel");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kvm_ioctls::Kvm;
+
+    #[test]
+    fn test_new_initializes_irqchip_and_pit() {
+        let kvm = Kvm::new().unwrap();
+        let vm = kvm.create_vm().unwrap();
+        KvmIoapic::new(&vm).unwrap();
+        let state = vm.get_pit2().unwrap();
+        vm.set_pit2(&state).unwrap();
     }
 }
