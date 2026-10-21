@@ -5453,8 +5453,6 @@ pub unsafe extern "C" fn krun_set_kernel_console(ctx_id: u32, console_id: *const
     }
 }
 
-#[unsafe(no_mangle)]
-#[allow(unreachable_code)]
 /// The errno `krun_start_enter` returns when the VM could not be built. Every
 /// failure used to be `EINVAL`, which told the caller nothing when the host was
 /// simply full: a batch of branches on a saturated node got "invalid
@@ -5494,6 +5492,8 @@ fn start_errno(debug: &str) -> i32 {
         .unwrap_or(libc::EINVAL)
 }
 
+#[unsafe(no_mangle)]
+#[allow(unreachable_code)]
 pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     clear_last_error();
     #[cfg(target_os = "linux")]
