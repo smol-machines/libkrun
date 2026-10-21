@@ -288,6 +288,36 @@ fn is_valid_owner(owner: Option<(u32, u32)>) -> bool {
 }
 // We won't need this once expressions like "if let ... &&" are allowed.
 #[allow(clippy::unnecessary_unwrap)]
+/// Mirror a guest chmod's permission bits onto the host file, as the Linux
+/// backend's real chmod does, so a script the guest makes executable also runs
+/// on the host. The full mode, special bits included, stays in the override
+/// xattr the guest reads. Only regular files and directories carry it: other
+/// types are emulated by the xattr. A refusal (a file another host user owns)
+/// leaves the host mode as it was.
+fn apply_host_permissions(file: &InodeHandle, mode: u32) {
+    let Ok(st) = istat(file, true) else {
+        return;
+    };
+    let kind = st.st_mode & libc::S_IFMT;
+    if kind != libc::S_IFREG && kind != libc::S_IFDIR {
+        return;
+    }
+    let perms = (mode & 0o777) as libc::mode_t;
+    // SAFETY: the fd or path is live for the call and the result is checked.
+    let res = unsafe {
+        match file {
+            InodeHandle::Fd(fd) => libc::fchmod(*fd, perms),
+            InodeHandle::Path(c_path) => libc::chmod(c_path.as_ptr(), perms),
+        }
+    };
+    if res < 0 {
+        debug!(
+            "setattr: host chmod {perms:o} refused: {}",
+            io::Error::last_os_error()
+        );
+    }
+}
+
 fn set_xattr_stat(
     file: &InodeHandle,
     st: Option<bindings::stat64>,
@@ -1854,7 +1884,8 @@ impl FileSystem for PassthroughFs {
         }
 
         if valid.contains(SetattrValid::MODE) {
-            set_xattr_stat(&ihandle, None, None, Some(attr.st_mode as u32))?
+            set_xattr_stat(&ihandle, None, None, Some(attr.st_mode as u32))?;
+            apply_host_permissions(&ihandle, attr.st_mode as u32);
         }
 
         if valid.intersects(SetattrValid::UID | SetattrValid::GID) {
@@ -3013,6 +3044,61 @@ mod tests {
     // A RELEASE racing a setattr must not close the handle's fd before the
     // fd syscalls run: a file opened in between would reuse the number and
     // the truncate would land on it instead.
+    // A guest chmod reaches the host file's permission bits, as on Linux, so a
+    // script the guest makes executable runs on the host; the guest still
+    // reads the full mode it set.
+    #[test]
+    fn a_guest_chmod_sets_the_host_permission_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "libkrun-setattr-mode-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("s.sh"), b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(root.join("s.sh"), fs::Permissions::from_mode(0o644)).unwrap();
+        fs::create_dir(root.join("d")).unwrap();
+
+        let filesystem = PassthroughFs::new(
+            Config {
+                root_dir: root.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        FileSystem::init(&filesystem, FsOptions::empty()).unwrap();
+        let context = Context {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        };
+        for (name, mode) in [("s.sh", 0o4755u32), ("d", 0o700)] {
+            let c = CString::new(name).unwrap();
+            let entry = FileSystem::lookup(&filesystem, context, fuse::ROOT_ID, &c).unwrap();
+            let mut attr: bindings::stat64 = unsafe { std::mem::zeroed() };
+            attr.st_mode = mode as u16;
+            let (st, _) = FileSystem::setattr(
+                &filesystem,
+                context,
+                entry.inode,
+                attr,
+                None,
+                SetattrValid::MODE,
+            )
+            .unwrap();
+            assert_eq!(u32::from(st.st_mode) & 0o7777, mode, "{name}: the guest reads its mode");
+            let host = fs::metadata(root.join(name)).unwrap().permissions().mode();
+            // The permission bits reach the host; setuid stays in the xattr.
+            assert_eq!(host & 0o7777, mode & 0o777, "{name}: host mode");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn setattr_keeps_its_handle_open_across_a_concurrent_release() {
         let nonce = SystemTime::now()
