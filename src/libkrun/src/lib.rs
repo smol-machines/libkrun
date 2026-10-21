@@ -837,6 +837,41 @@ fn handle_save(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str, durable: bool) -> String {
     }
 }
 
+/// `SAVE` for a VM frozen as a fork base: the same self-contained checkpoint,
+/// taken without resuming the VM afterwards or on failure, since its clones
+/// map its RAM.
+#[cfg(all(snapshot_supported, fork_supported, unix))]
+fn handle_save_frozen(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
+    if dir.is_empty() {
+        return "ERR EINVAL snapshot dir required\n".to_string();
+    }
+    let dir = std::path::Path::new(dir);
+    if let Err(error) = std::fs::create_dir(dir) {
+        return format!("ERR EIO create {}: {error}\n", dir.display());
+    }
+    let memory_partial = dir.join("memory.bin.partial");
+    let result = (|| -> std::result::Result<(u64, usize), String> {
+        let mut memory = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&memory_partial)
+            .map_err(|error| format!("create memory image: {error}"))?;
+        let (checkpoint, descs) = vmm
+            .lock()
+            .unwrap()
+            .checkpoint_fork_base_sparse(&mut memory)
+            .map_err(|error| format!("capture VM: {error}"))?;
+        publish_portable_save(dir, Some(memory), checkpoint, &descs, true)
+    })();
+    match result {
+        Ok((bytes, regions)) => format!("OK saved ({bytes} bytes, {regions} regions, frozen)\n"),
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(dir);
+            format!("ERR EIO {error}\n")
+        }
+    }
+}
+
 /// Capture a durable CPU/device/RAM boundary without serializing RAM while the
 /// source is paused. The caller stages disk state, resumes the VM, and then
 /// sends `FINISH_SAVE` to write the retained generation.
@@ -1977,6 +2012,10 @@ fn handle_control_stream(mut stream: ControlStream, vmm: &Arc<Mutex<vmm::Vmm>>) 
                 // instead of after the host disk flushes it.
                 #[cfg(snapshot_supported)]
                 "SAVE_UNSYNCED" => handle_save(vmm, _arg, false),
+                // SAVE_FROZEN <dir>: SAVE for a VM frozen as a fork base. It
+                // stays frozen whatever happens, since its clones map its RAM.
+                #[cfg(all(snapshot_supported, fork_supported, unix))]
+                "SAVE_FROZEN" => handle_save_frozen(vmm, _arg),
                 // PREPARE_SAVE captures an immutable COW RAM generation and
                 // leaves the VM paused only for caller-side disk staging.
                 // After RESUME, FINISH_SAVE persists that retained generation;
