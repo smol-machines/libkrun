@@ -3,7 +3,10 @@
 
 use std::fmt::{Display, Formatter, Result};
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub const DEFAULT_KERNEL_CMDLINE: &str = "reboot=k panic=-1 panic_print=0 nomodule console=hvc0 \
+                                          rootfstype=virtiofs rw quiet no-kvmapf cpuidle_haltpoll.force=1";
+#[cfg(all(target_os = "linux", not(target_arch = "x86_64")))]
 pub const DEFAULT_KERNEL_CMDLINE: &str = "reboot=k panic=-1 panic_print=0 nomodule console=hvc0 \
                                           rootfstype=virtiofs rw quiet no-kvmapf";
 #[cfg(target_os = "macos")]
@@ -37,5 +40,25 @@ impl Display for KernelCmdlineConfigError {
                 write!(f, "The kernel command line is invalid: {}", e.as_str())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DEFAULT_KERNEL_CMDLINE;
+
+    #[test]
+    fn guest_haltpoll_is_enabled_only_for_linux_x86_64() {
+        let polling_arguments: Vec<_> = DEFAULT_KERNEL_CMDLINE
+            .split_whitespace()
+            .filter(|argument| argument.starts_with("cpuidle_haltpoll."))
+            .collect();
+        let expected: &[&str] = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            &["cpuidle_haltpoll.force=1"]
+        } else {
+            &[]
+        };
+        assert_eq!(polling_arguments, expected);
+        assert!(!DEFAULT_KERNEL_CMDLINE.contains("halt_poll_ns"));
     }
 }
