@@ -5455,6 +5455,45 @@ pub unsafe extern "C" fn krun_set_kernel_console(ctx_id: u32, console_id: *const
 
 #[unsafe(no_mangle)]
 #[allow(unreachable_code)]
+/// The errno `krun_start_enter` returns when the VM could not be built. Every
+/// failure used to be `EINVAL`, which told the caller nothing when the host was
+/// simply full: a batch of branches on a saturated node got "invalid
+/// configuration" for what was KVM or the memory mapping answering ENOMEM, or a
+/// process out of file descriptors. Resource exhaustion is returned as itself,
+/// found by the `os error N` / `Error(N)` / `code: N` an io, KVM or errno error
+/// prints anywhere in the error's chain; everything else stays `EINVAL`.
+fn start_errno(debug: &str) -> i32 {
+    fn number_after(text: &str, marker: &str) -> Vec<i32> {
+        text.match_indices(marker)
+            .filter_map(|(i, _)| {
+                let digits: String = text[i + marker.len()..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                digits.parse().ok()
+            })
+            .collect()
+    }
+    let found: Vec<i32> = ["os error ", "Error(", "code: "]
+        .iter()
+        .flat_map(|m| number_after(debug, m))
+        .collect();
+    found
+        .into_iter()
+        .find(|n| {
+            matches!(
+                *n,
+                libc::EAGAIN
+                    | libc::ENOMEM
+                    | libc::EMFILE
+                    | libc::ENFILE
+                    | libc::ENOSPC
+                    | libc::EBUSY
+            )
+        })
+        .unwrap_or(libc::EINVAL)
+}
+
 pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     clear_last_error();
     #[cfg(target_os = "linux")]
@@ -5648,9 +5687,10 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     ) {
         Ok(vmm) => vmm,
         Err(e) => {
-            error!("Building the microVM failed: {e:?}");
+            let errno = start_errno(&format!("{e:?}"));
+            error!("Building the microVM failed (errno {errno}): {e:?}");
             set_last_error(format!("build microVM: {e}"));
-            return -libc::EINVAL;
+            return -errno;
         }
     };
     lk_timing!("build_microvm done");
@@ -6052,5 +6092,60 @@ mod block_io_engine_tests {
                 .is_some()
         );
         assert_eq!(krun_free_ctx(ctx), KRUN_SUCCESS);
+    }
+}
+
+#[cfg(test)]
+mod start_errno_tests {
+    use super::start_errno;
+
+    #[test]
+    fn resource_exhaustion_is_returned_as_itself() {
+        // vstate / kvm-ioctls errors print as `Error(N)`
+        assert_eq!(
+            start_errno("Internal(Vcpu(VcpuFd(Error(12))))"),
+            libc::ENOMEM
+        );
+        // io::Error inside a device or memory error prints `os error N`
+        assert_eq!(
+            start_errno("GuestMemoryMmap(\"mmap failed: Cannot allocate memory (os error 12)\")"),
+            libc::ENOMEM
+        );
+        assert_eq!(
+            start_errno(
+                "VcpuSpawn(Os { code: 11, kind: WouldBlock, message: \"Resource temporarily unavailable\" })"
+            ),
+            libc::EAGAIN
+        );
+        assert_eq!(
+            start_errno(
+                "OpenBlockDevice(Os { code: 24, kind: Uncategorized, message: \"Too many open files\" })"
+            ),
+            libc::EMFILE
+        );
+        assert_eq!(
+            start_errno(
+                "AttachBlockDevice(Os { code: 16, kind: ResourceBusy, message: \"Device or resource busy\" })"
+            ),
+            libc::EBUSY
+        );
+    }
+
+    #[test]
+    fn everything_else_stays_einval() {
+        assert_eq!(start_errno("MissingKernelConfig"), libc::EINVAL);
+        assert_eq!(start_errno("KernelCmdline(\"too long\")"), libc::EINVAL);
+        // a permission error is a configuration problem for the caller, not a full host
+        assert_eq!(
+            start_errno(
+                "ElfOpenKernel(Os { code: 13, kind: PermissionDenied, message: \"Permission denied\" })"
+            ),
+            libc::EINVAL
+        );
+        // the first resource errno wins over later unrelated numbers
+        assert_eq!(
+            start_errno("Internal(Vm(Error(2))) then Error(12)"),
+            libc::ENOMEM
+        );
     }
 }
