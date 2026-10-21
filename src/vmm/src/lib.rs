@@ -1533,6 +1533,29 @@ impl Vmm {
         })
     }
 
+    /// [`Self::checkpoint_frozen_sparse`] for a VM frozen as a fork base. It
+    /// must already be paused with its devices quiesced, and it stays that way
+    /// whether or not the capture succeeds: resuming it would write RAM that
+    /// its clones still map.
+    #[cfg(all(snapshot_supported, fork_supported, unix))]
+    pub fn checkpoint_fork_base_sparse(
+        &mut self,
+        mem_out: &mut std::fs::File,
+    ) -> Result<(VmCheckpoint, Vec<snapshot::MemoryRegionDesc>)> {
+        if self.run_state != VmmRunState::Paused || !self.devices_quiesced {
+            return Err(Error::Snapshot(
+                "VM is not frozen as a fork base".to_string(),
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        let device_windows_from = Some(self.device_windows_start());
+        #[cfg(not(target_os = "linux"))]
+        let device_windows_from = None;
+        self.capture_paused(|memory| {
+            snapshot::write_guest_memory_sparse_with_windows(memory, mem_out, device_windows_from)
+        })
+    }
+
     /// Capture CPU and device state together with an immutable COW RAM
     /// generation, leaving the VM paused only so the caller can snapshot its
     /// disks at the same boundary. Durable RAM serialization is deferred until
@@ -1663,7 +1686,28 @@ impl Vmm {
         F: FnOnce(&GuestMemoryMmap) -> std::io::Result<Vec<snapshot::MemoryRegionDesc>>,
     {
         self.pause()?;
-        let capture = (|| {
+        let capture = self.capture_paused(dump_memory);
+
+        if capture.is_err() {
+            // Preserve the pre-SAVE behavior on capture errors: a failed
+            // persistence attempt must not strand a previously-running VM.
+            self.rearm_devices();
+            let _ = self.resume();
+        }
+        capture
+    }
+
+    /// Capture the state of a paused VM and dump its RAM with `dump_memory`,
+    /// leaving it paused with its devices quiesced.
+    #[cfg(snapshot_supported)]
+    fn capture_paused<F>(
+        &mut self,
+        dump_memory: F,
+    ) -> Result<(VmCheckpoint, Vec<snapshot::MemoryRegionDesc>)>
+    where
+        F: FnOnce(&GuestMemoryMmap) -> std::io::Result<Vec<snapshot::MemoryRegionDesc>>,
+    {
+        (|| {
             self.quiesce_devices()?;
             let vcpu_states = self.save_vcpu_states()?;
             let vm_state = self.save_vm_state()?;
@@ -1689,15 +1733,7 @@ impl Vmm {
                 },
                 mem_descs,
             ))
-        })();
-
-        if capture.is_err() {
-            // Preserve the pre-SAVE behavior on capture errors: a failed
-            // persistence attempt must not strand a previously-running VM.
-            self.rearm_devices();
-            let _ = self.resume();
-        }
-        capture
+        })()
     }
 
     /// Restore a VM from a [`VmCheckpoint`] and its guest-memory image onto this
