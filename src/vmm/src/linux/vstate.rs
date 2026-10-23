@@ -57,7 +57,7 @@ use kvm_bindings::{
     CpuId, KVM_CLOCK_TSC_STABLE, KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE,
     KVM_MAX_CPUID_ENTRIES, MsrList, Msrs, kvm_clock_data, kvm_debugregs, kvm_irqchip,
     kvm_lapic_state, kvm_mp_state, kvm_pit_state2, kvm_regs, kvm_sregs, kvm_vcpu_events, kvm_xcrs,
-    kvm_xsave,
+    kvm_xsave, nested::KvmNestedStateBuffer,
 };
 use kvm_bindings::{KVM_API_VERSION, KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN};
 #[cfg(feature = "tee")]
@@ -236,6 +236,12 @@ pub enum Error {
     #[cfg(target_arch = "x86_64")]
     /// Failed to get KVM vcpu xsave.
     VcpuGetXsave(kvm_ioctls::Error),
+    #[cfg(target_arch = "x86_64")]
+    /// Failed to get the KVM vcpu's nested virtualization state.
+    VcpuGetNestedState(kvm_ioctls::Error),
+    #[cfg(target_arch = "x86_64")]
+    /// Failed to set the KVM vcpu's nested virtualization state.
+    VcpuSetNestedState(kvm_ioctls::Error),
     #[cfg(target_arch = "x86_64")]
     /// Failed to get the virtual TSC frequency.
     VcpuGetTscKhz(kvm_ioctls::Error),
@@ -454,6 +460,10 @@ impl Display for Error {
             VcpuGetXcrs(e) => write!(f, "Failed to get KVM vcpu xcrs: {e}"),
             #[cfg(target_arch = "x86_64")]
             VcpuGetXsave(e) => write!(f, "Failed to get KVM vcpu xsave: {e}"),
+            #[cfg(target_arch = "x86_64")]
+            VcpuGetNestedState(e) => write!(f, "Failed to get KVM vcpu nested state: {e}"),
+            #[cfg(target_arch = "x86_64")]
+            VcpuSetNestedState(e) => write!(f, "Failed to set KVM vcpu nested state: {e}"),
             #[cfg(target_arch = "x86_64")]
             VcpuGetTscKhz(e) => write!(f, "Failed to get KVM vcpu TSC frequency: {e}"),
             #[cfg(target_arch = "x86_64")]
@@ -2533,6 +2543,11 @@ impl Vcpu {
         let lapic = self.fd.get_lapic().map_err(Error::VcpuGetLapic)?;
         let nmsrs = self.fd.get_msrs(&mut msrs).map_err(Error::VcpuGetMsrs)?;
         assert_eq!(nmsrs, num_msrs);
+        let nested_state = if cpuid_offers_nested(&self.cpuid) {
+            Some(self.save_nested_state()?)
+        } else {
+            None
+        };
         let vcpu_events = self
             .fd
             .get_vcpu_events()
@@ -2549,7 +2564,29 @@ impl Vcpu {
             xcrs,
             xsave,
             tsc_migration,
+            nested_state,
         })
+    }
+
+    /// The vCPU's nested virtualization state as KVM reports it, header
+    /// included. The header alone matters: a guest whose own KVM has run
+    /// VMXON at boot is in VMX operation (`vmxon_pa` set) with no VMCS
+    /// loaded, which KVM reports as a header-only state. Dropping it leaves
+    /// the restored guest executing VMX instructions the host no longer
+    /// expects, and the guest's KVM hits BUG() in kvm_spurious_fault().
+    #[cfg(target_arch = "x86_64")]
+    fn save_nested_state(&self) -> Result<Vec<u8>> {
+        let mut buffer = KvmNestedStateBuffer::empty();
+        self.fd
+            .nested_state(&mut buffer)
+            .map_err(Error::VcpuGetNestedState)?;
+        let len = (buffer.size as usize).min(std::mem::size_of::<KvmNestedStateBuffer>());
+        // Safety: `KvmNestedStateBuffer` is `#[repr(C)]` plain data, and `len`
+        // is clamped to its size.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(&buffer as *const KvmNestedStateBuffer as *const u8, len)
+        };
+        Ok(bytes.to_vec())
     }
 
     #[allow(unused)]
@@ -2623,6 +2660,25 @@ impl Vcpu {
             && tsc.apply_offset
         {
             self.set_tsc_offset(tsc.offset)?;
+        }
+        // After SET_MSRS: KVM refuses to change the VMX capability MSRs while
+        // the vCPU is in VMX operation, which this restores.
+        if let Some(nested) = &state.nested_state {
+            let mut buffer = KvmNestedStateBuffer::empty();
+            let len = nested
+                .len()
+                .min(std::mem::size_of::<KvmNestedStateBuffer>());
+            // Safety: as in `save_nested_state`; the copy stays within the buffer.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    nested.as_ptr(),
+                    &mut buffer as *mut KvmNestedStateBuffer as *mut u8,
+                    len,
+                );
+            }
+            self.fd
+                .set_nested_state(&buffer)
+                .map_err(Error::VcpuSetNestedState)?;
         }
         self.fd
             .set_vcpu_events(&state.vcpu_events)
@@ -3168,6 +3224,18 @@ pub struct VcpuState {
     xcrs: kvm_xcrs,
     xsave: kvm_xsave,
     tsc_migration: Option<TscMigrationState>,
+    /// `KVM_GET_NESTED_STATE` bytes, for a vCPU whose CPUID offers VMX or SVM.
+    nested_state: Option<Vec<u8>>,
+}
+
+/// Whether the guest can run its own VMs: CPUID leaf 1 ECX.VMX (Intel) or
+/// leaf 0x8000_0001 ECX.SVM (AMD). Only then can the vCPU hold nested state.
+#[cfg(target_arch = "x86_64")]
+fn cpuid_offers_nested(cpuid: &CpuId) -> bool {
+    cpuid.as_slice().iter().any(|e| {
+        (e.function == 1 && e.ecx & (1 << 5) != 0)
+            || (e.function == 0x8000_0001 && e.ecx & (1 << 2) != 0)
+    })
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -3252,6 +3320,12 @@ impl VcpuState {
         ser_pod(&mut out, &self.vcpu_events);
         ser_pod(&mut out, &self.xcrs);
         ser_pod(&mut out, &self.xsave);
+        // Optional trailer, so a vCPU without nested state encodes exactly as
+        // before and blobs written before the trailer existed still decode.
+        if let Some(nested) = &self.nested_state {
+            out.push(1);
+            ser_fam(&mut out, nested);
+        }
         out
     }
 
@@ -3275,7 +3349,7 @@ impl VcpuState {
                 return Err(format!("invalid vCPU TSC migration-state marker {marker}"));
             }
         };
-        let state = VcpuState {
+        let mut state = VcpuState {
             cpuid,
             msrs,
             tsc_migration,
@@ -3287,7 +3361,14 @@ impl VcpuState {
             vcpu_events: de_pod(bytes, &mut pos)?,
             xcrs: de_pod(bytes, &mut pos)?,
             xsave: de_pod(bytes, &mut pos)?,
+            nested_state: None,
         };
+        if pos < bytes.len() {
+            match de_pod::<u8>(bytes, &mut pos)? {
+                1 => state.nested_state = Some(de_fam(bytes, &mut pos)?),
+                marker => return Err(format!("invalid vCPU nested-state marker {marker}")),
+            }
+        }
         Ok(state)
     }
 }
@@ -3911,6 +3992,73 @@ mod tests {
             VcpuResponse::RestoredState => {}
             other => panic!("expected RestoredState, got {other:?}"),
         }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn blank_vcpu_state(nested_state: Option<Vec<u8>>) -> VcpuState {
+        // Safety: every field below is plain KVM data, valid when zeroed.
+        unsafe {
+            VcpuState {
+                cpuid: CpuId::new(0).unwrap(),
+                msrs: Msrs::new(0).unwrap(),
+                debug_regs: std::mem::zeroed(),
+                lapic: std::mem::zeroed(),
+                mp_state: std::mem::zeroed(),
+                regs: std::mem::zeroed(),
+                sregs: std::mem::zeroed(),
+                vcpu_events: std::mem::zeroed(),
+                xcrs: std::mem::zeroed(),
+                xsave: std::mem::zeroed(),
+                tsc_migration: None,
+                nested_state,
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_nested_state_rides_an_optional_trailer() {
+        let plain = blank_vcpu_state(None).serialize();
+        let nested_bytes: Vec<u8> = (0..128u8).collect();
+        let nested = blank_vcpu_state(Some(nested_bytes.clone())).serialize();
+        // A vCPU without nested state encodes exactly as before the trailer.
+        assert_eq!(&nested[..plain.len()], &plain[..]);
+        assert!(
+            VcpuState::deserialize(&plain)
+                .unwrap()
+                .nested_state
+                .is_none()
+        );
+        assert_eq!(
+            VcpuState::deserialize(&nested).unwrap().nested_state,
+            Some(nested_bytes)
+        );
+        let mut bad = plain.clone();
+        bad.push(7);
+        assert!(VcpuState::deserialize(&bad).is_err());
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_only_a_vmx_or_svm_guest_carries_nested_state() {
+        let leaf = |function: u32, ecx: u32| kvm_bindings::kvm_cpuid_entry2 {
+            function,
+            ecx,
+            ..Default::default()
+        };
+        let cpuid =
+            |entries: &[kvm_bindings::kvm_cpuid_entry2]| CpuId::from_entries(entries).unwrap();
+        assert!(!cpuid_offers_nested(&cpuid(&[
+            leaf(1, 0),
+            leaf(0x8000_0001, 0)
+        ])));
+        assert!(cpuid_offers_nested(&cpuid(&[leaf(1, 1 << 5)])));
+        assert!(cpuid_offers_nested(&cpuid(&[leaf(0x8000_0001, 1 << 2)])));
+        // The same bits on other leaves mean something else.
+        assert!(!cpuid_offers_nested(&cpuid(&[
+            leaf(7, 1 << 5),
+            leaf(0x8000_0008, 1 << 2)
+        ])));
     }
 
     #[cfg(target_arch = "x86_64")]
