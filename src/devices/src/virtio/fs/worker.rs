@@ -332,6 +332,11 @@ impl FsWorker {
             &EpollEvent::new(EventSet::IN, stop_ev_fd as u64),
         );
 
+        // A restored device does not get back the interrupt status it had at
+        // the checkpoint, so raise it once: the guest then reads completions
+        // already in the used ring. Virtio permits spurious notifications.
+        self.interrupt.signal_used_queue();
+
         let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
         loop {
             match epoll.wait(epoll_events.len(), -1, epoll_events.as_mut_slice()) {
@@ -577,7 +582,10 @@ impl FsWorker {
 mod tests {
     use super::*;
     use crate::legacy::DummyIrqChip;
+    use crate::virtio::VIRTIO_MMIO_INT_VRING;
     use crate::virtio::queue::tests::VirtQueue;
+    use std::sync::atomic::Ordering;
+    use utils::eventfd::EFD_NONBLOCK;
     use vm_memory::GuestAddress;
 
     #[test]
@@ -601,5 +609,40 @@ mod tests {
             &None,
         );
         assert_eq!(ring.used.idx.get(), 1);
+    }
+
+    #[test]
+    fn a_started_worker_raises_its_used_queue_interrupt() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        let ring = VirtQueue::new(GuestAddress(0x1000), &mem, 8);
+        let queue = WorkerQueue {
+            index: 1,
+            queue: ring.create_queue(),
+            event: Arc::new(EventFd::new(EFD_NONBLOCK).unwrap()),
+        };
+        let interrupt =
+            InterruptTransport::new(DummyIrqChip::new().into(), "fs test".into()).unwrap();
+        let stop_fd = EventFd::new(EFD_NONBLOCK).unwrap();
+        stop_fd.write(1).unwrap();
+        let worker = FsWorker::new(
+            vec![queue],
+            interrupt.clone(),
+            mem.clone(),
+            None,
+            FsWorker::new_server(None, None, false, None, Vec::new(), None).unwrap(),
+            stop_fd,
+            Arc::new(AtomicI32::new(0)),
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            None,
+        );
+
+        worker.run().join().unwrap();
+
+        // A clone's guest only reads completions the checkpoint captured once
+        // it sees this status bit.
+        assert_eq!(
+            interrupt.status().load(Ordering::SeqCst),
+            VIRTIO_MMIO_INT_VRING as usize
+        );
     }
 }

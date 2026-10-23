@@ -535,6 +535,13 @@ impl BlockWorker {
             );
         }
 
+        // A restored device does not get back the interrupt status it had at
+        // the checkpoint, so raise it once: the guest then reads completions
+        // already in the used ring. Virtio permits spurious notifications.
+        if let Err(e) = self.interrupt.try_signal_used_queue() {
+            error!("error signalling queue: {e:?}");
+        }
+
         let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
         // Windows: a queue kick can occasionally go unseen by the event shim,
         // leaving requests in the ring until some later kick (seconds, in
