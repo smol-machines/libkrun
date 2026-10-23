@@ -106,8 +106,8 @@ struct Share {
 
 #[derive(Default)]
 struct ShareTable {
-    /// Ids are never reused, so an inode of a detached share stays revoked even
-    /// if a share of the same name is attached again.
+    /// Ids are never reused, so an inode of a detached share stays revoked
+    /// unless an attached share covers its host path again.
     next_id: u64,
     by_name: HashMap<CString, u64>,
     shares: HashMap<u64, Share>,
@@ -219,6 +219,17 @@ impl LiveShares {
 
     fn is_attached(&self, id: u64) -> bool {
         self.table.read().unwrap().shares.contains_key(&id)
+    }
+
+    /// The attached share whose host directory holds `path`. Shares never
+    /// overlap, so at most one does.
+    fn covering(&self, path: &Path) -> Option<u64> {
+        let table = self.table.read().unwrap();
+        table
+            .shares
+            .iter()
+            .find(|(_, s)| path.starts_with(&s.host_path))
+            .map(|(id, _)| *id)
     }
 
     fn snapshot(&self) -> Vec<LiveShareSnap> {
@@ -355,15 +366,28 @@ impl<T: LiveBackend> LiveFs<T> {
         self.inner.restore_with_roots(state, &roots)
     }
 
+    /// The attached share `inode` belongs to. An inode recorded under a
+    /// detached share is taken over by the share that now covers its host path:
+    /// the guest kernel keeps the inodes of a directory it has seen, so after the
+    /// same directory is detached and attached again it opens them without a new
+    /// lookup. One no attached share covers stays revoked.
+    fn owner(&self, inode: Inode) -> Option<u64> {
+        if let Some(id) = self.members.read().unwrap().get(&inode) {
+            if self.shares.is_attached(*id) {
+                return Some(*id);
+            }
+        }
+        let id = self.shares.covering(&self.inner.host_path_of(inode)?)?;
+        self.members.write().unwrap().insert(inode, id);
+        Some(id)
+    }
+
     /// Fail unless `inode` is the device root or below a share still attached.
     fn check(&self, inode: Inode) -> io::Result<()> {
         if inode == fuse::ROOT_ID {
             return Ok(());
         }
-        match self.members.read().unwrap().get(&inode) {
-            Some(id) if self.shares.is_attached(*id) => Ok(()),
-            _ => Err(linux_errno::enoent()),
-        }
+        self.owner(inode).map(|_| ()).ok_or_else(linux_errno::enoent)
     }
 
     /// The share `inode` belongs to, failing for the root (nothing is created
@@ -372,10 +396,7 @@ impl<T: LiveBackend> LiveFs<T> {
         if inode == fuse::ROOT_ID {
             return Err(linux_errno::eacces());
         }
-        match self.members.read().unwrap().get(&inode) {
-            Some(id) if self.shares.is_attached(*id) => Ok(*id),
-            _ => Err(linux_errno::enoent()),
-        }
+        self.owner(inode).ok_or_else(linux_errno::enoent)
     }
 
     fn record(&self, share: u64, entry: &Entry) {
@@ -977,13 +998,26 @@ mod tests {
             linux_errno::enoent().raw_os_error()
         );
 
-        // Attaching the same name again does not bring the old inodes back.
+        // Another directory attached in its place does not bring them back.
         live_shares("live-detach")
             .unwrap()
-            .attach("a", &d.a)
+            .attach("a", &d.b)
             .unwrap();
-        assert!(fs.getattr(CTX, file.inode, None).is_err());
-        let again = fs.lookup(CTX, fuse::ROOT_ID, &name("a")).unwrap();
+        assert_eq!(
+            errno(fs.getattr(CTX, file.inode, None)),
+            linux_errno::enoent().raw_os_error()
+        );
+        live_shares("live-detach").unwrap().detach("a").unwrap();
+
+        // The same directory attached again, under any name, serves the inodes
+        // the guest still holds without a new lookup, as the guest kernel uses
+        // them for a directory it has seen.
+        live_shares("live-detach")
+            .unwrap()
+            .attach("again", &d.a)
+            .unwrap();
+        assert_eq!(fs.getattr(CTX, file.inode, None).unwrap().0.st_size, 5);
+        let again = fs.lookup(CTX, fuse::ROOT_ID, &name("again")).unwrap();
         let file = fs.lookup(CTX, again.inode, &name("a.txt")).unwrap();
         assert!(fs.getattr(CTX, file.inode, None).is_ok());
     }
