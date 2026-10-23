@@ -372,10 +372,9 @@ impl<T: LiveBackend> LiveFs<T> {
     /// same directory is detached and attached again it opens them without a new
     /// lookup. One no attached share covers stays revoked.
     fn owner(&self, inode: Inode) -> Option<u64> {
-        if let Some(id) = self.members.read().unwrap().get(&inode) {
-            if self.shares.is_attached(*id) {
-                return Some(*id);
-            }
+        let recorded = self.members.read().unwrap().get(&inode).copied();
+        if let Some(id) = recorded.filter(|id| self.shares.is_attached(*id)) {
+            return Some(id);
         }
         let id = self.shares.covering(&self.inner.host_path_of(inode)?)?;
         self.members.write().unwrap().insert(inode, id);
@@ -387,7 +386,9 @@ impl<T: LiveBackend> LiveFs<T> {
         if inode == fuse::ROOT_ID {
             return Ok(());
         }
-        self.owner(inode).map(|_| ()).ok_or_else(linux_errno::enoent)
+        self.owner(inode)
+            .map(|_| ())
+            .ok_or_else(linux_errno::enoent)
     }
 
     /// The share `inode` belongs to, failing for the root (nothing is created
