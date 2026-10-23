@@ -4,6 +4,8 @@ mod device;
 mod filesystem;
 pub mod fuse;
 mod inode_alloc;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod live_fs;
 #[allow(dead_code)]
 mod multikey;
 mod null_fs;

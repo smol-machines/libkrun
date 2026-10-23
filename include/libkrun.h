@@ -356,6 +356,14 @@ int32_t krun_add_virtiofs3(uint32_t ctx_id,
    setuid bits and overlayfs whiteouts. Always in effect on macOS and Windows;
    on Linux only with this flag. */
 #define KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT (1 << 0)
+/* Serve host directories attached and detached while the VM runs, through the
+   control socket: "SHARE_ADD <tag> <name> <host dir>", "SHARE_REMOVE <tag>
+   <name>" and "SHARE_LIST <tag>". Each attached directory appears in the device
+   root under <name>; detaching revokes the guest's access to everything under
+   it, open files included. c_path must name an empty host directory the device
+   uses as its root, and shm_size must be 0 (no DAX window). With read_only, every
+   share is served read-only by the host. Linux and macOS only. */
+#define KRUN_VIRTIOFS_FLAG_LIVE (1 << 1)
 
 /**
  * Like krun_add_virtiofs3, with per-share behavior flags (KRUN_VIRTIOFS_FLAG_*).

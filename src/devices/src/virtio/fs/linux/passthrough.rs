@@ -3,6 +3,7 @@
 // found in the LICENSE file.
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::collections::btree_map;
 use std::convert::TryInto;
 use std::ffi::{CStr, CString};
@@ -882,6 +883,105 @@ impl PassthroughFs {
     /// `/proc/self/fd`), since the fds themselves cannot cross to the clone
     /// process. The root inode is omitted — it is re-established by
     /// [`Self::setup_root_inode`] when the clone's server is constructed.
+    /// Register the inode `f` names (an `O_PATH` fd from a lookup) and return its
+    /// entry, reusing the existing nodeid when the same host inode is already
+    /// known. `parent_dev`/`parent_mnt` decide whether a directory is announced
+    /// as a submount.
+    fn register_lookup(&self, f: File, parent_dev: u64, parent_mnt: u64) -> io::Result<Entry> {
+        let (mut st, mnt_id) = statx(&f)?;
+        self.override_stat(f.as_raw_fd(), &mut st);
+
+        let mut attr_flags: u32 = 0;
+
+        if st.st_mode & libc::S_IFMT == libc::S_IFDIR
+            && self.announce_submounts.load(Ordering::Relaxed)
+            && (st.st_dev != parent_dev || mnt_id != parent_mnt)
+        {
+            attr_flags |= fuse::ATTR_SUBMOUNT;
+        }
+
+        let altkey = InodeAltKey {
+            ino: st.st_ino,
+            dev: st.st_dev,
+            mnt_id,
+        };
+        let data = self.inodes.read().unwrap().get_alt(&altkey).cloned();
+
+        let inode = if let Some(data) = data {
+            // Matches with the release store in `forget`.
+            data.refcount.fetch_add(1, Ordering::Acquire);
+            data.inode
+        } else {
+            // There is a possible race here where 2 threads end up adding the same file
+            // into the inode list.  However, since each of those will get a unique Inode
+            // value and unique file descriptors this shouldn't be that much of a problem.
+            let inode = self.inode_alloc.next();
+            self.inodes.write().unwrap().insert(
+                inode,
+                InodeAltKey {
+                    ino: st.st_ino,
+                    dev: st.st_dev,
+                    mnt_id,
+                },
+                Arc::new(InodeData {
+                    inode,
+                    file: f,
+                    dev: st.st_dev,
+                    mnt_id,
+                    refcount: AtomicU64::new(1),
+                }),
+            );
+
+            inode
+        };
+
+        Ok(Entry {
+            inode,
+            generation: 0,
+            attr: st,
+            attr_flags,
+            attr_timeout: self.cfg.attr_timeout,
+            entry_timeout: self.cfg.entry_timeout,
+        })
+    }
+
+    /// Look up a host directory by absolute path, outside this export's root, and
+    /// return its entry. This is how a live share's root enters the inode map; it
+    /// is reached only through [`super::super::live_fs::LiveFs`], which decides
+    /// which host paths may be served.
+    pub fn lookup_host_path(&self, path: &Path) -> io::Result<Entry> {
+        use std::os::unix::ffi::OsStrExt;
+
+        let (root_dev, root_mnt) = self
+            .inodes
+            .read()
+            .unwrap()
+            .get(&fuse::ROOT_ID)
+            .map(|root| (root.dev, root.mnt_id))
+            .ok_or_else(ebadf)?;
+        let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| einval())?;
+        // Safe because this doesn't modify any memory and we check the return value.
+        let fd = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // Safe because we just opened this fd.
+        let f = unsafe { File::from_raw_fd(fd) };
+        self.register_lookup(f, root_dev, root_mnt)
+    }
+
+    /// The host path an inode currently names, if it is still reachable.
+    pub fn host_path_of(&self, inode: Inode) -> Option<PathBuf> {
+        let inodes = self.inodes.read().unwrap();
+        let data = inodes.get(&inode)?;
+        std::fs::read_link(format!("/proc/self/fd/{}", data.file.as_raw_fd())).ok()
+    }
+
     pub fn snapshot(&self) -> FuseServerState {
         let mut inode_snaps = Vec::new();
         {
@@ -902,6 +1002,7 @@ impl PassthroughFs {
                             .and_then(|root| Self::relative_snapshot_path(root, &p)),
                         path: p.to_string_lossy().into_owned(),
                         refcount: data.refcount.load(Ordering::Relaxed),
+                        share: None,
                     }),
                     Err(e) => warn!("fs snapshot: cannot resolve path for nodeid {nodeid}: {e}"),
                 }
@@ -932,6 +1033,7 @@ impl PassthroughFs {
             announce_submounts: self.announce_submounts.load(Ordering::Relaxed),
             zero_message_opendir: self.zero_message_opendir.load(Ordering::Relaxed),
             dax_maps: self.dax.maps.read().unwrap().values().copied().collect(),
+            live_shares: Vec::new(),
         }
     }
 
@@ -944,6 +1046,18 @@ impl PassthroughFs {
     ///
     /// [`snapshot`]: Self::snapshot
     pub fn restore(&self, state: &FuseServerState) -> io::Result<()> {
+        self.restore_with_roots(state, &HashMap::new())
+    }
+
+    /// [`Self::restore`], also reopening the inodes a snapshot reached through a
+    /// live share: each beneath that share's host directory in `share_roots`,
+    /// the same way the rest are reopened beneath the export root. An inode of a
+    /// share missing from `share_roots` is skipped.
+    pub fn restore_with_roots(
+        &self,
+        state: &FuseServerState,
+        share_roots: &HashMap<u64, PathBuf>,
+    ) -> io::Result<()> {
         // Every inode is reopened beneath the root inode's fd; clone it before
         // taking the write lock below.
         let root = self
@@ -953,13 +1067,46 @@ impl PassthroughFs {
             .get(&fuse::ROOT_ID)
             .map(|data| data.file.try_clone())
             .ok_or_else(ebadf)??;
+        let mut share_fds = HashMap::new();
+        for (id, path) in share_roots {
+            match File::open(path) {
+                Ok(f) => {
+                    share_fds.insert(*id, f);
+                }
+                Err(e) => warn!("fs restore: open live share {}: {e}", path.display()),
+            }
+        }
         {
             let mut inodes = self.inodes.write().unwrap();
             for snap in &state.inodes {
-                let Some(path) = self.restore_inode_path(snap) else {
-                    continue;
+                let (base, path) = match snap.share {
+                    Some(id) => {
+                        let Some(base) = share_fds.get(&id) else {
+                            continue;
+                        };
+                        match snap.relative_path.as_deref().map(Path::new) {
+                            Some(rel)
+                                if rel.as_os_str().is_empty() || Self::safe_relative_path(rel) =>
+                            {
+                                (base, rel.to_path_buf())
+                            }
+                            _ => {
+                                warn!(
+                                    "fs restore: rejecting live share inode path {:?}",
+                                    snap.relative_path
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                    None => {
+                        let Some(path) = self.restore_inode_path(snap) else {
+                            continue;
+                        };
+                        (&root, path)
+                    }
                 };
-                let f = match Self::open_beneath(&root, &path) {
+                let f = match Self::open_beneath(base, &path) {
                     Ok(f) => f,
                     Err(e) => {
                         warn!("fs restore: reopen {} failed: {e}", path.display());
@@ -1607,63 +1754,13 @@ impl FileSystem for PassthroughFs {
         // Safe because we just opened this fd.
         let f = unsafe { File::from_raw_fd(fd) };
 
-        let (mut st, mnt_id) = statx(&f)?;
-        self.override_stat(f.as_raw_fd(), &mut st);
-
-        let mut attr_flags: u32 = 0;
-
-        if st.st_mode & libc::S_IFMT == libc::S_IFDIR
-            && self.announce_submounts.load(Ordering::Relaxed)
-            && (st.st_dev != p.dev || mnt_id != p.mnt_id)
-        {
-            attr_flags |= fuse::ATTR_SUBMOUNT;
-        }
-
-        let altkey = InodeAltKey {
-            ino: st.st_ino,
-            dev: st.st_dev,
-            mnt_id,
-        };
-        let data = self.inodes.read().unwrap().get_alt(&altkey).cloned();
-
-        let inode = if let Some(data) = data {
-            // Matches with the release store in `forget`.
-            data.refcount.fetch_add(1, Ordering::Acquire);
-            data.inode
-        } else {
-            // There is a possible race here where 2 threads end up adding the same file
-            // into the inode list.  However, since each of those will get a unique Inode
-            // value and unique file descriptors this shouldn't be that much of a problem.
-            let inode = self.inode_alloc.next();
-            self.inodes.write().unwrap().insert(
-                inode,
-                InodeAltKey {
-                    ino: st.st_ino,
-                    dev: st.st_dev,
-                    mnt_id,
-                },
-                Arc::new(InodeData {
-                    inode,
-                    file: f,
-                    dev: st.st_dev,
-                    mnt_id,
-                    refcount: AtomicU64::new(1),
-                }),
-            );
-
-            inode
-        };
-
-        debug!("lookup: {}, inode: {:?}", name.to_str().unwrap(), inode);
-
-        Ok(Entry {
-            inode,
-            generation: 0,
-            attr: st,
-            attr_flags,
-            attr_timeout: self.cfg.attr_timeout,
-            entry_timeout: self.cfg.entry_timeout,
-        })
+        let entry = self.register_lookup(f, p.dev, p.mnt_id)?;
+        debug!(
+            "lookup: {}, inode: {:?}",
+            name.to_str().unwrap(),
+            entry.inode
+        );
+        Ok(entry)
     }
 
     fn forget(&self, _ctx: Context, inode: Inode, count: u64) {
@@ -3288,6 +3385,7 @@ mod tests {
                 relative_path: Some(path.to_string()),
                 path: String::new(),
                 refcount: 1,
+                share: None,
             };
             assert!(fs.restore_inode_path(&snap).is_none(), "accepted {path:?}");
         }

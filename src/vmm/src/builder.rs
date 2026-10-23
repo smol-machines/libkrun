@@ -3413,6 +3413,7 @@ fn attach_fs_devices(
                 exit_code.clone(),
                 config.read_only,
                 config.override_stat,
+                config.live,
                 config.virtual_entries.clone(),
             )
             .unwrap(),
