@@ -2252,8 +2252,20 @@ impl FileSystem for PassthroughFs {
         };
         let link_c_path = self.name_to_path(newparent, newname)?;
 
+        // `link()` follows a symlink source on macOS, so a guest could hard-link
+        // a symlink it made pointing outside the share and reach that host file
+        // through the new name. `linkat` without AT_SYMLINK_FOLLOW links the
+        // symlink itself, as Linux does.
         // Safe because this doesn't modify any memory and we check the return value.
-        let res = unsafe { libc::link(orig_c_path.as_ptr(), link_c_path.as_ptr()) };
+        let res = unsafe {
+            libc::linkat(
+                libc::AT_FDCWD,
+                orig_c_path.as_ptr(),
+                libc::AT_FDCWD,
+                link_c_path.as_ptr(),
+                0,
+            )
+        };
         if res == 0 {
             self.lookup(ctx, newparent, newname)
         } else {
