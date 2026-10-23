@@ -1139,6 +1139,7 @@ fn handle_share_list(arg: &str) -> String {
     format!("OK {}\n", listed.join("\t"))
 }
 
+#[cfg(all(snapshot_supported, deferred_stream_supported))]
 fn handle_save_status(dir: &str) -> String {
     if dir.is_empty() {
         return "ERR EINVAL snapshot dir required\n".to_string();
