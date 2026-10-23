@@ -1258,6 +1258,7 @@ impl PassthroughFs {
                         relative_path: Some(relative.to_string_lossy().into_owned()),
                         path: path.to_string_lossy().into_owned(),
                         refcount: data.refcount.load(Ordering::Relaxed),
+                        share: None,
                     })
                 })
                 .collect(),
@@ -1278,6 +1279,7 @@ impl PassthroughFs {
             announce_submounts: self.announce_submounts.load(Ordering::Relaxed),
             zero_message_opendir: false,
             dax_maps: Vec::new(),
+            live_shares: Vec::new(),
         }
     }
 

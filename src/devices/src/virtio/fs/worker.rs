@@ -24,6 +24,8 @@ use super::augment_fs::AugmentFs;
 use super::defs::HPQ_INDEX;
 use super::descriptor_utils::{Reader, Writer};
 use super::inode_alloc::InodeAllocator;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use super::live_fs::LiveFs;
 use super::null_fs::NullFs;
 use super::passthrough::{self, PassthroughFs};
 use super::read_only::PassthroughFsRo;
@@ -49,6 +51,10 @@ pub(super) enum FsServer {
     ReadWrite(Server<AugmentFs<PassthroughFs>>),
     ReadOnly(Server<AugmentFs<PassthroughFsRo>>),
     Null(Server<AugmentFs<NullFs>>),
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    Live(Server<AugmentFs<LiveFs<PassthroughFs>>>),
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    LiveRo(Server<AugmentFs<LiveFs<PassthroughFsRo>>>),
 }
 
 pub(super) struct WorkerQueue {
@@ -87,6 +93,8 @@ impl FsServer {
                 .replay_dax_maps(host_shm_base, shm_size),
             // No passthrough host files, so no window mappings to replay.
             FsServer::Null(_) => {}
+            // Live devices have no DAX window.
+            FsServer::Live(_) | FsServer::LiveRo(_) => {}
         }
     }
 
@@ -125,6 +133,24 @@ impl FsServer {
                 #[cfg(any(target_os = "macos", target_os = "windows"))]
                 map_sender,
             ),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            FsServer::Live(s) => s.handle_message(
+                r,
+                w,
+                shm_region,
+                exit_code,
+                #[cfg(target_os = "macos")]
+                map_sender,
+            ),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            FsServer::LiveRo(s) => s.handle_message(
+                r,
+                w,
+                shm_region,
+                exit_code,
+                #[cfg(target_os = "macos")]
+                map_sender,
+            ),
         }
     }
 }
@@ -153,10 +179,40 @@ impl FsWorker {
         _shm_region: Option<VirtioShmRegion>,
         passthrough_cfg: Option<passthrough::Config>,
         read_only: bool,
+        live_tag: Option<&str>,
         virtual_entries: Vec<VirtualDirEntry>,
         restore_fuse: Option<FuseServerState>,
     ) -> Result<Arc<FsServer>, io::Error> {
         let inode_alloc = Arc::new(InodeAllocator::new());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let (Some(tag), Some(cfg)) = (live_tag, passthrough_cfg.clone()) {
+            let server = if read_only {
+                let fs = LiveFs::new(PassthroughFsRo::new(cfg, inode_alloc.clone())?, tag);
+                if let Some(state) = restore_fuse.as_ref() {
+                    fs.restore(state)?;
+                }
+                FsServer::LiveRo(Server::new(AugmentFs::new(
+                    fs,
+                    &inode_alloc,
+                    virtual_entries,
+                )))
+            } else {
+                let fs = LiveFs::new(PassthroughFs::new(cfg, inode_alloc.clone())?, tag);
+                if let Some(state) = restore_fuse.as_ref() {
+                    fs.restore(state)?;
+                }
+                FsServer::Live(Server::new(AugmentFs::new(
+                    fs,
+                    &inode_alloc,
+                    virtual_entries,
+                )))
+            };
+            return Ok(Arc::new(server));
+        }
+        #[cfg(target_os = "windows")]
+        if live_tag.is_some() {
+            return Err(io::Error::from_raw_os_error(libc::ENOTSUP));
+        }
         let server = match passthrough_cfg {
             Some(cfg) if read_only => {
                 let inner = PassthroughFsRo::new(cfg, inode_alloc.clone())?;
@@ -250,6 +306,10 @@ impl FsWorker {
             FsServer::ReadWrite(s) => Some(s.fs().inner().snapshot()),
             FsServer::ReadOnly(s) => Some(s.fs().inner().inner().snapshot()),
             FsServer::Null(_) => None,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            FsServer::Live(s) => Some(s.fs().inner().snapshot()),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            FsServer::LiveRo(s) => Some(s.fs().inner().snapshot()),
         }
     }
 
@@ -528,7 +588,7 @@ mod tests {
         ring.avail.ring[0].set(0);
         ring.avail.idx.set(1);
         let mut queue = ring.create_queue();
-        let server = FsWorker::new_server(None, None, false, Vec::new(), None).unwrap();
+        let server = FsWorker::new_server(None, None, false, None, Vec::new(), None).unwrap();
 
         FsWorker::process_queue(
             &mut queue,

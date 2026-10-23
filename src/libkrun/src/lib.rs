@@ -1067,6 +1067,78 @@ fn handle_cancel_save(dir: &str) -> String {
 }
 
 #[cfg(all(snapshot_supported, deferred_stream_supported))]
+/// The live virtio-fs device named by the first word of `arg`, and the rest.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn live_device(
+    arg: &str,
+) -> Result<
+    (
+        std::sync::Arc<devices::virtio::fs::live_fs::LiveShares>,
+        &str,
+    ),
+    String,
+> {
+    let mut parts = arg.splitn(2, char::is_whitespace);
+    let tag = parts.next().unwrap_or("");
+    let rest = parts.next().map(str::trim_start).unwrap_or("");
+    match devices::virtio::fs::live_fs::live_shares(tag) {
+        Some(shares) => Ok((shares, rest)),
+        None if tag.is_empty() => Err("ERR EINVAL live device tag required\n".to_string()),
+        None => Err(format!("ERR ENOENT no live virtio-fs device {tag}\n")),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn handle_share_add(arg: &str) -> String {
+    let (shares, rest) = match live_device(arg) {
+        Ok(device) => device,
+        Err(reply) => return reply,
+    };
+    let mut parts = rest.splitn(2, char::is_whitespace);
+    let name = parts.next().unwrap_or("");
+    let path = parts.next().map(str::trim_start).unwrap_or("");
+    if name.is_empty() || path.is_empty() {
+        return "ERR EINVAL usage: SHARE_ADD <tag> <name> <host dir>\n".to_string();
+    }
+    if path.chars().any(char::is_control) {
+        return "ERR EINVAL share path contains a control character\n".to_string();
+    }
+    match shares.attach(name, std::path::Path::new(path)) {
+        Ok(_) => format!("OK attached {name}\n"),
+        Err(error) => format!("ERR EINVAL {error}\n"),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn handle_share_remove(arg: &str) -> String {
+    let (shares, name) = match live_device(arg) {
+        Ok(device) => device,
+        Err(reply) => return reply,
+    };
+    let name = name.trim();
+    if name.is_empty() {
+        return "ERR EINVAL usage: SHARE_REMOVE <tag> <name>\n".to_string();
+    }
+    match shares.detach(name) {
+        Ok(()) => format!("OK detached {name}\n"),
+        Err(error) => format!("ERR ENOENT {error}\n"),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn handle_share_list(arg: &str) -> String {
+    let (shares, _) = match live_device(arg) {
+        Ok(device) => device,
+        Err(reply) => return reply,
+    };
+    let listed: Vec<String> = shares
+        .list()
+        .into_iter()
+        .map(|(name, path)| format!("{name}={}", path.display()))
+        .collect();
+    format!("OK {}\n", listed.join("\t"))
+}
+
 fn handle_save_status(dir: &str) -> String {
     if dir.is_empty() {
         return "ERR EINVAL snapshot dir required\n".to_string();
@@ -2016,6 +2088,18 @@ fn handle_control_stream(mut stream: ControlStream, vmm: &Arc<Mutex<vmm::Vmm>>) 
                 // stays frozen whatever happens, since its clones map its RAM.
                 #[cfg(all(snapshot_supported, fork_supported, unix))]
                 "SAVE_FROZEN" => handle_save_frozen(vmm, _arg),
+                // SHARE_ADD <tag> <name> <host dir>: attach a host directory to
+                // the live virtio-fs device <tag> under <name>, while it runs.
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                "SHARE_ADD" => handle_share_add(_arg),
+                // SHARE_REMOVE <tag> <name>: detach it, revoking the guest's
+                // access to everything under it, open files included.
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                "SHARE_REMOVE" => handle_share_remove(_arg),
+                // SHARE_LIST <tag>: the attached shares, as name=host dir
+                // separated by tabs.
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                "SHARE_LIST" => handle_share_list(_arg),
                 // PREPARE_SAVE captures an immutable COW RAM generation and
                 // leaves the VM paused only for caller-side disk staging.
                 // After RESUME, FINISH_SAVE persists that retained generation;
@@ -2721,6 +2805,10 @@ pub unsafe extern "C" fn krun_add_virtiofs3(
 /// Windows; on Linux only with this flag.
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 pub const KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT: u32 = 1 << 0;
+/// Serve host directories attached and detached at runtime through the control
+/// socket (`SHARE_ADD`, `SHARE_REMOVE`, `SHARE_LIST`). `c_path` must name an empty
+/// host directory the device uses as its root, and `shm_size` must be 0.
+pub const KRUN_VIRTIOFS_FLAG_LIVE: u32 = 1 << 1;
 
 #[allow(clippy::missing_safety_doc)]
 #[unsafe(no_mangle)]
@@ -2733,10 +2821,19 @@ pub unsafe extern "C" fn krun_add_virtiofs4(
     read_only: bool,
     flags: u32,
 ) -> i32 {
-    if flags & !KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT != 0 {
+    if flags & !(KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT | KRUN_VIRTIOFS_FLAG_LIVE) != 0 {
         return -libc::EINVAL;
     }
     let override_stat = flags & KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT != 0;
+    let live = flags & KRUN_VIRTIOFS_FLAG_LIVE != 0;
+    // A live device's mappings into guest memory could not be revoked on
+    // detach, so it has no DAX window, and it needs a host root to serve from.
+    if live && (shm_size > 0 || c_path.is_null()) {
+        return -libc::EINVAL;
+    }
+    if live && cfg!(target_os = "windows") {
+        return -libc::ENOTSUP;
+    }
     unsafe {
         if c_tag.is_null() {
             return -libc::EINVAL;
@@ -2781,6 +2878,7 @@ pub unsafe extern "C" fn krun_add_virtiofs4(
                     shm_size: shm,
                     read_only,
                     override_stat,
+                    live,
                     virtual_entries,
                 });
             }
@@ -4943,6 +5041,7 @@ pub unsafe extern "C" fn krun_set_root_disk_remount(
                     shm_size: Some(1 << 29),
                     read_only: false,
                     override_stat: false,
+                    live: false,
                     virtual_entries,
                 });
 

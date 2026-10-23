@@ -1611,13 +1611,14 @@ pub fn build_microvm(
     attach_fs_devices(
         &mut vmm,
         &vm_resources.fs,
+        false,
         &mut _shm_manager,
         #[cfg(not(feature = "tee"))]
-        export_table,
+        export_table.clone(),
         intc.clone(),
-        exit_code,
+        exit_code.clone(),
         #[cfg(any(target_os = "macos", target_os = "windows"))]
-        _sender,
+        _sender.clone(),
     )?;
     #[cfg(feature = "blk")]
     attach_block_devices(&mut vmm, &vm_resources.block, intc.clone())?;
@@ -1656,6 +1657,24 @@ pub fn build_microvm(
     if vm_resources.dhcp_client {
         vmm.kernel_cmdline.insert_str("KRUN_DHCP=1")?;
     }
+
+    // Live virtio-fs devices are registered after every other device, so adding
+    // them leaves the MMIO addresses of the rest where an older checkpoint has
+    // them: restoring one into a VM that also has live devices leaves those idle,
+    // unseen by a guest that discovered its devices before they existed.
+    #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+    attach_fs_devices(
+        &mut vmm,
+        &vm_resources.fs,
+        true,
+        &mut _shm_manager,
+        #[cfg(not(feature = "tee"))]
+        export_table,
+        intc.clone(),
+        exit_code,
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        _sender,
+    )?;
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
     if !restoring && vmm.prototype_cpu_topology.is_some() {
@@ -3397,6 +3416,7 @@ fn attach_mmio_device(
 fn attach_fs_devices(
     vmm: &mut Vmm,
     fs_devs: &[FsDeviceConfig],
+    live: bool,
     shm_manager: &mut ShmManager,
     #[cfg(not(feature = "tee"))] export_table: Option<ExportTable>,
     intc: IrqChip,
@@ -3405,7 +3425,9 @@ fn attach_fs_devices(
 ) -> std::result::Result<(), StartMicrovmError> {
     use self::StartMicrovmError::*;
 
-    for (i, config) in fs_devs.iter().enumerate() {
+    // `i` stays each device's index among all of `fs_devs`: it names the device
+    // and selects its shared-memory region.
+    for (i, config) in fs_devs.iter().enumerate().filter(|(_, c)| c.live == live) {
         let fs = Arc::new(Mutex::new(
             devices::virtio::Fs::new(
                 config.fs_id.clone(),
@@ -3413,6 +3435,7 @@ fn attach_fs_devices(
                 exit_code.clone(),
                 config.read_only,
                 config.override_stat,
+                config.live,
                 config.virtual_entries.clone(),
             )
             .unwrap(),

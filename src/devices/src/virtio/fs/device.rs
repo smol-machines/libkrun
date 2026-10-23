@@ -51,6 +51,8 @@ pub struct Fs {
     shm_region: Option<VirtioShmRegion>,
     passthrough_cfg: Option<passthrough::Config>,
     read_only: bool,
+    /// The virtio-fs tag, when this device serves live shares.
+    live_tag: Option<String>,
     virtual_entries: Vec<VirtualDirEntry>,
     worker_threads: Vec<JoinHandle<FsWorker>>,
     worker_stopfds: Vec<EventFd>,
@@ -108,6 +110,18 @@ pub struct FuseServerState {
     /// field existed.
     #[serde(default)]
     pub dax_maps: Vec<FuseDaxMapSnap>,
+    /// Host directories attached to a live virtio-fs device at runtime, so a
+    /// clone or restore serves the same shares. Empty for every other device.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub live_shares: Vec<LiveShareSnap>,
+}
+
+/// A host directory attached to a live virtio-fs device under `name`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LiveShareSnap {
+    pub id: u64,
+    pub name: String,
+    pub host_path: String,
 }
 
 /// One FUSE inode: the guest's nodeid mapped to its source-host identity and,
@@ -122,6 +136,10 @@ pub struct FuseInodeSnap {
     pub relative_path: Option<String>,
     pub path: String,
     pub refcount: u64,
+    /// The live share this inode was reached through. Its `relative_path` is
+    /// then relative to that share's host directory, not the export root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share: Option<u64>,
 }
 
 /// One open FUSE handle: the guest's fh, its owning nodeid, and the open flags
@@ -160,10 +178,12 @@ impl Fs {
         exit_code: Arc<AtomicI32>,
         read_only: bool,
         override_stat: bool,
+        live: bool,
         virtual_entries: Vec<VirtualDirEntry>,
     ) -> super::Result<Fs> {
         let avail_features = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_RING_F_EVENT_IDX);
 
+        let live_tag = live.then(|| fs_id.clone());
         let tag = fs_id.into_bytes();
         let mut config = VirtioFsConfig::default();
         config.tag[..tag.len()].copy_from_slice(tag.as_slice());
@@ -185,6 +205,7 @@ impl Fs {
             server: None,
             passthrough_cfg: fs_cfg,
             read_only,
+            live_tag,
             virtual_entries,
             worker_threads: Vec::new(),
             worker_stopfds: Vec::new(),
@@ -318,6 +339,7 @@ mod tests {
             Arc::new(AtomicI32::new(0)),
             false,
             false,
+            false,
             Vec::new(),
         )
         .unwrap();
@@ -346,6 +368,7 @@ mod tests {
             "test".to_owned(),
             None,
             Arc::new(AtomicI32::new(0)),
+            false,
             false,
             false,
             Vec::new(),
@@ -420,6 +443,7 @@ impl VirtioDevice for Fs {
             self.shm_region.clone(),
             self.passthrough_cfg.clone(),
             self.read_only,
+            self.live_tag.as_deref(),
             virtual_entries,
             self.pending_fuse.take(),
         )
