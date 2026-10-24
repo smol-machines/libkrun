@@ -5592,8 +5592,9 @@ pub unsafe extern "C" fn krun_set_kernel_console(ctx_id: u32, console_id: *const
     }
 }
 
-/// The errno `krun_start_enter` returns when the VM could not be built. Every
-/// failure used to be `EINVAL`, which told the caller nothing when the host was
+/// The errno `krun_start_enter` returns when the VM could not be built or its
+/// checkpoint could not be restored. Every failure used to be `EINVAL`, which
+/// told the caller nothing when the host was
 /// simply full: a batch of branches on a saturated node got "invalid
 /// configuration" for what was KVM or the memory mapping answering ENOMEM, or a
 /// process out of file descriptors. Resource exhaustion is returned as itself,
@@ -5805,9 +5806,15 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
             match result {
                 Ok(rc) => Some(rc),
                 Err(e) => {
-                    error!("fork restore from {}: {e}", dir.display());
+                    // Restore errors are io::Error text. On Windows its
+                    // `os error N` is a Win32 code, not an errno, so it stays EINVAL.
+                    #[cfg(unix)]
+                    let errno = start_errno(&e);
+                    #[cfg(not(unix))]
+                    let errno = libc::EINVAL;
+                    error!("fork restore from {} (errno {errno}): {e}", dir.display());
                     set_last_error(format!("restore checkpoint from {}: {e}", dir.display()));
-                    return -libc::EINVAL;
+                    return -errno;
                 }
             }
         }
@@ -6251,9 +6258,11 @@ mod start_errno_tests {
             libc::ENOMEM
         );
         assert_eq!(
-            start_errno(
-                "VcpuSpawn(Os { code: 11, kind: WouldBlock, message: \"Resource temporarily unavailable\" })"
-            ),
+            // EAGAIN is 11 on Linux but 35 on macOS
+            start_errno(&format!(
+                "VcpuSpawn(Os {{ code: {}, kind: WouldBlock, message: \"Resource temporarily unavailable\" }})",
+                libc::EAGAIN
+            )),
             libc::EAGAIN
         );
         assert_eq!(
@@ -6267,6 +6276,32 @@ mod start_errno_tests {
                 "AttachBlockDevice(Os { code: 16, kind: ResourceBusy, message: \"Device or resource busy\" })"
             ),
             libc::EBUSY
+        );
+    }
+
+    #[test]
+    fn restore_failures_carry_the_io_errno() {
+        // restore errors are `{io::Error}` Display text, which ends in `(os error N)`
+        assert_eq!(
+            start_errno("map guest memory: Cannot allocate memory (os error 12)"),
+            libc::ENOMEM
+        );
+        assert_eq!(
+            start_errno("memory: Too many open files (os error 24)"),
+            libc::EMFILE
+        );
+        assert_eq!(
+            start_errno("cow-map guest memory: No space left on device (os error 28)"),
+            libc::ENOSPC
+        );
+        // a missing or malformed checkpoint is not a full host
+        assert_eq!(
+            start_errno("checkpoint: No such file or directory (os error 2)"),
+            libc::EINVAL
+        );
+        assert_eq!(
+            start_errno("manifest: unrecognized snapshot format"),
+            libc::EINVAL
         );
     }
 
