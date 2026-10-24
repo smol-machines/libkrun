@@ -1184,7 +1184,7 @@ impl Vmm {
             .lock()
             .unwrap()
             .restore_state(checkpoint.vm_state.pit_state());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         self.mmio_device_manager.replay_restored_interrupts();
         Ok(())
     }

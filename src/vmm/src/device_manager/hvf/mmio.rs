@@ -129,16 +129,33 @@ impl MMIODeviceManager {
     /// Capture the runtime state of every snapshot-supporting virtio device
     /// for VM checkpoint/fork. Mirrors the KVM device manager.
     pub fn snapshot_devices(&self) -> VmDevicesState {
+        // Read each transport's status first: restore locks a transport before
+        // its device, so don't take them the other way round.
+        let status_of: Vec<_> = self
+            .mmio_transports
+            .iter()
+            .map(|transport| {
+                let transport = transport.lock().expect("poisoned transport lock");
+                (transport.device(), transport.interrupt_status())
+            })
+            .collect();
         let mut snapshots = Vec::new();
+        let mut interrupt_status = Vec::new();
         for dev in &self.virtio_devices {
             let guard = dev.lock().expect("poisoned virtio device lock");
             if let Some(snap) = snapshot_device(&*guard) {
                 snapshots.push(snap);
+                interrupt_status.push(
+                    status_of
+                        .iter()
+                        .find(|(device, _)| Arc::ptr_eq(device, dev))
+                        .map_or(0, |(_, status)| *status),
+                );
             }
         }
         VmDevicesState {
             devices: snapshots,
-            interrupt_status: Vec::new(),
+            interrupt_status,
         }
     }
 
@@ -319,7 +336,7 @@ impl MMIODeviceManager {
         state: &VmDevicesState,
     ) -> std::result::Result<(), String> {
         let mut used = vec![false; self.mmio_transports.len()];
-        for snap in &state.devices {
+        for (index, snap) in state.devices.iter().enumerate() {
             let want = snap.device_type();
             let queue_states = snap.queue_states();
             let acked = snap.acked_features();
@@ -337,6 +354,9 @@ impl MMIODeviceManager {
                 // the subsequent `activate` rebuilds its worker from that state.
                 restore_device(&mut *t.locked_device(), snap)?;
                 t.restore_and_activate(&queue_states, acked)?;
+                t.set_restored_interrupt_status(
+                    state.interrupt_status.get(index).copied().unwrap_or(0),
+                );
                 // Devices that defer worker startup past `activate` (the console
                 // starts each port's worker only on the guest's PORT_OPEN, which
                 // a restored guest never re-sends) restart their workers here.
@@ -352,6 +372,18 @@ impl MMIODeviceManager {
             }
         }
         Ok(())
+    }
+
+    /// Raise the interrupts restored devices had pending at the checkpoint (see
+    /// [`devices::virtio::MmioTransport::replay_restored_interrupt`]). Call
+    /// after the vCPUs' state is restored.
+    pub fn replay_restored_interrupts(&self) {
+        for transport in &self.mmio_transports {
+            transport
+                .lock()
+                .expect("poisoned transport lock")
+                .replay_restored_interrupt();
+        }
     }
 
     /// Register an already created MMIO device to be used via MMIO transport.
@@ -822,6 +854,40 @@ mod tests {
             device_manager
                 .get_device(DeviceType::Virtio(type_id), &id)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn a_clone_raises_the_interrupt_its_source_had_pending() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mut cmdline = kernel_cmdline::Cmdline::new(4096);
+        let rng_manager = |mem: &GuestMemoryMmap, cmdline: &mut kernel_cmdline::Cmdline| {
+            let mut manager =
+                MMIODeviceManager::new(&mut 0xd000_0000, (arch::IRQ_BASE, arch::IRQ_MAX));
+            let rng = Arc::new(Mutex::new(devices::virtio::Rng::new().unwrap()));
+            manager
+                .register_virtio_device(mem.clone(), rng, cmdline, 0, "rng")
+                .unwrap();
+            manager
+        };
+        let source = rng_manager(&mem, &mut cmdline);
+        {
+            // The guest has not acknowledged a used-queue interrupt yet.
+            let mut transport = source.mmio_transports[0].lock().unwrap();
+            transport.set_restored_interrupt_status(devices::virtio::VIRTIO_MMIO_INT_VRING);
+            transport.replay_restored_interrupt();
+        }
+        let state = source.snapshot_devices();
+
+        let clone = rng_manager(&mem, &mut cmdline);
+        clone.restore_activate_devices(&state).unwrap();
+        clone.replay_restored_interrupts();
+
+        // Without the status bit the clone's guest reads 0 and never looks at
+        // the used ring the checkpoint captured.
+        assert_eq!(
+            clone.mmio_transports[0].lock().unwrap().interrupt_status(),
+            devices::virtio::VIRTIO_MMIO_INT_VRING
         );
     }
 }
