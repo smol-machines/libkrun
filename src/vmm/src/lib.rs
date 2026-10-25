@@ -786,11 +786,15 @@ impl Vmm {
         if self.layered_ram.is_some() {
             return Ok(());
         }
-        snapshot::rebase_guest_memory_private(&self.guest_memory)
-            .map_err(|error| Error::Snapshot(format!("seal guest RAM generation: {error}")))?;
+        let rebase = snapshot::rebase_guest_memory_private(&self.guest_memory);
         // The rebase replaced every file-backed host mapping, including the
         // virtio-fs DAX windows the guest still has page-table entries for.
+        // That holds when it fails after the remap too (the kernel refuses the
+        // write seal while it holds pages by reference): without the replay
+        // the source resumes reading zeros for every file it had mapped, and
+        // every exec into it fails with ENOEXEC.
         self.mmio_device_manager.replay_fs_dax_maps();
+        rebase.map_err(|error| Error::Snapshot(format!("seal guest RAM generation: {error}")))?;
         let base = layered_restore::Generation::from_sealed_memory(&self.guest_memory)
             .map_err(|error| Error::Snapshot(format!("adopt guest RAM generation: {error}")))?;
         self.layered_ram = Some(base);
@@ -1903,25 +1907,42 @@ impl Vmm {
         self.pause()?;
         let checkpoint = (|| {
             self.quiesce_devices()?;
-            #[cfg(all(target_os = "linux", fork_continue_supported, feature = "blk"))]
-            if adopt_layered {
-                self.adopt_layered_ram()?;
-            }
             #[cfg(target_os = "windows")]
             snapshot::flush_guest_memory_backing(&self.guest_memory)
                 .map_err(|error| Error::Snapshot(format!("flush fork RAM: {error}")))?;
             let vcpu_states = self.save_vcpu_states()?;
+            // A vCPU running its own nested guest has KVM holding some of its
+            // pages by reference: sealing refuses with EBUSY and a remap would
+            // leave KVM on the old pages. Leave the source's RAM mappings alone
+            // and give the clones a copy instead.
+            #[cfg(all(target_os = "linux", fork_continue_supported, feature = "blk"))]
+            let nested = vcpu_states.iter().any(|state| state.runs_nested_guest());
+            #[cfg(all(target_os = "linux", fork_continue_supported, feature = "blk"))]
+            if adopt_layered && !nested {
+                self.adopt_layered_ram()?;
+            }
             let vm_state = self.save_vm_state()?;
             let devices = self.snapshot_devices();
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", fork_continue_supported, feature = "blk"))]
+            if !nested && let Some(generation) = self.capture_layered_ram()? {
+                memory = ForkMemory::Layered(generation);
+            }
+            #[cfg(all(
+                target_os = "linux",
+                not(all(fork_continue_supported, feature = "blk"))
+            ))]
             if let Some(generation) = self.capture_layered_ram()? {
                 memory = ForkMemory::Layered(generation);
             }
             // The source stays frozen, so copy its current RAM into a fresh
             // generation right here, as a continuing branch does, and keep the
-            // files open in this process for clones to map.
+            // files open in this process for clones to map. A layered source
+            // running a nested guest needs it too: its memfds hold an older
+            // generation.
             #[cfg(all(target_os = "linux", fork_continue_supported, feature = "blk"))]
-            if needs_materialization && matches!(memory, ForkMemory::Mapped(_)) {
+            if (needs_materialization || (nested && layered))
+                && matches!(memory, ForkMemory::Mapped(_))
+            {
                 let copy = snapshot::start_fork_generation_copy_with_windows(
                     &self.guest_memory,
                     Some(self.device_windows_start()),
@@ -2000,6 +2021,17 @@ impl Vmm {
         self.pause()?;
         let capture = (|| {
             self.quiesce_devices()?;
+            let vcpu_states = self.save_vcpu_states()?;
+            // A vCPU running its own nested guest has KVM holding some of its
+            // pages by reference: the kernel refuses to write-seal their file
+            // (EBUSY), and remapping the source over a generation would leave
+            // KVM writing the old pages. Such a source keeps its mappings
+            // untouched and its RAM is copied into a fresh generation before
+            // it resumes, so the copy is exact without a sealed boundary.
+            let nested = (has_memfd_backing || layered)
+                && vcpu_states.iter().any(|state| state.runs_nested_guest());
+            let adopt_layered = adopt_layered && !nested;
+            let needs_materialization = needs_materialization && !nested;
             if adopt_layered {
                 self.adopt_layered_ram()?;
             }
@@ -2008,14 +2040,31 @@ impl Vmm {
                 && !snapshot::guest_memory_backing_is_immutable(&self.guest_memory)
                     .map_err(|e| Error::Snapshot(format!("inspect added RAM: {e}")))?
             {
-                snapshot::rebase_guest_memory_private(&self.guest_memory)
-                    .map_err(|e| Error::Snapshot(format!("freeze added RAM: {e}")))?;
+                let rebase = snapshot::rebase_guest_memory_private(&self.guest_memory);
                 self.mmio_device_manager.replay_fs_dax_maps();
+                rebase.map_err(|e| Error::Snapshot(format!("freeze added RAM: {e}")))?;
             }
-            let vcpu_states = self.save_vcpu_states()?;
             let vm_state = self.save_vm_state()?;
             let devices = self.snapshot_devices();
-            let layered_generation = self.capture_layered_ram()?;
+            let layered_generation = if nested {
+                None
+            } else {
+                self.capture_layered_ram()?
+            };
+            let nested_copy = if nested {
+                let copy = snapshot::start_fork_generation_copy_with_windows(
+                    &self.guest_memory,
+                    Some(self.device_windows_start()),
+                )
+                .map_err(|error| {
+                    Error::Snapshot(format!("start RAM generation worker: {error}"))
+                })?;
+                Some(copy.finish().map_err(|error| {
+                    Error::Snapshot(format!("finish RAM generation worker: {error}"))
+                })?)
+            } else {
+                None
+            };
             let generation_guardian = if needs_materialization {
                 guardian_socket
                     .map(|path| {
@@ -2054,10 +2103,12 @@ impl Vmm {
                 .pivot_block_devices(&pivot_specs)
                 .map_err(|error| Error::Snapshot(format!("pivot source disks: {error}")))?;
             if !needs_materialization
+                && !nested
                 && !layered
                 && !adopt_layered
                 && let Err(error) = snapshot::rebase_guest_memory_private(&self.guest_memory)
             {
+                self.mmio_device_manager.replay_fs_dax_maps();
                 let rollback = self
                     .mmio_device_manager
                     .rollback_block_pivots(disk_rollback);
@@ -2074,7 +2125,7 @@ impl Vmm {
             // source reads zeros for every file it had mapped — and because its
             // executables come from that share, every exec into the still-running
             // source fails with ENOEXEC until it is restarted.
-            if !needs_materialization {
+            if !needs_materialization && !nested {
                 self.mmio_device_manager.replay_fs_dax_maps();
             }
             Ok((
@@ -2090,21 +2141,28 @@ impl Vmm {
                 generation_guardian,
                 disk_rollback,
                 layered_generation,
+                nested_copy,
             ))
         })();
 
-        let (checkpoint, generation_copy, generation_guardian, disk_rollback, layered_generation) =
-            match capture {
-                Ok(capture) => capture,
-                Err(capture_error) => {
-                    return match self.resume() {
-                        Ok(()) => Err(capture_error),
-                        Err(resume_error) => Err(Error::Snapshot(format!(
-                            "RAM generation capture failed ({capture_error}); source resume failed ({resume_error})"
-                        ))),
-                    };
-                }
-            };
+        let (
+            checkpoint,
+            generation_copy,
+            generation_guardian,
+            disk_rollback,
+            layered_generation,
+            nested_copy,
+        ) = match capture {
+            Ok(capture) => capture,
+            Err(capture_error) => {
+                return match self.resume() {
+                    Ok(()) => Err(capture_error),
+                    Err(resume_error) => Err(Error::Snapshot(format!(
+                        "RAM generation capture failed ({capture_error}); source resume failed ({resume_error})"
+                    ))),
+                };
+            }
+        };
         if let Err(marker_error) = publish_generation_commit_marker(commit_marker) {
             drop(generation_copy);
             drop(generation_guardian);
@@ -2151,7 +2209,9 @@ impl Vmm {
         // pivot by closing the old worker-owned handles.
         drop(disk_rollback);
 
-        let (generation, retained_generation_files) = if let Some(generation) = layered_generation {
+        let (generation, retained_generation_files) = if let Some((descs, files)) = nested_copy {
+            (ForkContinueRamGeneration::Mapped(descs), files)
+        } else if let Some(generation) = layered_generation {
             (ForkContinueRamGeneration::Layered(generation), Vec::new())
         } else if let Some(guardian) = generation_guardian {
             (ForkContinueRamGeneration::Guardian(guardian), Vec::new())
