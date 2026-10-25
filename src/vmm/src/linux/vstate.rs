@@ -3297,8 +3297,46 @@ fn de_fam<T>(inp: &[u8], pos: &mut usize) -> std::result::Result<Vec<T>, String>
     Ok(entries)
 }
 
+/// Whether a `KVM_GET_NESTED_STATE` blob says the vCPU was running its own
+/// (L2) guest, or about to enter one, when it was captured. While it is, the
+/// host's KVM keeps some of the vCPU's guest pages mapped by reference (the
+/// nested guest's virtual-APIC page, posted-interrupt descriptor and
+/// APIC-access page), so the kernel refuses to write-seal the RAM file that
+/// holds them, and remapping that RAM would leave KVM on the old pages. A
+/// guest that only has VMX/SVM enabled holds no such pages.
+#[cfg(target_arch = "x86_64")]
+fn nested_state_in_guest_mode(nested: &[u8]) -> bool {
+    const KVM_STATE_NESTED_GUEST_MODE: u16 = 0x1;
+    const KVM_STATE_NESTED_RUN_PENDING: u16 = 0x2;
+    let Some(flags) = nested.get(..2) else {
+        return false;
+    };
+    let flags = u16::from_ne_bytes([flags[0], flags[1]]);
+    flags & (KVM_STATE_NESTED_GUEST_MODE | KVM_STATE_NESTED_RUN_PENDING) != 0
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn nested_guest_mode_is_read_from_the_state_header() {
+    assert!(!nested_state_in_guest_mode(&[]));
+    // VMXON only: flags 0, format VMX.
+    assert!(!nested_state_in_guest_mode(&[0, 0, 0, 0]));
+    assert!(nested_state_in_guest_mode(&1u16.to_ne_bytes()));
+    assert!(nested_state_in_guest_mode(&2u16.to_ne_bytes()));
+    // KVM_STATE_NESTED_EVMCS alone is not guest mode.
+    assert!(!nested_state_in_guest_mode(&4u16.to_ne_bytes()));
+}
+
 #[cfg(target_arch = "x86_64")]
 impl VcpuState {
+    /// Whether this vCPU was running a nested guest when it was saved; see
+    /// [`nested_state_in_guest_mode`].
+    pub fn runs_nested_guest(&self) -> bool {
+        self.nested_state
+            .as_deref()
+            .is_some_and(nested_state_in_guest_mode)
+    }
+
     /// Serialize the full vCPU register state to a self-describing byte blob.
     pub fn serialize(&self) -> Vec<u8> {
         let mut out = Vec::new();
@@ -3433,6 +3471,11 @@ pub struct VcpuState {
 
 #[cfg(target_arch = "aarch64")]
 impl VcpuState {
+    /// Nested guests are not offered on aarch64.
+    pub fn runs_nested_guest(&self) -> bool {
+        false
+    }
+
     /// vCPU state translated from another hypervisor's checkpoint.
     pub(crate) fn imported(mp_state: u32, regs: Vec<(u64, u128)>) -> VcpuState {
         VcpuState {

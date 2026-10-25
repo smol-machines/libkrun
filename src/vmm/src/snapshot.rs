@@ -1534,10 +1534,12 @@ pub fn cow_clone_guest_memory(parent: &GuestMemoryMmap) -> std::io::Result<Guest
 /// guest writes are private CoW faults and cannot modify the generation that
 /// restored clones map from `/proc/<pid>/fd/<fd>`.
 ///
-/// The VM must be paused and all device workers must be quiesced. Callers must
-/// treat a failure after rebasing begins as non-retryable for that generation;
-/// the source mapping remains valid, but the complete immutable boundary was
-/// not published.
+/// The VM must be paused and all device workers must be quiesced. A failure
+/// after rebasing began leaves the source mapping valid (private, holding its
+/// writes) but the immutable boundary unpublished. Calling this again later
+/// only retries the seals; it never remaps a backing twice. Either way the
+/// caller must replay the virtio-fs DAX windows, because the remap replaced
+/// them.
 #[cfg(target_os = "linux")]
 pub fn rebase_guest_memory_private(parent: &GuestMemoryMmap) -> io::Result<()> {
     struct Backing {
@@ -1587,8 +1589,19 @@ pub fn rebase_guest_memory_private(parent: &GuestMemoryMmap) -> io::Result<()> {
     // Prevent any new writable shared mapping or write(2) before removing the
     // source's existing MAP_SHARED views. Existing mappings remain writable
     // until the MAP_FIXED replacement immediately below.
+    //
+    // A backing that already has the future-write seal went through this
+    // function before and failed after its remap (the kernel refuses the write
+    // seal with EBUSY while it still holds pages by reference). Its mapping is
+    // already the private view and holds every write made since; remapping it
+    // again would silently discard them, so it is only sealed below.
+    let mut remap = Vec::with_capacity(backings.len());
     for backing in &backings {
         let seals = unsafe { libc::fcntl(backing.fd, libc::F_GET_SEALS) };
+        if seals < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        remap.push(seals & (libc::F_SEAL_WRITE | libc::F_SEAL_FUTURE_WRITE) == 0);
         if seals & libc::F_SEAL_WRITE != 0 {
             continue;
         }
@@ -1601,14 +1614,10 @@ pub fn rebase_guest_memory_private(parent: &GuestMemoryMmap) -> io::Result<()> {
         }
     }
 
-    for backing in &backings {
+    for (backing, remap) in backings.iter().zip(remap) {
         // An already sealed backing is an older generation. Its live mapping
         // can contain newer private writes; remapping it would discard them.
-        let seals = unsafe { libc::fcntl(backing.fd, libc::F_GET_SEALS) };
-        if seals < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if seals & libc::F_SEAL_WRITE != 0 {
+        if !remap {
             continue;
         }
         let mapped = unsafe {
@@ -6021,6 +6030,73 @@ mod tests {
         assert_eq!(write_error.raw_os_error(), Some(libc::EPERM));
         let truncate_error = inspect_fd.set_len(PAGE as u64).unwrap_err();
         assert_eq!(truncate_error.raw_os_error(), Some(libc::EPERM));
+    }
+
+    // A page held by reference (vmsplice here; KVM does the same for a vCPU
+    // running a nested guest) makes the kernel refuse the write seal with
+    // EBUSY after the source was already remapped privately. A later attempt
+    // must only retry the seals: remapping again would drop every write the
+    // source made in between.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rebase_after_a_refused_seal_keeps_the_writes_made_since() {
+        if run_with_private_address_space("rebase_after_a_refused_seal_keeps_the_writes_made_since")
+        {
+            return;
+        }
+        use crate::builder::create_guest_ram_memfd;
+        use std::os::unix::fs::FileExt;
+        use vm_memory::FileOffset;
+
+        const PAGE: usize = 4096;
+        let size = 4 * PAGE;
+        let memfd = create_guest_ram_memfd(size).expect("sealable memfd");
+        let inspect_fd = memfd.try_clone().expect("inspection fd");
+        let parent = GuestMemoryMmap::from_ranges_with_files([(
+            GuestAddress(0),
+            size,
+            Some(FileOffset::new(memfd, 0)),
+        )])
+        .expect("memfd-backed parent");
+        parent.write_slice(&[0x11; PAGE], GuestAddress(0)).unwrap();
+
+        let mut pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        let iov = libc::iovec {
+            iov_base: parent.get_host_address(GuestAddress(0)).unwrap().cast(),
+            iov_len: PAGE,
+        };
+        assert_eq!(
+            unsafe { libc::vmsplice(pipe[1], &iov, 1, 0) },
+            PAGE as isize,
+            "vmsplice: {}",
+            io::Error::last_os_error()
+        );
+
+        let refused = rebase_guest_memory_private(&parent).unwrap_err();
+        assert_eq!(refused.raw_os_error(), Some(libc::EBUSY));
+        // The source keeps running on its private view.
+        parent.write_slice(&[0x22; PAGE], GuestAddress(0)).unwrap();
+
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
+        rebase_guest_memory_private(&parent).expect("seal once the page is released");
+
+        let mut bytes = [0_u8; 16];
+        parent.read_slice(&mut bytes, GuestAddress(0)).unwrap();
+        assert_eq!(
+            bytes, [0x22; 16],
+            "the write made between attempts survives"
+        );
+        inspect_fd.read_exact_at(&mut bytes, 0).unwrap();
+        assert_eq!(
+            bytes, [0x11; 16],
+            "the sealed generation is the first remap"
+        );
+        let seals = unsafe { libc::fcntl(inspect_fd.as_raw_fd(), libc::F_GET_SEALS) };
+        assert_ne!(seals & libc::F_SEAL_WRITE, 0);
     }
 
     #[cfg(target_os = "linux")]
