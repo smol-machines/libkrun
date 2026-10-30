@@ -246,11 +246,17 @@ impl FsWorker {
                     virtual_entries,
                 )))
             }
-            None => FsServer::Null(Server::new(AugmentFs::new(
-                NullFs,
-                &inode_alloc,
-                virtual_entries,
-            ))),
+            None => {
+                // Only virtual entries, and nothing restores a counter here:
+                // number them the same way every session so a restored guest's
+                // cached nodeids still name them.
+                let inode_alloc = InodeAllocator::sequential();
+                FsServer::Null(Server::new(AugmentFs::new(
+                    NullFs,
+                    &inode_alloc,
+                    virtual_entries,
+                )))
+            }
         };
         Ok(Arc::new(server))
     }
