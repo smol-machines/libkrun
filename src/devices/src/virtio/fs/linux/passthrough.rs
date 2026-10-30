@@ -3811,4 +3811,79 @@ mod tests {
         drop(b);
         fs::remove_dir_all(root).unwrap();
     }
+
+    // overlayfs keeps a lower file's handle across reboots. A new server must
+    // not give an earlier session's nodeid to a file, so such a handle finds
+    // nothing; a restored server must keep the snapshotted nodeids, including
+    // the small ones of a snapshot taken by an engine that numbered from 2.
+    #[test]
+    fn nodeids_differ_per_session_and_survive_restore() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "libkrun-nodeid-base-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("file"), b"data").unwrap();
+        fs::write(root.join("other"), b"other").unwrap();
+        let server = || {
+            let fs = PassthroughFs::new(
+                Config {
+                    root_dir: root.to_string_lossy().into_owned(),
+                    ..Default::default()
+                },
+                Arc::new(InodeAllocator::new()),
+            )
+            .unwrap();
+            FileSystem::init(&fs, FsOptions::empty()).unwrap();
+            fs
+        };
+        let context = Context {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        };
+        let lookup = |fs: &PassthroughFs, name: &str| {
+            let name = CString::new(name).unwrap();
+            FileSystem::lookup(fs, context, fuse::ROOT_ID, &name).unwrap()
+        };
+
+        let first = server();
+        let before = lookup(&first, "file");
+        assert_eq!(before.generation, 0);
+
+        let next_boot = server();
+        let other = lookup(&next_boot, "other");
+        assert_ne!(other.inode, before.inode);
+        assert!(FileSystem::getattr(&next_boot, context, before.inode, None).is_err());
+
+        let restored = server();
+        restored.restore(&first.snapshot()).unwrap();
+        assert_eq!(lookup(&restored, "file").inode, before.inode);
+        assert!(FileSystem::getattr(&restored, context, before.inode, None).is_ok());
+
+        let old: FuseServerState = serde_json::from_value(serde_json::json!({
+            "inodes": [{
+                "nodeid": 2,
+                "relative_path": "file",
+                "path": root.join("file").to_string_lossy(),
+                "refcount": 1
+            }],
+            "handles": [],
+            "next_inode": 3,
+            "next_handle": 0,
+            "writeback": false,
+            "announce_submounts": false
+        }))
+        .unwrap();
+        let from_old = server();
+        from_old.restore(&old).unwrap();
+        assert_eq!(lookup(&from_old, "file").inode, 2);
+        assert_eq!(lookup(&from_old, "other").inode, 3);
+
+        fs::remove_dir_all(root).unwrap();
+    }
 }
