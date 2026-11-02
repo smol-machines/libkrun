@@ -8,6 +8,8 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
 use vm_memory::mmap::MmapRegion;
 use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestRegionMmap};
 
@@ -860,23 +862,9 @@ impl Instance {
         } else {
             let delta =
                 crate::builder::create_guest_ram_memfd(self.image.len).map_err(io::Error::other)?;
-            let mut buffer = vec![0; 64 * 1024];
             // Folded runs are read through the current mapping, which shows the
             // backing file's bytes for pages the guest never wrote.
-            for &(start, end) in &copy {
-                for offset in (start..end).step_by(buffer.len()) {
-                    let len = (end - offset).min(buffer.len());
-                    self.memory
-                        .read_slice(
-                            &mut buffer[..len],
-                            GuestAddress(self.image.gpa + offset as u64),
-                        )
-                        .map_err(|error| {
-                            io::Error::other(format!("read private RAM: {error:?}"))
-                        })?;
-                    write_nonzero_pages(&delta, &buffer[..len], offset as u64)?;
-                }
-            }
+            copy_into_delta(&self.memory, self.image.gpa, &delta, &copy, COPY_CHUNK)?;
             let seals =
                 libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
             if unsafe { libc::fcntl(delta.as_raw_fd(), libc::F_ADD_SEALS, seals) } < 0 {
@@ -941,27 +929,130 @@ impl Instance {
     }
 }
 
-/// Write the non-zero pages of `bytes` at `offset`. A zero page stays a hole
-/// in the delta, which reads back as zero without holding memory.
-fn write_nonzero_pages(file: &File, bytes: &[u8], offset: u64) -> io::Result<()> {
+/// Whether every byte of `bytes` is zero. Compares 256-byte blocks of whole
+/// words, which the compiler vectorizes; a byte at a time took about 15 times
+/// as long and dominated the capture of a mostly zero region.
+fn is_zero(bytes: &[u8]) -> bool {
+    // SAFETY: u128 has no invalid bit patterns.
+    let (head, words, tail) = unsafe { bytes.align_to::<u128>() };
+    head.iter().all(|byte| *byte == 0)
+        && tail.iter().all(|byte| *byte == 0)
+        && words
+            .chunks(16)
+            .all(|block| block.iter().fold(0, |any, word| any | word) == 0)
+}
+
+/// Bytes of guest RAM one capture worker copies at a time.
+const COPY_CHUNK: usize = 64 << 20;
+
+/// The most threads a capture copies with. A few threads reach the host's
+/// memory bandwidth; more would only take CPU from the host's other VMs while
+/// this one is paused.
+const MAX_COPY_THREADS: usize = 8;
+
+/// Copy the non-zero pages of `ranges` (offsets into the region at `gpa`) into
+/// `delta` at the same offsets, `chunk` bytes at a time across up to
+/// [`MAX_COPY_THREADS`] threads; a zero page stays a hole, which reads back as
+/// zero without holding memory. The source stays paused for the whole copy, so
+/// a branch that had written a few GB waited seconds on one thread. Workers
+/// write through a shared mapping of `delta`: `pwrite` into a memfd holds its
+/// inode lock, so writes from several threads would still run one at a time.
+/// The mapping is gone when this returns, so the caller can seal `delta`.
+fn copy_into_delta(
+    memory: &GuestMemoryMmap,
+    gpa: u64,
+    delta: &File,
+    ranges: &[(usize, usize)],
+    chunk: usize,
+) -> io::Result<()> {
+    let len = usize::try_from(delta.metadata()?.len())
+        .map_err(|_| invalid("RAM delta too large to map"))?;
+    if ranges.iter().any(|&(start, end)| start > end || end > len) {
+        return Err(invalid("RAM capture range outside its delta"));
+    }
+    let source = memory
+        .get_host_address(GuestAddress(gpa))
+        .map_err(|error| io::Error::other(format!("read private RAM: {error:?}")))?
+        as usize;
+    // SAFETY: a new shared mapping of the whole delta, written only by the
+    // workers below and unmapped before this returns.
+    let target = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            delta.as_raw_fd(),
+            0,
+        )
+    };
+    if target == libc::MAP_FAILED {
+        return Err(io::Error::last_os_error());
+    }
+    // A process forked while this writable mapping exists would keep one of
+    // its own, and the kernel refuses the write seal for as long as any such
+    // mapping lives. The VMM forks copy workers and guardians.
+    // SAFETY: the mapping made above.
+    if unsafe { libc::madvise(target, len, libc::MADV_DONTFORK) } < 0 {
+        let error = io::Error::last_os_error();
+        // SAFETY: the mapping made above, not yet shared with any worker.
+        unsafe { libc::munmap(target, len) };
+        return Err(error);
+    }
+    let target = target as usize;
+    let chunks: Vec<(usize, usize)> = ranges
+        .iter()
+        .flat_map(|&(start, end)| {
+            (start..end)
+                .step_by(chunk)
+                .map(move |from| (from, (from + chunk).min(end)))
+        })
+        .collect();
+    let threads = thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(MAX_COPY_THREADS)
+        .min(chunks.len())
+        .max(1);
     let page = host_page_size();
-    let mut run: Option<usize> = None;
-    for start in (0..bytes.len()).step_by(page) {
-        let end = (start + page).min(bytes.len());
-        let zero = bytes[start..end].iter().all(|byte| *byte == 0);
-        match (zero, run) {
-            (false, None) => run = Some(start),
-            (true, Some(first)) => {
-                file.write_all_at(&bytes[first..start], offset + first as u64)?;
-                run = None;
-            }
-            _ => {}
-        }
+    let next = AtomicUsize::new(0);
+    let copied = thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                scope.spawn(|| {
+                    while let Some(&(start, end)) = chunks.get(next.fetch_add(1, Ordering::Relaxed))
+                    {
+                        for offset in (start..end).step_by(page) {
+                            let len = (end - offset).min(page);
+                            // SAFETY: `offset + len` is inside both the guest
+                            // region and the delta, the guest is paused, and
+                            // the chunks are disjoint, so no two workers write
+                            // the same bytes.
+                            unsafe {
+                                let from = (source + offset) as *const u8;
+                                if !is_zero(std::slice::from_raw_parts(from, len)) {
+                                    std::ptr::copy_nonoverlapping(
+                                        from,
+                                        (target + offset) as *mut u8,
+                                        len,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+        workers.into_iter().try_for_each(|worker| {
+            worker
+                .join()
+                .map_err(|_| io::Error::other("RAM capture worker panicked"))
+        })
+    });
+    // SAFETY: the mapping made above; every worker has finished with it.
+    if unsafe { libc::munmap(target as *mut libc::c_void, len) } < 0 {
+        return Err(io::Error::last_os_error());
     }
-    if let Some(first) = run {
-        file.write_all_at(&bytes[first..], offset + first as u64)?;
-    }
-    Ok(())
+    copied
 }
 
 /// When a capture compacts one region of a generation.
@@ -1267,6 +1358,156 @@ fn capture_uses_the_embedder_pagemap_once_the_process_is_not_dumpable() {
     let (_, copied) = generation.capture_quiesced(&memory).unwrap();
     assert_eq!(copied, host_page_size());
     drop(pagemap);
+}
+
+#[test]
+fn a_capture_split_across_threads_copies_every_range_exactly() {
+    use crate::snapshot::MemoryRegionDesc;
+    let page = host_page_size();
+    let size = 64 * page;
+    let file = crate::builder::create_guest_ram_memfd(size).unwrap();
+    let generation = Generation::from_immutable_file(
+        &[MemoryRegionDesc {
+            gpa: 0,
+            len: size as u64,
+        }],
+        &file,
+    )
+    .unwrap();
+    let memory = generation.restore().unwrap();
+    // Every page gets its own byte, except a zero page in each range.
+    for index in 0..64 {
+        let byte = if index % 9 == 4 { 0 } else { index as u8 + 1 };
+        memory
+            .write_slice(&vec![byte; page], GuestAddress((index * page) as u64))
+            .unwrap();
+    }
+    let ranges = [
+        (0, 7 * page),
+        (10 * page, 11 * page),
+        (20 * page, 63 * page),
+    ];
+    let delta = crate::builder::create_guest_ram_memfd(size).unwrap();
+    // Two pages a chunk splits the ranges across many workers.
+    copy_into_delta(&memory, 0, &delta, &ranges, 2 * page).unwrap();
+    let mut got = vec![0; page];
+    for index in 0..64 {
+        delta
+            .read_exact_at(&mut got, (index * page) as u64)
+            .unwrap();
+        let copied = ranges
+            .iter()
+            .any(|&(start, end)| (start..end).contains(&(index * page)));
+        let want = if copied && index % 9 != 4 {
+            index as u8 + 1
+        } else {
+            0
+        };
+        assert!(got.iter().all(|byte| *byte == want), "page {index}");
+    }
+    // The zero pages stay holes, and the delta can be sealed afterwards.
+    let mut data = 0_u64;
+    let mut offset = 0_i64;
+    loop {
+        let start = unsafe { libc::lseek(delta.as_raw_fd(), offset, libc::SEEK_DATA) };
+        if start < 0 {
+            break;
+        }
+        let end = unsafe { libc::lseek(delta.as_raw_fd(), start, libc::SEEK_HOLE) };
+        data += (end - start) as u64;
+        offset = end;
+    }
+    let nonzero = (0..64)
+        .filter(|index| {
+            index % 9 != 4
+                && ranges
+                    .iter()
+                    .any(|&(start, end)| (start..end).contains(&(index * page)))
+        })
+        .count();
+    assert_eq!(data, (nonzero * page) as u64);
+    let seals = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+    assert_eq!(
+        unsafe { libc::fcntl(delta.as_raw_fd(), libc::F_ADD_SEALS, seals) },
+        0
+    );
+}
+
+#[test]
+fn zero_check_sees_one_set_byte_anywhere() {
+    let buffer = vec![0_u8; 4096 + 64];
+    // Unaligned starts and lengths exercise the head, words and tail.
+    for start in 0..17 {
+        for len in [0, 1, 15, 16, 255, 256, 257, 4096] {
+            assert!(is_zero(&buffer[start..start + len]));
+            for set in 0..len {
+                let mut bytes = buffer[start..start + len].to_vec();
+                bytes[set] = 1;
+                assert!(!is_zero(&bytes), "start {start} len {len} byte {set}");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_delta_copied_while_a_child_lives_can_still_be_sealed() {
+    use crate::snapshot::MemoryRegionDesc;
+    let page = host_page_size();
+    let size = 64 << 20;
+    let file = crate::builder::create_guest_ram_memfd(size).unwrap();
+    let generation = Generation::from_immutable_file(
+        &[MemoryRegionDesc {
+            gpa: 0,
+            len: size as u64,
+        }],
+        &file,
+    )
+    .unwrap();
+    let memory = generation.restore().unwrap();
+    memory.write_slice(&vec![7; size], GuestAddress(0)).unwrap();
+    let delta = crate::builder::create_guest_ram_memfd(size).unwrap();
+    // A child forked mid-copy outlives it: one-page chunks keep the 64 MiB
+    // copy running for tens of milliseconds, and the fork lands 2 ms in.
+    let (ready_read, ready_write) = {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        (fds[0], fds[1])
+    };
+    let child = thread::scope(|scope| {
+        let forker = scope.spawn(|| {
+            let mut byte = 0_u8;
+            unsafe { libc::read(ready_read, (&mut byte as *mut u8).cast(), 1) };
+            thread::sleep(std::time::Duration::from_millis(2));
+            let pid = unsafe { libc::syscall(libc::SYS_fork) as libc::pid_t };
+            if pid == 0 {
+                unsafe {
+                    libc::sleep(5);
+                    libc::_exit(0);
+                }
+            }
+            pid
+        });
+        unsafe { libc::write(ready_write, [1_u8].as_ptr().cast(), 1) };
+        copy_into_delta(&memory, 0, &delta, &[(0, size)], page).unwrap();
+        forker.join().unwrap()
+    });
+    let seals = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+    let sealed = unsafe { libc::fcntl(delta.as_raw_fd(), libc::F_ADD_SEALS, seals) };
+    unsafe {
+        libc::kill(child, libc::SIGKILL);
+        libc::waitpid(child, std::ptr::null_mut(), 0);
+        libc::close(ready_read);
+        libc::close(ready_write);
+    }
+    assert_eq!(sealed, 0, "{}", io::Error::last_os_error());
+}
+
+#[test]
+fn a_capture_range_past_the_delta_is_refused() {
+    let page = host_page_size();
+    let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4 * page)]).unwrap();
+    let delta = crate::builder::create_guest_ram_memfd(2 * page).unwrap();
+    assert!(copy_into_delta(&memory, 0, &delta, &[(page, 3 * page)], page).is_err());
 }
 
 #[test]
@@ -3039,5 +3280,39 @@ fn sealed_memfd_source_adopts_its_files_without_copying() {
             .read_obj::<u8>(GuestAddress(page as u64))
             .unwrap(),
         0x33
+    );
+}
+
+#[test]
+#[ignore = "timing only: run explicitly to compare capture speed"]
+fn capture_timing_bench() {
+    use crate::snapshot::MemoryRegionDesc;
+    let gib = 4_usize;
+    let size = gib << 30;
+    let page = host_page_size();
+    let file = crate::builder::create_guest_ram_memfd(size).unwrap();
+    let base = Generation::from_immutable_file(
+        &[MemoryRegionDesc {
+            gpa: 0,
+            len: size as u64,
+        }],
+        &file,
+    )
+    .unwrap();
+    let memory = base.restore().unwrap();
+    // A branch that wrote every page: half data, half zero (freed guest memory).
+    let data = vec![0x5a_u8; page];
+    let zero = vec![0_u8; page];
+    for index in 0..size / page {
+        let bytes = if index % 2 == 0 { &data } else { &zero };
+        memory
+            .write_slice(bytes, GuestAddress((index * page) as u64))
+            .unwrap();
+    }
+    let started = std::time::Instant::now();
+    let (_next, copied) = base.capture_quiesced(&memory).unwrap();
+    eprintln!(
+        "CAPTURE {gib} GiB written, {copied} bytes copied in {:.3} s",
+        started.elapsed().as_secs_f64()
     );
 }
