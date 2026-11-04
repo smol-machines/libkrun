@@ -266,8 +266,14 @@ pub enum Error {
     /// Failed to set KVM vcpu msrs.
     VcpuSetMsrs(kvm_ioctls::Error),
     #[cfg(target_arch = "x86_64")]
-    /// KVM accepted only a prefix of the checkpoint's MSR state.
-    VcpuSetMsrsIncomplete { expected: usize, actual: usize },
+    /// KVM accepted only a prefix of the checkpoint's MSR state; `index` and
+    /// `data` are the MSR it stopped at.
+    VcpuSetMsrsIncomplete {
+        expected: usize,
+        actual: usize,
+        index: u32,
+        data: u64,
+    },
     #[cfg(target_arch = "x86_64")]
     /// Failed to set KVM vcpu regs.
     VcpuSetRegs(kvm_ioctls::Error),
@@ -479,9 +485,14 @@ impl Display for Error {
             #[cfg(target_arch = "x86_64")]
             VcpuSetMsrs(e) => write!(f, "Failed to set KVM vcpu msrs: {e}"),
             #[cfg(target_arch = "x86_64")]
-            VcpuSetMsrsIncomplete { expected, actual } => write!(
+            VcpuSetMsrsIncomplete {
+                expected,
+                actual,
+                index,
+                data,
+            } => write!(
                 f,
-                "KVM restored only {actual} of {expected} checkpoint MSRs"
+                "KVM restored only {actual} of {expected} checkpoint MSRs: it refused MSR {index:#x} = {data:#x}"
             ),
             #[cfg(target_arch = "x86_64")]
             VcpuSetRegs(e) => write!(f, "Failed to set KVM vcpu regs: {e}"),
@@ -2648,9 +2659,14 @@ impl Vcpu {
         let expected_msrs = state.msrs.as_slice().len();
         let restored_msrs = self.fd.set_msrs(&state.msrs).map_err(Error::VcpuSetMsrs)?;
         if restored_msrs != expected_msrs {
+            // KVM_SET_MSRS stops at the first entry it refuses; name it, since
+            // which MSR and what value is the whole diagnosis.
+            let refused = state.msrs.as_slice().get(restored_msrs);
             return Err(Error::VcpuSetMsrsIncomplete {
                 expected: expected_msrs,
                 actual: restored_msrs,
+                index: refused.map_or(0, |entry| entry.index),
+                data: refused.map_or(0, |entry| entry.data),
             });
         }
         // SET_MSRS includes IA32_TSC and therefore changes KVM's offset. Apply
