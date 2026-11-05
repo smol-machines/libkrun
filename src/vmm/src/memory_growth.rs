@@ -1,5 +1,6 @@
 //! RAM growth with checkpointed boot layout and device state.
 
+use devices::virtio::VirtioDevice;
 use std::sync::Arc;
 use vm_memory::{FileOffset, GuestAddress, GuestRegionMmap};
 
@@ -112,8 +113,11 @@ impl Vmm {
             .map_err(|_| "RAM device lock poisoned")?;
         let (base, mapped, capacity) = device.geometry();
         let plugged = device.plugged_size();
+        // Whether the guest driver took the device. It never does when its probe
+        // failed, and then no RAM added here can reach the guest.
+        let driver = u8::from(device.is_activated());
         Ok(format!(
-            "OK boot_mib {boot} base {base} mapped {mapped} plugged {plugged} capacity {capacity}\n"
+            "OK boot_mib {boot} base {base} mapped {mapped} plugged {plugged} capacity {capacity} driver {driver}\n"
         ))
     }
 }

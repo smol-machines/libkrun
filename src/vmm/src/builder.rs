@@ -100,6 +100,8 @@ use flate2::read::GzDecoder;
 use krun_display::DisplayBackend;
 #[cfg(feature = "gpu")]
 use krun_display::IntoDisplayBackend;
+#[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+use kvm_bindings::CpuId;
 #[cfg(feature = "amd-sev")]
 use kvm_bindings::KVM_MAX_CPUID_ENTRIES;
 #[cfg(unix)]
@@ -1521,8 +1523,16 @@ pub fn build_microvm(
                 .ok_or_else(|| {
                     StartMicrovmError::GuestMemoryMmap("RAM aperture overflow".into())
                 })?;
-            devices::virtio::memory::MemoryState::new(base, 64u64 << 30, 2 << 20)
-                .map_err(StartMicrovmError::GuestMemoryMmap)?
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            let limit = guest_phys_limit(vmm.vm.supported_cpuid());
+            #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+            let limit = None;
+            devices::virtio::memory::MemoryState::new(
+                base,
+                memory_growth_region_size(base, limit, alignment),
+                2 << 20,
+            )
+            .map_err(StartMicrovmError::GuestMemoryMmap)?
         };
         let device = Arc::new(Mutex::new(
             devices::virtio::memory::MemoryDevice::new(state)
@@ -3893,6 +3903,38 @@ fn attach_unixsock_vsock_device(
     Ok(())
 }
 
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    not(feature = "tee")
+))]
+/// The RAM growth region: 64 GiB above boot RAM, cut down to end below `limit`
+/// in whole `alignment` units. Zero when no unit fits, which `MemoryState::new`
+/// refuses: the machine fails to start rather than boot a device its guest
+/// cannot take.
+fn memory_growth_region_size(base: u64, limit: Option<u64>, alignment: u64) -> u64 {
+    let size = 64u64 << 30;
+    match limit {
+        Some(limit) => size.min(limit.saturating_sub(base) & !(alignment - 1)),
+        None => size,
+    }
+}
+
+/// The end of the guest's physical address space. An x86 guest takes its
+/// width from CPUID leaf 0x8000_0008, which KVM passes through from the host,
+/// and refuses to reserve a device region past it: virtio-mem then fails its
+/// probe with EBUSY. Nested and older hosts often report only 36 bits (64 GiB).
+#[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+fn guest_phys_limit(cpuid: &CpuId) -> Option<u64> {
+    cpuid
+        .as_slice()
+        .iter()
+        .find(|entry| entry.function == 0x8000_0008)
+        .map(|entry| entry.eax & 0xff)
+        .filter(|bits| (32..64).contains(bits))
+        .map(|bits| 1u64 << bits)
+}
+
 #[cfg(not(feature = "tee"))]
 fn attach_balloon_device(
     vmm: &mut Vmm,
@@ -4273,5 +4315,56 @@ pub mod tests {
     fn test_kernel_cmdline_err_to_startuvm_err() {
         let err = StartMicrovmError::from(kernel::cmdline::Error::HasSpace);
         let _ = format!("{err}{err:?}");
+    }
+
+    #[cfg(all(
+        any(target_os = "linux", target_os = "macos"),
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        not(feature = "tee")
+    ))]
+    #[test]
+    fn memory_growth_region_ends_below_the_guest_address_limit() {
+        const GIB: u64 = 1 << 30;
+        let unit = 128 << 20;
+        // A 4 GiB x86 guest's region starts at 5.5 GiB, as in issue 2060.
+        let base = 0x1_6000_0000;
+        assert_eq!(memory_growth_region_size(base, None, unit), 64 * GIB);
+        assert_eq!(
+            memory_growth_region_size(base, Some(1 << 48), unit),
+            64 * GIB
+        );
+        // 36 address bits end at 64 GiB.
+        let cut = memory_growth_region_size(base, Some(1 << 36), unit);
+        assert_eq!(base + cut, 64 * GIB);
+        // Whole units only: one fits, then none.
+        assert_eq!(
+            memory_growth_region_size(64 * GIB - unit, Some(64 * GIB + unit - 1), unit),
+            unit
+        );
+        assert_eq!(memory_growth_region_size(64 * GIB, Some(64 * GIB), unit), 0);
+        assert_eq!(memory_growth_region_size(80 * GIB, Some(64 * GIB), unit), 0);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    #[test]
+    fn guest_phys_limit_reads_the_address_width_leaf() {
+        let entry = |function: u32, eax: u32| kvm_bindings::kvm_cpuid_entry2 {
+            function,
+            eax,
+            ..Default::default()
+        };
+        let cpuid =
+            |entries: &[kvm_bindings::kvm_cpuid_entry2]| CpuId::from_entries(entries).unwrap();
+        // Bits 7:0 are the physical width; 15:8 the linear width.
+        assert_eq!(
+            guest_phys_limit(&cpuid(&[entry(0, 0), entry(0x8000_0008, 0x3024)])),
+            Some(1 << 36)
+        );
+        assert_eq!(
+            guest_phys_limit(&cpuid(&[entry(0x8000_0008, 0x3030)])),
+            Some(1 << 48)
+        );
+        assert_eq!(guest_phys_limit(&cpuid(&[entry(0, 0)])), None);
+        assert_eq!(guest_phys_limit(&cpuid(&[entry(0x8000_0008, 0)])), None);
     }
 }
