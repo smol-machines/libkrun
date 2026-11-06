@@ -98,6 +98,9 @@ jobs:
 
   integration-tests-aarch64:
     name: Integration Tests (Linux aarch64)
+    # Needs a KVM-capable aarch64 runner, which GitHub does not host. Runs
+    # only once one is registered and LIBKRUN_SELF_HOSTED_ARM is set to true.
+    if: vars.LIBKRUN_SELF_HOSTED_ARM == 'true'
     runs-on: self-hosted
     env:
       KRUN_TEST_FREEBSD: '0'
