@@ -90,15 +90,25 @@ int32_t krun_set_vm_config(uint32_t ctx_id, uint8_t num_vcpus, uint32_t ram_mib)
  */
 int32_t krun_set_live_resize(uint32_t ctx_id, uint32_t flags);
 
-/* Stable Intel CPU baseline used by migratable live checkpoints. */
-#define KRUN_CPU_TEMPLATE_PORTABLE_V1 1
+/* libkrun's portable Intel CPU profile, used by migratable live checkpoints. */
+#define KRUN_CPU_TEMPLATE_PORTABLE 1
+/* Former name of KRUN_CPU_TEMPLATE_PORTABLE; the same profile. */
+#define KRUN_CPU_TEMPLATE_PORTABLE_V1 KRUN_CPU_TEMPLATE_PORTABLE
 
 /**
  * Selects a stable virtual CPU feature contract before the VM starts.
  *
- * This currently supports KRUN_CPU_TEMPLATE_PORTABLE_V1 on Linux/x86_64.
- * The profile removes host-generation-specific extended CPU state so a live
- * checkpoint can be restored on another compatible Intel KVM host.
+ * This currently supports KRUN_CPU_TEMPLATE_PORTABLE on Linux/x86_64 Intel
+ * hosts (-ENOTSUP elsewhere). The guest sees only features that add no XSAVE
+ * state beyond x87/SSE/AVX and that are not specific to one Intel host
+ * generation, so a live checkpoint can be restored on another Intel KVM host.
+ * It includes SHA, ADX, RDSEED, CLFLUSHOPT, CLWB and RDPID when the host has
+ * them, and hides AVX-512, AMX, PKU, MPX, PT, SGX and TSX.
+ *
+ * A checkpoint keeps the CPUID its guest booted with. Restore refuses a host
+ * whose KVM lacks an instruction set the guest was given (SHA, AVX2, AES, ...)
+ * or an XSAVE component its XCR0 enabled, naming what is missing; speculation
+ * controls and other microcode- or kernel-dependent bits never refuse it.
  */
 int32_t krun_set_cpu_template(uint32_t ctx_id, uint32_t cpu_template);
 

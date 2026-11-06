@@ -460,6 +460,9 @@ pub struct Vmm {
     mac_cpu_error: Option<String>,
     #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
     prototype_cpu_topology: Option<vstate::VcpuConfig>,
+    /// CPUID of the vCPUs a checkpoint restored, which CPUs added later copy.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    restored_cpuid: Option<kvm_bindings::CpuId>,
     #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
     cpu_growth_progress: cpu_growth::CpuGrowthProgress,
     #[cfg(all(
@@ -610,6 +613,7 @@ fn paused_vm_with_failed_ram_mapping_cannot_capture_or_rearm() {
         prototype_memory: None,
         memory_growth_topology: None,
         prototype_cpu_topology: None,
+        restored_cpuid: None,
         cpu_growth_progress: cpu_growth::CpuGrowthProgress::default(),
         demand_pager: None,
         layered_ram: None,
@@ -854,6 +858,14 @@ impl Vmm {
                 "checkpoint CPU count or growth topology differs from this VM; restore into a machine configured for that checkpoint".into(),
             ));
         }
+        // Restore installs the CPUID recorded in the checkpoint, so a guest
+        // booted on a host with more features must not land on one without.
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        for state in &checkpoint.vcpu_states {
+            state
+                .check_host_support(self.vm.supported_cpuid())
+                .map_err(Error::VcpuSnapshot)?;
+        }
         #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
         self.cpu_growth_progress
             .check()
@@ -970,8 +982,12 @@ impl Vmm {
                     .map_err(|error| error.to_string())?,
             )
             .map_err(|error| error.to_string())?;
-            vcpu.configure_hot_added_x86_64(&self.guest_memory, &config)
-                .map_err(|error| error.to_string())?;
+            vcpu.configure_hot_added_x86_64(
+                &self.guest_memory,
+                &config,
+                self.restored_cpuid.as_ref(),
+            )
+            .map_err(|error| error.to_string())?;
             vcpu.set_mmio_bus(self.mmio_device_manager.bus.clone());
             let handle = vcpu.start_threaded().map_err(|error| error.to_string())?;
             self.vcpus_handles.push(handle);
@@ -1417,6 +1433,10 @@ impl Vmm {
                 states.len(),
                 self.vcpus_handles.len()
             )));
+        }
+        #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+        {
+            self.restored_cpuid = states.first().map(|state| state.cpuid().clone());
         }
         for (handle, state) in self.vcpus_handles.iter().zip(states) {
             handle

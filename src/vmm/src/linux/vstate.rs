@@ -49,7 +49,7 @@ use kbs_types::Tee;
 use crate::resources::TeeConfig;
 use crate::vmm_config::machine_config::CpuFeaturesTemplate;
 #[cfg(target_arch = "x86_64")]
-use cpuid::{VmSpec, c3, filter_cpuid, t2};
+use cpuid::{VmSpec, c3, compat, filter_cpuid, intel_portable, t2};
 #[cfg(not(feature = "tee"))]
 use kvm_bindings::kvm_userspace_memory_region;
 #[cfg(target_arch = "x86_64")]
@@ -1419,7 +1419,7 @@ fn advance_tsc(source_tsc: u64, guest_delta_ns: i128, khz: u32) -> u64 {
 
 #[cfg(target_arch = "x86_64")]
 fn portable_msr_should_serialize(index: u32) -> bool {
-    // PortableV1 masks MPX and Debug Store/LBR in CPUID. Their corresponding
+    // The portable profile masks MPX and Debug Store/LBR in CPUID. Their corresponding
     // MSRs are nevertheless present in KVM_GET_MSR_INDEX_LIST on some bare
     // metal hosts and absent from nested or newer KVM implementations. They
     // are not guest-visible under this CPU contract and must not leak into the
@@ -2358,16 +2358,15 @@ impl Vcpu {
                 CpuFeaturesTemplate::C3 => {
                     c3::set_cpuid_entries(&mut self.cpuid, &cpuid_vm_spec).map_err(Error::CpuId)?
                 }
-                // The existing T2 mask is a conservative Haswell-era Intel
-                // contract: it removes host-specific extended state (MPX,
-                // AVX-512, PKU, and XSAVE extensions) that cannot safely cross
-                // CPU generations in a live checkpoint while retaining the
-                // broadly available AVX2 baseline.
-                CpuFeaturesTemplate::PortableV1 => {
-                    t2::set_cpuid_entries(&mut self.cpuid, &cpuid_vm_spec).map_err(Error::CpuId)?
+                // libkrun's own baseline: no feature that adds XSAVE state
+                // or exists only on some Intel hosts, so a live checkpoint
+                // can cross hosts. See `cpuid::intel_portable`.
+                CpuFeaturesTemplate::Portable => {
+                    intel_portable::set_cpuid_entries(&mut self.cpuid, &cpuid_vm_spec)
+                        .map_err(Error::CpuId)?
                 }
             }
-            self.portable_cpu = template == CpuFeaturesTemplate::PortableV1;
+            self.portable_cpu = template == CpuFeaturesTemplate::Portable;
         }
 
         self.fd
@@ -2387,13 +2386,26 @@ impl Vcpu {
     }
 
     /// Initialize a secondary CPU without rewriting the running guest's boot tables.
+    ///
+    /// `restored_profile` is the CPUID of a vCPU restored from a checkpoint,
+    /// if the guest was restored: the new vCPU then offers the features the
+    /// guest booted with, not the ones this libkrun's profile would pick.
     #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
     pub fn configure_hot_added_x86_64(
         &mut self,
         guest_mem: &GuestMemoryMmap,
         config: &VcpuConfig,
+        restored_profile: Option<&CpuId>,
     ) -> Result<()> {
         self.configure_x86_64(guest_mem, GuestAddress(0), config, false, false)?;
+        if let Some(profile) = restored_profile {
+            compat::adopt_feature_leaves(&mut self.cpuid, profile)
+                .map_err(|error| Error::CpuId(cpuid::Error::FamError(error)))?;
+            // KVM accepts a new CPUID until the vCPU first runs.
+            self.fd
+                .set_cpuid2(&self.cpuid)
+                .map_err(Error::VcpuSetCpuid)?;
+        }
         arch::x86_64::msr::setup_msrs(&self.fd).map_err(Error::MSRSConfiguration)?;
         arch::x86_64::regs::setup_fpu(&self.fd).map_err(Error::FPUConfiguration)?;
         arch::x86_64::interrupts::set_lint(&self.fd).map_err(Error::LocalIntConfiguration)?;
@@ -3345,12 +3357,45 @@ fn nested_guest_mode_is_read_from_the_state_header() {
 
 #[cfg(target_arch = "x86_64")]
 impl VcpuState {
+    /// The CPUID the guest on this vCPU was given.
+    pub fn cpuid(&self) -> &CpuId {
+        &self.cpuid
+    }
+
     /// Whether this vCPU was running a nested guest when it was saved; see
     /// [`nested_state_in_guest_mode`].
     pub fn runs_nested_guest(&self) -> bool {
         self.nested_state
             .as_deref()
             .is_some_and(nested_state_in_guest_mode)
+    }
+
+    /// Refuse a host whose KVM lacks an instruction set this vCPU's guest was
+    /// given, or an XSAVE component its XCR0 enabled. Restore installs the
+    /// recorded CPUID, not this host's profile, and `KVM_SET_CPUID2` accepts
+    /// feature bits the host lacks; the guest would only find out when an
+    /// instruction faults. Microcode- and kernel-dependent bits are not
+    /// compared (see `cpuid::compat::missing_features`).
+    pub fn check_host_support(&self, supported: &CpuId) -> std::result::Result<(), String> {
+        let missing = compat::missing_features(&self.cpuid, supported);
+        let xcr0 = self.xcrs.xcrs[..(self.xcrs.nr_xcrs as usize).min(self.xcrs.xcrs.len())]
+            .iter()
+            .find(|xcr| xcr.xcr == 0)
+            .map_or(0, |xcr| xcr.value);
+        let missing_state = compat::missing_xcr0(xcr0, supported);
+        if missing.is_empty() && missing_state == 0 {
+            return Ok(());
+        }
+        let mut lacking: Vec<String> = missing.iter().map(ToString::to_string).collect();
+        if missing_state != 0 {
+            lacking.push(format!(
+                "XSAVE state components {missing_state:#x} enabled in XCR0"
+            ));
+        }
+        Err(format!(
+            "this host's CPU lacks features the checkpoint's guest was given: {}; restore it on a host that has them",
+            lacking.join(", ")
+        ))
     }
 
     /// Serialize the full vCPU register state to a self-describing byte blob.
@@ -3821,8 +3866,8 @@ mod tests {
                 .is_ok()
         );
 
-        // PortableV1 must select the state contract used by checkpoint capture.
-        vcpu_config.cpu_template = Some(CpuFeaturesTemplate::PortableV1);
+        // The portable profile must select the state contract used by checkpoint capture.
+        vcpu_config.cpu_template = Some(CpuFeaturesTemplate::Portable);
         assert!(
             vcpu.configure_x86_64(&vm_mem, GuestAddress(0), &vcpu_config, true, false)
                 .is_ok()
@@ -4012,6 +4057,213 @@ mod tests {
         assert_eq!(brand_word(&installed), expected_brand);
         let resaved = vcpu.save_state().expect("checkpoint restored CPU profile");
         assert_eq!(brand_word(&resaved.cpuid), expected_brand);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn portable_vcpu_config() -> VcpuConfig {
+        VcpuConfig {
+            vcpu_count: 2,
+            ht_enabled: false,
+            cpu_template: Some(CpuFeaturesTemplate::Portable),
+            nested_enabled: false,
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn leaf(cpuid: &CpuId, function: u32, index: u32) -> kvm_bindings::kvm_cpuid_entry2 {
+        *cpuid
+            .as_slice()
+            .iter()
+            .find(|e| e.function == function && e.index == index)
+            .unwrap()
+    }
+
+    // A vCPU booted on this host, under either profile, asks nothing of the
+    // host it lacks: restore on the same host must never be refused.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a_checkpoint_restores_on_the_host_that_took_it() {
+        for template in [None, Some(CpuFeaturesTemplate::Portable)] {
+            let (vm, mut vcpu, mem) = setup_vcpu(0x10000);
+            let config = VcpuConfig {
+                cpu_template: template,
+                ..portable_vcpu_config()
+            };
+            vcpu.configure_x86_64(&mem, GuestAddress(0), &config, true, false)
+                .unwrap();
+            let state = vcpu.save_state().unwrap();
+            assert_eq!(
+                state.check_host_support(vm.supported_cpuid()),
+                Ok(()),
+                "{template:?}"
+            );
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a_checkpoint_needing_a_feature_this_host_lacks_is_refused() {
+        let (vm, mut vcpu, mem) = setup_vcpu(0x10000);
+        vcpu.configure_x86_64(&mem, GuestAddress(0), &portable_vcpu_config(), true, false)
+            .unwrap();
+        let mut state = vcpu.save_state().unwrap();
+        let host = leaf(vm.supported_cpuid(), 7, 0).ebx;
+        // An instruction restore requires that this host lacks: SHA on hosts
+        // without SHA-NI (this profile's older Intel parts).
+        let lacking = cpuid::intel_portable::required::LEAF7_0_EBX & !host;
+        if lacking != 0 {
+            let bit = if lacking & (1 << 29) != 0 {
+                29
+            } else {
+                lacking.trailing_zeros()
+            };
+            for entry in state.cpuid.as_mut_slice() {
+                if entry.function == 7 && entry.index == 0 {
+                    entry.ebx |= 1 << bit;
+                }
+            }
+            let error = state.check_host_support(vm.supported_cpuid()).unwrap_err();
+            assert!(
+                error.contains(&format!("EBX[{bit}]")),
+                "unexpected refusal: {error}"
+            );
+            if bit == 29 {
+                assert!(error.contains("sha_ni"), "{error}");
+            }
+        }
+
+        // Bits restore does not require never refuse it, even ones no host
+        // reports (MD_CLEAR-style controls, AMX_TILE, a reserved bit).
+        let mut state = vcpu.save_state().unwrap();
+        for entry in state.cpuid.as_mut_slice() {
+            if entry.function == 7 && entry.index == 0 {
+                entry.ebx |= 1 << 22;
+                entry.edx |= (1 << 10) | (1 << 24);
+            }
+        }
+        assert_eq!(state.check_host_support(vm.supported_cpuid()), Ok(()));
+
+        // State the guest enabled in XCR0 is checked as well (bit 63 is
+        // reserved on every CPU).
+        let mut state = vcpu.save_state().unwrap();
+        state.xcrs.xcrs[0].value |= 1 << 63;
+        let error = state.check_host_support(vm.supported_cpuid()).unwrap_err();
+        assert!(error.contains("XCR0"), "{error}");
+    }
+
+    // The profile as the guest itself reads it: run CPUID inside the VM.
+    // Where the host has SHA, also execute SHA256RNDS2 in the guest: a #UD
+    // there would never reach the port write below.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_guest_reads_the_portable_profile_through_cpuid() {
+        use kvm_bindings::KVM_MP_STATE_RUNNABLE;
+        use vm_memory::Bytes;
+
+        let (vm, mut vcpu, mem) = setup_vcpu(0x10000);
+        vcpu.configure_x86_64(&mem, GuestAddress(0), &portable_vcpu_config(), false, false)
+            .unwrap();
+        let host = leaf(vm.supported_cpuid(), 7, 0);
+        let host_sha = host.ebx & (1 << 29) != 0;
+
+        let mut code = vec![
+            0x66, 0xb8, 0x07, 0x00, 0x00, 0x00, // mov eax, 7
+            0x66, 0x31, 0xc9, // xor ecx, ecx
+            0x0f, 0xa2, // cpuid
+            0x66, 0x89, 0x1e, 0x00, 0x20, // mov [0x2000], ebx
+            0x66, 0x89, 0x0e, 0x04, 0x20, // mov [0x2004], ecx
+        ];
+        if host_sha {
+            code.extend([0x0f, 0x38, 0xcb, 0xca]); // sha256rnds2 xmm1, xmm2
+        }
+        // The in-kernel LAPIC would absorb a HLT, so leave through a port write.
+        code.extend([0xe6, 0x80]); // out 0x80, al
+        mem.write_slice(&code, GuestAddress(0)).unwrap();
+
+        let mut sregs = vcpu.fd.get_sregs().unwrap();
+        sregs.cs.base = 0;
+        sregs.cs.selector = 0;
+        sregs.ds.base = 0;
+        sregs.ds.selector = 0;
+        sregs.cr0 &= !((1 << 2) | (1 << 3)); // EM, TS: SSE usable
+        sregs.cr4 |= 1 << 9; // OSFXSR
+        vcpu.fd.set_sregs(&sregs).unwrap();
+        vcpu.fd
+            .set_regs(&kvm_regs {
+                rip: 0,
+                rflags: 2,
+                ..Default::default()
+            })
+            .unwrap();
+        // The test vCPU is an AP, which would otherwise wait for INIT/SIPI.
+        vcpu.fd
+            .set_mp_state(kvm_mp_state {
+                mp_state: KVM_MP_STATE_RUNNABLE,
+            })
+            .unwrap();
+        assert!(matches!(vcpu.fd.run().unwrap(), VcpuExit::IoOut(0x80, _)));
+
+        let guest_ebx: u32 = mem.read_obj(GuestAddress(0x2000)).unwrap();
+        let guest_ecx: u32 = mem.read_obj(GuestAddress(0x2004)).unwrap();
+        assert_eq!(guest_ebx, host.ebx & intel_portable::LEAF7_0_EBX);
+        assert_eq!(guest_ecx, host.ecx & intel_portable::LEAF7_0_ECX);
+        // SHA, ADX, RDSEED, CLFLUSHOPT, CLWB and RDPID reach the guest
+        // whenever the host has them; the T2 mask used to hide all six.
+        let stateless_ebx = (1 << 29) | (1 << 19) | (1 << 18) | (1 << 23) | (1 << 24);
+        assert_eq!(guest_ebx & stateless_ebx, host.ebx & stateless_ebx);
+        assert_eq!(guest_ecx & (1 << 22), host.ecx & (1 << 22));
+        assert_eq!(guest_ebx & (1 << 29) != 0, host_sha);
+        // Nothing with extra state: no AVX-512F, no PKU.
+        assert_eq!(guest_ebx & (1 << 16), 0);
+        assert_eq!(guest_ecx & (1 << 3), 0);
+        eprintln!(
+            "host leaf 7 EBX {:#010x} ECX {:#010x}; guest EBX {guest_ebx:#010x} ECX {guest_ecx:#010x}; sha in guest: {}",
+            host.ebx,
+            host.ecx,
+            guest_ebx & (1 << 29) != 0
+        );
+    }
+
+    // A CPU added to a restored guest offers what the guest booted with,
+    // not what this libkrun's profile would offer today.
+    #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+    #[test]
+    fn a_cpu_added_after_restore_matches_the_restored_cpus() {
+        let (vm, mut boot, mem) = setup_vcpu(0x10000);
+        boot.configure_x86_64(&mem, GuestAddress(0), &portable_vcpu_config(), true, false)
+            .unwrap();
+        // The restored profile: today's minus a feature the host does have,
+        // as a checkpoint taken under an older, narrower mask would be.
+        let mut restored = boot.save_state().unwrap().cpuid;
+        let dropped = leaf(&restored, 7, 0).ebx & intel_portable::LEAF7_0_EBX;
+        assert_ne!(dropped, 0, "host shows none of the leaf 7 baseline");
+        let dropped = 1 << dropped.trailing_zeros();
+        for entry in restored.as_mut_slice() {
+            if entry.function == 7 && entry.index == 0 {
+                entry.ebx &= !dropped;
+            }
+        }
+
+        let exit_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap();
+        // setup_vcpu's vCPU took id 1; the added one is id 0.
+        let mut added = Vcpu::new_x86_64(
+            0,
+            vm.fd(),
+            vm.supported_cpuid().clone(),
+            vm.supported_msrs().clone(),
+            devices::Bus::new(),
+            exit_evt,
+        )
+        .unwrap();
+        added
+            .configure_hot_added_x86_64(&mem, &portable_vcpu_config(), Some(&restored))
+            .unwrap();
+        let installed = added.fd.get_cpuid2(KVM_MAX_CPUID_ENTRIES).unwrap();
+        assert_eq!(leaf(&installed, 7, 0).ebx, leaf(&restored, 7, 0).ebx);
+        assert_eq!(leaf(&installed, 0xd, 0).eax, leaf(&restored, 0xd, 0).eax);
+        assert_eq!(leaf(&restored, 1, 0).ebx >> 24, 1);
+        assert_eq!(leaf(&installed, 1, 0).ebx >> 24, 0, "its own APIC ID");
+        assert!(added.portable_cpu, "still captured as a portable vCPU");
     }
 
     #[cfg(target_arch = "x86_64")]

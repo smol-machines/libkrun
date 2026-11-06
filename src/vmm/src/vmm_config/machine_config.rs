@@ -78,8 +78,9 @@ impl fmt::Display for VmConfig {
 pub enum CpuFeaturesTemplate {
     /// C3 Template.
     C3,
-    /// Stable Intel feature baseline for portable live checkpoints.
-    PortableV1,
+    /// libkrun's one portable Intel profile for live checkpoints that move
+    /// between hosts; see `cpuid::intel_portable` for its baseline.
+    Portable,
     /// T2 Template.
     T2,
 }
@@ -88,7 +89,7 @@ impl fmt::Display for CpuFeaturesTemplate {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             CpuFeaturesTemplate::C3 => write!(f, "C3"),
-            CpuFeaturesTemplate::PortableV1 => write!(f, "PortableV1"),
+            CpuFeaturesTemplate::Portable => write!(f, "Portable"),
             CpuFeaturesTemplate::T2 => write!(f, "T2"),
         }
     }
@@ -103,8 +104,8 @@ mod tests {
         assert_eq!(CpuFeaturesTemplate::C3.to_string(), "C3".to_string());
         assert_eq!(CpuFeaturesTemplate::T2.to_string(), "T2".to_string());
         assert_eq!(
-            CpuFeaturesTemplate::PortableV1.to_string(),
-            "PortableV1".to_string()
+            CpuFeaturesTemplate::Portable.to_string(),
+            "Portable".to_string()
         );
     }
 

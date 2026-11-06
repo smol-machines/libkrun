@@ -1451,6 +1451,8 @@ pub fn build_microvm(
         #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
         prototype_cpu_topology,
         #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+        restored_cpuid: None,
+        #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
         cpu_growth_progress: Default::default(),
         #[cfg(all(
             any(target_os = "linux", target_os = "macos"),

@@ -2719,13 +2719,13 @@ pub extern "C" fn krun_set_live_resize(ctx_id: u32, flags: u32) -> i32 {
 pub extern "C" fn krun_set_cpu_template(ctx_id: u32, cpu_template: u32) -> i32 {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     let template = match cpu_template {
-        1 => vmm::vmm_config::machine_config::CpuFeaturesTemplate::PortableV1,
+        1 => vmm::vmm_config::machine_config::CpuFeaturesTemplate::Portable,
         _ => return -libc::EINVAL,
     };
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
-        // PortableV1 is an Intel architectural contract. Applying its model
+        // The portable profile is an Intel architectural contract. Applying its model
         // and MSR expectations to AMD would make a checkpoint look portable
         // when it is not; leave those VMs on libkrun's host CPU contract.
         let leaf = std::arch::x86_64::__cpuid(0);
@@ -5954,6 +5954,32 @@ fn krun_start_enter_nitro(ctx_id: u32) -> i32 {
 
             -libc::EINVAL
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+mod test_cpu_template {
+    use super::*;
+    use vmm::vmm_config::machine_config::CpuFeaturesTemplate;
+
+    // There is one portable profile and it is Intel's: an AMD host is told
+    // ENOTSUP and its VMs keep the host's CPUID.
+    #[test]
+    fn only_intel_hosts_take_the_portable_profile() {
+        let ctx = krun_create_ctx() as u32;
+        let leaf = std::arch::x86_64::__cpuid(0);
+        let intel = [leaf.ebx, leaf.edx, leaf.ecx] == [0x756e_6547, 0x4965_6e69, 0x6c65_746e];
+        assert_eq!(krun_set_cpu_template(ctx, 2), -libc::EINVAL);
+        let result = krun_set_cpu_template(ctx, 1);
+        let template = CTX_MAP.lock().unwrap()[&ctx].vmr.vm_config().cpu_template;
+        if intel {
+            assert_eq!(result, KRUN_SUCCESS);
+            assert_eq!(template, Some(CpuFeaturesTemplate::Portable));
+        } else {
+            assert_eq!(result, -libc::ENOTSUP);
+            assert_eq!(template, None);
+        }
+        assert_eq!(krun_free_ctx(ctx), KRUN_SUCCESS);
     }
 }
 
