@@ -20,9 +20,13 @@ pub mod bit_helper;
 
 mod template;
 pub use crate::template::c3;
+pub use crate::template::intel_portable;
 pub use crate::template::t2;
 
 mod cpu_leaf;
+
+/// Whether a host can run a guest whose CPUID was recorded elsewhere.
+pub mod compat;
 
 mod transformer;
 use crate::transformer::*;

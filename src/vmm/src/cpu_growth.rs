@@ -37,7 +37,7 @@ impl CpuGrowthTopology {
                 None => 0,
                 Some(CpuFeaturesTemplate::C3) => 1,
                 Some(CpuFeaturesTemplate::T2) => 2,
-                Some(CpuFeaturesTemplate::PortableV1) => 3,
+                Some(CpuFeaturesTemplate::Portable) => 3,
             },
         ]
     }
@@ -57,7 +57,7 @@ impl CpuGrowthTopology {
             0 => None,
             1 => Some(CpuFeaturesTemplate::C3),
             2 => Some(CpuFeaturesTemplate::T2),
-            3 => Some(CpuFeaturesTemplate::PortableV1),
+            3 => Some(CpuFeaturesTemplate::Portable),
             _ => return Err("unknown checkpoint CPU template".into()),
         };
         Ok(Self {
@@ -129,7 +129,7 @@ mod tests {
             None,
             Some(CpuFeaturesTemplate::C3),
             Some(CpuFeaturesTemplate::T2),
-            Some(CpuFeaturesTemplate::PortableV1),
+            Some(CpuFeaturesTemplate::Portable),
         ] {
             let topology = CpuGrowthTopology {
                 capacity: 16,
