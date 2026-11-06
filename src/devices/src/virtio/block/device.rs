@@ -28,7 +28,7 @@ use imago::{
     raw::Raw,
     vmdk::Vmdk,
 };
-use log::{error, warn};
+use log::{error, info, warn};
 use utils::eventfd::{EFD_NONBLOCK, EventFd};
 use virtio_bindings::{
     virtio_blk::*,
@@ -48,7 +48,10 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 use super::worker::{AsyncIo, BlockWorker, PreparedAsyncIo, take_prepared_async_io};
 use super::{
-    super::{ActivateResult, DeviceQueue, DeviceState, QueueConfig, TYPE_BLOCK, VirtioDevice},
+    super::{
+        ActivateResult, DeviceQueue, DeviceState, QueueConfig, TYPE_BLOCK, VirtioDevice,
+        VmmExitObserver,
+    },
     Error, NUM_QUEUES, QUEUE_CONFIG, SECTOR_SHIFT, SECTOR_SIZE,
 };
 
@@ -1039,6 +1042,48 @@ impl VirtioDevice for Block {
     }
 }
 
+/// The VMM ends with `_exit`, which skips `DiskProperties::drop`. The image
+/// driver keeps the cluster mappings of recent writes in a write-back cache
+/// and writes them out only on a guest flush, so a guest that never asks for
+/// one (a disk marked "write through" in the guest never does) would lose
+/// them with the process: its newest blocks would read back unmapped on the
+/// next boot. Drain the worker and write the image out before exiting. The
+/// driver's metadata cache exists whatever the cache type, so only a
+/// read-only disk, which never dirties it, is skipped.
+impl VmmExitObserver for Block {
+    fn on_vmm_exit(&mut self) {
+        self.quiesce_worker();
+        if self.is_read_only() {
+            return;
+        }
+        // The flush comes first and is what keeps the image consistent: it
+        // hands the cached metadata to the host page cache, which outlives
+        // the process, and takes milliseconds. The sync after it only makes
+        // that durable against a host crash and can take seconds, so a host
+        // that escalates to SIGKILL may cut it short. Each step is logged on
+        // both ends, so a cut-short exit shows as a start without a finish.
+        info!("block '{}': flushing image metadata before exit", self.id);
+        let started = std::time::Instant::now();
+        if let Err(error) = self.disk_image.flush() {
+            error!("block '{}': flush on exit failed: {error}", self.id);
+        }
+        let flushed = started.elapsed();
+        info!(
+            "block '{}': image metadata flushed in {} ms; syncing",
+            self.id,
+            flushed.as_millis()
+        );
+        if let Err(error) = self.disk_image.sync() {
+            error!("block '{}': sync on exit failed: {error}", self.id);
+        }
+        info!(
+            "block '{}': image synced in {} ms",
+            self.id,
+            (started.elapsed() - flushed).as_millis()
+        );
+    }
+}
+
 #[cfg(test)]
 mod overlay_tests {
     use super::*;
@@ -1072,6 +1117,58 @@ mod overlay_tests {
                 .resize_grow(original * 2, imago::format::PreallocateMode::Zero)
                 .is_err()
         );
+    }
+
+    /// A write that allocated a qcow2 cluster survives a VMM exit that runs
+    /// no drop: the exit observer writes the cluster mapping out, whatever
+    /// the cache type, and a fresh open of the image finds the data.
+    #[test]
+    fn exit_writes_out_cluster_mappings_that_drop_never_would() {
+        let base = TempFile::new().unwrap();
+        base.as_file().set_len(4 * 1024 * 1024).unwrap();
+        let path = base.as_path().to_str().unwrap();
+        let overlay = format!("{path}.exit.qcow2");
+        create_overlay(&overlay, path, ImageType::Raw).unwrap();
+        let open = |cache_type| {
+            Block::new(
+                "exit".into(),
+                None,
+                cache_type,
+                overlay.clone(),
+                ImageType::Qcow2,
+                false,
+                false,
+                SyncMode::Full,
+                BlockIoEngine::Sync,
+                None,
+            )
+            .unwrap()
+        };
+
+        let mut block = open(CacheType::Unsafe);
+        let marker = [0xa5; 4096];
+        // Past the first cluster, so the write allocates one and updates the
+        // L2 table the driver keeps cached.
+        block
+            .disk_image
+            .writev(IoVector::from(&marker[..]), 3 * 1024 * 1024)
+            .unwrap();
+        block.on_vmm_exit();
+        // `_exit` runs no destructor: neither must the test.
+        std::mem::forget(block);
+
+        let reopened = open(CacheType::Writeback);
+        let mut data = [0; 4096];
+        reopened
+            .disk_image
+            .readv(IoVectorMut::from(&mut data[..]), 3 * 1024 * 1024)
+            .unwrap();
+        assert_eq!(
+            data, marker,
+            "the cluster mapping was lost with the process"
+        );
+        drop(reopened);
+        std::fs::remove_file(overlay).unwrap();
     }
 
     #[test]

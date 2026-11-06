@@ -10,8 +10,10 @@ use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
+#[cfg(test)]
+use vm_memory::Bytes;
 use vm_memory::mmap::MmapRegion;
-use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestRegionMmap};
+use vm_memory::{GuestAddress, GuestMemory, GuestMemoryMmap, GuestRegionMmap};
 
 fn host_page_size() -> usize {
     static SIZE: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
