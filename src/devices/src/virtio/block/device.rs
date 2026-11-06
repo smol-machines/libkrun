@@ -48,7 +48,10 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 use super::worker::{AsyncIo, BlockWorker, PreparedAsyncIo, take_prepared_async_io};
 use super::{
-    super::{ActivateResult, DeviceQueue, DeviceState, QueueConfig, TYPE_BLOCK, VirtioDevice},
+    super::{
+        ActivateResult, DeviceQueue, DeviceState, QueueConfig, TYPE_BLOCK, VirtioDevice,
+        VmmExitObserver,
+    },
     Error, NUM_QUEUES, QUEUE_CONFIG, SECTOR_SHIFT, SECTOR_SIZE,
 };
 
@@ -1036,6 +1039,26 @@ impl VirtioDevice for Block {
     /// Re-arm the worker after a checkpoint/restore (resumes I/O).
     fn rearm_after_snapshot(&mut self) {
         self.rearm_worker();
+    }
+}
+
+/// The VMM ends with `_exit`, which skips `DiskProperties::drop`. The image
+/// driver keeps the cluster mappings of recent writes in a write-back cache
+/// and writes them out only on a guest flush, so a guest that never asks for
+/// one (a disk marked "write through" in the guest never does) would lose
+/// them with the process: its newest blocks would read back unmapped on the
+/// next boot. Drain the worker and write the image out before exiting.
+impl VmmExitObserver for Block {
+    fn on_vmm_exit(&mut self) {
+        self.quiesce_worker();
+        if self.cache_type == CacheType::Writeback {
+            if let Err(error) = self.disk_image.flush() {
+                error!("block '{}': flush on exit failed: {error}", self.id);
+            }
+            if let Err(error) = self.disk_image.sync() {
+                error!("block '{}': sync on exit failed: {error}", self.id);
+            }
+        }
     }
 }
 

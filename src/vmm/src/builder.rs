@@ -20,7 +20,7 @@ use std::os::fd::{BorrowedFd, FromRawFd};
 use std::os::windows::io::{AsRawHandle, BorrowedHandle, FromRawHandle};
 #[cfg(windows)]
 use std::path::PathBuf;
-use std::sync::atomic::AtomicI32;
+use std::sync::atomic::{AtomicI32, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 #[cfg(windows)]
 use utils::windows::SendHandle;
@@ -1117,6 +1117,8 @@ pub fn build_microvm(
     let exit_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK)
         .map_err(Error::EventFd)
         .map_err(StartMicrovmError::Internal)?;
+    #[cfg(unix)]
+    exit_on_sigterm(&exit_evt);
 
     #[cfg(target_arch = "x86_64")]
     // Safe to unwrap 'serial_device' as it's always 'Some' on x86_64.
@@ -3685,6 +3687,50 @@ fn autoconfigure_console_ports(
     }
 }
 
+/// Descriptor of the VMM's exit event, written by the SIGTERM handler.
+#[cfg(unix)]
+static SIGTERM_EXIT_EVT: AtomicI32 = AtomicI32::new(-1);
+
+#[cfg(unix)]
+extern "C" fn sigterm_requests_exit(_signal: libc::c_int) {
+    let fd = SIGTERM_EXIT_EVT.load(AtomicOrdering::Relaxed);
+    if fd >= 0 {
+        let one = 1_u64;
+        // SAFETY: write(2) on an eventfd is async-signal-safe; the buffer is a
+        // local u64 that outlives the call.
+        unsafe { libc::write(fd, (&one as *const u64).cast(), std::mem::size_of::<u64>()) };
+    }
+}
+
+/// End the VMM on SIGTERM the way a guest power-off does, through its exit
+/// event, so the exit observers (block devices writing out their images) run
+/// before the process goes. The default action would kill it on the spot,
+/// and the host stops a machine with SIGTERM once the guest has quiesced.
+#[cfg(unix)]
+fn exit_on_sigterm(exit_evt: &EventFd) {
+    let Ok(evt) = exit_evt.try_clone() else {
+        log::warn!("SIGTERM will not flush block devices: could not clone the exit event");
+        return;
+    };
+    // The handler may run at any point until the process exits, so the
+    // descriptor it writes is never closed.
+    SIGTERM_EXIT_EVT.store(evt.as_raw_fd(), AtomicOrdering::Relaxed);
+    std::mem::forget(evt);
+    // SAFETY: a zeroed sigaction with a valid handler and an empty mask.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = sigterm_requests_exit as extern "C" fn(libc::c_int) as usize;
+        action.sa_flags = libc::SA_RESTART;
+        libc::sigemptyset(&mut action.sa_mask);
+        if libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut()) != 0 {
+            log::warn!(
+                "SIGTERM will not flush block devices: {}",
+                io::Error::last_os_error()
+            );
+        }
+    }
+}
+
 #[cfg(unix)]
 fn setup_terminal_raw_mode(
     vmm: &mut Vmm,
@@ -3972,6 +4018,8 @@ fn attach_block_devices(
 
         // The device mutex mustn't be locked here otherwise it will deadlock.
         attach_mmio_device(vmm, id, intc.clone(), block.clone()).map_err(RegisterBlockDevice)?;
+        // Write the image out when the VMM exits, which skips every drop.
+        vmm.exit_observers.push(block.clone());
     }
 
     Ok(())
