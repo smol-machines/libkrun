@@ -504,11 +504,9 @@ impl Proxy for TsiDgramProxy {
 
     fn release(&mut self) -> ProxyUpdate {
         debug!("release");
-        let remove_proxy = if self.status == ProxyStatus::Listening {
-            ProxyRemoval::Immediate
-        } else {
-            ProxyRemoval::Deferred
-        };
+        // The guest closed its datagram socket; nothing of it is left to
+        // deliver, so its host socket goes now rather than after a grace period.
+        let remove_proxy = ProxyRemoval::Immediate;
         ProxyUpdate {
             remove_proxy,
             ..Default::default()

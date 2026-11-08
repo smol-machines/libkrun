@@ -17,9 +17,12 @@ use super::muxer_thread::MuxerThread;
 use super::packet::TsiConnectReq;
 use super::packet::{TsiGetnameRsp, VsockPacket};
 use super::proxy::ProxyRawHandle;
-use super::proxy::{ListenerDesc, Proxy, ProxyRemoval, ProxyStatus, ProxyUpdate, StreamIntercept};
+use super::proxy::{
+    ListenerDesc, Proxy, ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate, StreamIntercept,
+};
 use super::reaper::ReaperThread;
 use super::snapshot_gate::SnapshotGate;
+use super::sys;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use super::timesync::TimesyncThread;
 use super::tsi_dgram::TsiDgramProxy;
@@ -146,6 +149,54 @@ pub struct VsockMuxer {
     /// interceptor (see `krun_set_stream_intercept`). Applied after the egress
     /// policy admitted the real destination.
     stream_intercept: Option<StreamIntercept>,
+    /// Guest sockets whose host socket could not be created, with the errno,
+    /// so the guest's connect fails with the reason (say, the host process
+    /// is out of file descriptors) instead of a refusal from nowhere.
+    failed_creates: Mutex<FailedCreates>,
+}
+
+/// Bound on [`FailedCreates`]: guest sockets that fail to get a host socket
+/// and are never connected must not grow it without limit.
+const MAX_FAILED_CREATES: usize = 4096;
+/// The shortest gap between two "host refused a socket" warnings.
+const CREATE_WARNING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+#[derive(Default)]
+struct FailedCreates {
+    errnos: HashMap<u64, i32>,
+    total: u64,
+    reported: u64,
+    last_warning: Option<std::time::Instant>,
+}
+
+impl FailedCreates {
+    /// Remember why the host socket for guest socket `id` failed, and say so
+    /// in the log at most once per interval.
+    fn record(&mut self, id: u64, err: &ProxyError, open: usize) {
+        let errno = match err {
+            ProxyError::CreatingSocket(e) => sys::to_linux_errno(e),
+            _ => return,
+        };
+        if self.errnos.len() >= MAX_FAILED_CREATES {
+            self.errnos.clear();
+        }
+        self.errnos.insert(id, errno);
+        self.total = self.total.saturating_add(1);
+        let now = std::time::Instant::now();
+        if self
+            .last_warning
+            .is_some_and(|at| now.duration_since(at) < CREATE_WARNING_INTERVAL)
+        {
+            return;
+        }
+        warn!(
+            "the host could not open a socket for a guest connection ({err}) with {open} open; \
+             raise this process's open-file limit; {} failed since the last report",
+            self.total - self.reported
+        );
+        self.reported = self.total;
+        self.last_warning = Some(now);
+    }
 }
 
 impl VsockMuxer {
@@ -193,6 +244,7 @@ impl VsockMuxer {
             dns_forwarder,
             snapshot_gate: Arc::new(SnapshotGate::default()),
             stream_intercept,
+            failed_creates: Mutex::new(FailedCreates::default()),
         }
     }
 
@@ -617,7 +669,10 @@ impl VsockMuxer {
                                 .unwrap()
                                 .insert(id, Mutex::new(Box::new(proxy)));
                         }
-                        Err(e) => debug!("error creating tcp proxy: {e}"),
+                        Err(e) => {
+                            let open = self.proxy_map.read().unwrap().len();
+                            self.failed_creates.lock().unwrap().record(id, &e, open);
+                        }
                     }
                 }
                 defs::SOCK_DGRAM => {
@@ -652,7 +707,10 @@ impl VsockMuxer {
                                 .unwrap()
                                 .insert(id, Mutex::new(Box::new(proxy)));
                         }
-                        Err(e) => debug!("error creating udp proxy: {e}"),
+                        Err(e) => {
+                            let open = self.proxy_map.read().unwrap().len();
+                            self.failed_creates.lock().unwrap().record(id, &e, open);
+                        }
                     }
                 }
                 _ => debug!("unknown type on connection request"),
@@ -691,10 +749,19 @@ impl VsockMuxer {
                     }
                 }
                 None => {
+                    // No proxy: its host socket could not be created (say why),
+                    // or the guest never asked for one.
+                    let errno = self
+                        .failed_creates
+                        .lock()
+                        .unwrap()
+                        .errnos
+                        .remove(&id)
+                        .unwrap_or(super::super::linux_errno::LINUX_ECONNREFUSED);
                     self.push_packet(MuxerRx::ConnResponse {
                         local_port: pkt.dst_port(),
                         peer_port: pkt.src_port(),
-                        result: -libc::ECONNREFUSED,
+                        result: -errno,
                     });
                     return;
                 }
@@ -1572,5 +1639,98 @@ mod tests {
                 peer_port: 5
             })
         ));
+    }
+
+    /// A guest socket whose host socket cannot be created (the VMM is out of
+    /// file descriptors) fails its connect with EMFILE, not a bare refusal.
+    /// Runs itself in a child process, since it uses up every file descriptor.
+    #[cfg(unix)]
+    #[test]
+    fn a_connect_without_a_free_fd_reports_emfile() {
+        use super::super::packet::VSOCK_PKT_HDR_SIZE;
+        use crate::virtio::queue::tests::VirtQueue as TestQueue;
+        use std::os::fd::AsRawFd;
+        use vm_memory::{Bytes, GuestAddress};
+
+        const NAME: &str =
+            "virtio::vsock::muxer::tests::a_connect_without_a_free_fd_reports_emfile";
+        if std::env::var_os("LIBKRUN_TEST_CHILD").is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture"])
+                .env("LIBKRUN_TEST_CHILD", "1")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+
+        const GUEST: u32 = 7001;
+        const LINUX_EMFILE: i32 = 24;
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        let rx = TestQueue::new(GuestAddress(0x4000), &mem, 8);
+        let mut muxer = VsockMuxer::new(
+            3,
+            None,
+            None,
+            TsiFlags::HIJACK_INET,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        muxer.mem = Some(mem.clone());
+        muxer.queue = Some(Arc::new(Mutex::new(rx.create_queue())));
+        let packet = |dst: u32, data: &[u8]| {
+            let tx = TestQueue::new(GuestAddress(0x1000), &mem, 8);
+            let hdr = GuestAddress(0x10000);
+            mem.write_slice(&[0; VSOCK_PKT_HDR_SIZE], hdr).unwrap();
+            mem.write_obj(data.len() as u32, GuestAddress(0x10000 + 24))
+                .unwrap();
+            mem.write_slice(data, GuestAddress(0x10000 + VSOCK_PKT_HDR_SIZE as u64))
+                .unwrap();
+            tx.dtable[0].set(0x10000, (VSOCK_PKT_HDR_SIZE + data.len()) as u32, 0, 0);
+            tx.avail.ring[0].set(0);
+            tx.avail.idx.set(1);
+            let mut pkt =
+                VsockPacket::from_tx_virtq_head(&tx.create_queue().pop(&mem).unwrap()).unwrap();
+            pkt.set_op(uapi::VSOCK_OP_RW)
+                .set_src_port(GUEST + 1)
+                .set_dst_port(dst);
+            pkt
+        };
+        let create = [
+            &GUEST.to_le_bytes()[..],
+            &(defs::LINUX_AF_INET).to_le_bytes(),
+            &(defs::SOCK_STREAM).to_le_bytes(),
+        ]
+        .concat();
+        let sockaddr: Vec<u8> = [
+            &2u16.to_le_bytes()[..],
+            &80u16.to_be_bytes(),
+            &[127, 0, 0, 1],
+            &[0; 8],
+        ]
+        .concat();
+        let connect = [&GUEST.to_le_bytes()[..], &16u32.to_le_bytes(), &sockaddr].concat();
+
+        let null = std::fs::File::open("/dev/null").unwrap();
+        let limit = libc::rlimit {
+            rlim_cur: 256,
+            rlim_max: 256,
+        };
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+        while unsafe { libc::dup(null.as_raw_fd()) } >= 0 {}
+        muxer.process_proxy_create(&packet(defs::TSI_PROXY_CREATE, &create));
+        muxer.process_connect(&packet(defs::TSI_CONNECT, &connect));
+
+        match muxer.rxq.lock().unwrap().pop() {
+            Some(MuxerRx::ConnResponse { result, .. }) => assert_eq!(result, -LINUX_EMFILE),
+            _ => panic!("expected a connect response"),
+        }
     }
 }

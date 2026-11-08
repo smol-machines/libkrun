@@ -687,7 +687,7 @@ impl Proxy for UnixProxy {
             debug!("process_event: HANG_UP");
 
             if self.status == ProxyStatus::Connecting {
-                self.push_connect_rsp(-libc::ECONNREFUSED);
+                self.push_connect_rsp(-super::super::linux_errno::LINUX_ECONNREFUSED);
                 self.status = ProxyStatus::Closed;
                 update.polling = Some((self.id, raw_handle(&self.sock), EventSet::empty()));
                 update.signal_queue = true;
