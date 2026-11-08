@@ -3717,8 +3717,14 @@ fn exit_on_sigterm(exit_evt: &EventFd) {
         return;
     };
     // The handler may run at any point until the process exits, so the
-    // descriptor it writes is never closed.
-    SIGTERM_EXIT_EVT.store(evt.as_raw_fd(), AtomicOrdering::Relaxed);
+    // descriptor it writes is never closed. On macOS an EventFd can be a pipe,
+    // whose readable descriptor (`as_raw_fd`) refuses writes: the handler then
+    // did nothing and a stop waited out the host's SIGTERM grace.
+    #[cfg(target_os = "macos")]
+    let fd = evt.get_write_fd();
+    #[cfg(not(target_os = "macos"))]
+    let fd = evt.as_raw_fd();
+    SIGTERM_EXIT_EVT.store(fd, AtomicOrdering::Relaxed);
     std::mem::forget(evt);
     // SAFETY: a zeroed sigaction with a valid handler and an empty mask.
     unsafe {
@@ -4160,6 +4166,20 @@ fn attach_input_devices(
 
 #[cfg(test)]
 pub mod tests {
+
+    /// SIGTERM ends the VMM through its exit event; a handler that cannot
+    /// write the event leaves the process running until it is killed.
+    #[cfg(unix)]
+    #[test]
+    fn sigterm_writes_the_exit_event() {
+        use utils::eventfd::{EFD_NONBLOCK, EventFd};
+        let exit_evt = EventFd::new(EFD_NONBLOCK).unwrap();
+        super::exit_on_sigterm(&exit_evt);
+        // SAFETY: raise delivers SIGTERM to this thread, whose handler only
+        // writes the exit event.
+        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+        assert_eq!(exit_evt.read().unwrap(), 1);
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
