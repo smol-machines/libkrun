@@ -1032,6 +1032,7 @@ impl PassthroughFs {
             writeback: self.writeback.load(Ordering::Relaxed),
             announce_submounts: self.announce_submounts.load(Ordering::Relaxed),
             zero_message_opendir: self.zero_message_opendir.load(Ordering::Relaxed),
+            zero_message_open: false,
             dax_maps: self.dax.maps.read().unwrap().values().copied().collect(),
             live_shares: Vec::new(),
         }

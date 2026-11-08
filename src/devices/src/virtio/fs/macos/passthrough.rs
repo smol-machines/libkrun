@@ -4,6 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::collections::btree_map;
 use std::ffi::{CStr, CString, OsStr};
 use std::fs::File;
@@ -83,6 +84,27 @@ struct DirStream {
     entries: Vec<CachedDirEntry>,
     ready: bool,
 }
+
+/// A descriptor kept for a file the kernel opened without a request (see
+/// `PassthroughFs::zero_message_open`): the requests that follow name the
+/// inode and handle 0, so the server keeps one open file per inode for them.
+struct CachedFd {
+    data: Arc<HandleData>,
+    /// Opened read-write; a read-only file gets a read-only descriptor and is
+    /// reopened when a write arrives for it.
+    writable: bool,
+}
+
+/// Descriptors for files opened without a request, by inode, oldest first.
+#[derive(Default)]
+struct InodeFds {
+    map: HashMap<Inode, CachedFd>,
+    order: VecDeque<Inode>,
+}
+
+/// Files kept open for the kernel's handle-less requests. A forgotten inode
+/// drops its entry; past this many, the oldest goes and is reopened on demand.
+const INODE_FDS_MAX: usize = 256;
 
 impl DirStream {
     fn new() -> Self {
@@ -331,9 +353,7 @@ fn set_xattr_stat(
         0
     };
 
-    let buf = if is_valid_owner(owner) && mode.is_some() {
-        let owner = owner.unwrap();
-        let mode = mode.unwrap();
+    let buf = if let (Some(owner), Some(mode), true) = (owner, mode, is_valid_owner(owner)) {
         format!("{}:{}:0{:o}", owner.0, owner.1, mode)
     } else {
         let (orig_uid, orig_gid, orig_mode) = match file {
@@ -616,6 +636,10 @@ pub struct PassthroughFs {
     /// The kernel opens directories without a request (FUSE_NO_OPENDIR_SUPPORT),
     /// so a readdir can arrive for a directory this server never opened.
     zero_message_opendir: AtomicBool,
+    /// The kernel opens regular files without a request (FUSE_NO_OPEN_SUPPORT):
+    /// read, write, setattr and the rest arrive with handle 0 for them.
+    zero_message_open: AtomicBool,
+    inode_fds: Mutex<InodeFds>,
     /// Listings in progress for directories opened without a request, by
     /// inode: a directory's entries are read once at offset 0 and served
     /// chunk by chunk, then dropped when the listing reaches its end.
@@ -776,6 +800,8 @@ impl PassthroughFs {
             writeback: AtomicBool::new(false),
             announce_submounts: AtomicBool::new(false),
             zero_message_opendir: AtomicBool::new(false),
+            zero_message_open: AtomicBool::new(false),
+            inode_fds: Mutex::new(InodeFds::default()),
             handleless_dirs: Mutex::new(HashMap::new()),
             cfg,
         })
@@ -956,6 +982,7 @@ impl PassthroughFs {
             writeback: self.writeback.load(Ordering::Relaxed),
             announce_submounts: self.announce_submounts.load(Ordering::Relaxed),
             zero_message_opendir: self.zero_message_opendir.load(Ordering::Relaxed),
+            zero_message_open: self.zero_message_open.load(Ordering::Relaxed),
             // DAX fork-replay is Linux-only; macOS clones have no DAX window.
             dax_maps: Vec::new(),
             live_shares: Vec::new(),
@@ -1052,6 +1079,8 @@ impl PassthroughFs {
             .store(state.announce_submounts, Ordering::Relaxed);
         self.zero_message_opendir
             .store(state.zero_message_opendir, Ordering::Relaxed);
+        self.zero_message_open
+            .store(state.zero_message_open, Ordering::Relaxed);
 
         for snap in &state.handles {
             // open_inode reopens via volfs on demand. Try RDWR, then RDONLY
@@ -1385,6 +1414,118 @@ impl PassthroughFs {
         Ok(())
     }
 
+    /// The open file a request names: the handle's, or, for a file the kernel
+    /// opened without a request (handle 0 and no such handle), a descriptor
+    /// opened for the inode and kept for the requests that follow.
+    fn file_for(&self, inode: Inode, handle: Handle, write: bool) -> io::Result<Arc<HandleData>> {
+        if let Some(data) = self
+            .handles
+            .read()
+            .unwrap()
+            .get(&handle)
+            .filter(|hd| hd.inode == inode)
+            .cloned()
+        {
+            return Ok(data);
+        }
+        if !self.zero_message_open.load(Ordering::Relaxed) {
+            return Err(ebadf());
+        }
+        self.inode_fd(inode, write)
+    }
+
+    /// The kept descriptor for `inode`, opened on first use: read-only for a
+    /// read, read-write for a write (a read-only one is replaced then).
+    fn inode_fd(&self, inode: Inode, write: bool) -> io::Result<Arc<HandleData>> {
+        let cached = self
+            .inode_fds
+            .lock()
+            .unwrap()
+            .map
+            .get(&inode)
+            .filter(|cached| cached.writable || !write)
+            .map(|cached| cached.data.clone());
+        if let Some(data) = cached {
+            if self.fd_still_names(inode, &data) {
+                return Ok(data);
+            }
+            self.inode_fds.lock().unwrap().map.remove(&inode);
+        }
+        // Open before taking the cache lock: open_inode reads the inode map,
+        // which forget holds while it drops a descriptor from this cache. Two
+        // requests racing here may both open; the later insert wins and the
+        // other descriptor closes with its last user.
+        let flags = if write { libc::O_RDWR } else { libc::O_RDONLY };
+        let file = self.open_inode(inode, flags)?;
+        let data = Arc::new(HandleData {
+            inode,
+            file: RwLock::new(file),
+            dirstream: Mutex::new(DirStream::new()),
+        });
+        Ok(self.keep_inode_fd(inode, data, write, false))
+    }
+
+    /// Whether a kept descriptor still names the file the inode stands for.
+    /// The host may have unlinked the file and reused its inode number for
+    /// another, or the guest may have created a new file under a number a
+    /// forgotten one had; a descriptor into the old file must not serve the
+    /// new one. One fstat (a few microseconds) against the numbers the inode
+    /// was registered with.
+    fn fd_still_names(&self, inode: Inode, data: &HandleData) -> bool {
+        let Some(expected) = self.inodes.read().unwrap().get(&inode).cloned() else {
+            return false;
+        };
+        let fd = data.file.read().unwrap().as_raw_fd();
+        match fstat(fd, true) {
+            Ok(st) => st.st_ino == expected.ino && st.st_dev == expected.dev && st.st_nlink > 0,
+            Err(_) => false,
+        }
+    }
+
+    /// Keep `data` as the descriptor for `inode`; a descriptor opened by a
+    /// create replaces whatever was kept, since it names the file just made.
+    /// Otherwise a usable one that arrived first wins. Returns the one to use.
+    /// Past the cap, the oldest kept goes.
+    fn keep_inode_fd(
+        &self,
+        inode: Inode,
+        data: Arc<HandleData>,
+        writable: bool,
+        replace: bool,
+    ) -> Arc<HandleData> {
+        let mut fds = self.inode_fds.lock().unwrap();
+        if !replace
+            && let Some(cached) = fds.map.get(&inode)
+            && (cached.writable || !writable)
+        {
+            return cached.data.clone();
+        }
+        if !fds.map.contains_key(&inode) {
+            if fds.map.len() >= INODE_FDS_MAX {
+                while let Some(old) = fds.order.pop_front() {
+                    if fds.map.remove(&old).is_some() {
+                        break;
+                    }
+                }
+            }
+            // Releases and forgets remove from the map only; drop their
+            // leftovers from the order before it outgrows the map.
+            if fds.order.len() >= 2 * INODE_FDS_MAX {
+                let InodeFds { map, order } = &mut *fds;
+                order.retain(|kept| map.contains_key(kept));
+            }
+            fds.order.push_back(inode);
+        }
+        fds.map.insert(
+            inode,
+            CachedFd {
+                data: data.clone(),
+                writable,
+            },
+        );
+        data
+    }
+
     fn do_release(&self, inode: Inode, handle: Handle) -> io::Result<()> {
         let mut handles = self.handles.write().unwrap();
 
@@ -1700,12 +1841,28 @@ impl FileSystem for PassthroughFs {
             opts |= FsOptions::ZERO_MESSAGE_OPENDIR;
         }
 
+        // The same for regular files: no OPEN and no RELEASE per file, and the
+        // kernel keeps a file's pages across opens (it applies KEEP_CACHE to
+        // files it opened without a request). Reading a tree of small files
+        // then costs the READ requests and nothing else. The server opens a
+        // descriptor per inode on the first handle-less request and keeps it
+        // (see `file_for`). The server withdraws ATOMIC_O_TRUNC when this is
+        // on: with no OPEN to carry the truncation, O_TRUNC must come as a
+        // SETATTR, which the kernel only sends without that flag.
+        let zero_message_open = capable.contains(FsOptions::ZERO_MESSAGE_OPEN);
+        self.zero_message_open
+            .store(zero_message_open, Ordering::Relaxed);
+        if zero_message_open {
+            opts |= FsOptions::ZERO_MESSAGE_OPEN;
+        }
+
         Ok(opts)
     }
 
     fn destroy(&self) {
         self.handles.write().unwrap().clear();
         self.inodes.write().unwrap().clear();
+        *self.inode_fds.lock().unwrap() = InodeFds::default();
     }
 
     fn statfs(&self, _ctx: Context, inode: Inode) -> io::Result<bindings::statvfs64> {
@@ -1747,16 +1904,35 @@ impl FileSystem for PassthroughFs {
     }
 
     fn forget(&self, _ctx: Context, inode: Inode, count: u64) {
-        let mut inodes = self.inodes.write().unwrap();
-
-        forget_one(&mut inodes, inode, count)
+        let gone = {
+            let mut inodes = self.inodes.write().unwrap();
+            forget_one(&mut inodes, inode, count);
+            inodes.get(&inode).is_none()
+        };
+        // After the inode lock is released: inode_fd takes the two locks the
+        // other way round while it opens a file, and holding both here would
+        // deadlock the worker threads.
+        if gone {
+            self.inode_fds.lock().unwrap().map.remove(&inode);
+        }
     }
 
     fn batch_forget(&self, _ctx: Context, requests: Vec<(Inode, u64)>) {
-        let mut inodes = self.inodes.write().unwrap();
-
-        for (inode, count) in requests {
-            forget_one(&mut inodes, inode, count)
+        let gone: Vec<Inode> = {
+            let mut inodes = self.inodes.write().unwrap();
+            requests
+                .into_iter()
+                .filter_map(|(inode, count)| {
+                    forget_one(&mut inodes, inode, count);
+                    inodes.get(&inode).is_none().then_some(inode)
+                })
+                .collect()
+        };
+        if !gone.is_empty() {
+            let mut fds = self.inode_fds.lock().unwrap();
+            for inode in gone {
+                fds.map.remove(&inode);
+            }
         }
     }
 
@@ -1875,6 +2051,11 @@ impl FileSystem for PassthroughFs {
         kill_priv: bool,
         flags: u32,
     ) -> io::Result<(Option<Handle>, OpenOptions)> {
+        if self.zero_message_open.load(Ordering::Relaxed) {
+            // Linux's ENOSYS, as for opendir: the kernel reads it as "no OPEN
+            // needed" and never sends another.
+            return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));
+        }
         self.do_open(inode, kill_priv, flags)
     }
 
@@ -1888,7 +2069,21 @@ impl FileSystem for PassthroughFs {
         _flock_release: bool,
         _lock_owner: Option<u64>,
     ) -> io::Result<()> {
-        self.do_release(inode, handle)
+        match self.do_release(inode, handle) {
+            // A file opened without a request has no handle, but the kernel
+            // still sends a release, naming handle 0, when the guest closes a
+            // file it created. The guest is done with the file, so the kept
+            // descriptor closes now rather than when the cache evicts it: the
+            // host sees the close when the guest's happens, which keeps the
+            // host's own change notifications for the file together. A later
+            // request for the inode opens afresh.
+            Err(_) if self.zero_message_open.load(Ordering::Relaxed) => {
+                let dropped = self.inode_fds.lock().unwrap().map.remove(&inode);
+                drop(dropped);
+                Ok(())
+            }
+            other => other,
+        }
     }
 
     fn create(
@@ -1953,14 +2148,24 @@ impl FileSystem for PassthroughFs {
 
         let entry = self.lookup(ctx, parent, name)?;
 
-        let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
         let data = HandleData {
             inode: entry.inode,
             file,
             dirstream: Mutex::new(DirStream::new()),
         };
-
-        self.handles.write().unwrap().insert(handle, Arc::new(data));
+        // While files open without a request, the requests that follow name
+        // handle 0 whatever this reply says, and a handle here would hold its
+        // descriptor until a release that may never come. Keep the descriptor
+        // with the inode instead, where the handle-0 writes that follow find
+        // it; the guest's close (release) or the cache's bound ends it.
+        let handle = if self.zero_message_open.load(Ordering::Relaxed) {
+            self.keep_inode_fd(entry.inode, Arc::new(data), true, true);
+            None
+        } else {
+            let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
+            self.handles.write().unwrap().insert(handle, Arc::new(data));
+            Some(handle)
+        };
 
         let mut opts = OpenOptions::empty();
         match self.cfg.cache_policy {
@@ -1973,7 +2178,7 @@ impl FileSystem for PassthroughFs {
         // notification is suppressed.
         opts |= OpenOptions::NOFLUSH;
 
-        Ok((entry, Some(handle), opts))
+        Ok((entry, handle, opts))
     }
 
     fn unlink(&self, ctx: Context, parent: Inode, name: &CStr) -> io::Result<()> {
@@ -1992,14 +2197,7 @@ impl FileSystem for PassthroughFs {
         _flags: u32,
     ) -> io::Result<usize> {
         debug!("read: {inode:?}");
-        let data = self
-            .handles
-            .read()
-            .unwrap()
-            .get(&handle)
-            .filter(|hd| hd.inode == inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
+        let data = self.file_for(inode, handle, false)?;
 
         // This is safe because write_from uses preadv64, so the underlying file descriptor
         // offset is not affected by this operation.
@@ -2020,14 +2218,7 @@ impl FileSystem for PassthroughFs {
         kill_priv: bool,
         _flags: u32,
     ) -> io::Result<usize> {
-        let data = self
-            .handles
-            .read()
-            .unwrap()
-            .get(&handle)
-            .filter(|hd| hd.inode == inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
+        let data = self.file_for(inode, handle, true)?;
 
         // This is safe because read_to uses pwritev64, so the underlying file descriptor
         // offset is not affected by this operation.
@@ -2076,20 +2267,27 @@ impl FileSystem for PassthroughFs {
         // `hd` outlives every use of the raw fd: a concurrent release would
         // otherwise close it and a newly opened file could reuse the number.
         let hd;
-        let ihandle = if let Some(handle) = handle {
-            hd = self
-                .handles
+        let known = handle.and_then(|handle| {
+            self.handles
                 .read()
                 .unwrap()
                 .get(&handle)
                 .filter(|hd| hd.inode == inode)
                 .cloned()
-                .ok_or_else(ebadf)?;
-
-            let fd = hd.file.write().unwrap().as_raw_fd();
-            InodeHandle::Fd(fd)
-        } else {
-            self.inode_to_handle(inode, true)?
+        });
+        let ihandle = match (handle, known) {
+            (Some(_), Some(data)) => {
+                hd = data;
+                let fd = hd.file.write().unwrap().as_raw_fd();
+                InodeHandle::Fd(fd)
+            }
+            // A handle the server never issued: the kernel's handle 0 for a
+            // file it opened without a request (an ftruncate on it), served
+            // by inode like a setattr with no handle.
+            (Some(_), None) if !self.zero_message_open.load(Ordering::Relaxed) => {
+                return Err(ebadf());
+            }
+            _ => self.inode_to_handle(inode, true)?,
         };
 
         #[cfg(test)]
@@ -2466,14 +2664,14 @@ impl FileSystem for PassthroughFs {
         handle: Handle,
         _lock_owner: u64,
     ) -> io::Result<()> {
-        let data = self
-            .handles
-            .read()
-            .unwrap()
-            .get(&handle)
-            .filter(|hd| hd.inode == inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
+        // Files opened without a request carry the kernel's default open
+        // flags, which lack NOFLUSH, so each close would send a FLUSH this
+        // server answers by dup(2)+close(2). Linux's ENOSYS once makes the
+        // kernel stop sending them (fuse_flush sets no_flush); fsync stays.
+        if self.zero_message_open.load(Ordering::Relaxed) {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));
+        }
+        let data = self.file_for(inode, handle, false)?;
 
         // Since this method is called whenever an fd is closed in the client, we can emulate that
         // behavior by doing the same thing (dup-ing the fd and then immediately closing it). Safe
@@ -2499,14 +2697,7 @@ impl FileSystem for PassthroughFs {
         _datasync: bool,
         handle: Handle,
     ) -> io::Result<()> {
-        let data = self
-            .handles
-            .read()
-            .unwrap()
-            .get(&handle)
-            .filter(|hd| hd.inode == inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
+        let data = self.file_for(inode, handle, false)?;
 
         let fd = data.file.write().unwrap().as_raw_fd();
 
@@ -2834,14 +3025,7 @@ impl FileSystem for PassthroughFs {
         offset: u64,
         length: u64,
     ) -> io::Result<()> {
-        let data = self
-            .handles
-            .read()
-            .unwrap()
-            .get(&handle)
-            .filter(|hd| hd.inode == inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
+        let data = self.file_for(inode, handle, true)?;
 
         let fd = data.file.write().unwrap().as_raw_fd();
 
@@ -2928,14 +3112,7 @@ impl FileSystem for PassthroughFs {
         offset: u64,
         whence: u32,
     ) -> io::Result<u64> {
-        let data = self
-            .handles
-            .read()
-            .unwrap()
-            .get(&handle)
-            .filter(|hd| hd.inode == inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
+        let data = self.file_for(inode, handle, false)?;
 
         // SEEK_DATA and SEEK_HOLE have slightly different semantics
         // in Linux vs. macOS, which means we can't support them.
@@ -3351,9 +3528,11 @@ mod tests {
         };
 
         // Without the kernel's offer, opendir hands out a handle as before.
-        assert!(!FileSystem::init(&filesystem, FsOptions::empty())
-            .unwrap()
-            .contains(FsOptions::ZERO_MESSAGE_OPENDIR));
+        assert!(
+            !FileSystem::init(&filesystem, FsOptions::empty())
+                .unwrap()
+                .contains(FsOptions::ZERO_MESSAGE_OPENDIR)
+        );
         let (handle, _) =
             FileSystem::opendir(&filesystem, context, fuse::ROOT_ID, libc::O_RDONLY as u32)
                 .unwrap();
@@ -3361,9 +3540,11 @@ mod tests {
 
         // With it, opendir is ENOSYS and readdir works with no handle: a
         // first chunk, a continuation from its offset, then the end.
-        assert!(FileSystem::init(&filesystem, FsOptions::ZERO_MESSAGE_OPENDIR)
-            .unwrap()
-            .contains(FsOptions::ZERO_MESSAGE_OPENDIR));
+        assert!(
+            FileSystem::init(&filesystem, FsOptions::ZERO_MESSAGE_OPENDIR)
+                .unwrap()
+                .contains(FsOptions::ZERO_MESSAGE_OPENDIR)
+        );
         let err = FileSystem::opendir(&filesystem, context, fuse::ROOT_ID, libc::O_RDONLY as u32)
             .unwrap_err();
         assert_eq!(
@@ -3381,11 +3562,19 @@ mod tests {
         })
         .unwrap();
         assert_eq!(names.len(), 1);
-        FileSystem::readdir(&filesystem, context, fuse::ROOT_ID, 0, 4096, next, |entry| {
-            names.push(String::from_utf8_lossy(entry.name).into_owned());
-            next = entry.offset;
-            Ok(1)
-        })
+        FileSystem::readdir(
+            &filesystem,
+            context,
+            fuse::ROOT_ID,
+            0,
+            4096,
+            next,
+            |entry| {
+                names.push(String::from_utf8_lossy(entry.name).into_owned());
+                next = entry.offset;
+                Ok(1)
+            },
+        )
         .unwrap();
         names.sort();
         assert_eq!(names, ["a", "b", "c"]);
@@ -3403,6 +3592,250 @@ mod tests {
         // releasedir for a handle that never existed is not an error
         FileSystem::releasedir(&filesystem, context, fuse::ROOT_ID, 0, 0).unwrap();
         FileSystem::fsyncdir(&filesystem, context, fuse::ROOT_ID, false, 0).unwrap();
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Test stand-ins for the transport: a sink the server copies file bytes
+    /// into, and a source it copies into the file.
+    struct Sink(Vec<u8>);
+    impl io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl ZeroCopyWriter for Sink {
+        fn write_from(&mut self, f: &File, count: usize, off: u64) -> io::Result<usize> {
+            use std::os::unix::fs::FileExt;
+            let mut buf = vec![0; count];
+            let n = f.read_at(&mut buf, off)?;
+            self.0.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+    }
+    struct Source(Vec<u8>);
+    impl io::Read for Source {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = buf.len().min(self.0.len());
+            buf[..n].copy_from_slice(&self.0[..n]);
+            self.0.drain(..n);
+            Ok(n)
+        }
+    }
+    impl ZeroCopyReader for Source {
+        fn read_to(&mut self, f: &File, count: usize, off: u64) -> io::Result<usize> {
+            use std::os::unix::fs::FileExt;
+            let n = count.min(self.0.len());
+            let written = f.write_at(&self.0[..n], off)?;
+            self.0.drain(..written);
+            Ok(written)
+        }
+    }
+
+    #[test]
+    fn files_read_and_write_without_an_open_when_the_kernel_offers_to_skip_it() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("libkrun-zero-open-{}-{nonce}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("f"), b"hello").unwrap();
+        let filesystem = PassthroughFs::new(
+            Config {
+                root_dir: root.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        let context = Context {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        };
+        let name = CString::new("f").unwrap();
+
+        // Without the kernel's offer, open hands out a handle as before.
+        assert!(
+            !FileSystem::init(&filesystem, FsOptions::empty())
+                .unwrap()
+                .contains(FsOptions::ZERO_MESSAGE_OPEN)
+        );
+        let entry = FileSystem::lookup(&filesystem, context, fuse::ROOT_ID, &name).unwrap();
+        let (handle, _) = FileSystem::open(
+            &filesystem,
+            context,
+            entry.inode,
+            false,
+            libc::O_RDONLY as u32,
+        )
+        .unwrap();
+        assert!(handle.is_some());
+        FileSystem::release(
+            &filesystem,
+            context,
+            entry.inode,
+            0,
+            handle.unwrap(),
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+
+        // With it: open is Linux's ENOSYS, and read, write, ftruncate and
+        // release all work with handle 0.
+        assert!(
+            FileSystem::init(&filesystem, FsOptions::ZERO_MESSAGE_OPEN)
+                .unwrap()
+                .contains(FsOptions::ZERO_MESSAGE_OPEN)
+        );
+        let err = FileSystem::open(
+            &filesystem,
+            context,
+            entry.inode,
+            false,
+            libc::O_RDONLY as u32,
+        )
+        .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(bindings::LINUX_ENOSYS));
+
+        let mut out = Sink(Vec::new());
+        let n = FileSystem::read(
+            &filesystem,
+            context,
+            entry.inode,
+            0,
+            &mut out,
+            16,
+            0,
+            None,
+            0,
+        )
+        .unwrap();
+        assert_eq!(&out.0[..n], b"hello");
+
+        let n = FileSystem::write(
+            &filesystem,
+            context,
+            entry.inode,
+            0,
+            Source(b"HE".to_vec()),
+            2,
+            0,
+            None,
+            false,
+            false,
+            0,
+        )
+        .unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(fs::read(root.join("f")).unwrap(), b"HEllo");
+
+        // the kernel's ftruncate on such a file names handle 0 too
+        let mut attr: bindings::stat64 = unsafe { std::mem::zeroed() };
+        attr.st_size = 1;
+        FileSystem::setattr(
+            &filesystem,
+            context,
+            entry.inode,
+            attr,
+            Some(0),
+            SetattrValid::SIZE,
+        )
+        .unwrap();
+        assert_eq!(fs::read(root.join("f")).unwrap(), b"H");
+
+        assert_eq!(
+            filesystem.inode_fds.lock().unwrap().map.len(),
+            1,
+            "one kept descriptor"
+        );
+        FileSystem::release(&filesystem, context, entry.inode, 0, 0, false, false, None).unwrap();
+        assert!(
+            filesystem.inode_fds.lock().unwrap().map.is_empty(),
+            "a release naming handle 0 closes the kept descriptor"
+        );
+        let mut again = Sink(Vec::new());
+        let n = FileSystem::read(
+            &filesystem,
+            context,
+            entry.inode,
+            0,
+            &mut again,
+            16,
+            0,
+            None,
+            0,
+        )
+        .unwrap();
+        assert_eq!(&again.0[..n], b"H", "and the next request opens afresh");
+        assert_eq!(
+            FileSystem::flush(&filesystem, context, entry.inode, 0, 0)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(bindings::LINUX_ENOSYS),
+            "no FLUSH while files open without a request"
+        );
+
+        // a created file hands out no handle either; its descriptor is kept
+        // with the inode, where the handle-0 writes find it
+        let created = CString::new("made").unwrap();
+        let (made, handle, _) = FileSystem::create(
+            &filesystem,
+            context,
+            fuse::ROOT_ID,
+            &created,
+            0o644,
+            false,
+            libc::O_WRONLY as u32,
+            0,
+            Extensions::default(),
+        )
+        .unwrap();
+        assert!(handle.is_none());
+        assert!(
+            filesystem.handles.read().unwrap().is_empty(),
+            "no handle kept"
+        );
+        assert_eq!(filesystem.inode_fds.lock().unwrap().map.len(), 2);
+        let n = FileSystem::write(
+            &filesystem,
+            context,
+            made.inode,
+            0,
+            Source(b"new".to_vec()),
+            3,
+            0,
+            None,
+            false,
+            false,
+            0,
+        )
+        .unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(fs::read(root.join("made")).unwrap(), b"new");
+        FileSystem::forget(&filesystem, context, entry.inode, u64::MAX);
+        assert!(
+            !filesystem
+                .inode_fds
+                .lock()
+                .unwrap()
+                .map
+                .contains_key(&entry.inode),
+            "a forgotten inode drops its descriptor"
+        );
+        FileSystem::batch_forget(&filesystem, context, vec![(made.inode, u64::MAX)]);
+        assert!(
+            filesystem.inode_fds.lock().unwrap().map.is_empty(),
+            "so does a batch forget"
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -3512,7 +3945,11 @@ mod tests {
                 SetattrValid::MODE,
             )
             .unwrap();
-            assert_eq!(u32::from(st.st_mode) & 0o7777, mode, "{name}: the guest reads its mode");
+            assert_eq!(
+                u32::from(st.st_mode) & 0o7777,
+                mode,
+                "{name}: the guest reads its mode"
+            );
             let host = fs::metadata(root.join(name)).unwrap().permissions().mode();
             // The permission bits reach the host; setuid stays in the xattr.
             assert_eq!(host & 0o7777, mode & 0o777, "{name}: host mode");

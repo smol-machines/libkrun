@@ -948,6 +948,12 @@ impl<F: FileSystem + Sync> Server<F> {
 
         match self.fs.init(capable) {
             Ok(want) => {
+                // A filesystem that takes opens without a request has no OPEN
+                // to carry an O_TRUNC in, and the kernel sends the truncation
+                // as a SETATTR only when atomic O_TRUNC is not offered.
+                if want.contains(FsOptions::ZERO_MESSAGE_OPEN) {
+                    supported.remove(FsOptions::ATOMIC_O_TRUNC);
+                }
                 let enabled = (capable & (want | supported)).bits();
                 self.options.store(enabled, Ordering::Relaxed);
 
