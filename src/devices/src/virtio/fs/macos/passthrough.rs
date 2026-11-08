@@ -613,6 +613,13 @@ pub struct PassthroughFs {
     // `cfg.writeback` is true and `init` was called with `FsOptions::WRITEBACK_CACHE`.
     writeback: AtomicBool,
     announce_submounts: AtomicBool,
+    /// The kernel opens directories without a request (FUSE_NO_OPENDIR_SUPPORT),
+    /// so a readdir can arrive for a directory this server never opened.
+    zero_message_opendir: AtomicBool,
+    /// Listings in progress for directories opened without a request, by
+    /// inode: a directory's entries are read once at offset 0 and served
+    /// chunk by chunk, then dropped when the listing reaches its end.
+    handleless_dirs: Mutex<HashMap<Inode, DirStream>>,
     cfg: Config,
 }
 
@@ -768,6 +775,8 @@ impl PassthroughFs {
 
             writeback: AtomicBool::new(false),
             announce_submounts: AtomicBool::new(false),
+            zero_message_opendir: AtomicBool::new(false),
+            handleless_dirs: Mutex::new(HashMap::new()),
             cfg,
         })
     }
@@ -946,7 +955,7 @@ impl PassthroughFs {
             next_handle: self.next_handle.load(Ordering::Relaxed),
             writeback: self.writeback.load(Ordering::Relaxed),
             announce_submounts: self.announce_submounts.load(Ordering::Relaxed),
-            zero_message_opendir: false,
+            zero_message_opendir: self.zero_message_opendir.load(Ordering::Relaxed),
             // DAX fork-replay is Linux-only; macOS clones have no DAX window.
             dax_maps: Vec::new(),
             live_shares: Vec::new(),
@@ -1041,6 +1050,8 @@ impl PassthroughFs {
         self.writeback.store(state.writeback, Ordering::Relaxed);
         self.announce_submounts
             .store(state.announce_submounts, Ordering::Relaxed);
+        self.zero_message_opendir
+            .store(state.zero_message_opendir, Ordering::Relaxed);
 
         for snap in &state.handles {
             // open_inode reopens via volfs on demand. Try RDWR, then RDONLY
@@ -1193,8 +1204,14 @@ impl PassthroughFs {
             .unwrap()
             .get(&handle)
             .filter(|hd| hd.inode == inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
+            .cloned();
+        let Some(data) = data else {
+            return if self.zero_message_opendir.load(Ordering::Relaxed) {
+                self.readdir_without_handle(inode, offset, add_entry)
+            } else {
+                Err(ebadf())
+            };
+        };
 
         let mut ds = data.dirstream.lock().unwrap();
 
@@ -1304,6 +1321,68 @@ impl PassthroughFs {
         opts |= OpenOptions::NOFLUSH;
 
         Ok((Some(handle), opts))
+    }
+
+    /// Serve a readdir chunk for a directory the kernel opened without a
+    /// request. Offset 0 reads the directory into a stream kept by inode; later
+    /// chunks continue from it; the stream goes when the listing reaches its
+    /// end or the directory is released. A stream lost in between (the cap
+    /// below, or a restore) is read again from the offset asked for, which is
+    /// what any reopened listing would see.
+    fn readdir_without_handle<F>(
+        &self,
+        inode: Inode,
+        mut offset: u64,
+        mut add_entry: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(DirEntry) -> io::Result<usize>,
+    {
+        /// Listings kept at once. Each holds one directory's names; a walk
+        /// finishes a directory's listing before descending, so a handful is
+        /// plenty and a forgotten one costs a re-read, not correctness.
+        const HANDLELESS_DIR_STREAMS: usize = 64;
+
+        let mut streams = self.handleless_dirs.lock().unwrap();
+        if offset == 0 || !streams.contains_key(&inode) {
+            let dir = self.open_inode(inode, libc::O_RDONLY | libc::O_DIRECTORY)?;
+            let mut ds = DirStream::new();
+            if let Err(e) = ds.fill_from_fd(dir.as_raw_fd()) {
+                if ds.entries.is_empty() {
+                    return Err(e);
+                }
+                warn!("virtio-fs: error in readdir {}: {:?}", inode, e);
+            }
+            ds.ready = true;
+            if streams.len() >= HANDLELESS_DIR_STREAMS && !streams.contains_key(&inode) {
+                streams.clear();
+            }
+            streams.insert(inode, ds);
+        }
+        let ds = streams.get(&inode).expect("inserted above");
+        while let Some(entry) = ds.get_entry(offset) {
+            offset += 1;
+            let name = entry.name;
+            match add_entry(entry) {
+                Ok(size) => {
+                    if size == 0 {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "virtio-fs: error adding entry {}: {:?}",
+                        String::from_utf8_lossy(name),
+                        e
+                    );
+                    break;
+                }
+            }
+        }
+        if ds.get_entry(offset).is_none() {
+            streams.remove(&inode);
+        }
+        Ok(())
     }
 
     fn do_release(&self, inode: Inode, handle: Handle) -> io::Result<()> {
@@ -1610,6 +1689,17 @@ impl FileSystem for PassthroughFs {
             }
         }
 
+        // Let the kernel skip OPENDIR and RELEASEDIR: a directory walk then
+        // costs its readdir chunks and nothing else, two requests fewer per
+        // directory. The entries are read when the first chunk is asked for
+        // (see `readdir_without_handle`).
+        let zero_message_opendir = capable.contains(FsOptions::ZERO_MESSAGE_OPENDIR);
+        self.zero_message_opendir
+            .store(zero_message_opendir, Ordering::Relaxed);
+        if zero_message_opendir {
+            opts |= FsOptions::ZERO_MESSAGE_OPENDIR;
+        }
+
         Ok(opts)
     }
 
@@ -1676,7 +1766,15 @@ impl FileSystem for PassthroughFs {
         inode: Inode,
         flags: u32,
     ) -> io::Result<(Option<Handle>, OpenOptions)> {
-        self.do_open(inode, false, flags | libc::O_DIRECTORY as u32)
+        if self.zero_message_opendir.load(Ordering::Relaxed) {
+            // ENOSYS here is the protocol's way of saying "no OPENDIR needed":
+            // the kernel treats it as success and stops sending them. It must
+            // be Linux's ENOSYS (38): the host's (78 on macOS) would reach the
+            // guest as EREMCHG and fail every directory open.
+            Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)))
+        } else {
+            self.do_open(inode, false, flags | libc::O_DIRECTORY as u32)
+        }
     }
 
     fn releasedir(
@@ -1686,7 +1784,15 @@ impl FileSystem for PassthroughFs {
         _flags: u32,
         handle: Handle,
     ) -> io::Result<()> {
-        self.do_release(inode, handle)
+        match self.do_release(inode, handle) {
+            // A directory opened without a request has no handle to release;
+            // whatever listing it had in progress goes with it.
+            Err(_) if self.zero_message_opendir.load(Ordering::Relaxed) => {
+                self.handleless_dirs.lock().unwrap().remove(&inode);
+                Ok(())
+            }
+            other => other,
+        }
     }
 
     fn mkdir(
@@ -2421,6 +2527,22 @@ impl FileSystem for PassthroughFs {
         datasync: bool,
         handle: Handle,
     ) -> io::Result<()> {
+        if self.zero_message_opendir.load(Ordering::Relaxed)
+            && !self
+                .handles
+                .read()
+                .unwrap()
+                .get(&handle)
+                .is_some_and(|data| data.inode == inode)
+        {
+            let dir = self.open_inode(inode, libc::O_RDONLY | libc::O_DIRECTORY)?;
+            let res = unsafe { libc::fsync(dir.as_raw_fd()) };
+            return if res == 0 {
+                Ok(())
+            } else {
+                Err(linux_error(io::Error::last_os_error()))
+            };
+        }
         self.fsync(ctx, inode, datasync, handle)
     }
 
@@ -3196,6 +3318,91 @@ mod tests {
         )
         .unwrap();
         assert!(create_options.contains(OpenOptions::NOFLUSH));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn directories_list_without_an_opendir_when_the_kernel_offers_to_skip_it() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "libkrun-zero-opendir-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        for name in ["a", "b", "c"] {
+            fs::write(root.join(name), b"x").unwrap();
+        }
+        let filesystem = PassthroughFs::new(
+            Config {
+                root_dir: root.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        let context = Context {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        };
+
+        // Without the kernel's offer, opendir hands out a handle as before.
+        assert!(!FileSystem::init(&filesystem, FsOptions::empty())
+            .unwrap()
+            .contains(FsOptions::ZERO_MESSAGE_OPENDIR));
+        let (handle, _) =
+            FileSystem::opendir(&filesystem, context, fuse::ROOT_ID, libc::O_RDONLY as u32)
+                .unwrap();
+        assert!(handle.is_some());
+
+        // With it, opendir is ENOSYS and readdir works with no handle: a
+        // first chunk, a continuation from its offset, then the end.
+        assert!(FileSystem::init(&filesystem, FsOptions::ZERO_MESSAGE_OPENDIR)
+            .unwrap()
+            .contains(FsOptions::ZERO_MESSAGE_OPENDIR));
+        let err = FileSystem::opendir(&filesystem, context, fuse::ROOT_ID, libc::O_RDONLY as u32)
+            .unwrap_err();
+        assert_eq!(
+            err.raw_os_error(),
+            Some(bindings::LINUX_ENOSYS),
+            "the guest must see Linux's ENOSYS, not the host's"
+        );
+        let mut names = Vec::new();
+        let mut next = 0;
+        FileSystem::readdir(&filesystem, context, fuse::ROOT_ID, 0, 4096, 0, |entry| {
+            names.push(String::from_utf8_lossy(entry.name).into_owned());
+            next = entry.offset;
+            // the kernel's buffer holds one entry: ask for the rest later
+            Ok(if names.len() == 1 { 0 } else { 1 })
+        })
+        .unwrap();
+        assert_eq!(names.len(), 1);
+        FileSystem::readdir(&filesystem, context, fuse::ROOT_ID, 0, 4096, next, |entry| {
+            names.push(String::from_utf8_lossy(entry.name).into_owned());
+            next = entry.offset;
+            Ok(1)
+        })
+        .unwrap();
+        names.sort();
+        assert_eq!(names, ["a", "b", "c"]);
+        let mut extra = 0;
+        FileSystem::readdir(&filesystem, context, fuse::ROOT_ID, 0, 4096, next, |_| {
+            extra += 1;
+            Ok(1)
+        })
+        .unwrap();
+        assert_eq!(extra, 0, "the listing has ended");
+        assert!(
+            filesystem.handleless_dirs.lock().unwrap().is_empty(),
+            "a finished listing keeps nothing"
+        );
+        // releasedir for a handle that never existed is not an error
+        FileSystem::releasedir(&filesystem, context, fuse::ROOT_ID, 0, 0).unwrap();
+        FileSystem::fsyncdir(&filesystem, context, fuse::ROOT_ID, false, 0).unwrap();
 
         fs::remove_dir_all(root).unwrap();
     }
