@@ -12,6 +12,9 @@ pub struct FsDeviceConfig {
     /// Serve ownership and mode from the `user.containers.override_stat`
     /// xattr (see the passthrough `Config`).
     pub override_stat: bool,
+    /// Let the guest keep a missing name for a second (see the passthrough
+    /// `Config::negative_timeout`).
+    pub negative_entries: bool,
     /// Serve host directories attached and detached at runtime (see
     /// `devices::virtio::fs::live_fs`) instead of one fixed directory.
     pub live: bool,

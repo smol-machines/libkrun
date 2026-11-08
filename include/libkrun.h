@@ -374,6 +374,12 @@ int32_t krun_add_virtiofs3(uint32_t ctx_id,
    uses as its root, and shm_size must be 0 (no DAX window). With read_only, every
    share is served read-only by the host. Linux and macOS only. */
 #define KRUN_VIRTIOFS_FLAG_LIVE (1 << 1)
+/* Let the guest keep a name that does not exist for one second instead of asking
+   again on every stat of it (a negative directory entry). Meant for shares whose
+   host directory is watched by the caller, which expires the guest's entries
+   when the host creates a file; without such a watcher a file the host creates
+   under a name the guest just looked up appears up to a second late. */
+#define KRUN_VIRTIOFS_FLAG_NEGATIVE_ENTRIES (1 << 2)
 
 /**
  * Like krun_add_virtiofs3, with per-share behavior flags (KRUN_VIRTIOFS_FLAG_*).

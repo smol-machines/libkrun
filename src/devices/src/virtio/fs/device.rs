@@ -5,6 +5,7 @@ use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use utils::eventfd::{EFD_NONBLOCK, EventFd};
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -185,6 +186,32 @@ impl Fs {
         live: bool,
         virtual_entries: Vec<VirtualDirEntry>,
     ) -> super::Result<Fs> {
+        Self::new_with(
+            fs_id,
+            shared_dir,
+            exit_code,
+            read_only,
+            override_stat,
+            false,
+            live,
+            virtual_entries,
+        )
+    }
+
+    /// [`Self::new`] with the share options that have no default worth a
+    /// positional argument: `negative_entries` lets the guest keep a missing
+    /// name for a second (see `passthrough::Config::negative_timeout`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with(
+        fs_id: String,
+        shared_dir: Option<String>,
+        exit_code: Arc<AtomicI32>,
+        read_only: bool,
+        override_stat: bool,
+        negative_entries: bool,
+        live: bool,
+        virtual_entries: Vec<VirtualDirEntry>,
+    ) -> super::Result<Fs> {
         let avail_features = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_RING_F_EVENT_IDX);
 
         let live_tag = live.then(|| fs_id.clone());
@@ -196,6 +223,11 @@ impl Fs {
         let fs_cfg = shared_dir.map(|root_dir| passthrough::Config {
             root_dir,
             override_stat,
+            negative_timeout: if negative_entries {
+                Duration::from_secs(1)
+            } else {
+                Duration::ZERO
+            },
             ..Default::default()
         });
 

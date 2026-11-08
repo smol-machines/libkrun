@@ -3444,12 +3444,13 @@ fn attach_fs_devices(
     // and selects its shared-memory region.
     for (i, config) in fs_devs.iter().enumerate().filter(|(_, c)| c.live == live) {
         let fs = Arc::new(Mutex::new(
-            devices::virtio::Fs::new(
+            devices::virtio::Fs::new_with(
                 config.fs_id.clone(),
                 config.shared_dir.clone(),
                 exit_code.clone(),
                 config.read_only,
                 config.override_stat,
+                config.negative_entries,
                 config.live,
                 config.virtual_entries.clone(),
             )
