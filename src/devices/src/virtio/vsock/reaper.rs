@@ -52,12 +52,17 @@ impl ReaperThread {
             debug!("remainig proxies: {}", pmap.len());
         }
 
-        let mut timeout = Duration::MAX;
-        if highest_elapsed > Duration::ZERO {
-            timeout = TIMEOUT - highest_elapsed;
-            assert!(timeout > Duration::ZERO);
+        // Wake when the oldest pending proxy expires. Testing the elapsed time
+        // instead of whether any are pending left a batch released within one
+        // clock tick (elapsed zero) waiting with no timeout at all: its host
+        // sockets stayed open until some later release woke the thread.
+        if self.released_map.is_empty() {
+            Duration::MAX
+        } else {
+            TIMEOUT
+                .saturating_sub(highest_elapsed)
+                .max(Duration::from_millis(1))
         }
-        timeout
     }
 
     fn work(&mut self) {
@@ -74,5 +79,26 @@ impl ReaperThread {
             .name("vsock reaper".into())
             .spawn(move || self.work())
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proxies_released_in_the_same_instant_still_expire() {
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let proxy_map: ProxyMap = Arc::new(RwLock::new(HashMap::new()));
+        let mut reaper = ReaperThread::new(receiver, proxy_map);
+        let now = Instant::now();
+        reaper.released_map.insert(1, now);
+        reaper.released_map.insert(2, now);
+        drop(sender);
+        let timeout = reaper.check_expiration();
+        assert!(
+            timeout <= TIMEOUT,
+            "pending proxies must bound the wait, got {timeout:?}"
+        );
     }
 }

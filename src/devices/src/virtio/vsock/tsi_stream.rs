@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use socket2::{Domain, Socket, Type};
 
 use super::super::Queue as VirtQueue;
+use super::super::linux_errno::{LINUX_EADDRINUSE, LINUX_EAGAIN, LINUX_ECONNREFUSED};
 use super::defs;
 use super::defs::uapi;
 use super::muxer::{MuxerRx, push_packet};
@@ -520,7 +521,7 @@ impl TsiStreamProxy {
     fn advance_verdict(&mut self, update: &mut ProxyUpdate) {
         if !self.preamble.is_empty() {
             if self.flush_tx().is_err() {
-                return self.fail_connect(update, libc::ECONNREFUSED);
+                return self.fail_connect(update, LINUX_ECONNREFUSED);
             }
             if !self.preamble.is_empty() {
                 update.polling = Some((
@@ -552,7 +553,7 @@ impl TsiStreamProxy {
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 update.polling = Some((self.id, raw_handle(&self.sock), EventSet::IN));
             }
-            Ok(_) | Err(_) => self.fail_connect(update, libc::ECONNREFUSED),
+            Ok(_) | Err(_) => self.fail_connect(update, LINUX_ECONNREFUSED),
         }
     }
 
@@ -633,7 +634,7 @@ impl TsiStreamProxy {
         };
         if let Err(e) = self.sock.bind(&addr.into()) {
             warn!("relisten bind id={} err={e}", self.id);
-            return -libc::EADDRINUSE;
+            return -LINUX_EADDRINUSE;
         }
         let clamped = backlog.clamp(0, sys::SOMAXCONN);
         if let Err(e) = self.sock.listen(clamped) {
@@ -1034,7 +1035,7 @@ impl Proxy for TsiStreamProxy {
             self.push_accept_rsp(0);
             update.signal_queue = true;
         } else if (req.flags & defs::LINUX_O_NONBLOCK) != 0 {
-            self.push_accept_rsp(-libc::EWOULDBLOCK);
+            self.push_accept_rsp(-LINUX_EAGAIN);
             update.signal_queue = true;
         } else {
             self.status = ProxyStatus::WaitingOnAccept;
@@ -1177,7 +1178,15 @@ impl Proxy for TsiStreamProxy {
             "release: id={}, tx_cnt={}, last_tx_cnt={}",
             self.id, self.tx_cnt, self.last_tx_cnt_sent
         );
-        let remove_proxy = if self.status == ProxyStatus::Listening {
+        // The guest closed its socket. With no guest bytes still waiting for
+        // the host socket, close it now: holding it through the reaper's grace
+        // period kept one host descriptor per closed connection for 5 s, so a
+        // guest opening and closing a few thousand connections a second held
+        // tens of thousands of descriptors and hit the process's limit. Bytes
+        // still buffered keep the deferral so they get their chance to drain.
+        let remove_proxy = if self.status == ProxyStatus::Listening
+            || (self.tx_buf.is_empty() && self.preamble.is_empty())
+        {
             ProxyRemoval::Immediate
         } else {
             ProxyRemoval::Deferred
@@ -1199,7 +1208,14 @@ impl Proxy for TsiStreamProxy {
         if evset.contains(EventSet::HANG_UP) {
             debug!("process_event: HANG_UP");
             if self.status == ProxyStatus::Connecting {
-                self.push_connect_rsp(-libc::ECONNREFUSED);
+                // Report why the dial failed (timed out, unreachable, out of
+                // local ports), in the guest's errno numbering; a refusal is
+                // only the fallback when the socket holds no error.
+                let errno = match self.sock.take_error() {
+                    Ok(Some(e)) => sys::to_linux_errno(&e),
+                    _ => LINUX_ECONNREFUSED,
+                };
+                self.push_connect_rsp(-errno);
                 self.status = ProxyStatus::Closed;
                 update.polling = Some((self.id, raw_handle(&self.sock), EventSet::empty()));
                 update.signal_queue = true;
