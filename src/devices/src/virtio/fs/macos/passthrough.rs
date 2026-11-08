@@ -67,6 +67,25 @@ struct InodeData {
     dev: i32,
     refcount: AtomicU64,
     unlinked_fd: AtomicI64,
+    /// The override xattr's values as last read or written for this file,
+    /// with the host ctime at that moment. A stat whose ctime matches uses
+    /// them without reading the xattr; the host bumps a file's ctime for any
+    /// change to its xattrs (and its owner or mode), so a value read under
+    /// the same ctime is the current one, whoever last wrote it.
+    override_cache: Mutex<Option<CachedOverride>>,
+}
+
+/// The uid, gid and mode an override xattr holds, each optional.
+type Override = (Option<u32>, Option<u32>, Option<u32>);
+
+#[derive(Clone, Copy)]
+struct CachedOverride {
+    over: Override,
+    ctime: (i64, i64),
+}
+
+fn ctime_of(st: &bindings::stat64) -> (i64, i64) {
+    (st.st_ctime, st.st_ctime_nsec)
 }
 
 enum InodeHandle {
@@ -844,6 +863,7 @@ impl PassthroughFs {
                 dev: st.st_dev,
                 refcount: AtomicU64::new(2),
                 unlinked_fd: AtomicI64::new(-1),
+                override_cache: Mutex::new(None),
             }),
         );
         Ok(())
@@ -860,7 +880,12 @@ impl PassthroughFs {
     /// return its entry, reusing the existing nodeid when the same host inode is
     /// already known. `parent_dev` decides whether a directory is announced as a
     /// submount.
-    fn register_lookup(&self, st: bindings::stat64, parent_dev: i32) -> io::Result<Entry> {
+    fn register_lookup(
+        &self,
+        st: bindings::stat64,
+        parent_dev: i32,
+        over: Override,
+    ) -> io::Result<Entry> {
         let mut attr_flags: u32 = 0;
 
         if st.st_mode & libc::S_IFMT == libc::S_IFDIR
@@ -879,6 +904,10 @@ impl PassthroughFs {
         let inode = if let Some(data) = data {
             // Matches with the release store in `forget`.
             data.refcount.fetch_add(1, Ordering::Acquire);
+            *data.override_cache.lock().unwrap() = Some(CachedOverride {
+                over,
+                ctime: ctime_of(&st),
+            });
             data.inode
         } else {
             // There is a possible race here where 2 threads end up adding the same file
@@ -897,6 +926,10 @@ impl PassthroughFs {
                     dev: st.st_dev,
                     refcount: AtomicU64::new(1),
                     unlinked_fd: AtomicI64::new(-1),
+                    override_cache: Mutex::new(Some(CachedOverride {
+                        over,
+                        ctime: ctime_of(&st),
+                    })),
                 }),
             );
 
@@ -926,8 +959,10 @@ impl PassthroughFs {
             .map(|root| root.dev)
             .ok_or_else(ebadf)?;
         let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| einval())?;
-        let st = lstat(&c_path, false)?;
-        self.register_lookup(st, root_dev)
+        let st = lstat(&c_path, true)?;
+        let over = get_xattr_lstat(&c_path, st)?;
+        let st = stat_common(st, over.0, over.1, over.2, false)?;
+        self.register_lookup(st, root_dev, over)
     }
 
     /// The host path an inode currently names, if it is still reachable.
@@ -1065,6 +1100,7 @@ impl PassthroughFs {
                         dev,
                         refcount: AtomicU64::new(snap.refcount),
                         unlinked_fd: AtomicI64::new(-1),
+                        override_cache: Mutex::new(None),
                     }),
                 );
             }
@@ -1526,6 +1562,82 @@ impl PassthroughFs {
         data
     }
 
+    /// The inode's record, if the guest still holds it.
+    fn inode_data(&self, inode: Inode) -> Option<Arc<InodeData>> {
+        self.inodes.read().unwrap().get(&inode).cloned()
+    }
+
+    /// The override xattr's values for a file whose host stat is `st`: the
+    /// remembered ones when the ctime still matches, else read and
+    /// remembered.
+    fn override_for(
+        &self,
+        ihandle: &InodeHandle,
+        st: &bindings::stat64,
+        data: Option<&InodeData>,
+    ) -> io::Result<Override> {
+        let ctime = ctime_of(st);
+        if let Some(cached) = data.and_then(|d| *d.override_cache.lock().unwrap())
+            && cached.ctime == ctime
+        {
+            return Ok(cached.over);
+        }
+        let over = match ihandle {
+            InodeHandle::Fd(fd) => get_xattr_fstat(*fd, *st)?,
+            InodeHandle::Path(c_path) => get_xattr_lstat(c_path, *st)?,
+        };
+        if let Some(d) = data {
+            *d.override_cache.lock().unwrap() = Some(CachedOverride { over, ctime });
+        }
+        Ok(over)
+    }
+
+    /// stat as the guest sees the file: the host stat with the override
+    /// xattr applied, the xattr read from the host unless remembered for
+    /// this ctime.
+    fn gstat(
+        &self,
+        ihandle: &InodeHandle,
+        data: Option<&InodeData>,
+    ) -> io::Result<bindings::stat64> {
+        let st = istat(ihandle, true)?;
+        let over = self.override_for(ihandle, &st, data)?;
+        stat_common(st, over.0, over.1, over.2, false)
+    }
+
+    /// Look a name up. `known` is the override xattr a caller has just
+    /// written for the file, which saves reading it back; otherwise it is
+    /// read unless remembered for the file's current ctime.
+    fn lookup_as(&self, parent: Inode, name: &CStr, known: Option<Override>) -> io::Result<Entry> {
+        let parent_data = self.inode_data(parent).ok_or_else(ebadf)?;
+        let c_path = self.name_to_path(parent, name)?;
+        let st = lstat(&c_path, true)?;
+
+        debug!(
+            "lookup: inode={} path={}",
+            st.st_ino,
+            c_path.to_str().unwrap()
+        );
+
+        let over = match known {
+            Some(over) => over,
+            None => {
+                let existing = self
+                    .inodes
+                    .read()
+                    .unwrap()
+                    .get_alt(&InodeAltKey {
+                        ino: st.st_ino,
+                        dev: st.st_dev,
+                    })
+                    .cloned();
+                self.override_for(&InodeHandle::Path(c_path.clone()), &st, existing.as_deref())?
+            }
+        };
+        let view = stat_common(st, over.0, over.1, over.2, false)?;
+        self.register_lookup(view, parent_data.dev, over)
+    }
+
     fn do_release(&self, inode: Inode, handle: Handle) -> io::Result<()> {
         let mut handles = self.handles.write().unwrap();
 
@@ -1542,11 +1654,9 @@ impl PassthroughFs {
     }
 
     fn do_getattr(&self, inode: Inode) -> io::Result<(bindings::stat64, Duration)> {
+        let data = self.inode_data(inode);
         let ihandle = self.inode_to_handle(inode, true)?;
-        let st = match ihandle {
-            InodeHandle::Path(c_path) => lstat(&c_path, false)?,
-            InodeHandle::Fd(fd) => fstat(fd, false)?,
-        };
+        let st = self.gstat(&ihandle, data.as_deref())?;
 
         Ok((st, self.cfg.attr_timeout))
     }
@@ -1883,24 +1993,7 @@ impl FileSystem for PassthroughFs {
     }
 
     fn lookup(&self, _ctx: Context, parent: Inode, name: &CStr) -> io::Result<Entry> {
-        let parent_data = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&parent)
-            .cloned()
-            .ok_or_else(ebadf)?;
-
-        let c_path = self.name_to_path(parent, name)?;
-        let st = lstat(&c_path, false)?;
-
-        debug!(
-            "lookup: inode={} path={}",
-            st.st_ino,
-            c_path.to_str().unwrap()
-        );
-
-        self.register_lookup(st, parent_data.dev)
+        self.lookup_as(parent, name, None)
     }
 
     fn forget(&self, _ctx: Context, inode: Inode, count: u64) {
@@ -1991,13 +2084,9 @@ impl FileSystem for PassthroughFs {
                 set_secctx(&ihandle, secctx, false)?
             };
 
-            set_xattr_stat(
-                &ihandle,
-                None,
-                Some((ctx.uid, ctx.gid)),
-                Some(mode & !umask),
-            )?;
-            self.lookup(ctx, parent, name)
+            let written = (Some(ctx.uid), Some(ctx.gid), Some(mode & !umask));
+            set_xattr_stat(&ihandle, None, written.0.zip(written.1), written.2)?;
+            self.lookup_as(parent, name, Some(written))
         } else {
             Err(linux_error(io::Error::last_os_error()))
         }
@@ -2121,12 +2210,12 @@ impl FileSystem for PassthroughFs {
         }
         let ihandle = InodeHandle::Fd(fd);
 
-        if let Err(e) = set_xattr_stat(
-            &ihandle,
-            None,
-            Some((ctx.uid, ctx.gid)),
+        let written = (
+            Some(ctx.uid),
+            Some(ctx.gid),
             Some(libc::S_IFREG as u32 | (mode & !(umask & 0o777))),
-        ) {
+        );
+        if let Err(e) = set_xattr_stat(&ihandle, None, written.0.zip(written.1), written.2) {
             unsafe { libc::close(fd) };
             return Err(e);
         }
@@ -2146,7 +2235,8 @@ impl FileSystem for PassthroughFs {
         // Safe because we just opened this fd.
         let file = RwLock::new(unsafe { File::from_raw_fd(fd) });
 
-        let entry = self.lookup(ctx, parent, name)?;
+        // The xattr was just written: the lookup need not read it back.
+        let entry = self.lookup_as(parent, name, Some(written))?;
 
         let data = HandleData {
             inode: entry.inode,
@@ -2234,11 +2324,10 @@ impl FileSystem for PassthroughFs {
 
             if let Ok(st) = fstat(fd, false) {
                 let new_mode = clear_suid_sgid(st.st_mode as u32);
-                if new_mode != st.st_mode as u32 {
-                    // Update mode in xattr
-                    if let Err(err) = set_xattr_stat(&ihandle, Some(st), None, Some(new_mode)) {
-                        error!("Couldn't clear suid/sgid for inode {inode}: {err}");
-                    }
+                if new_mode != st.st_mode as u32
+                    && let Err(err) = set_xattr_stat(&ihandle, Some(st), None, Some(new_mode))
+                {
+                    error!("Couldn't clear suid/sgid for inode {inode}: {err}");
                 }
             }
         }
@@ -2553,18 +2642,14 @@ impl FileSystem for PassthroughFs {
                 set_secctx(&ihandle, secctx, false)?
             };
 
-            if let Err(e) = set_xattr_stat(
-                &ihandle,
-                None,
-                Some((ctx.uid, ctx.gid)),
-                Some(mode & !umask),
-            ) {
+            let written = (Some(ctx.uid), Some(ctx.gid), Some(mode & !umask));
+            if let Err(e) = set_xattr_stat(&ihandle, None, written.0.zip(written.1), written.2) {
                 unsafe { libc::close(fd) };
                 return Err(e);
             }
 
             unsafe { libc::close(fd) };
-            self.lookup(ctx, parent, name)
+            self.lookup_as(parent, name, Some(written))
         }
     }
 
@@ -2622,9 +2707,10 @@ impl FileSystem for PassthroughFs {
                 set_secctx(&ihandle, secctx, true)?
             };
 
-            let mut entry = self.lookup(ctx, parent, name)?;
             let mode = libc::S_IFLNK | 0o777;
-            set_xattr_stat(&ihandle, None, Some((ctx.uid, ctx.gid)), Some(mode as u32))?;
+            let written = (Some(ctx.uid), Some(ctx.gid), Some(mode as u32));
+            set_xattr_stat(&ihandle, None, written.0.zip(written.1), written.2)?;
+            let mut entry = self.lookup_as(parent, name, Some(written))?;
             entry.attr.st_uid = ctx.uid;
             entry.attr.st_gid = ctx.gid;
             entry.attr.st_mode = mode;
@@ -2738,10 +2824,8 @@ impl FileSystem for PassthroughFs {
     }
 
     fn access(&self, ctx: Context, inode: Inode, mask: u32) -> io::Result<()> {
-        let st = match self.inode_to_handle(inode, true)? {
-            InodeHandle::Path(c_path) => lstat(&c_path, false)?,
-            InodeHandle::Fd(fd) => fstat(fd, false)?,
-        };
+        let data = self.inode_data(inode);
+        let st = self.gstat(&self.inode_to_handle(inode, true)?, data.as_deref())?;
 
         let mode = mask as i32 & (libc::R_OK | libc::W_OK | libc::X_OK);
 
