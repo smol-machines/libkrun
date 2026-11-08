@@ -1069,7 +1069,10 @@ fn handle_cancel_save(dir: &str) -> String {
 
 #[cfg(all(snapshot_supported, deferred_stream_supported))]
 /// The live virtio-fs device named by the first word of `arg`, and the rest.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    not(any(feature = "tee", feature = "aws-nitro"))
+))]
 fn live_device(
     arg: &str,
 ) -> Result<
@@ -1089,7 +1092,10 @@ fn live_device(
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    not(any(feature = "tee", feature = "aws-nitro"))
+))]
 fn handle_share_add(arg: &str) -> String {
     let (shares, rest) = match live_device(arg) {
         Ok(device) => device,
@@ -1110,7 +1116,10 @@ fn handle_share_add(arg: &str) -> String {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    not(any(feature = "tee", feature = "aws-nitro"))
+))]
 fn handle_share_remove(arg: &str) -> String {
     let (shares, name) = match live_device(arg) {
         Ok(device) => device,
@@ -1126,7 +1135,10 @@ fn handle_share_remove(arg: &str) -> String {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    not(any(feature = "tee", feature = "aws-nitro"))
+))]
 fn handle_share_list(arg: &str) -> String {
     let (shares, _) = match live_device(arg) {
         Ok(device) => device,
@@ -2092,15 +2104,24 @@ fn handle_control_stream(mut stream: ControlStream, vmm: &Arc<Mutex<vmm::Vmm>>) 
                 "SAVE_FROZEN" => handle_save_frozen(vmm, _arg),
                 // SHARE_ADD <tag> <name> <host dir>: attach a host directory to
                 // the live virtio-fs device <tag> under <name>, while it runs.
-                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                #[cfg(all(
+                    any(target_os = "linux", target_os = "macos"),
+                    not(any(feature = "tee", feature = "aws-nitro"))
+                ))]
                 "SHARE_ADD" => handle_share_add(_arg),
                 // SHARE_REMOVE <tag> <name>: detach it, revoking the guest's
                 // access to everything under it, open files included.
-                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                #[cfg(all(
+                    any(target_os = "linux", target_os = "macos"),
+                    not(any(feature = "tee", feature = "aws-nitro"))
+                ))]
                 "SHARE_REMOVE" => handle_share_remove(_arg),
                 // SHARE_LIST <tag>: the attached shares, as name=host dir
                 // separated by tabs.
-                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                #[cfg(all(
+                    any(target_os = "linux", target_os = "macos"),
+                    not(any(feature = "tee", feature = "aws-nitro"))
+                ))]
                 "SHARE_LIST" => handle_share_list(_arg),
                 // PREPARE_SAVE captures an immutable COW RAM generation and
                 // leaves the VM paused only for caller-side disk staging.
