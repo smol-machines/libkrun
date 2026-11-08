@@ -38,6 +38,9 @@ use crate::virtio::InterruptTransport;
 
 pub(super) const DNS_PORT: u16 = 53;
 const DNS_TIMEOUT: Duration = Duration::from_secs(2);
+// The host forwarder resends a lost query itself and gives up after a few
+// seconds; wait a little longer than it does.
+const FORWARDER_TIMEOUT: Duration = Duration::from_secs(4);
 const MAX_DNS_PACKET_SIZE: usize = 65_535;
 // Learned IPs live at least this long (smooths sub-second TTLs) and at most
 // this long (bounds how long a single answer keeps an IP reachable before the
@@ -360,12 +363,10 @@ pub(super) struct DnsRequest {
     pub cid: u64,
 }
 
-/// Dedicated worker that performs the blocking upstream DNS resolution off the
-/// muxer thread and pushes the answer back onto the guest RX queue. Modelled on
-/// [`super::reaper::ReaperThread`].
-pub(super) struct DnsWorker {
-    receiver: Receiver<DnsRequest>,
-    policy: Arc<RwLock<EgressPolicy>>,
+/// What a DNS worker thread needs to answer a query and deliver the answer.
+struct DnsShared {
+    policy: Option<Arc<RwLock<EgressPolicy>>>,
+    forwarder: Option<SocketAddr>,
     mem: GuestMemoryMmap,
     queue: Arc<Mutex<VirtQueue>>,
     rxq: Arc<Mutex<MuxerRxQ>>,
@@ -373,10 +374,50 @@ pub(super) struct DnsWorker {
     snapshot_gate: Arc<SnapshotGate>,
 }
 
+impl DnsShared {
+    /// Resolve one request and push the answer onto the guest RX queue. No
+    /// answer (a forwarder that never replied) leaves the guest to retry.
+    fn answer(&self, req: DnsRequest) {
+        let Some(response) = handle_dns_query(self.policy.as_ref(), self.forwarder, &req.query)
+        else {
+            return;
+        };
+        push_packet(
+            req.cid,
+            MuxerRx::DgramDataDnsResponse {
+                peer_port: req.peer_port,
+                data: response,
+                fwd_cnt: req.fwd_cnt,
+            },
+            &self.rxq,
+            &self.queue,
+            &self.mem,
+            &self.snapshot_gate,
+        );
+        self.interrupt.signal_used_queue();
+    }
+}
+
+/// Upstream lookups resolved at once, at most; past it a query waits on the
+/// dispatching thread. A burst of 128 concurrent lookups is 256 queries.
+const MAX_DNS_THREADS: usize = 64;
+
+/// Worker that performs the blocking upstream DNS resolution off the muxer
+/// thread and pushes the answer back onto the guest RX queue. Modelled on
+/// [`super::reaper::ReaperThread`]. Each query is resolved on its own short
+/// thread (up to [`MAX_DNS_THREADS`]): answering them one after another made
+/// every query in a burst wait for all the ones before it.
+pub(super) struct DnsWorker {
+    receiver: Receiver<DnsRequest>,
+    shared: Arc<DnsShared>,
+}
+
 impl DnsWorker {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         receiver: Receiver<DnsRequest>,
-        policy: Arc<RwLock<EgressPolicy>>,
+        policy: Option<Arc<RwLock<EgressPolicy>>>,
+        forwarder: Option<SocketAddr>,
         mem: GuestMemoryMmap,
         queue: Arc<Mutex<VirtQueue>>,
         rxq: Arc<Mutex<MuxerRxQ>>,
@@ -385,12 +426,15 @@ impl DnsWorker {
     ) -> Self {
         Self {
             receiver,
-            policy,
-            mem,
-            queue,
-            rxq,
-            interrupt,
-            snapshot_gate,
+            shared: Arc::new(DnsShared {
+                policy,
+                forwarder,
+                mem,
+                queue,
+                rxq,
+                interrupt,
+                snapshot_gate,
+            }),
         }
     }
 
@@ -402,64 +446,86 @@ impl DnsWorker {
     }
 
     fn work(self) {
+        let busy = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         for req in self.receiver.iter() {
-            let response = handle_dns_query(&self.policy, &req.query);
-            push_packet(
-                req.cid,
-                MuxerRx::DgramDataDnsResponse {
-                    peer_port: req.peer_port,
-                    data: response,
-                    fwd_cnt: req.fwd_cnt,
-                },
-                &self.rxq,
-                &self.queue,
-                &self.mem,
-                &self.snapshot_gate,
-            );
-            self.interrupt.signal_used_queue();
+            use std::sync::atomic::Ordering;
+            if busy.fetch_add(1, Ordering::AcqRel) < MAX_DNS_THREADS {
+                let shared = self.shared.clone();
+                let busy_done = busy.clone();
+                let spawned =
+                    thread::Builder::new()
+                        .name("vsock dns query".into())
+                        .spawn(move || {
+                            shared.answer(req);
+                            busy_done.fetch_sub(1, Ordering::AcqRel);
+                        });
+                if spawned.is_ok() {
+                    continue;
+                }
+                // The request moved into the failed closure is gone; the guest
+                // retries it. Keep the count honest.
+                busy.fetch_sub(1, Ordering::AcqRel);
+                continue;
+            }
+            busy.fetch_sub(1, Ordering::AcqRel);
+            self.shared.answer(req);
         }
     }
 }
 
-/// Resolve a guest DNS query against the policy, forwarding allowed queries to
-/// the host-trusted resolvers only. Returns the raw DNS response bytes to hand
-/// back to the guest.
-fn handle_dns_query(policy: &Arc<RwLock<EgressPolicy>>, query: &[u8]) -> Vec<u8> {
-    let question = match parse_question(query) {
-        Ok(question) => question,
-        Err(_) => return build_error_response(query, DNS_RCODE_SERVFAIL),
-    };
-
-    // Snapshot the allow decision and the trusted resolvers under a short read
-    // lock; never hold the lock across the blocking upstream I/O below.
-    let (allowed, resolvers) = match policy.read() {
-        Ok(policy) => (
-            policy.is_hostname_allowed(&question.name),
-            policy.resolvers(),
-        ),
-        Err(_) => return build_error_response(query, DNS_RCODE_SERVFAIL),
-    };
-
-    if !allowed {
-        return build_error_response(query, DNS_RCODE_NXDOMAIN);
-    }
-
-    for resolver in resolvers {
-        let target = SocketAddr::new(resolver, DNS_PORT);
-        match forward_dns_udp(query, target) {
-            Ok(response) => {
-                if let Ok(ips) = parse_answer_ips(&response)
-                    && let Ok(mut policy) = policy.write()
-                {
-                    policy.learn_ips(ips);
-                }
-                return response;
-            }
-            Err(err) => debug!("DNS upstream {target} failed: {err}"),
+/// Answer a guest DNS query. With an allow-host policy the name is checked
+/// first (a denied name gets NXDOMAIN and never leaves the host) and the
+/// addresses of an allowed answer are learned. The query then goes to the
+/// host forwarder when one is configured, otherwise to the host-trusted
+/// resolvers. Returns the raw response for the guest, or `None` when the
+/// forwarder did not answer in time.
+fn handle_dns_query(
+    policy: Option<&Arc<RwLock<EgressPolicy>>>,
+    forwarder: Option<SocketAddr>,
+    query: &[u8],
+) -> Option<Vec<u8>> {
+    let filtering = policy.is_some_and(|p| p.read().map(|p| p.dns_active()).unwrap_or(true));
+    if filtering {
+        let policy = policy.expect("filtering implies a policy");
+        let question = match parse_question(query) {
+            Ok(question) => question,
+            Err(_) => return Some(build_error_response(query, DNS_RCODE_SERVFAIL)),
+        };
+        // Snapshot the allow decision and the trusted resolvers under a short
+        // read lock; never hold the lock across the blocking upstream I/O.
+        let (allowed, resolvers) = match policy.read() {
+            Ok(policy) => (
+                policy.is_hostname_allowed(&question.name),
+                policy.resolvers(),
+            ),
+            Err(_) => return Some(build_error_response(query, DNS_RCODE_SERVFAIL)),
+        };
+        if !allowed {
+            return Some(build_error_response(query, DNS_RCODE_NXDOMAIN));
         }
+        let response = match forwarder {
+            Some(forwarder) => forward_dns_udp(query, forwarder, FORWARDER_TIMEOUT).ok()?,
+            None => resolvers
+                .into_iter()
+                .find_map(|resolver| {
+                    let target = SocketAddr::new(resolver, DNS_PORT);
+                    forward_dns_udp(query, target, DNS_TIMEOUT)
+                        .map_err(|err| debug!("DNS upstream {target} failed: {err}"))
+                        .ok()
+                })
+                .unwrap_or_else(|| build_error_response(query, DNS_RCODE_SERVFAIL)),
+        };
+        if let Ok(ips) = parse_answer_ips(&response)
+            && let Ok(mut policy) = policy.write()
+        {
+            policy.learn_ips(ips);
+        }
+        return Some(response);
     }
-
-    build_error_response(query, DNS_RCODE_SERVFAIL)
+    let forwarder = forwarder?;
+    forward_dns_udp(query, forwarder, FORWARDER_TIMEOUT)
+        .map_err(|err| debug!("DNS forwarder {forwarder} failed: {err}"))
+        .ok()
 }
 
 pub(super) fn sockaddr_port(addr: &VsockAddr) -> Option<u16> {
@@ -509,15 +575,19 @@ fn normalize_hostname(hostname: &str) -> Option<String> {
     }
 }
 
-fn forward_dns_udp(query: &[u8], resolver: SocketAddr) -> std::io::Result<Vec<u8>> {
+fn forward_dns_udp(
+    query: &[u8],
+    resolver: SocketAddr,
+    timeout: Duration,
+) -> std::io::Result<Vec<u8>> {
     let bind_addr = if resolver.is_ipv4() {
         "0.0.0.0:0"
     } else {
         "[::]:0"
     };
     let socket = UdpSocket::bind(bind_addr)?;
-    socket.set_read_timeout(Some(DNS_TIMEOUT))?;
-    socket.set_write_timeout(Some(DNS_TIMEOUT))?;
+    socket.set_read_timeout(Some(timeout))?;
+    socket.set_write_timeout(Some(timeout))?;
     socket.connect(resolver)?;
     socket.send(query)?;
 
@@ -911,12 +981,86 @@ mod tests {
     #[test]
     fn blocked_query_returns_nxdomain_without_learning() {
         let policy = Arc::new(RwLock::new(host_policy(vec!["allowed.example.com"])));
-        let response = handle_dns_query(&policy, &query_for("blocked.example.com"));
+        let response = handle_dns_query(Some(&policy), None, &query_for("blocked.example.com"))
+            .expect("answered");
         assert_eq!(
             read_u16(&response, DNS_FLAGS_OFFSET).unwrap() & DNS_RCODE_MASK,
             DNS_RCODE_NXDOMAIN
         );
         assert!(policy.read().unwrap().allowed_ips.is_empty());
+    }
+
+    /// A loopback forwarder that echoes each query back as its answer, after
+    /// setting QR, and counts what it got.
+    fn echo_forwarder() -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = socket.local_addr().unwrap();
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = seen.clone();
+        thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            while let Ok((n, peer)) = socket.recv_from(&mut buf) {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                buf[2] |= 0x80;
+                let _ = socket.send_to(&buf[..n], peer);
+            }
+        });
+        (addr, seen)
+    }
+
+    #[test]
+    fn without_a_policy_every_query_goes_to_the_forwarder() {
+        let (forwarder, seen) = echo_forwarder();
+        let query = query_for("anything.example.com");
+        let response = handle_dns_query(None, Some(forwarder), &query).expect("answered");
+        assert_eq!(&response[..2], &query[..2]);
+        assert_ne!(
+            read_u16(&response, DNS_FLAGS_OFFSET).unwrap() & DNS_FLAG_RESPONSE,
+            0
+        );
+        assert_eq!(seen.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn the_allow_list_still_decides_before_the_forwarder() {
+        let (forwarder, seen) = echo_forwarder();
+        let policy = Arc::new(RwLock::new(host_policy(vec!["allowed.example.com"])));
+        let denied = handle_dns_query(
+            Some(&policy),
+            Some(forwarder),
+            &query_for("blocked.example.com"),
+        )
+        .expect("answered");
+        assert_eq!(
+            read_u16(&denied, DNS_FLAGS_OFFSET).unwrap() & DNS_RCODE_MASK,
+            DNS_RCODE_NXDOMAIN
+        );
+        assert_eq!(seen.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(
+            handle_dns_query(
+                Some(&policy),
+                Some(forwarder),
+                &query_for("allowed.example.com")
+            )
+            .is_some()
+        );
+        assert_eq!(seen.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn a_silent_forwarder_leaves_the_guest_to_retry() {
+        // Bound but never read: the query times out without an answer.
+        let silent = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let started = std::time::Instant::now();
+        assert!(
+            handle_dns_query(
+                None,
+                Some(silent.local_addr().unwrap()),
+                &query_for("a.example")
+            )
+            .is_none()
+        );
+        assert!(started.elapsed() >= FORWARDER_TIMEOUT);
     }
 
     #[test]

@@ -139,6 +139,8 @@ pub struct VsockMuxer {
     floor: FloorMode,
     /// Sender to the DNS worker thread; Some only when DNS filtering is active.
     dns_sender: Option<Sender<DnsRequest>>,
+    /// Host DNS forwarder that answers every guest UDP DNS query, if set.
+    dns_forwarder: Option<std::net::SocketAddr>,
     snapshot_gate: Arc<SnapshotGate>,
     /// Redirect guest stream connects to one destination port through a host
     /// interceptor (see `krun_set_stream_intercept`). Applied after the egress
@@ -156,6 +158,7 @@ impl VsockMuxer {
         egress_cidrs: Option<Vec<(IpAddr, u8)>>,
         egress_hosts: Option<Vec<String>>,
         egress_resolvers: Option<Vec<IpAddr>>,
+        dns_forwarder: Option<std::net::SocketAddr>,
         stream_intercept: Option<StreamIntercept>,
     ) -> Self {
         if let Some(ref intercept) = stream_intercept {
@@ -187,6 +190,7 @@ impl VsockMuxer {
             egress_policy,
             floor: floor_mode(),
             dns_sender: None,
+            dns_forwarder,
             snapshot_gate: Arc::new(SnapshotGate::default()),
             stream_intercept,
         }
@@ -266,25 +270,27 @@ impl VsockMuxer {
         }
 
         // Spawn the DNS worker (off-muxer blocking resolution) when DNS
-        // filtering is active. The dgram proxy treats `dns_sender.is_some()` as
-        // the "DNS filtering active" signal.
-        if let Some(policy) = &self.egress_policy {
-            let dns_active = policy.read().map(|p| p.dns_active()).unwrap_or(false);
-            if dns_active {
-                let (dns_sender, dns_receiver) = unbounded::<DnsRequest>();
-                let worker = DnsWorker::new(
-                    dns_receiver,
-                    policy.clone(),
-                    mem.clone(),
-                    queue.clone(),
-                    self.rxq.clone(),
-                    interrupt.clone(),
-                    self.snapshot_gate.clone(),
-                );
-                worker.run();
-                self.dns_sender = Some(dns_sender);
-                debug!("[VSOCK_TIMING] DnsWorker spawned");
-            }
+        // filtering is active or a host forwarder takes the guest's DNS. The
+        // dgram proxy treats `dns_sender.is_some()` as "intercept port 53".
+        let dns_active = self
+            .egress_policy
+            .as_ref()
+            .is_some_and(|policy| policy.read().map(|p| p.dns_active()).unwrap_or(false));
+        if dns_active || self.dns_forwarder.is_some() {
+            let (dns_sender, dns_receiver) = unbounded::<DnsRequest>();
+            let worker = DnsWorker::new(
+                dns_receiver,
+                self.egress_policy.clone(),
+                self.dns_forwarder,
+                mem.clone(),
+                queue.clone(),
+                self.rxq.clone(),
+                interrupt.clone(),
+                self.snapshot_gate.clone(),
+            );
+            worker.run();
+            self.dns_sender = Some(dns_sender);
+            debug!("[VSOCK_TIMING] DnsWorker spawned");
         }
 
         let (sender, receiver) = unbounded();
@@ -1409,8 +1415,17 @@ mod tests {
         std::thread::spawn(move || {
             let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
             let rx = TestQueue::new(GuestAddress(0x4000), &mem, 8);
-            let mut muxer =
-                VsockMuxer::new(3, None, None, TsiFlags::default(), None, None, None, None);
+            let mut muxer = VsockMuxer::new(
+                3,
+                None,
+                None,
+                TsiFlags::default(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
             muxer.mem = Some(mem.clone());
             muxer.queue = Some(Arc::new(Mutex::new(rx.create_queue())));
 
@@ -1524,6 +1539,7 @@ mod tests {
             None,
             Some(ipc),
             TsiFlags::default(),
+            None,
             None,
             None,
             None,

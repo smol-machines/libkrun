@@ -217,6 +217,7 @@ struct ContextConfig {
     unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
     egress_hosts: Option<Vec<String>>,
     egress_resolvers: Option<Vec<std::net::IpAddr>>,
+    dns_forwarder: Option<std::net::SocketAddr>,
     stream_intercept: Option<devices::virtio::vsock::StreamIntercept>,
     shutdown_efd: Option<EventFd>,
     gpu_virgl_flags: Option<u32>,
@@ -3651,6 +3652,45 @@ pub unsafe extern "C" fn krun_set_egress_policy(
     KRUN_SUCCESS
 }
 
+/// Route every guest UDP DNS query (destination port 53, whatever resolver
+/// the guest chose) to a host DNS forwarder on loopback, and relay its answers
+/// back. The forwarder decides the upstream and may cache. With an allow-host
+/// egress policy the name is still checked here first and the answer's
+/// addresses learned; the forwarder only replaces the trusted resolvers.
+///
+/// `c_addr` is an `ip:port` on the host's loopback. Returns -EINVAL for any
+/// other address, -ENOENT for an unknown context and -ENODEV without vsock.
+#[allow(clippy::missing_safety_doc)]
+#[allow(unsafe_op_in_unsafe_fn)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn krun_set_dns_forwarder(ctx_id: u32, c_addr: *const c_char) -> i32 {
+    if c_addr.is_null() {
+        return -libc::EINVAL;
+    }
+    let addr: std::net::SocketAddr = match CStr::from_ptr(c_addr).to_str().map(str::parse) {
+        Ok(Ok(addr)) => addr,
+        _ => return -libc::EINVAL,
+    };
+    if !addr.ip().is_loopback() || addr.port() == 0 {
+        return -libc::EINVAL;
+    }
+    let mut map = match CTX_MAP.lock() {
+        Ok(map) => map,
+        Err(_) => return -libc::EINVAL,
+    };
+    match map.entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            let cfg = ctx_cfg.get_mut();
+            if cfg.vsock_config == VsockConfig::Disabled {
+                return -libc::ENODEV;
+            }
+            cfg.dns_forwarder = Some(addr);
+        }
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+    KRUN_SUCCESS
+}
+
 #[allow(clippy::missing_safety_doc)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn krun_set_stream_intercept(
@@ -5738,6 +5778,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     let egress_cidrs = ctx_cfg.egress_cidrs.take();
     let egress_hosts = ctx_cfg.egress_hosts.take();
     let egress_resolvers = ctx_cfg.egress_resolvers.take();
+    let dns_forwarder = ctx_cfg.dns_forwarder.take();
     let stream_intercept = ctx_cfg.stream_intercept.take();
 
     match &ctx_cfg.vsock_config {
@@ -5752,6 +5793,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
                 egress_cidrs,
                 egress_hosts,
                 egress_resolvers,
+                dns_forwarder,
                 stream_intercept,
             };
             ctx_cfg.vmr.set_vsock_device(vsock_device_config).unwrap();

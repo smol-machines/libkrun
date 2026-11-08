@@ -258,44 +258,47 @@ impl Proxy for TsiDgramProxy {
     fn connect(&mut self, pkt: &VsockPacket, req: TsiConnectReq) -> ProxyUpdate {
         debug!("connect: addr={}", req.addr);
 
-        // A connected DNS socket is intercepted: we never open a host socket to
-        // the (guest-chosen) resolver. Sends are routed to the DNS worker, which
-        // queries only the host-trusted resolvers.
+        // A connected DNS socket is intercepted: its sends are routed to the
+        // DNS worker, which queries only the host forwarder or the
+        // host-trusted resolvers, never the guest-chosen one. The host socket
+        // is still connected (a datagram connect sends nothing, it only looks
+        // up the route), so a resolver the host cannot reach fails the connect
+        // exactly as it would without interception, and the guest's resolver
+        // and address selection see the same errors.
         let intercept = self.dns_sender.is_some() && sockaddr_port(&req.addr) == Some(DNS_PORT);
-        let (res, poll_host_socket) = if intercept {
-            debug!("connect: intercepting DNS socket (no host connect)");
-            self.connected_dns = true;
-            self.status = ProxyStatus::Connected;
-            (0, false)
-        } else {
-            self.connected_dns = false;
-            let addr: std::io::Result<socket2::SockAddr> = match req.addr.inet() {
-                _ if !req.addr.suits_family(self.family) => {
-                    warn!(
-                        "connect: id={} refused address {} for its family",
-                        self.id, req.addr
-                    );
-                    Err(std::io::Error::from_raw_os_error(libc::EINVAL))
-                }
-                Some(inet) => Ok(inet.into()),
-                #[cfg(target_os = "linux")]
-                None => match req.addr.unix_path() {
-                    Some(p) => socket2::SockAddr::unix(p),
-                    None => Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
-                },
-                #[cfg(not(target_os = "linux"))]
+        self.connected_dns = false;
+        let addr: std::io::Result<socket2::SockAddr> = match req.addr.inet() {
+            _ if !req.addr.suits_family(self.family) => {
+                warn!(
+                    "connect: id={} refused address {} for its family",
+                    self.id, req.addr
+                );
+                Err(std::io::Error::from_raw_os_error(libc::EINVAL))
+            }
+            Some(inet) => Ok(inet.into()),
+            #[cfg(target_os = "linux")]
+            None => match req.addr.unix_path() {
+                Some(p) => socket2::SockAddr::unix(p),
                 None => Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
-            };
-            match addr.and_then(|a| self.sock.connect(&a)) {
-                Ok(()) => {
+            },
+            #[cfg(not(target_os = "linux"))]
+            None => Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+        };
+        let (res, poll_host_socket) = match addr.and_then(|a| self.sock.connect(&a)) {
+            Ok(()) => {
+                self.status = ProxyStatus::Connected;
+                if intercept {
+                    debug!("connect: intercepting DNS socket");
+                    self.connected_dns = true;
+                    (0, false)
+                } else {
                     debug!("connect: Connected");
-                    self.status = ProxyStatus::Connected;
                     (0, true)
                 }
-                Err(e) => {
-                    debug!("Error connecting: {e}");
-                    (-sys::to_linux_errno(&e), false)
-                }
+            }
+            Err(e) => {
+                debug!("Error connecting: {e}");
+                (-sys::to_linux_errno(&e), false)
             }
         };
 
