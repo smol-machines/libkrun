@@ -1340,6 +1340,7 @@ impl PassthroughFs {
         &self,
         inode: Inode,
         kill_priv: bool,
+        writer_gid: libc::gid_t,
         flags: u32,
     ) -> io::Result<(Option<Handle>, OpenOptions)> {
         let flags = self.parse_open_flags(flags as i32);
@@ -1354,7 +1355,8 @@ impl PassthroughFs {
             remove_security_capability(&ihandle);
 
             if let Ok(st) = fstat(fd, false) {
-                let new_mode = clear_suid_sgid(st.st_mode as u32);
+                let new_mode =
+                    mode_after_unprivileged_write(st.st_mode as u32, writer_gid, st.st_gid);
                 if new_mode != st.st_mode as u32
                     && let Err(err) = set_xattr_stat(&ihandle, Some(st), None, Some(new_mode))
                 {
@@ -1887,6 +1889,19 @@ fn clear_suid_sgid(mode: u32) -> u32 {
     new_mode
 }
 
+/// The mode a regular file is left with after an unprivileged write or truncating open (the kernel's
+/// `setattr_should_drop_suidgid`): the setuid bit always goes, and the setgid bit goes when the file is
+/// group-executable (without it the bit only marks mandatory locking) or when the writer is outside the
+/// file's group. A FUSE request carries the caller's primary gid alone, so that is the group it is
+/// checked against.
+fn mode_after_unprivileged_write(mode: u32, writer_gid: libc::gid_t, file_gid: libc::gid_t) -> u32 {
+    let mut new_mode = clear_suid_sgid(mode);
+    if writer_gid != file_gid {
+        new_mode &= !libc::S_ISGID as u32;
+    }
+    new_mode
+}
+
 fn forget_one(
     inodes: &mut MultikeyBTreeMap<Inode, InodeAltKey, Arc<InodeData>>,
     inode: Inode,
@@ -2059,7 +2074,7 @@ impl FileSystem for PassthroughFs {
 
     fn opendir(
         &self,
-        _ctx: Context,
+        ctx: Context,
         inode: Inode,
         flags: u32,
     ) -> io::Result<(Option<Handle>, OpenOptions)> {
@@ -2070,7 +2085,7 @@ impl FileSystem for PassthroughFs {
             // guest as EREMCHG and fail every directory open.
             Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)))
         } else {
-            self.do_open(inode, false, flags | libc::O_DIRECTORY as u32)
+            self.do_open(inode, false, ctx.gid, flags | libc::O_DIRECTORY as u32)
         }
     }
 
@@ -2163,7 +2178,7 @@ impl FileSystem for PassthroughFs {
 
     fn open(
         &self,
-        _ctx: Context,
+        ctx: Context,
         inode: Inode,
         kill_priv: bool,
         flags: u32,
@@ -2173,7 +2188,7 @@ impl FileSystem for PassthroughFs {
             // needed" and never sends another.
             return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));
         }
-        self.do_open(inode, kill_priv, flags)
+        self.do_open(inode, kill_priv, ctx.gid, flags)
     }
 
     fn release(
@@ -2325,7 +2340,7 @@ impl FileSystem for PassthroughFs {
 
     fn write<R: io::Read + ZeroCopyReader>(
         &self,
-        _ctx: Context,
+        ctx: Context,
         inode: Inode,
         handle: Handle,
         mut r: R,
@@ -2351,7 +2366,7 @@ impl FileSystem for PassthroughFs {
             remove_security_capability(&ihandle);
 
             if let Ok(st) = fstat(fd, false) {
-                let new_mode = clear_suid_sgid(st.st_mode as u32);
+                let new_mode = mode_after_unprivileged_write(st.st_mode as u32, ctx.gid, st.st_gid);
                 if new_mode != st.st_mode as u32
                     && let Err(err) = set_xattr_stat(&ihandle, Some(st), None, Some(new_mode))
                 {
@@ -3746,6 +3761,101 @@ mod tests {
             self.0.drain(..written);
             Ok(written)
         }
+    }
+
+    #[test]
+    fn an_unprivileged_write_drops_setgid_as_a_local_filesystem_does() {
+        // The kernel's rule for a local file (setattr_should_drop_suidgid): an
+        // unprivileged write always drops setuid, and drops setgid when the file
+        // is group-executable or the writer is outside the file's group. The
+        // server is handed the write with the kill flag and must apply the same.
+        assert_eq!(mode_after_unprivileged_write(0o106_666, 7, 7), 0o102_666);
+        assert_eq!(mode_after_unprivileged_write(0o106_666, 7, 8), 0o100_666);
+        assert_eq!(mode_after_unprivileged_write(0o102_666, 7, 7), 0o102_666);
+        assert_eq!(mode_after_unprivileged_write(0o102_676, 7, 7), 0o100_676);
+        assert_eq!(mode_after_unprivileged_write(0o102_676, 7, 8), 0o100_676);
+        assert_eq!(mode_after_unprivileged_write(0o100_666, 7, 8), 0o100_666);
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("libkrun-sgid-write-{}-{nonce}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let filesystem = PassthroughFs::new(
+            Config {
+                root_dir: root.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        FileSystem::init(&filesystem, FsOptions::empty()).unwrap();
+        let root_ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        };
+        // Two setuid-and-setgid files without a group-exec bit, each written by
+        // a user in a group other than the file's and by one in the file's group.
+        let mut modes = Vec::new();
+        for (name, writer_gid) in [("outside", 1234u32), ("inside", 0u32)] {
+            let name = CString::new(name).unwrap();
+            let (entry, handle, _) = FileSystem::create(
+                &filesystem,
+                root_ctx,
+                fuse::ROOT_ID,
+                &name,
+                0o100_666,
+                false,
+                libc::O_WRONLY as u32,
+                0,
+                Extensions::default(),
+            )
+            .unwrap();
+            let mut attr: bindings::stat64 = unsafe { std::mem::zeroed() };
+            attr.st_mode = 0o106_666;
+            FileSystem::setattr(
+                &filesystem,
+                root_ctx,
+                entry.inode,
+                attr,
+                handle,
+                SetattrValid::MODE,
+            )
+            .unwrap();
+            let (st, _) = FileSystem::getattr(&filesystem, root_ctx, entry.inode, None).unwrap();
+            assert_eq!(
+                st.st_mode as u32 & 0o7777,
+                0o6666,
+                "{name:?} before the write"
+            );
+            assert_eq!(st.st_gid, 0, "{name:?} is group 0 as the guest sees it");
+            let writer = Context {
+                uid: 1234,
+                gid: writer_gid,
+                pid: 0,
+            };
+            FileSystem::write(
+                &filesystem,
+                writer,
+                entry.inode,
+                handle.unwrap(),
+                Source(b"y".to_vec()),
+                1,
+                0,
+                None,
+                false,
+                true,
+                0,
+            )
+            .unwrap();
+            let (st, _) = FileSystem::getattr(&filesystem, root_ctx, entry.inode, None).unwrap();
+            modes.push(st.st_mode as u32 & 0o7777);
+        }
+        assert_eq!(modes, vec![0o666, 0o2666]);
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
