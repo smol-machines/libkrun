@@ -1589,6 +1589,20 @@ impl FileSystem for PassthroughFs {
             self.announce_submounts.store(true, Ordering::Relaxed);
         }
 
+        // readdirplus answers a directory listing with each entry's attributes
+        // in the same reply, so a listing followed by a stat of every entry
+        // (ls -l, git status, tar, a package manager walking node_modules)
+        // costs one request per readdir chunk instead of one LOOKUP per entry.
+        // AUTO lets the kernel keep plain readdir for a listing it has not seen
+        // entries of stat'ed, so `find -type f`, which needs only d_type, pays
+        // nothing extra.
+        if capable.contains(FsOptions::DO_READDIRPLUS) {
+            opts |= FsOptions::DO_READDIRPLUS;
+            if capable.contains(FsOptions::READDIRPLUS_AUTO) {
+                opts |= FsOptions::READDIRPLUS_AUTO;
+            }
+        }
+
         Ok(opts)
     }
 
@@ -3079,6 +3093,45 @@ mod tests {
         const FS_IOC_SETFLAGS: u32 = 0x4008_6602;
         assert!(!is_terminal_ioctl(FS_IOC_GETFLAGS));
         assert!(!is_terminal_ioctl(FS_IOC_SETFLAGS));
+    }
+
+    #[test]
+    fn init_offers_readdirplus_when_the_kernel_can_take_it() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "libkrun-readdirplus-init-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        let filesystem = PassthroughFs::new(
+            Config {
+                root_dir: root.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        let both = FsOptions::DO_READDIRPLUS | FsOptions::READDIRPLUS_AUTO;
+        assert_eq!(
+            FileSystem::init(&filesystem, both).unwrap() & both,
+            both,
+            "a kernel offering both gets adaptive readdirplus"
+        );
+        assert_eq!(
+            FileSystem::init(&filesystem, FsOptions::DO_READDIRPLUS).unwrap() & both,
+            FsOptions::DO_READDIRPLUS,
+            "without AUTO the kernel issues readdirplus for every listing"
+        );
+        assert!(
+            !FileSystem::init(&filesystem, FsOptions::empty())
+                .unwrap()
+                .intersects(both),
+            "a kernel that cannot take it is not offered it"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
