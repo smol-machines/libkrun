@@ -1296,6 +1296,13 @@ impl PassthroughFs {
             _ => {}
         };
 
+        // As on Linux (virtio/fs: reduce request latency): this server does
+        // not negotiate POSIX/FLOCK locks and its flush() only dup(2)+close(2)s
+        // the same host descriptor, while durability is FUSE_FSYNC's job, so
+        // the close-time FUSE_FLUSH is a redundant guest/host round trip: one
+        // of the five requests every small file read costs.
+        opts |= OpenOptions::NOFLUSH;
+
         Ok((Some(handle), opts))
     }
 
@@ -1855,6 +1862,10 @@ impl FileSystem for PassthroughFs {
             CachePolicy::Always => opts |= OpenOptions::KEEP_CACHE,
             _ => {}
         };
+
+        // See open(): explicit fsync remains intact; only the redundant close
+        // notification is suppressed.
+        opts |= OpenOptions::NOFLUSH;
 
         Ok((entry, Some(handle), opts))
     }
@@ -3131,6 +3142,61 @@ mod tests {
                 .intersects(both),
             "a kernel that cannot take it is not offered it"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn regular_opens_skip_redundant_close_flushes() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "libkrun-no-close-flush-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("existing"), b"data").unwrap();
+
+        let filesystem = PassthroughFs::new(
+            Config {
+                root_dir: root.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        let negotiated =
+            FileSystem::init(&filesystem, FsOptions::POSIX_LOCKS | FsOptions::FLOCK_LOCKS).unwrap();
+        assert!(!negotiated.intersects(FsOptions::POSIX_LOCKS | FsOptions::FLOCK_LOCKS));
+        let context = Context {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        };
+        let existing = CString::new("existing").unwrap();
+        let entry = FileSystem::lookup(&filesystem, context, fuse::ROOT_ID, &existing).unwrap();
+        for access in [libc::O_RDONLY, libc::O_WRONLY, libc::O_RDWR] {
+            let (_, open_options) =
+                FileSystem::open(&filesystem, context, entry.inode, false, access as u32).unwrap();
+            assert!(open_options.contains(OpenOptions::NOFLUSH), "{access:#o}");
+        }
+
+        let created = CString::new("created").unwrap();
+        let (_, _, create_options) = FileSystem::create(
+            &filesystem,
+            context,
+            fuse::ROOT_ID,
+            &created,
+            0o644,
+            false,
+            libc::O_WRONLY as u32,
+            0,
+            Extensions::default(),
+        )
+        .unwrap();
+        assert!(create_options.contains(OpenOptions::NOFLUSH));
+
         fs::remove_dir_all(root).unwrap();
     }
 
