@@ -105,6 +105,10 @@ pub struct FuseServerState {
     /// resumes after FUSE_INIT, so the replacement server must restore this.
     #[serde(default)]
     pub zero_message_opendir: bool,
+    /// Whether the guest negotiated handle-free opens of regular files; the
+    /// replacement server must answer handle 0 the same way.
+    #[serde(default)]
+    pub zero_message_open: bool,
     /// Active DAX window mappings, replayed into a clone's window after the
     /// inode map is rebuilt. Defaults to empty for snapshots taken before this
     /// field existed.
