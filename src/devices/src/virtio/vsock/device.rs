@@ -88,6 +88,7 @@ impl Vsock {
         egress_cidrs: Option<Vec<(IpAddr, u8)>>,
         egress_hosts: Option<Vec<String>>,
         egress_resolvers: Option<Vec<IpAddr>>,
+        dns_forwarder: Option<std::net::SocketAddr>,
         stream_intercept: Option<super::proxy::StreamIntercept>,
     ) -> super::Result<Vsock> {
         Ok(Vsock {
@@ -100,6 +101,7 @@ impl Vsock {
                 egress_cidrs,
                 egress_hosts,
                 egress_resolvers,
+                dns_forwarder,
                 stream_intercept,
             ),
             queue_rx: None,
@@ -509,8 +511,18 @@ mod tests {
 
     #[test]
     fn save_state_uses_listener_metadata_captured_before_quiesce() {
-        let mut vsock =
-            Vsock::new(3, None, None, TsiFlags::empty(), None, None, None, None).unwrap();
+        let mut vsock = Vsock::new(
+            3,
+            None,
+            None,
+            TsiFlags::empty(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let listener = ListenerDesc {
             family: defs::LINUX_AF_INET,
             peer_port: 41,

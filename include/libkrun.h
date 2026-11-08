@@ -1039,6 +1039,26 @@ int32_t krun_set_egress_policy(uint32_t ctx_id,
                                const char **c_dns_resolvers);
 
 /**
+ * Routes every guest UDP DNS query (destination port 53, whatever resolver the
+ * guest chose) to a host DNS forwarder on loopback and relays its answers back
+ * to the guest. The forwarder chooses the upstream and may cache. With an
+ * allow-host egress policy the queried name is still checked first, and the
+ * addresses in an allowed answer are still learned; the forwarder then takes
+ * the place of the trusted resolvers.
+ *
+ * Arguments:
+ *  "ctx_id" - the configuration context ID.
+ *  "c_addr" - the forwarder's "ip:port", on the host's loopback.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ *  -EINVAL if c_addr is not a loopback "ip:port".
+ *  -ENOENT if ctx_id is invalid.
+ *  -ENODEV if vsock is disabled.
+ */
+int32_t krun_set_dns_forwarder(uint32_t ctx_id, const char *c_addr);
+
+/**
  * Redirects guest TSI stream connects to one destination port through a host
  * interceptor. Every guest TCP connect to "port" (after the egress policy has
  * admitted the real destination) is dialed to "c_endpoint" instead, and the

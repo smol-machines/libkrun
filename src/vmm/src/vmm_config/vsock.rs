@@ -49,6 +49,8 @@ pub struct VsockDeviceConfig {
     pub egress_hosts: Option<Vec<String>>,
     /// Optional host-trusted DNS resolvers (queries are forwarded only here).
     pub egress_resolvers: Option<Vec<IpAddr>>,
+    /// Optional host DNS forwarder every guest UDP DNS query is routed to.
+    pub dns_forwarder: Option<std::net::SocketAddr>,
     /// Optional host interceptor for guest stream connects to one port.
     pub stream_intercept: Option<devices::virtio::vsock::StreamIntercept>,
 }
@@ -102,6 +104,7 @@ impl VsockBuilder {
             cfg.egress_cidrs,
             cfg.egress_hosts,
             cfg.egress_resolvers,
+            cfg.dns_forwarder,
             cfg.stream_intercept,
         )
         .map_err(VsockConfigError::CreateVsockDevice)
@@ -144,6 +147,7 @@ pub(crate) mod tests {
             egress_cidrs: None,
             egress_hosts: None,
             egress_resolvers: None,
+            dns_forwarder: None,
             stream_intercept: None,
         }
     }
