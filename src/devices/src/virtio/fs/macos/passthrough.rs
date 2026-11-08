@@ -558,6 +558,13 @@ pub struct Config {
     /// The default value for this option is 5 seconds.
     pub entry_timeout: Duration,
 
+    /// How long the guest may keep a name that does not exist before asking
+    /// again. Zero (the default) caches nothing: every stat of a missing path
+    /// is a request. A share whose host directory is watched can afford a
+    /// second, since the watcher drops the guest's entry when the host
+    /// creates the name.
+    pub negative_timeout: Duration,
+
     /// How long the FUSE client should consider file and directory attributes to be valid. If the
     /// attributes of a file or directory can only be modified by the FUSE client (i.e., the file
     /// system has exclusive access), then this should be set to a large value.
@@ -620,6 +627,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             entry_timeout: Duration::from_secs(5),
+            negative_timeout: Duration::ZERO,
             attr_timeout: Duration::from_secs(5),
             cache_policy: Default::default(),
             writeback: false,
@@ -1611,7 +1619,27 @@ impl PassthroughFs {
     fn lookup_as(&self, parent: Inode, name: &CStr, known: Option<Override>) -> io::Result<Entry> {
         let parent_data = self.inode_data(parent).ok_or_else(ebadf)?;
         let c_path = self.name_to_path(parent, name)?;
-        let st = lstat(&c_path, true)?;
+        let st = match lstat(&c_path, true) {
+            Ok(st) => st,
+            // A name that does not exist: an entry with inode 0 tells the
+            // kernel to remember the absence for `negative_timeout` instead
+            // of asking again at every stat of the path.
+            Err(e)
+                if e.raw_os_error() == Some(libc::ENOENT)
+                    && self.cfg.negative_timeout > Duration::ZERO =>
+            {
+                return Ok(Entry {
+                    inode: 0,
+                    generation: 0,
+                    // SAFETY: an all-zero stat is a valid value of the C struct.
+                    attr: unsafe { std::mem::zeroed() },
+                    attr_flags: 0,
+                    attr_timeout: Duration::ZERO,
+                    entry_timeout: self.cfg.negative_timeout,
+                });
+            }
+            Err(e) => return Err(e),
+        };
 
         debug!(
             "lookup: inode={} path={}",
@@ -3920,6 +3948,74 @@ mod tests {
             filesystem.inode_fds.lock().unwrap().map.is_empty(),
             "so does a batch forget"
         );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_missing_name_is_an_error_unless_the_share_keeps_negative_entries() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("libkrun-negative-{}-{nonce}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let context = Context {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        };
+        let missing = CString::new("nothing-here").unwrap();
+
+        // as before: ENOENT, which the kernel does not cache
+        let plain = PassthroughFs::new(
+            Config {
+                root_dir: root.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        FileSystem::init(&plain, FsOptions::empty()).unwrap();
+        let Err(err) = FileSystem::lookup(&plain, context, fuse::ROOT_ID, &missing) else {
+            panic!("a missing name looked up without negative entries must fail");
+        };
+        assert_eq!(err.raw_os_error(), Some(libc::ENOENT));
+
+        // with a negative timeout: an entry with inode 0 the kernel keeps that long
+        let keeping = PassthroughFs::new(
+            Config {
+                root_dir: root.to_string_lossy().into_owned(),
+                negative_timeout: Duration::from_secs(1),
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        FileSystem::init(&keeping, FsOptions::empty()).unwrap();
+        let entry = FileSystem::lookup(&keeping, context, fuse::ROOT_ID, &missing).unwrap();
+        assert_eq!(entry.inode, 0);
+        assert_eq!(entry.entry_timeout, Duration::from_secs(1));
+        assert!(
+            keeping
+                .inodes
+                .read()
+                .unwrap()
+                .get_alt(&InodeAltKey { ino: 0, dev: 0 })
+                .is_none()
+        );
+        // a name that exists is unaffected
+        fs::write(root.join("present"), b"x").unwrap();
+        let present = FileSystem::lookup(
+            &keeping,
+            context,
+            fuse::ROOT_ID,
+            &CString::new("present").unwrap(),
+        )
+        .unwrap();
+        assert_ne!(present.inode, 0);
+        assert_eq!(present.entry_timeout, Duration::from_secs(5));
 
         fs::remove_dir_all(root).unwrap();
     }

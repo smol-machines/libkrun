@@ -2832,6 +2832,8 @@ pub const KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT: u32 = 1 << 0;
 /// socket (`SHARE_ADD`, `SHARE_REMOVE`, `SHARE_LIST`). `c_path` must name an empty
 /// host directory the device uses as its root, and `shm_size` must be 0.
 pub const KRUN_VIRTIOFS_FLAG_LIVE: u32 = 1 << 1;
+/// Let the guest keep a missing name for one second (see `KRUN_VIRTIOFS_FLAG_NEGATIVE_ENTRIES`).
+pub const KRUN_VIRTIOFS_FLAG_NEGATIVE_ENTRIES: u32 = 1 << 2;
 
 #[allow(clippy::missing_safety_doc)]
 #[unsafe(no_mangle)]
@@ -2844,10 +2846,16 @@ pub unsafe extern "C" fn krun_add_virtiofs4(
     read_only: bool,
     flags: u32,
 ) -> i32 {
-    if flags & !(KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT | KRUN_VIRTIOFS_FLAG_LIVE) != 0 {
+    if flags
+        & !(KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT
+            | KRUN_VIRTIOFS_FLAG_LIVE
+            | KRUN_VIRTIOFS_FLAG_NEGATIVE_ENTRIES)
+        != 0
+    {
         return -libc::EINVAL;
     }
     let override_stat = flags & KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT != 0;
+    let negative_entries = flags & KRUN_VIRTIOFS_FLAG_NEGATIVE_ENTRIES != 0;
     let live = flags & KRUN_VIRTIOFS_FLAG_LIVE != 0;
     // A live device's mappings into guest memory could not be revoked on
     // detach, so it has no DAX window, and it needs a host root to serve from.
@@ -2901,6 +2909,7 @@ pub unsafe extern "C" fn krun_add_virtiofs4(
                     shm_size: shm,
                     read_only,
                     override_stat,
+                    negative_entries,
                     live,
                     virtual_entries,
                 });
@@ -5103,6 +5112,7 @@ pub unsafe extern "C" fn krun_set_root_disk_remount(
                     shm_size: Some(1 << 29),
                     read_only: false,
                     override_stat: false,
+                    negative_entries: false,
                     live: false,
                     virtual_entries,
                 });

@@ -227,6 +227,12 @@ pub struct Config {
     /// The default value for this option is 5 seconds.
     pub entry_timeout: Duration,
 
+    /// How long the guest may keep a name that does not exist before asking
+    /// again (`KRUN_VIRTIOFS_FLAG_NEGATIVE_ENTRIES`). Honoured by the macOS
+    /// passthrough; this one answers ENOENT as before, and the kernel keeps
+    /// nothing.
+    pub negative_timeout: Duration,
+
     /// How long the FUSE client should consider file and directory attributes to be valid. If the
     /// attributes of a file or directory can only be modified by the FUSE client (i.e., the file
     /// system has exclusive access), then this should be set to a large value.
@@ -278,6 +284,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             entry_timeout: Duration::from_secs(5),
+            negative_timeout: Duration::ZERO,
             attr_timeout: Duration::from_secs(5),
             cache_policy: Default::default(),
             writeback: false,
