@@ -42,6 +42,9 @@ jobs:
 
   unit-tests-linux-aarch64:
     name: Unit tests (Linux aarch64)
+    # Needs a KVM-capable aarch64 runner, which GitHub does not host. Runs
+    # only once one is registered and LIBKRUN_SELF_HOSTED_ARM is set to true.
+    if: vars.LIBKRUN_SELF_HOSTED_ARM == 'true'
     runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
