@@ -52,6 +52,16 @@ const MACOS_XATTR_PREFIX: &[u8] = b"com.apple.";
 
 const UID_MAX: u32 = u32::MAX - 1;
 
+/// Where macOS keeps the Rosetta runtime for Linux guests. A share rooted here
+/// holds the binary the guest registers as its x86_64 binfmt interpreter.
+const ROSETTA_RUNTIME_DIR: &str = "/Library/Apple/usr/libexec/oah/RosettaLinux";
+
+/// What Rosetta expects to read back from the file system holding its binary
+/// before it translates anything. Virtualization.framework's Rosetta share
+/// answers with this; the reply is the string and its terminating NUL.
+const ROSETTA_KEY: &[u8] =
+    b"Our hard work\nby these words guarded\nplease don't steal\n\xC2\xA9 Apple Inc\0";
+
 type Inode = u64;
 type Handle = u64;
 
@@ -671,6 +681,9 @@ pub struct PassthroughFs {
     /// inode: a directory's entries are read once at offset 0 and served
     /// chunk by chunk, then dropped when the listing reaches its end.
     handleless_dirs: Mutex<HashMap<Inode, DirStream>>,
+    /// The share is the host's Rosetta runtime directory, so Rosetta's start-up
+    /// ioctls on its own binary are answered here.
+    rosetta_runtime: bool,
     cfg: Config,
 }
 
@@ -815,6 +828,10 @@ impl PassthroughFs {
 
         unsafe { libc::close(fd) };
 
+        let rosetta_runtime = Path::new(&cfg.root_dir)
+            .canonicalize()
+            .is_ok_and(|root| root == Path::new(ROSETTA_RUNTIME_DIR));
+
         Ok(PassthroughFs {
             inodes: RwLock::new(MultikeyBTreeMap::new()),
             inode_alloc,
@@ -830,6 +847,7 @@ impl PassthroughFs {
             zero_message_open: AtomicBool::new(false),
             inode_fds: Mutex::new(InodeFds::default()),
             handleless_dirs: Mutex::new(HashMap::new()),
+            rosetta_runtime,
             cfg,
         })
     }
@@ -3416,6 +3434,19 @@ impl FileSystem for PassthroughFs {
         const VIRTIO_IOC_EXIT_CODE_REQ: u32 = 0x7602;
         const VIRTIO_IOC_REMOVE_ROOT_DIR_REQ: u32 = 0x7603;
 
+        // Rosetta checks, through its own binary, that the share it was
+        // started from is the one a Rosetta-enabled VM provides. Answering
+        // here lets the guest register Rosetta itself as the binfmt
+        // interpreter, so a translated program keeps its pid, its signals and
+        // its setuid credentials. Without the answer Rosetta aborts, and the
+        // guest has to run it under a ptrace shim that fakes this reply and
+        // stays between the program and its parent.
+        if self.rosetta_runtime
+            && let Some(reply) = rosetta_ioctl_reply(cmd)
+        {
+            return Ok(reply);
+        }
+
         match cmd {
             VIRTIO_IOC_EXIT_CODE_REQ => {
                 exit_code.store(arg as i32, Ordering::SeqCst);
@@ -3453,6 +3484,36 @@ fn is_terminal_ioctl(cmd: u32) -> bool {
     const IOC_TYPE_SHIFT: u32 = 8;
     const IOC_TYPE_MASK: u32 = 0xff;
     (cmd >> IOC_TYPE_SHIFT) & IOC_TYPE_MASK == b'T' as u32
+}
+
+/// The reply to one of Rosetta's start-up ioctls, or `None` for any other
+/// request.
+///
+/// Rosetta issues two read ioctls of type `'a'` on its own binary. The request
+/// number has changed between macOS releases (0x22, then 0x25, for the first),
+/// so they are told apart by the size of the buffer they read into:
+///
+/// - 69 bytes: the key that proves the share comes from a Rosetta-enabled VM.
+/// - 128 bytes: where the translation cache daemon listens. All zeroes means
+///   there is none, and Rosetta translates in process.
+fn rosetta_ioctl_reply(cmd: u32) -> Option<Vec<u8>> {
+    const IOC_READ: u32 = 2;
+    const CACHE_REPLY_LEN: usize = 128;
+
+    let dir = cmd >> 30;
+    let size = ((cmd >> 16) & 0x3fff) as usize;
+    let ty = (cmd >> 8) & 0xff;
+    if ty != b'a' as u32 || dir != IOC_READ {
+        return None;
+    }
+
+    if size == ROSETTA_KEY.len() {
+        Some(ROSETTA_KEY.to_vec())
+    } else if size == CACHE_REPLY_LEN {
+        Some(vec![0u8; CACHE_REPLY_LEN])
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -3520,6 +3581,32 @@ mod tests {
         assert!(is_terminal_ioctl(TCGETS));
         assert!(is_terminal_ioctl(TCGETS2));
         assert!(is_terminal_ioctl(TIOCGWINSZ));
+    }
+
+    #[test]
+    fn rosetta_start_up_ioctls_get_their_reply() {
+        // The key request under both numbers macOS has used for it.
+        for cmd in [0x8045_6122u32, 0x8045_6125] {
+            let reply = rosetta_ioctl_reply(cmd).expect("key request");
+            assert_eq!(reply.len(), 69);
+            assert!(reply.starts_with(b"Our hard work\n"));
+            assert_eq!(reply.last(), Some(&0));
+        }
+
+        assert_eq!(rosetta_ioctl_reply(0x8080_6123), Some(vec![0u8; 128]));
+    }
+
+    #[test]
+    fn other_ioctls_get_no_rosetta_reply() {
+        const FS_IOC_GETFLAGS: u32 = 0x8008_6601;
+        const TCGETS: u32 = 0x5401;
+
+        assert_eq!(rosetta_ioctl_reply(FS_IOC_GETFLAGS), None);
+        assert_eq!(rosetta_ioctl_reply(TCGETS), None);
+        // Type 'a' but no buffer to read into, a write, or another size.
+        assert_eq!(rosetta_ioctl_reply(0x6124), None);
+        assert_eq!(rosetta_ioctl_reply(0x4045_6125), None);
+        assert_eq!(rosetta_ioctl_reply(0x8008_6125), None);
     }
 
     #[test]
