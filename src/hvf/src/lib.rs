@@ -1183,6 +1183,30 @@ impl HvfVcpu<'_> {
             if ret != HV_SUCCESS {
                 return Err(Error::VcpuInitialRegisters);
             }
+
+            // Hide SME here too: a guest that sees it records it in its CPU
+            // features, and no arm64 server CPU it could move to provides it.
+            // Best effort, since a hypervisor without SME has nothing to hide.
+            let val: u64 = 0;
+            let ret = unsafe {
+                hv_vcpu_get_sys_reg(
+                    self.vcpuid,
+                    hv_sys_reg_t_HV_SYS_REG_ID_AA64PFR1_EL1,
+                    &val as *const _ as *mut _,
+                )
+            };
+            if ret == HV_SUCCESS && val & AA64PFR1_EL1_SMEMASK != 0 {
+                let ret = unsafe {
+                    hv_vcpu_set_sys_reg(
+                        self.vcpuid,
+                        hv_sys_reg_t_HV_SYS_REG_ID_AA64PFR1_EL1,
+                        val & !AA64PFR1_EL1_SMEMASK,
+                    )
+                };
+                if ret != HV_SUCCESS {
+                    warn!("vcpu[{}]: could not hide SME from the guest", self.vcpuid);
+                }
+            }
         }
 
         let ret = unsafe { hv_vcpu_set_reg(self.vcpuid, hv_reg_t_HV_REG_PC, entry_addr) };
