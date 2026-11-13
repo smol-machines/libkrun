@@ -4,6 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::collections::btree_map;
 use std::convert::TryInto;
 use std::ffi::{CStr, CString};
@@ -61,6 +62,17 @@ struct HandleData {
     file: RwLock<File>,
     exported: AtomicBool,
 }
+
+/// Files kept open for the guest's handle-less requests (see
+/// `PassthroughFs::zero_message_open`), by inode, oldest first.
+#[derive(Default)]
+struct InodeFds {
+    map: HashMap<Inode, (Arc<HandleData>, bool)>,
+    order: VecDeque<Inode>,
+}
+
+/// Past this many kept descriptors the oldest goes and is reopened on demand.
+const INODE_FDS_MAX: usize = 256;
 
 // Runs inside setattr once it holds the handle's fd, so a test can race a
 // RELEASE against the fd syscalls deterministically.
@@ -487,6 +499,12 @@ pub struct PassthroughFs {
     writeback: AtomicBool,
     announce_submounts: AtomicBool,
     zero_message_opendir: AtomicBool,
+    // Whether the guest opens files without a request, so reads and writes
+    // name the inode and handle 0. This server never negotiates it; it comes
+    // with a checkpoint taken on macOS, whose server does, and the guest then
+    // never sends OPEN for the files it had.
+    zero_message_open: AtomicBool,
+    inode_fds: Mutex<InodeFds>,
     my_uid: Option<libc::uid_t>,
     my_gid: Option<libc::gid_t>,
     cap_fowner: bool,
@@ -821,6 +839,8 @@ impl PassthroughFs {
             writeback: AtomicBool::new(false),
             announce_submounts: AtomicBool::new(false),
             zero_message_opendir: AtomicBool::new(false),
+            zero_message_open: AtomicBool::new(false),
+            inode_fds: Mutex::new(InodeFds::default()),
             my_uid,
             my_gid,
             cap_fowner,
@@ -1039,7 +1059,7 @@ impl PassthroughFs {
             writeback: self.writeback.load(Ordering::Relaxed),
             announce_submounts: self.announce_submounts.load(Ordering::Relaxed),
             zero_message_opendir: self.zero_message_opendir.load(Ordering::Relaxed),
-            zero_message_open: false,
+            zero_message_open: self.zero_message_open.load(Ordering::Relaxed),
             dax_maps: self.dax.maps.read().unwrap().values().copied().collect(),
             live_shares: Vec::new(),
         }
@@ -1155,6 +1175,8 @@ impl PassthroughFs {
             .store(state.announce_submounts, Ordering::Relaxed);
         self.zero_message_opendir
             .store(state.zero_message_opendir, Ordering::Relaxed);
+        self.zero_message_open
+            .store(state.zero_message_open, Ordering::Relaxed);
 
         for snap in &state.handles {
             match self.open_inode(snap.nodeid, snap.flags) {
@@ -1217,6 +1239,74 @@ impl PassthroughFs {
                 );
             }
         }
+    }
+
+    /// The open file a read, write or sync of `inode` through `handle` uses:
+    /// the handle's own, else, when the guest opens files without a request
+    /// (a checkpoint from macOS), one descriptor kept per inode, read-only for
+    /// a read and read-write for a write.
+    fn file_for(&self, inode: Inode, handle: Handle, write: bool) -> io::Result<Arc<HandleData>> {
+        if let Some(data) = self
+            .handles
+            .read()
+            .unwrap()
+            .get(&handle)
+            .filter(|hd| hd.inode == inode)
+            .cloned()
+        {
+            return Ok(data);
+        }
+        if !self.zero_message_open.load(Ordering::Relaxed) {
+            return Err(ebadf());
+        }
+        let cached = self
+            .inode_fds
+            .lock()
+            .unwrap()
+            .map
+            .get(&inode)
+            .filter(|(_, writable)| *writable || !write)
+            .map(|(data, _)| data.clone());
+        if let Some(data) = cached {
+            if self.fd_still_names(inode, &data) {
+                return Ok(data);
+            }
+            self.inode_fds.lock().unwrap().map.remove(&inode);
+        }
+        // Open before taking the cache lock: open_inode reads the inode map.
+        let flags = if write { libc::O_RDWR } else { libc::O_RDONLY };
+        let data = Arc::new(HandleData {
+            inode,
+            file: RwLock::new(self.open_inode(inode, flags)?),
+            exported: AtomicBool::new(false),
+        });
+        let mut fds = self.inode_fds.lock().unwrap();
+        fds.map.insert(inode, (data.clone(), write));
+        fds.order.retain(|kept| *kept != inode);
+        fds.order.push_back(inode);
+        while fds.map.len() > INODE_FDS_MAX {
+            let Some(oldest) = fds.order.pop_front() else {
+                break;
+            };
+            fds.map.remove(&oldest);
+        }
+        Ok(data)
+    }
+
+    /// Whether a kept descriptor still names the file `inode` stands for: the
+    /// guest may have forgotten the inode and the host reused the number.
+    fn fd_still_names(&self, inode: Inode, data: &HandleData) -> bool {
+        let Some(expected) = self.inodes.read().unwrap().get(&inode).cloned() else {
+            return false;
+        };
+        let (Ok(kept), Ok(named)) = (
+            data.file.read().unwrap().metadata(),
+            expected.file.metadata(),
+        ) else {
+            return false;
+        };
+        use std::os::unix::fs::MetadataExt;
+        kept.ino() == named.ino() && kept.dev() == named.dev() && kept.nlink() > 0
     }
 
     fn open_inode(&self, inode: Inode, mut flags: i32) -> io::Result<File> {
@@ -1998,14 +2088,7 @@ impl FileSystem for PassthroughFs {
         _flags: u32,
     ) -> io::Result<usize> {
         debug!("read: {inode:?}");
-        let data = self
-            .handles
-            .read()
-            .unwrap()
-            .get(&handle)
-            .filter(|hd| hd.inode == inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
+        let data = self.file_for(inode, handle, false)?;
 
         // This is safe because write_from uses preadv64, so the underlying file descriptor
         // offset is not affected by this operation.
@@ -2035,14 +2118,7 @@ impl FileSystem for PassthroughFs {
             None
         };
 
-        let data = self
-            .handles
-            .read()
-            .unwrap()
-            .get(&handle)
-            .filter(|hd| hd.inode == inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
+        let data = self.file_for(inode, handle, true)?;
 
         // This is safe because read_to uses pwritev64, so the underlying file descriptor
         // offset is not affected by this operation.
@@ -2472,14 +2548,7 @@ impl FileSystem for PassthroughFs {
         handle: Handle,
         _lock_owner: u64,
     ) -> io::Result<()> {
-        let data = self
-            .handles
-            .read()
-            .unwrap()
-            .get(&handle)
-            .filter(|hd| hd.inode == inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
+        let data = self.file_for(inode, handle, false)?;
 
         // Since this method is called whenever an fd is closed in the client, we can emulate that
         // behavior by doing the same thing (dup-ing the fd and then immediately closing it). Safe
@@ -2499,14 +2568,7 @@ impl FileSystem for PassthroughFs {
     }
 
     fn fsync(&self, _ctx: Context, inode: Inode, datasync: bool, handle: Handle) -> io::Result<()> {
-        let data = self
-            .handles
-            .read()
-            .unwrap()
-            .get(&handle)
-            .filter(|hd| hd.inode == inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
+        let data = self.file_for(inode, handle, false)?;
 
         let fd = data.file.write().unwrap().as_raw_fd();
 
@@ -2815,14 +2877,7 @@ impl FileSystem for PassthroughFs {
         offset: u64,
         length: u64,
     ) -> io::Result<()> {
-        let data = self
-            .handles
-            .read()
-            .unwrap()
-            .get(&handle)
-            .filter(|hd| hd.inode == inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
+        let data = self.file_for(inode, handle, true)?;
 
         let fd = data.file.write().unwrap().as_raw_fd();
         // Safe because this doesn't modify any memory and we check the return value.
@@ -2849,14 +2904,7 @@ impl FileSystem for PassthroughFs {
         offset: u64,
         whence: u32,
     ) -> io::Result<u64> {
-        let data = self
-            .handles
-            .read()
-            .unwrap()
-            .get(&handle)
-            .filter(|hd| hd.inode == inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
+        let data = self.file_for(inode, handle, false)?;
 
         let fd = data.file.write().unwrap().as_raw_fd();
 
@@ -3824,6 +3872,96 @@ mod tests {
     // not give an earlier session's nodeid to a file, so such a handle finds
     // nothing; a restored server must keep the snapshotted nodeids, including
     // the small ones of a snapshot taken by an engine that numbered from 2.
+    /// A sink the server copies file bytes into, standing in for the transport.
+    struct Sink(Vec<u8>);
+    impl io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl ZeroCopyWriter for Sink {
+        fn write_from(&mut self, f: &File, count: usize, off: u64) -> io::Result<usize> {
+            use std::os::unix::fs::FileExt;
+            let mut buf = vec![0; count];
+            let n = f.read_at(&mut buf, off)?;
+            self.0.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+    }
+
+    // A checkpoint from macOS: its server answered OPEN with ENOSYS, so the
+    // guest reads files it had open through handle 0 and never opens them
+    // again. The restored Linux server must serve those reads by inode, or the
+    // guest's next page fault on such a file is a SIGBUS.
+    #[test]
+    fn a_macos_checkpoint_reads_files_by_inode_after_restore() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "libkrun-zero-open-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("busybox"), b"busybox bytes").unwrap();
+        let server = || {
+            let fs = PassthroughFs::new(
+                Config {
+                    root_dir: root.to_string_lossy().into_owned(),
+                    ..Default::default()
+                },
+                Arc::new(InodeAllocator::new()),
+            )
+            .unwrap();
+            FileSystem::init(&fs, FsOptions::empty()).unwrap();
+            fs
+        };
+        let context = Context {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        };
+        let state = |zero_message_open: bool| -> FuseServerState {
+            serde_json::from_value(serde_json::json!({
+                "inodes": [{
+                    "nodeid": 7,
+                    "relative_path": "busybox",
+                    "path": "/.vol/16777234/42",
+                    "refcount": 1
+                }],
+                "handles": [],
+                "next_inode": 8,
+                "next_handle": 1,
+                "writeback": false,
+                "announce_submounts": false,
+                "zero_message_opendir": true,
+                "zero_message_open": zero_message_open
+            }))
+            .unwrap()
+        };
+        let read = |fs: &PassthroughFs| {
+            let mut out = Sink(Vec::new());
+            FileSystem::read(fs, context, 7, 0, &mut out, 64, 0, None, 0).map(|_| out.0)
+        };
+
+        let restored = server();
+        restored.restore(&state(true)).unwrap();
+        assert!(restored.snapshot().zero_message_open);
+        assert_eq!(read(&restored).unwrap(), b"busybox bytes");
+        assert_eq!(read(&restored).unwrap(), b"busybox bytes", "the kept fd serves again");
+
+        let without = server();
+        without.restore(&state(false)).unwrap();
+        assert_eq!(read(&without).unwrap_err().raw_os_error(), Some(libc::EBADF));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn nodeids_differ_per_session_and_survive_restore() {
         let nonce = SystemTime::now()
