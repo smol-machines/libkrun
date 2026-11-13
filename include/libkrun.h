@@ -363,8 +363,10 @@ int32_t krun_add_virtiofs3(uint32_t ctx_id,
 /* Serve ownership and mode from the "user.containers.override_stat" xattr on
    each file instead of the host inode, and record the guest's chown/chmod/mknod
    there. Lets an unprivileged host share an image tree with its exact owners,
-   setuid bits and overlayfs whiteouts. Always in effect on macOS and Windows;
-   on Linux only with this flag. */
+   setuid bits and overlayfs whiteouts. Ownership is always virtualized on
+   macOS and Windows; on Linux only with this flag. On macOS this flag also
+   keeps guest chmod changes from changing the host inode permissions, so the
+   unprivileged server retains access to guest mode-000 paths. */
 #define KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT (1 << 0)
 /* Serve host directories attached and detached while the VM runs, through the
    control socket: "SHARE_ADD <tag> <name> <host dir>", "SHARE_REMOVE <tag>

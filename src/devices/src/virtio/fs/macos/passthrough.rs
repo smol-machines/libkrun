@@ -695,8 +695,11 @@ pub struct Config {
     ///
     /// The default value for this options is `false`.
     pub xattr: bool,
-    /// Accepted for API symmetry with the Linux server: this server always
-    /// presents ownership from the override xattr.
+    /// Keep chmod changes in the override xattr without changing host access,
+    /// matching the Linux recorded-ownership server. Guest root must still be
+    /// able to traverse mode-000 directories (including overlayfs workdirs).
+    /// Ownership is always read from the override xattr on macOS; without this
+    /// flag, chmod also mirrors ordinary permission bits onto the host.
     pub override_stat: bool,
 
     /// Optional file descriptor for /proc/self/fd. Callers can obtain a file descriptor and pass it
@@ -2597,7 +2600,12 @@ impl FileSystem for PassthroughFs {
 
         if valid.contains(SetattrValid::MODE) {
             set_xattr_stat(&ihandle, None, None, Some(attr.st_mode as u32))?;
-            apply_host_permissions(&ihandle, attr.st_mode as u32);
+            // Recorded ownership is virtual: applying a mode-000 guest chmod
+            // to the host would deny our unprivileged server access even when
+            // guest root is entitled to it. The guest enforces the xattr mode.
+            if !self.cfg.override_stat {
+                apply_host_permissions(&ihandle, attr.st_mode as u32);
+            }
         }
 
         if valid.intersects(SetattrValid::UID | SetattrValid::GID) {
@@ -4685,6 +4693,117 @@ mod tests {
             // The permission bits reach the host; setuid stays in the xattr.
             assert_eq!(host & 0o7777, mode & 0o777, "{name}: host mode");
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recorded_chmod_keeps_host_access_to_overlay_workdirs() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("krun-recorded-mode-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let filesystem = PassthroughFs::new(
+            Config {
+                root_dir: root.to_string_lossy().into_owned(),
+                override_stat: true,
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        FileSystem::init(&filesystem, FsOptions::ZERO_MESSAGE_OPEN).unwrap();
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        };
+        let denied = Context {
+            uid: 65534,
+            gid: 65534,
+            pid: 0,
+        };
+        let work = FileSystem::mkdir(
+            &filesystem,
+            ctx,
+            fuse::ROOT_ID,
+            &CString::new("work").unwrap(),
+            0o700,
+            0,
+            Extensions::default(),
+        )
+        .unwrap();
+        let mut attr = work.attr;
+        attr.st_mode = 0;
+        let (st, _) =
+            FileSystem::setattr(&filesystem, ctx, work.inode, attr, None, SetattrValid::MODE)
+                .unwrap();
+        assert_eq!(st.st_mode as u32 & 0o777, 0);
+        assert_eq!(
+            fs::metadata(root.join("work"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert!(FileSystem::access(&filesystem, denied, work.inode, libc::R_OK as u32).is_err());
+        // Overlayfs creates and inspects entries inside its mode-000 workdir
+        // as guest root. The host server must retain traversal/write access.
+        let (child, _, _) = FileSystem::create(
+            &filesystem,
+            ctx,
+            work.inode,
+            &CString::new("child").unwrap(),
+            0o600,
+            false,
+            libc::O_RDWR as u32,
+            0,
+            Extensions::default(),
+        )
+        .unwrap();
+        let mut child_attr = child.attr;
+        child_attr.st_mode = 0;
+        FileSystem::setattr(
+            &filesystem,
+            ctx,
+            child.inode,
+            child_attr,
+            None,
+            SetattrValid::MODE,
+        )
+        .unwrap();
+        FileSystem::write(
+            &filesystem,
+            ctx,
+            child.inode,
+            0,
+            Source(b"payload".to_vec()),
+            7,
+            0,
+            None,
+            false,
+            false,
+            0,
+        )
+        .unwrap();
+        assert_eq!(fs::read(root.join("work/child")).unwrap(), b"payload");
+        let (st, _) = FileSystem::getattr(&filesystem, ctx, child.inode, None).unwrap();
+        assert_eq!(st.st_mode as u32 & 0o777, 0);
+        assert_eq!(st.st_uid, 0);
+        assert!(FileSystem::access(&filesystem, denied, child.inode, libc::R_OK as u32).is_err());
+        FileSystem::unlink(
+            &filesystem,
+            ctx,
+            work.inode,
+            &CString::new("child").unwrap(),
+        )
+        .unwrap();
+        FileSystem::rmdir(
+            &filesystem,
+            ctx,
+            fuse::ROOT_ID,
+            &CString::new("work").unwrap(),
+        )
+        .unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 
