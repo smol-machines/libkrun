@@ -752,6 +752,20 @@ impl Vmm {
         self.layered_exports.push(service);
         Ok(())
     }
+    /// Whether guest RAM is a layered generation (a fork clone, or a source
+    /// adopted as one). Capturing such RAM never rebases device windows, so a
+    /// deferred save keeps a packed image's DAX file mappings intact.
+    pub fn has_layered_ram(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.layered_ram.is_some()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
     #[cfg(target_os = "linux")]
     fn capture_layered_ram(&mut self) -> Result<Option<layered_restore::Generation>> {
         self.ensure_ram_mapping_valid()?;
@@ -1549,12 +1563,48 @@ impl Vmm {
         mem_out: &mut std::fs::File,
     ) -> Result<(VmCheckpoint, Vec<snapshot::MemoryRegionDesc>)> {
         #[cfg(target_os = "linux")]
+        if self.layered_ram.is_some() {
+            return self.checkpoint_frozen_layered_sparse(mem_out);
+        }
+        #[cfg(target_os = "linux")]
         let device_windows_from = Some(self.device_windows_start());
         #[cfg(not(target_os = "linux"))]
         let device_windows_from = None;
         self.checkpoint_frozen_with(|memory| {
             snapshot::write_guest_memory_sparse_with_windows(memory, mem_out, device_windows_from)
         })
+    }
+
+    /// [`Self::checkpoint_frozen_sparse`] for a VM whose RAM is a layered
+    /// generation, such as a fork clone. Its RAM regions are private views of
+    /// sealed files, so reading them through the mapping faults every page the
+    /// source never wrote into the source's file: a 2 GiB clone's checkpoint
+    /// filled the source's RAM and DAX-window files, about 3 GiB charged to the
+    /// clone, to write 50 MiB. Instead capture the next generation, as the
+    /// deferred save does (only the clone's own pages are copied, and device
+    /// windows stay mapped as they are), and write it from its files, whose
+    /// holes read as zeros without being allocated. The VM stays paused until
+    /// the image is written.
+    #[cfg(all(snapshot_supported, target_os = "linux"))]
+    fn checkpoint_frozen_layered_sparse(
+        &mut self,
+        mem_out: &mut std::fs::File,
+    ) -> Result<(VmCheckpoint, Vec<snapshot::MemoryRegionDesc>)> {
+        self.pause()?;
+        let capture = (|| {
+            self.quiesce_devices()?;
+            let generation = self
+                .capture_layered_ram()?
+                .ok_or_else(|| Error::Snapshot("VM has no layered RAM".to_string()))?;
+            self.capture_paused(|_| {
+                snapshot::DeferredMemorySave::from_layered(generation).finish(mem_out)
+            })
+        })();
+        if capture.is_err() {
+            self.rearm_devices();
+            let _ = self.resume();
+        }
+        capture
     }
 
     /// [`Self::checkpoint_frozen_sparse`] for a VM frozen as a fork base. It

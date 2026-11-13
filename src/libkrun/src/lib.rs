@@ -2128,10 +2128,18 @@ fn handle_control_stream(mut stream: ControlStream, vmm: &Arc<Mutex<vmm::Vmm>>) 
                 // After RESUME, FINISH_SAVE persists that retained generation;
                 // CANCEL_SAVE releases it after a caller-side failure.
                 #[cfg(all(snapshot_supported, deferred_stream_supported))]
+                // PREPARE_SAVE_LAYERED is PREPARE_SAVE only for RAM that is a
+                // layered generation, whose capture leaves device windows in
+                // place; anything else declines without pausing, and the
+                // caller falls back to SAVE.
+                "PREPARE_SAVE_LAYERED" if !vmm.lock().unwrap().has_layered_ram() => {
+                    "ERR ENOTSUP guest RAM is not a layered generation\n".to_string()
+                }
+                #[cfg(all(snapshot_supported, deferred_stream_supported))]
                 // PREPARE_SAVE_HELD is PREPARE_SAVE for a caller that keeps
                 // the VM paused until FINISH_SAVE* and then stops it, so RAM
                 // that cannot be retained as a generation is read in place.
-                "PREPARE_SAVE" | "PREPARE_SAVE_HELD" => {
+                "PREPARE_SAVE" | "PREPARE_SAVE_HELD" | "PREPARE_SAVE_LAYERED" => {
                     let response = handle_prepare_save(vmm, _arg, verb == "PREPARE_SAVE_HELD");
                     if let Err(error) = write_prepared_save_reply(&mut stream, &response, || {
                         // The control listener is serial: no later command can
