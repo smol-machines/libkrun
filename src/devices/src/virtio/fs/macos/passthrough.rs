@@ -119,8 +119,9 @@ struct DirStream {
 /// inode and handle 0, so the server keeps one open file per inode for them.
 struct CachedFd {
     data: Arc<HandleData>,
-    /// Opened read-write; a read-only file gets a read-only descriptor and is
-    /// reopened when a write arrives for it.
+    /// CREATE can supply a write-only or read-only descriptor. Handle-less
+    /// requests must reopen it when the requested access is not available.
+    readable: bool,
     writable: bool,
 }
 
@@ -1507,7 +1508,13 @@ impl PassthroughFs {
             .unwrap()
             .map
             .get(&inode)
-            .filter(|cached| cached.writable || !write)
+            .filter(|cached| {
+                if write {
+                    cached.writable
+                } else {
+                    cached.readable
+                }
+            })
             .map(|cached| cached.data.clone());
         if let Some(data) = cached {
             if self.fd_still_names(inode, &data) {
@@ -1526,7 +1533,7 @@ impl PassthroughFs {
             file: RwLock::new(file),
             dirstream: Mutex::new(DirStream::new()),
         });
-        Ok(self.keep_inode_fd(inode, data, write, false))
+        Ok(self.keep_inode_fd(inode, data, true, write, false))
     }
 
     /// Whether a kept descriptor still names the file the inode stands for.
@@ -1554,12 +1561,14 @@ impl PassthroughFs {
         &self,
         inode: Inode,
         data: Arc<HandleData>,
+        readable: bool,
         writable: bool,
         replace: bool,
     ) -> Arc<HandleData> {
         let mut fds = self.inode_fds.lock().unwrap();
         if !replace
             && let Some(cached) = fds.map.get(&inode)
+            && (cached.readable || !readable)
             && (cached.writable || !writable)
         {
             return cached.data.clone();
@@ -1584,6 +1593,7 @@ impl PassthroughFs {
             inode,
             CachedFd {
                 data: data.clone(),
+                readable,
                 writable,
             },
         );
@@ -2310,7 +2320,14 @@ impl FileSystem for PassthroughFs {
         // with the inode instead, where the handle-0 writes that follow find
         // it; the guest's close (release) or the cache's bound ends it.
         let handle = if self.zero_message_open.load(Ordering::Relaxed) {
-            self.keep_inode_fd(entry.inode, Arc::new(data), true, true);
+            let access = flags & libc::O_ACCMODE;
+            self.keep_inode_fd(
+                entry.inode,
+                Arc::new(data),
+                access != libc::O_WRONLY,
+                access != libc::O_RDONLY,
+                true,
+            );
             None
         } else {
             let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
@@ -4130,6 +4147,22 @@ mod tests {
         .unwrap();
         assert_eq!(n, 3);
         assert_eq!(fs::read(root.join("made")).unwrap(), b"new");
+        // A later read arrives without OPEN/RELEASE too. The create used
+        // O_WRONLY, so its cached descriptor must not serve this read.
+        let mut created_out = Sink(Vec::new());
+        let n = FileSystem::read(
+            &filesystem,
+            context,
+            made.inode,
+            0,
+            &mut created_out,
+            16,
+            0,
+            None,
+            0,
+        )
+        .unwrap();
+        assert_eq!(&created_out.0[..n], b"new");
         FileSystem::forget(&filesystem, context, entry.inode, u64::MAX);
         assert!(
             !filesystem
