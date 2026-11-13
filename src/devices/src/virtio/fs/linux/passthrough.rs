@@ -1920,8 +1920,16 @@ impl FileSystem for PassthroughFs {
             .cloned()
             .ok_or_else(ebadf)?;
 
+        // Override shares keep guest permissions in xattrs. The unprivileged
+        // host owner still needs access to stamp and populate a read-only (or
+        // mode-000) directory, as guest root does when copying an image tree.
+        let host_mode = if self.cfg.override_stat {
+            0o700
+        } else {
+            mode & !umask
+        };
         // Safe because this doesn't modify any memory and we check the return value.
-        let res = unsafe { libc::mkdirat(data.file.as_raw_fd(), name.as_ptr(), mode & !umask) };
+        let res = unsafe { libc::mkdirat(data.file.as_raw_fd(), name.as_ptr(), host_mode) };
         if res == 0 {
             self.stamp_created(data.file.as_raw_fd(), name, &ctx, (mode & !umask) & 0o7777)?;
             self.lookup(ctx, parent, name)
@@ -2027,12 +2035,17 @@ impl FileSystem for PassthroughFs {
         // Safe because this doesn't modify any memory and we check the return value. We don't
         // really check `flags` because if the kernel can't handle poorly specified flags then we
         // have much bigger problems.
+        let host_mode = if self.cfg.override_stat {
+            0o600
+        } else {
+            mode & !(umask & 0o777)
+        };
         let fd = unsafe {
             libc::openat(
                 data.file.as_raw_fd(),
                 name.as_ptr(),
                 flags as i32 | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-                mode & !(umask & 0o777),
+                host_mode,
             )
         };
         if fd < 0 {
@@ -3560,6 +3573,74 @@ mod tests {
         assert!(update_symlink_owners(&records, b"b", (0, 0)).is_empty());
         // A truncated record yields what it can and never panics.
         assert_eq!(find_symlink_owner(b"a\x001:2\x00b", b"b"), None);
+    }
+
+    #[test]
+    fn override_creates_keep_host_access_and_exact_guest_modes() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("krun-create-modes-{nonce}"));
+        fs::create_dir(&root).unwrap();
+        let filesystem = PassthroughFs::new(
+            Config {
+                root_dir: root.to_string_lossy().into_owned(),
+                override_stat: true,
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        FileSystem::init(&filesystem, FsOptions::empty()).unwrap();
+        let ctx = Context {
+            uid: 1234,
+            gid: 5678,
+            pid: 0,
+        };
+        for (i, (mode, umask)) in [(0, 0), (0o555, 0), (0o777, 0o027)].into_iter().enumerate() {
+            let name = CString::new(format!("dir-{i}")).unwrap();
+            let dir = FileSystem::mkdir(
+                &filesystem,
+                ctx,
+                fuse::ROOT_ID,
+                &name,
+                mode,
+                umask,
+                Extensions::default(),
+            )
+            .unwrap();
+            assert_eq!(dir.attr.st_mode & 0o7777, mode & !umask);
+            assert_eq!((dir.attr.st_uid, dir.attr.st_gid), (ctx.uid, ctx.gid));
+            let host_dir = root.join(name.to_str().unwrap());
+            assert_eq!(fs::metadata(&host_dir).unwrap().mode() & 0o7777, 0o700);
+
+            // Guest root can populate even a mode-000 directory while copying
+            // a snapshot; the host owner must still be able to stamp its xattr.
+            let file = FileSystem::create(
+                &filesystem,
+                Context {
+                    uid: 0,
+                    gid: 0,
+                    pid: 0,
+                },
+                dir.inode,
+                c"file",
+                mode & 0o666,
+                false,
+                libc::O_RDWR as u32,
+                umask,
+                Extensions::default(),
+            )
+            .unwrap();
+            assert_eq!(file.0.attr.st_mode & 0o7777, mode & 0o666 & !umask);
+            assert_eq!((file.0.attr.st_uid, file.0.attr.st_gid), (0, 0));
+            let host_file = host_dir.join("file");
+            assert_eq!(fs::metadata(&host_file).unwrap().mode() & 0o7777, 0o600);
+            fs::write(&host_file, b"payload").unwrap();
+            assert_eq!(fs::read(&host_file).unwrap(), b"payload");
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     // Linux has no user xattrs on symlinks, so an override share presents a
