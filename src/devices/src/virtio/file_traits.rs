@@ -442,7 +442,6 @@ impl FileReadWriteVolatile for File {
     }
 }
 
-
 /// Per-thread bounce buffer for gathered host I/O. Allocating a fresh zeroed
 /// buffer per request made Windows fault in and zero every page of it each
 /// time; reusing one keeps the cost to the copy itself.
@@ -532,9 +531,7 @@ impl FileReadWriteAtVolatile for File {
         if host_contiguous(bufs) {
             // SAFETY: the slices are adjacent and together span `len` bytes of
             // live guest memory.
-            let whole = unsafe {
-                VolatileSlice::new(bufs[0].ptr_guard_mut().as_ptr(), len)
-            };
+            let whole = unsafe { VolatileSlice::new(bufs[0].ptr_guard_mut().as_ptr(), len) };
             return self.read_at_volatile(whole, offset);
         }
         use std::os::windows::fs::FileExt;
@@ -600,9 +597,7 @@ impl FileReadWriteAtVolatile for File {
         let len: usize = bufs.iter().map(|b| b.len()).sum();
         if host_contiguous(bufs) {
             // SAFETY: see read_vectored_at_volatile.
-            let whole = unsafe {
-                VolatileSlice::new(bufs[0].ptr_guard_mut().as_ptr(), len)
-            };
+            let whole = unsafe { VolatileSlice::new(bufs[0].ptr_guard_mut().as_ptr(), len) };
             return self.write_at_volatile(whole, offset);
         }
         use std::os::windows::fs::FileExt;

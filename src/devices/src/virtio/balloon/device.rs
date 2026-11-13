@@ -1059,7 +1059,10 @@ mod hint_tests {
     #[test]
     fn a_state_without_the_hint_round_does_not_start_over() {
         let mut state = serde_json::to_value(Balloon::new().unwrap().save_state()).unwrap();
-        state.as_object_mut().unwrap().remove("free_page_hint_cmd_id");
+        state
+            .as_object_mut()
+            .unwrap()
+            .remove("free_page_hint_cmd_id");
         let state: BalloonState = serde_json::from_value(state).unwrap();
         assert_eq!(state.free_page_hint_cmd_id, 0);
         let fresh_first = next_hint_cmd_id(0);
