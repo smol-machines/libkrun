@@ -631,26 +631,66 @@ impl Generation {
         let mut logical = 0_u64;
         for image in &self.regions {
             for extent in &image.extents {
-                let mut offset = 0;
-                while offset < extent.end - extent.start {
-                    let len = (extent.end - extent.start - offset).min(buffer.len());
-                    extent
-                        .file
-                        .read_exact_at(&mut buffer[..len], extent.offset + offset as u64)?;
-                    if buffer[..len].iter().any(|byte| *byte != 0) {
-                        output.write_all_at(&buffer[..len], logical)?;
+                let extent_len = extent.end - extent.start;
+                // Read only the file's data ranges: a hole reads as zeros, and
+                // a clone's checkpoint writes this while the guest is paused.
+                for (data_from, data_to) in
+                    file_data_ranges(&extent.file, extent.offset, extent_len)?
+                {
+                    let mut offset = data_from;
+                    while offset < data_to {
+                        let len = (data_to - offset).min(buffer.len());
+                        extent
+                            .file
+                            .read_exact_at(&mut buffer[..len], extent.offset + offset as u64)?;
+                        if buffer[..len].iter().any(|byte| *byte != 0) {
+                            output.write_all_at(&buffer[..len], logical + offset as u64)?;
+                        }
+                        offset += len;
                     }
-                    logical = logical
-                        .checked_add(len as u64)
-                        .ok_or_else(|| invalid("RAM export size overflow"))?;
-                    offset += len;
                 }
+                logical = logical
+                    .checked_add(extent_len as u64)
+                    .ok_or_else(|| invalid("RAM export size overflow"))?;
             }
         }
         output.set_len(logical)?;
         output.seek(io::SeekFrom::Start(logical))?;
         Ok(())
     }
+}
+
+/// The ranges of `[start, start + len)` in `file` that may hold data, relative
+/// to `start`. The whole range when the file system cannot tell holes apart.
+fn file_data_ranges(file: &File, start: u64, len: usize) -> io::Result<Vec<(usize, usize)>> {
+    let end = start + len as u64;
+    let mut ranges = Vec::new();
+    let mut at = start;
+    while at < end {
+        // SAFETY: a plain lseek on a descriptor this generation owns.
+        let data = unsafe { libc::lseek(file.as_raw_fd(), at as libc::off_t, libc::SEEK_DATA) };
+        if data < 0 {
+            let error = io::Error::last_os_error();
+            return match error.raw_os_error() {
+                Some(libc::ENXIO) => Ok(ranges),
+                Some(libc::EINVAL) | Some(libc::EOPNOTSUPP) => Ok(vec![(0, len)]),
+                _ => Err(error),
+            };
+        }
+        let data = data as u64;
+        if data >= end {
+            break;
+        }
+        // SAFETY: as above.
+        let hole = unsafe { libc::lseek(file.as_raw_fd(), data as libc::off_t, libc::SEEK_HOLE) };
+        if hole < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let hole = (hole as u64).min(end);
+        ranges.push(((data - start) as usize, (hole - start) as usize));
+        at = hole;
+    }
+    Ok(ranges)
 }
 
 fn invalid(message: &'static str) -> io::Error {
@@ -3316,5 +3356,29 @@ fn capture_timing_bench() {
     eprintln!(
         "CAPTURE {gib} GiB written, {copied} bytes copied in {:.3} s",
         started.elapsed().as_secs_f64()
+    );
+}
+
+#[test]
+fn data_ranges_skip_a_memfd_s_holes() {
+    const MIB: u64 = 1024 * 1024;
+    let file = crate::builder::create_guest_ram_memfd((8 * MIB) as usize).unwrap();
+    file.write_all_at(&[1; 4096], MIB).unwrap();
+    file.write_all_at(&[2; 4096], 5 * MIB).unwrap();
+    let ranges = file_data_ranges(&file, 0, (8 * MIB) as usize).unwrap();
+    assert_eq!(
+        ranges,
+        vec![
+            (MIB as usize, MIB as usize + 4096),
+            (5 * MIB as usize, 5 * MIB as usize + 4096)
+        ]
+    );
+    // Offsets are relative to the start asked for, and clipped to its end.
+    assert_eq!(file_data_ranges(&file, MIB, 2048).unwrap(), vec![(0, 2048)]);
+    let empty = crate::builder::create_guest_ram_memfd(MIB as usize).unwrap();
+    assert!(
+        file_data_ranges(&empty, 0, MIB as usize)
+            .unwrap()
+            .is_empty()
     );
 }
