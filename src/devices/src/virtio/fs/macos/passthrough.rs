@@ -179,6 +179,7 @@ impl DirStream {
     }
 
     fn fill_from_fd(&mut self, fd: RawFd) -> io::Result<()> {
+        let dev = fstat(fd, true)?.st_dev;
         // fdopendir() takes ownership of the fd, so we need to obtain a new one
         // to be donated.
         let newfd = unsafe { libc::dup(fd) };
@@ -227,13 +228,52 @@ impl DirStream {
             let ino = unsafe { (*dentry).d_ino };
             // SAFETY: dentry is not null. The entry types use the same
             // exact constants (`libc::DT_*`) on macOS, Linux, and FUSE.
-            let type_ = unsafe { (*dentry).d_type };
+            let type_ = guest_dirent_type(dev, ino, unsafe { (*dentry).d_type });
 
             self.entries.push(CachedDirEntry { ino, name, type_ });
         }
 
         unsafe { libc::closedir(dir) };
         Ok(())
+    }
+}
+
+// Special guest nodes are regular backing files with a recorded mode. Returning
+// the host DT_REG for a whiteout makes overlayfs enumerate a deleted name even
+// though lookup correctly hides it. Read the recorded type for regular backing
+// files; directories and symlinks keep their native types without extra I/O.
+fn guest_dirent_type(dev: libc::dev_t, ino: u64, host_type: u8) -> u8 {
+    if host_type != libc::DT_REG {
+        return host_type;
+    }
+    let path = CString::new(format!("/.vol/{dev}/{ino}")).unwrap();
+    let mut buf = [0u8; 32];
+    // SAFETY: path and the key are NUL-terminated and buf is writable. NOFOLLOW
+    // prevents following a host symlink if the entry changes during the scan.
+    let size = unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            XATTR_KEY.as_ptr().cast(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            0,
+            libc::XATTR_NOFOLLOW,
+        )
+    };
+    if size < 0 {
+        // Absence means the native type is authoritative. Other errors must
+        // not mislabel a possible whiteout: let the guest resolve its type.
+        return if io::Error::last_os_error().raw_os_error() == Some(libc::ENOATTR) {
+            host_type
+        } else {
+            libc::DT_UNKNOWN
+        };
+    }
+    match get_xattr_common(&buf[..size as usize]) {
+        Ok((_, _, Some(mode))) if mode & libc::S_IFMT as u32 != 0 => {
+            ((mode & libc::S_IFMT as u32) >> 12) as u8
+        }
+        _ => host_type,
     }
 }
 
@@ -4577,6 +4617,117 @@ mod tests {
         assert_eq!(present.entry_timeout, Duration::from_secs(5));
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn directory_entries_preserve_recorded_whiteout_types() {
+        for handleless in [false, true] {
+            let root = std::env::temp_dir().join(format!(
+                "krun-whiteout-types-{}-{handleless}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join("regular"), b"data").unwrap();
+            fs::write(root.join("renamed"), b"data").unwrap();
+            let filesystem = PassthroughFs::new(
+                Config {
+                    root_dir: root.to_string_lossy().into_owned(),
+                    override_stat: true,
+                    ..Default::default()
+                },
+                Arc::new(InodeAllocator::new()),
+            )
+            .unwrap();
+            let options = if handleless {
+                FsOptions::ZERO_MESSAGE_OPENDIR
+            } else {
+                FsOptions::empty()
+            };
+            FileSystem::init(&filesystem, options).unwrap();
+            let ctx = Context {
+                uid: 0,
+                gid: 0,
+                pid: 0,
+            };
+            FileSystem::mknod(
+                &filesystem,
+                ctx,
+                fuse::ROOT_ID,
+                &CString::new("whiteout").unwrap(),
+                libc::S_IFCHR as u32 | 0o600,
+                0,
+                0,
+                Extensions::default(),
+            )
+            .unwrap();
+            FileSystem::rename(
+                &filesystem,
+                ctx,
+                fuse::ROOT_ID,
+                &CString::new("renamed").unwrap(),
+                fuse::ROOT_ID,
+                &CString::new("destination").unwrap(),
+                bindings::LINUX_RENAME_WHITEOUT as u32,
+            )
+            .unwrap();
+            let handle = if handleless {
+                0
+            } else {
+                FileSystem::opendir(&filesystem, ctx, fuse::ROOT_ID, libc::O_RDONLY as u32)
+                    .unwrap()
+                    .0
+                    .unwrap()
+            };
+            let mut found = Vec::new();
+            FileSystem::readdir(&filesystem, ctx, fuse::ROOT_ID, handle, 4096, 0, |entry| {
+                found.push((entry.name.to_vec(), entry.type_));
+                Ok(1)
+            })
+            .unwrap();
+            found.sort();
+            assert_eq!(
+                found,
+                vec![
+                    (b"destination".to_vec(), libc::DT_REG as u32),
+                    (b"regular".to_vec(), libc::DT_REG as u32),
+                    (b"renamed".to_vec(), libc::DT_CHR as u32),
+                    (b"whiteout".to_vec(), libc::DT_CHR as u32),
+                ]
+            );
+            FileSystem::readdirplus(
+                &filesystem,
+                ctx,
+                fuse::ROOT_ID,
+                handle,
+                4096,
+                0,
+                |dir, entry| {
+                    assert_eq!(
+                        dir.type_,
+                        (entry.attr.st_mode as u32 & libc::S_IFMT as u32) >> 12
+                    );
+                    Ok(1)
+                },
+            )
+            .unwrap();
+            // Rewinding must observe metadata changed outside this server too.
+            let path = CString::new(root.join("whiteout").as_os_str().as_bytes()).unwrap();
+            set_xattr_stat(
+                &InodeHandle::Path(path),
+                None,
+                None,
+                Some(libc::S_IFREG as u32 | 0o600),
+            )
+            .unwrap();
+            FileSystem::readdir(&filesystem, ctx, fuse::ROOT_ID, handle, 4096, 0, |entry| {
+                if entry.name == b"whiteout" {
+                    assert_eq!(entry.type_, libc::DT_REG as u32);
+                }
+                Ok(1)
+            })
+            .unwrap();
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
