@@ -25,6 +25,8 @@ use utils::worker_message::WorkerMessage;
 
 use crate::virtio::fs::filesystem::SecContext;
 
+use super::fd_budget::{DescriptorBudget, Reservation};
+
 use super::super::super::linux_errno::{LINUX_ERANGE, linux_error};
 use super::super::bindings;
 use super::super::filesystem::{
@@ -119,6 +121,7 @@ struct DirStream {
 /// `PassthroughFs::zero_message_open`): the requests that follow name the
 /// inode and handle 0, so the server keeps one open file per inode for them.
 struct CachedFd {
+    _reservation: Reservation,
     data: Arc<HandleData>,
     /// CREATE can supply a write-only or read-only descriptor. Handle-less
     /// requests must reopen it when the requested access is not available.
@@ -127,15 +130,35 @@ struct CachedFd {
 }
 
 /// Descriptors for files opened without a request, by inode, oldest first.
-#[derive(Default)]
 struct InodeFds {
+    budget: Arc<DescriptorBudget>,
     map: HashMap<Inode, CachedFd>,
     order: VecDeque<Inode>,
 }
 
 /// Files kept open for the kernel's handle-less requests. A forgotten inode
 /// drops its entry; past this many, the oldest goes and is reopened on demand.
-const INODE_FDS_MAX: usize = 256;
+const INODE_FDS_MAX: usize = 4096;
+
+impl Default for InodeFds {
+    fn default() -> Self {
+        Self {
+            budget: DescriptorBudget::process(),
+            map: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+}
+
+impl InodeFds {
+    fn evict_oldest(&mut self) {
+        while let Some(old) = self.order.pop_front() {
+            if self.map.remove(&old).is_some() {
+                break;
+            }
+        }
+    }
+}
 
 impl DirStream {
     fn new() -> Self {
@@ -1635,25 +1658,38 @@ impl PassthroughFs {
         {
             return cached.data.clone();
         }
-        if !fds.map.contains_key(&inode) {
+        let reservation = if let Some(previous) = fds.map.remove(&inode) {
+            // Upgrading an entry reuses its slot and its position in the
+            // eviction queue, even when another share has filled the budget.
+            previous._reservation
+        } else {
             if fds.map.len() >= INODE_FDS_MAX {
-                while let Some(old) = fds.order.pop_front() {
-                    if fds.map.remove(&old).is_some() {
-                        break;
-                    }
-                }
+                fds.evict_oldest();
             }
+            let reservation = fds.budget.reserve().or_else(|| {
+                // Other shares can consume the process budget. Recycle one
+                // of this share's entries instead of retaining another fd.
+                fds.evict_oldest();
+                fds.budget.reserve()
+            });
+            let Some(reservation) = reservation else {
+                // Retention is an optimization; the current request still
+                // owns this fd and the next can reopen it on demand.
+                return data;
+            };
             // Releases and forgets remove from the map only; drop their
             // leftovers from the order before it outgrows the map.
             if fds.order.len() >= 2 * INODE_FDS_MAX {
-                let InodeFds { map, order } = &mut *fds;
+                let InodeFds { map, order, .. } = &mut *fds;
                 order.retain(|kept| map.contains_key(kept));
             }
             fds.order.push_back(inode);
-        }
+            reservation
+        };
         fds.map.insert(
             inode,
             CachedFd {
+                _reservation: reservation,
                 data: data.clone(),
                 readable,
                 writable,
@@ -2579,7 +2615,7 @@ impl FileSystem for PassthroughFs {
             };
 
             remove_security_capability(&ihandle);
-            let st = istat(&ihandle, false)?;
+            let st = self.gstat(&ihandle, Some(&inode_data))?;
 
             // Clear suid/sgid if UID or GID is being changed
             let new_mode = clear_suid_sgid(st.st_mode as u32);
@@ -2591,6 +2627,7 @@ impl FileSystem for PassthroughFs {
             set_xattr_stat(&ihandle, Some(st), Some((uid, gid)), new_mode)?;
         }
 
+        let mut result_attr = None;
         if valid.contains(SetattrValid::SIZE) {
             // Safe because this doesn't modify any memory and we check the return value.
             match ihandle {
@@ -2602,10 +2639,12 @@ impl FileSystem for PassthroughFs {
 
                     // Clear security.capability on truncate unconditionally
                     remove_security_capability(&ihandle);
-                    let st = fstat(fd, false)?;
+                    let st = self.gstat(&ihandle, Some(&inode_data))?;
                     let new_mode = clear_suid_sgid(st.st_mode as u32);
                     if new_mode != st.st_mode as u32 {
                         set_xattr_stat(&ihandle, Some(st), None, Some(new_mode))?;
+                    } else {
+                        result_attr = Some(st);
                     }
                 }
                 InodeHandle::Path(_) => {
@@ -2622,16 +2661,19 @@ impl FileSystem for PassthroughFs {
                     // reuse the FD we just opened, thus reducing the number of syscalls.
                     let ihandle = InodeHandle::Fd(f.as_raw_fd());
                     remove_security_capability(&ihandle);
-                    let st = istat(&ihandle, false)?;
+                    let st = self.gstat(&ihandle, Some(&inode_data))?;
                     let new_mode = clear_suid_sgid(st.st_mode as u32);
                     if new_mode != st.st_mode as u32 {
                         set_xattr_stat(&ihandle, Some(st), None, Some(new_mode))?;
+                    } else {
+                        result_attr = Some(st);
                     }
                 }
             };
         }
 
         if valid.intersects(SetattrValid::ATIME | SetattrValid::MTIME) {
+            result_attr = None;
             let mut tvs = [
                 libc::timespec {
                     tv_sec: 0,
@@ -2660,7 +2702,7 @@ impl FileSystem for PassthroughFs {
             // Safe because this doesn't modify any memory and we check the return value.
             let res = match ihandle {
                 InodeHandle::Fd(fd) => unsafe { libc::futimens(fd, tvs.as_ptr()) },
-                InodeHandle::Path(c_path) => unsafe {
+                InodeHandle::Path(ref c_path) => unsafe {
                     let fd = libc::open(c_path.as_ptr(), libc::O_SYMLINK | libc::O_CLOEXEC);
                     let res = libc::futimens(fd, tvs.as_ptr());
                     libc::close(fd);
@@ -2672,7 +2714,15 @@ impl FileSystem for PassthroughFs {
             }
         }
 
-        self.do_getattr(inode)
+        // Truncation already obtained the final guest attributes after the
+        // host size/capability changes. Reuse that snapshot if no subsequent
+        // mode or timestamp update changed it; otherwise refresh through the
+        // same handle, keeping its descriptor alive throughout this request.
+        let st = match result_attr {
+            Some(st) => st,
+            None => self.gstat(&ihandle, Some(&inode_data))?,
+        };
+        Ok((st, self.cfg.attr_timeout))
     }
 
     fn rename(
@@ -4057,6 +4107,166 @@ mod tests {
         }
         assert_eq!(modes, vec![0o666, 0o2666]);
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn shared_descriptor_budget_recycles_entries_without_closing_active_requests() {
+        use std::os::unix::fs::FileExt;
+        let root = std::env::temp_dir().join(format!("krun-fd-budget-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a"), b"first").unwrap();
+        fs::write(root.join("b"), b"second").unwrap();
+        let budget = Arc::new(DescriptorBudget::new(2));
+        let make_share = || {
+            let fs = PassthroughFs::new(
+                Config {
+                    root_dir: root.to_string_lossy().into_owned(),
+                    ..Default::default()
+                },
+                Arc::new(InodeAllocator::new()),
+            )
+            .unwrap();
+            FileSystem::init(&fs, FsOptions::ZERO_MESSAGE_OPEN).unwrap();
+            fs.inode_fds.lock().unwrap().budget = budget.clone();
+            fs
+        };
+        let first = make_share();
+        let second = make_share();
+        let third = make_share();
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        };
+        let lookup = |fs: &PassthroughFs, name: &str| {
+            FileSystem::lookup(fs, ctx, fuse::ROOT_ID, &CString::new(name).unwrap())
+                .unwrap()
+                .inode
+        };
+        let a = lookup(&first, "a");
+        let active = first.inode_fd(a, false).unwrap();
+        let second_a = lookup(&second, "a");
+        second.inode_fd(second_a, false).unwrap();
+        assert!(budget.reserve().is_none());
+        // A new share still serves reads when other shares retain every slot.
+        let third_a = lookup(&third, "a");
+        third.inode_fd(third_a, false).unwrap();
+        assert!(third.inode_fds.lock().unwrap().map.is_empty());
+        // Upgrading a read descriptor must work with the budget already full.
+        first.inode_fd(a, true).unwrap();
+        assert!(first.inode_fds.lock().unwrap().map[&a].writable);
+        let b = lookup(&first, "b");
+        first.inode_fd(b, true).unwrap();
+        {
+            let cache = first.inode_fds.lock().unwrap();
+            assert_eq!(cache.map.len(), 1);
+            assert!(cache.map.contains_key(&b));
+            assert!(!cache.map.contains_key(&a));
+        }
+        let mut buf = [0; 5];
+        active
+            .file
+            .read()
+            .unwrap()
+            .read_exact_at(&mut buf, 0)
+            .unwrap();
+        assert_eq!(
+            &buf, b"first",
+            "eviction must not close an in-flight request's fd"
+        );
+        FileSystem::forget(&first, ctx, b, 1);
+        let returned = budget.reserve().expect("forget releases the retained slot");
+        assert!(budget.reserve().is_none());
+        drop(returned);
+        FileSystem::release(&second, ctx, second_a, 0, 0, false, false, None).unwrap();
+        let slots = (budget.reserve().unwrap(), budget.reserve().unwrap());
+        assert!(budget.reserve().is_none());
+        drop(slots);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn truncate_returns_final_modes_and_timestamps() {
+        let root = std::env::temp_dir().join(format!("krun-truncate-reply-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("f"), b"payload").unwrap();
+        let filesystem = PassthroughFs::new(
+            Config {
+                root_dir: root.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        FileSystem::init(&filesystem, FsOptions::ZERO_MESSAGE_OPEN).unwrap();
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        };
+        let entry =
+            FileSystem::lookup(&filesystem, ctx, fuse::ROOT_ID, &CString::new("f").unwrap())
+                .unwrap();
+        let mut attr = entry.attr;
+        attr.st_mode = (libc::S_IFREG | 0o6755) as _;
+        FileSystem::setattr(
+            &filesystem,
+            ctx,
+            entry.inode,
+            attr,
+            None,
+            SetattrValid::MODE,
+        )
+        .unwrap();
+        attr.st_size = 3;
+        let (truncated, _) = FileSystem::setattr(
+            &filesystem,
+            ctx,
+            entry.inode,
+            attr,
+            None,
+            SetattrValid::SIZE,
+        )
+        .unwrap();
+        assert_eq!(truncated.st_size, 3);
+        assert_eq!(truncated.st_mode as u32 & 0o7777, 0o755);
+        attr.st_size = 2;
+        attr.st_mtime = 123456789;
+        attr.st_mtime_nsec = 0;
+        let (timed, _) = FileSystem::setattr(
+            &filesystem,
+            ctx,
+            entry.inode,
+            attr,
+            Some(0),
+            SetattrValid::SIZE | SetattrValid::MTIME,
+        )
+        .unwrap();
+        assert_eq!(timed.st_size, 2);
+        assert_eq!(timed.st_mtime, 123456789);
+        // External metadata edits must still invalidate cached overrides.
+        let path = CString::new(root.join("f").to_str().unwrap()).unwrap();
+        set_xattr_stat(
+            &InodeHandle::Path(path),
+            None,
+            Some((123, 456)),
+            Some(libc::S_IFREG as u32 | 0o640),
+        )
+        .unwrap();
+        attr.st_size = 1;
+        let (external, _) = FileSystem::setattr(
+            &filesystem,
+            ctx,
+            entry.inode,
+            attr,
+            None,
+            SetattrValid::SIZE,
+        )
+        .unwrap();
+        assert_eq!(external.st_uid, 123);
+        assert_eq!(external.st_gid, 456);
+        assert_eq!(external.st_mode as u32 & 0o7777, 0o640);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
