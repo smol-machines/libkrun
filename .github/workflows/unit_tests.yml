@@ -18,6 +18,9 @@ jobs:
       - name: Test macOS event registration
         run: cargo test --locked -p krun-utils macos::epoll::tests
 
+      - name: Test macOS filesystem metadata and cached handles
+        run: cargo test --locked -p krun-devices --features net,blk --lib virtio::fs::macos
+
   unit-tests-linux-x86_64:
     name: Unit tests (Linux x86_64)
     runs-on: ubuntu-26.04

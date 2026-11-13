@@ -28,8 +28,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, Weak};
 use std::thread;
 
-use super::super::fuse;
 use super::super::FuseDaxMapSnap;
+use super::super::fuse;
 
 /// One mapped file: the descriptor its mappings were made from, the inotify
 /// watch on it, and how many window mappings use it.
@@ -103,27 +103,29 @@ impl DaxWindow {
         let window: Weak<DaxWindow> = Arc::downgrade(self);
         let spawned = thread::Builder::new()
             .name("fs-dax-watch".into())
-            .spawn(move || loop {
-                let mut pfd = libc::pollfd {
-                    fd: inotify.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                let ready = unsafe { libc::poll(&mut pfd, 1, -1) };
-                if ready > 0 && pfd.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
-                    return;
-                }
-                if ready < 0 {
-                    if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-                        continue;
+            .spawn(move || {
+                loop {
+                    let mut pfd = libc::pollfd {
+                        fd: inotify.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    let ready = unsafe { libc::poll(&mut pfd, 1, -1) };
+                    if ready > 0 && pfd.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+                        return;
                     }
-                    error!("fs dax watch: poll failed: {}", io::Error::last_os_error());
-                    return;
+                    if ready < 0 {
+                        if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        error!("fs dax watch: poll failed: {}", io::Error::last_os_error());
+                        return;
+                    }
+                    let Some(window) = window.upgrade() else {
+                        return;
+                    };
+                    window.lock().drain_events(host_shm_base);
                 }
-                let Some(window) = window.upgrade() else {
-                    return;
-                };
-                window.lock().drain_events(host_shm_base);
             });
         if let Err(e) = spawned {
             error!("fs dax watch: cannot start the watcher: {e}");

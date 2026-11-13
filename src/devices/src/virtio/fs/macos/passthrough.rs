@@ -83,6 +83,7 @@ struct InodeData {
     /// change to its xattrs (and its owner or mode), so a value read under
     /// the same ctime is the current one, whoever last wrote it.
     override_cache: Mutex<Option<CachedOverride>>,
+    metadata_lock: Mutex<()>,
 }
 
 /// The uid, gid and mode an override xattr holds, each optional.
@@ -359,7 +360,12 @@ fn apply_host_permissions(file: &InodeHandle, mode: u32) {
     let res = unsafe {
         match file {
             InodeHandle::Fd(fd) => libc::fchmod(*fd, perms),
-            InodeHandle::Path(c_path) => libc::chmod(c_path.as_ptr(), perms),
+            InodeHandle::Path(c_path) => libc::fchmodat(
+                libc::AT_FDCWD,
+                c_path.as_ptr(),
+                perms,
+                libc::AT_SYMLINK_NOFOLLOW,
+            ),
         }
     };
     if res < 0 {
@@ -370,13 +376,63 @@ fn apply_host_permissions(file: &InodeHandle, mode: u32) {
     }
 }
 
+/// Guest root may change ownership or permissions on a read-only inode. macOS
+/// nevertheless requires owner-write permission to update its override xattr.
+/// Temporarily grant only that bit to the host owner, and restore it even when
+/// the xattr update fails. Paths are inode anchors and never follow symlinks.
+fn metadata_write(file: &InodeHandle, mut write: impl FnMut() -> io::Result<()>) -> io::Result<()> {
+    let error = match write() {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    if error.raw_os_error() != Some(libc::EACCES) {
+        return Err(error);
+    }
+    let st = istat(file, true)?;
+    let kind = st.st_mode & libc::S_IFMT;
+    if st.st_uid != unsafe { libc::geteuid() }
+        || st.st_mode & libc::S_IWUSR != 0
+        || (kind != libc::S_IFREG && kind != libc::S_IFDIR)
+    {
+        return Err(error);
+    }
+    let mode = st.st_mode & 0o7777;
+    let chmod = |mode| {
+        // SAFETY: the borrowed fd or inode path remains live for this operation;
+        // fchmodat changes the link itself if a path names a symlink.
+        let rc = unsafe {
+            match file {
+                InodeHandle::Fd(fd) => libc::fchmod(*fd, mode),
+                InodeHandle::Path(path) => libc::fchmodat(
+                    libc::AT_FDCWD,
+                    path.as_ptr(),
+                    mode,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                ),
+            }
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    };
+    chmod(mode | libc::S_IWUSR)?;
+    let result = write();
+    chmod(mode)?;
+    result
+}
+
 fn set_xattr_stat(
     file: &InodeHandle,
     st: Option<bindings::stat64>,
     owner: Option<(u32, u32)>,
     mode: Option<u32>,
 ) -> io::Result<()> {
-    let st = st.unwrap_or(istat(file, true)?);
+    let st = match st {
+        Some(st) => st,
+        None => istat(file, true)?,
+    };
     let options = if (st.st_mode & libc::S_IFMT) == libc::S_IFLNK {
         libc::XATTR_NOFOLLOW
     } else {
@@ -421,34 +477,37 @@ fn set_xattr_stat(
         buf
     };
 
-    let res = match file {
-        InodeHandle::Path(path) => unsafe {
-            libc::setxattr(
-                path.as_ptr(),
-                XATTR_KEY.as_ptr() as *const i8,
-                buf.as_ptr() as *mut libc::c_void,
-                buf.len() as libc::size_t,
-                0,
-                options,
-            )
-        },
-        InodeHandle::Fd(fd) => unsafe {
-            libc::fsetxattr(
-                *fd,
-                XATTR_KEY.as_ptr() as *const i8,
-                buf.as_ptr() as *mut libc::c_void,
-                buf.len() as libc::size_t,
-                0,
-                options,
-            )
-        },
-    };
+    let write = || {
+        let res = match file {
+            InodeHandle::Path(path) => unsafe {
+                libc::setxattr(
+                    path.as_ptr(),
+                    XATTR_KEY.as_ptr() as *const i8,
+                    buf.as_ptr() as *mut libc::c_void,
+                    buf.len() as libc::size_t,
+                    0,
+                    libc::XATTR_NOFOLLOW,
+                )
+            },
+            InodeHandle::Fd(fd) => unsafe {
+                libc::fsetxattr(
+                    *fd,
+                    XATTR_KEY.as_ptr() as *const i8,
+                    buf.as_ptr() as *mut libc::c_void,
+                    buf.len() as libc::size_t,
+                    0,
+                    options,
+                )
+            },
+        };
 
-    if res < 0 {
-        Err(linux_error(io::Error::last_os_error()))
-    } else {
-        Ok(())
-    }
+        if res < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    };
+    metadata_write(file, write).map_err(linux_error)
 }
 
 fn stat_common(
@@ -891,6 +950,7 @@ impl PassthroughFs {
                 refcount: AtomicU64::new(2),
                 unlinked_fd: AtomicI64::new(-1),
                 override_cache: Mutex::new(None),
+                metadata_lock: Mutex::new(()),
             }),
         );
         Ok(())
@@ -953,6 +1013,7 @@ impl PassthroughFs {
                     dev: st.st_dev,
                     refcount: AtomicU64::new(1),
                     unlinked_fd: AtomicI64::new(-1),
+                    metadata_lock: Mutex::new(()),
                     override_cache: Mutex::new(Some(CachedOverride {
                         over,
                         ctime: ctime_of(&st),
@@ -1128,6 +1189,7 @@ impl PassthroughFs {
                         refcount: AtomicU64::new(snap.refcount),
                         unlinked_fd: AtomicI64::new(-1),
                         override_cache: Mutex::new(None),
+                        metadata_lock: Mutex::new(()),
                     }),
                 );
             }
@@ -1886,18 +1948,33 @@ fn set_secctx(file: &InodeHandle, secctx: SecContext, symlink: bool) -> io::Resu
 
 /// Remove the security.capability extended attribute
 fn remove_security_capability(file: &InodeHandle) {
-    let ret = match file {
-        InodeHandle::Path(path) => unsafe {
-            libc::removexattr(path.as_ptr(), SECURITY_CAPABILITY.as_ptr() as *const i8, 0)
-        },
-        InodeHandle::Fd(fd) => unsafe {
-            libc::fremovexattr(*fd, SECURITY_CAPABILITY.as_ptr() as *const i8, 0)
-        },
+    let remove = || {
+        let ret = match file {
+            InodeHandle::Path(path) => unsafe {
+                libc::removexattr(
+                    path.as_ptr(),
+                    SECURITY_CAPABILITY.as_ptr().cast(),
+                    libc::XATTR_NOFOLLOW,
+                )
+            },
+            InodeHandle::Fd(fd) => unsafe {
+                libc::fremovexattr(*fd, SECURITY_CAPABILITY.as_ptr().cast(), 0)
+            },
+        };
+        if ret == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        // Darwin reports ENOATTR, not Linux's ENODATA. Most files have no
+        // capability: this is the normal truncate/write path, not a warning.
+        if error.raw_os_error() == Some(libc::ENOATTR) {
+            Ok(())
+        } else {
+            Err(error)
+        }
     };
-
-    // ENODATA means the attribute didn't exist, which is fine
-    if ret != 0 && io::Error::last_os_error().raw_os_error() != Some(libc::ENODATA) {
-        warn!("Error removing security.capability from file");
+    if let Err(error) = metadata_write(file, remove) {
+        warn!("Error removing security.capability from file: {error}");
     }
 }
 
@@ -2430,6 +2507,26 @@ impl FileSystem for PassthroughFs {
         handle: Option<Handle>,
         valid: SetattrValid,
     ) -> io::Result<(bindings::stat64, Duration)> {
+        let inode_data = self
+            .inodes
+            .read()
+            .unwrap()
+            .get(&inode)
+            .cloned()
+            .ok_or_else(ebadf)?;
+        // Keep the temporary host permission adjustment and the final chmod in
+        // one metadata operation when requests for this inode run concurrently.
+        let _metadata = inode_data.metadata_lock.lock().unwrap();
+        // Reuse a handle-less writer for O_TRUNC, so the subsequent WRITE does
+        // not reopen the same inode after SETATTR just opened and closed it.
+        let truncation = if valid.contains(SetattrValid::SIZE)
+            && handle.is_none_or(|h| h == 0)
+            && self.zero_message_open.load(Ordering::Relaxed)
+        {
+            Some(self.file_for(inode, 0, true)?)
+        } else {
+            None
+        };
         // If we have a handle then use it otherwise get a new fd from the inode.
         // `hd` outlives every use of the raw fd: a concurrent release would
         // otherwise close it and a newly opened file could reuse the number.
@@ -2442,8 +2539,8 @@ impl FileSystem for PassthroughFs {
                 .filter(|hd| hd.inode == inode)
                 .cloned()
         });
-        let ihandle = match (handle, known) {
-            (Some(_), Some(data)) => {
+        let ihandle = match (handle, known.or(truncation)) {
+            (_, Some(data)) => {
                 hd = data;
                 let fd = hd.file.write().unwrap().as_raw_fd();
                 InodeHandle::Fd(fd)
@@ -4047,6 +4144,20 @@ mod tests {
         .unwrap();
         assert_eq!(&out.0[..n], b"hello");
 
+        // O_TRUNC without an OPEN carries no handle. A descriptor cached by
+        // the preceding read must be upgraded for truncation and later writes.
+        let mut truncate: bindings::stat64 = unsafe { std::mem::zeroed() };
+        truncate.st_size = 5;
+        FileSystem::setattr(
+            &filesystem,
+            context,
+            entry.inode,
+            truncate,
+            None,
+            SetattrValid::SIZE,
+        )
+        .unwrap();
+
         let n = FileSystem::write(
             &filesystem,
             context,
@@ -4364,6 +4475,184 @@ mod tests {
             // The permission bits reach the host; setuid stays in the xattr.
             assert_eq!(host & 0o7777, mode & 0o777, "{name}: host mode");
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn readonly_metadata_updates_preserve_host_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("krun-readonly-metadata-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("file"), b"payload").unwrap();
+        fs::create_dir(root.join("dir")).unwrap();
+        let filesystem = PassthroughFs::new(
+            Config {
+                root_dir: root.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        FileSystem::init(&filesystem, FsOptions::empty()).unwrap();
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        };
+        for (name, readonly) in [("file", 0o444), ("dir", 0o555)] {
+            let entry = FileSystem::lookup(
+                &filesystem,
+                ctx,
+                fuse::ROOT_ID,
+                &CString::new(name).unwrap(),
+            )
+            .unwrap();
+            let mut attr: bindings::stat64 = unsafe { std::mem::zeroed() };
+            attr.st_mode = readonly;
+            FileSystem::setattr(
+                &filesystem,
+                ctx,
+                entry.inode,
+                attr,
+                None,
+                SetattrValid::MODE,
+            )
+            .unwrap();
+            attr.st_uid = 1234;
+            attr.st_gid = 5678;
+            let (st, _) = FileSystem::setattr(
+                &filesystem,
+                ctx,
+                entry.inode,
+                attr,
+                None,
+                SetattrValid::UID | SetattrValid::GID,
+            )
+            .unwrap();
+            assert_eq!((st.st_uid, st.st_gid), (1234, 5678));
+            assert_eq!(st.st_mode & 0o777, readonly);
+            assert_eq!(
+                fs::metadata(root.join(name)).unwrap().permissions().mode() & 0o777,
+                u32::from(readonly)
+            );
+            attr.st_mode = 0o755;
+            FileSystem::setattr(
+                &filesystem,
+                ctx,
+                entry.inode,
+                attr,
+                None,
+                SetattrValid::MODE,
+            )
+            .unwrap();
+            assert_eq!(
+                fs::metadata(root.join(name)).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn chown_clears_readonly_capabilities_without_touching_symlink_targets() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let root =
+            std::env::temp_dir().join(format!("krun-readonly-capability-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("file");
+        fs::write(&path, b"data").unwrap();
+        let c = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let cap = b"capability";
+        assert_eq!(
+            unsafe {
+                libc::setxattr(
+                    c.as_ptr(),
+                    SECURITY_CAPABILITY.as_ptr().cast(),
+                    cap.as_ptr().cast(),
+                    cap.len(),
+                    0,
+                    0,
+                )
+            },
+            0
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+        symlink(&path, root.join("link")).unwrap();
+        let link =
+            InodeHandle::Path(CString::new(root.join("link").as_os_str().as_bytes()).unwrap());
+        remove_security_capability(&link);
+        assert_eq!(
+            unsafe {
+                libc::getxattr(
+                    c.as_ptr(),
+                    SECURITY_CAPABILITY.as_ptr().cast(),
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    0,
+                )
+            },
+            cap.len() as isize
+        );
+        remove_security_capability(&InodeHandle::Path(c.clone()));
+        assert_eq!(
+            unsafe {
+                libc::getxattr(
+                    c.as_ptr(),
+                    SECURITY_CAPABILITY.as_ptr().cast(),
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    0,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ENOATTR)
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o444
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_metadata_write_restores_mode_and_never_follows_links() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let root = std::env::temp_dir().join(format!("krun-metadata-error-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("target");
+        fs::write(&target, b"untouched").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o444)).unwrap();
+        let inode = InodeHandle::Path(CString::new(target.as_os_str().as_bytes()).unwrap());
+        let mut calls = 0;
+        let err = metadata_write(&inode, || {
+            calls += 1;
+            Err(io::Error::from_raw_os_error(if calls == 1 {
+                libc::EACCES
+            } else {
+                libc::EIO
+            }))
+        })
+        .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EIO));
+        assert_eq!(calls, 2);
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o444
+        );
+        symlink(&target, root.join("link")).unwrap();
+        let link =
+            InodeHandle::Path(CString::new(root.join("link").as_os_str().as_bytes()).unwrap());
+        metadata_write(&link, || Err(io::Error::from_raw_os_error(libc::EACCES))).unwrap_err();
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o444
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

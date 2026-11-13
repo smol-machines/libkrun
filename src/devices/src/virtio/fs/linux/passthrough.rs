@@ -3903,10 +3903,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "libkrun-zero-open-{}-{nonce}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("libkrun-zero-open-{}-{nonce}", std::process::id()));
         fs::create_dir(&root).unwrap();
         fs::write(root.join("busybox"), b"busybox bytes").unwrap();
         let server = || {
@@ -3953,11 +3951,18 @@ mod tests {
         restored.restore(&state(true)).unwrap();
         assert!(restored.snapshot().zero_message_open);
         assert_eq!(read(&restored).unwrap(), b"busybox bytes");
-        assert_eq!(read(&restored).unwrap(), b"busybox bytes", "the kept fd serves again");
+        assert_eq!(
+            read(&restored).unwrap(),
+            b"busybox bytes",
+            "the kept fd serves again"
+        );
 
         let without = server();
         without.restore(&state(false)).unwrap();
-        assert_eq!(read(&without).unwrap_err().raw_os_error(), Some(libc::EBADF));
+        assert_eq!(
+            read(&without).unwrap_err().raw_os_error(),
+            Some(libc::EBADF)
+        );
 
         fs::remove_dir_all(root).unwrap();
     }

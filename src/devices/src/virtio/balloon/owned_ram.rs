@@ -52,7 +52,11 @@ pub(crate) fn with_owned_backing<R>(file: &File, release: impl FnOnce() -> R) ->
         return None;
     }
     let id = identity(file)?;
-    if !OWNED.lock().unwrap_or_else(|e| e.into_inner()).contains(&id) {
+    if !OWNED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&id)
+    {
         return None;
     }
     Some(release())
@@ -69,16 +73,22 @@ mod tests {
         let foreign = tempfile_in_tmp("foreign");
         register_owned_guest_ram_file(&owned);
         assert_eq!(with_owned_backing(&owned, || 1), Some(1));
-        assert_eq!(with_owned_backing(&foreign, || 1), None, "a clone maps another's file");
+        assert_eq!(
+            with_owned_backing(&foreign, || 1),
+            None,
+            "a clone maps another's file"
+        );
         mark_guest_ram_shared();
-        assert_eq!(with_owned_backing(&owned, || 1), None, "shared with a frozen fork");
+        assert_eq!(
+            with_owned_backing(&owned, || 1),
+            None,
+            "shared with a frozen fork"
+        );
     }
 
     fn tempfile_in_tmp(tag: &str) -> File {
-        let path = std::env::temp_dir().join(format!(
-            "owned-ram-test-{tag}-{}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("owned-ram-test-{tag}-{}", std::process::id()));
         let file = File::options()
             .read(true)
             .write(true)
