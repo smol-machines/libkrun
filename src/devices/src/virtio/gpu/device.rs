@@ -19,14 +19,6 @@ use krun_display::DisplayBackend;
 #[cfg(target_os = "macos")]
 use utils::worker_message::WorkerMessage;
 
-// Supported features.
-pub(crate) const AVAIL_FEATURES: u64 = (1u64 << uapi::VIRTIO_F_VERSION_1)
-    | (1u64 << uapi::VIRTIO_GPU_F_VIRGL)
-    | (1u64 << uapi::VIRTIO_GPU_F_EDID)
-    | (1u64 << uapi::VIRTIO_GPU_F_RESOURCE_UUID)
-    | (1u64 << uapi::VIRTIO_GPU_F_RESOURCE_BLOB)
-    | (1u64 << uapi::VIRTIO_GPU_F_CONTEXT_INIT);
-
 const QUEUE_SIZE: u16 = 256;
 static QUEUE_CONFIG: [QueueConfig; defs::NUM_QUEUES] =
     [QueueConfig::new(QUEUE_SIZE); defs::NUM_QUEUES];
@@ -74,7 +66,7 @@ impl Gpu {
         #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
     ) -> super::Result<Gpu> {
         Ok(Gpu {
-            avail_features: AVAIL_FEATURES,
+            avail_features: super::advertised_features(),
             acked_features: 0,
             device_state: DeviceState::Inactive,
             shm_region: None,
