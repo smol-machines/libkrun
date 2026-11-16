@@ -1621,6 +1621,7 @@ mod simd_restore_tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires an Apple Silicon host with Hypervisor.framework available; run explicitly with --ignored"]
     fn restored_simd_registers_keep_every_bit() {
         // Hypervisor state belongs to this test's process and owning thread.
         // No guest code is run, and the test runner supplies HVF entitlements.
