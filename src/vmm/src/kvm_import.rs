@@ -16,6 +16,8 @@ const SYS_BASE: u64 = 0x6030_0000_0013_0000;
 const CORE_U64: u64 = 0x6030_0000_0010_0000;
 const CORE_U32: u64 = 0x6020_0000_0010_0000;
 const CORE_U128: u64 = 0x6040_0000_0010_0000;
+// PMCR_EL0 is S3_3_C9_C12_0; S3_1_C0_C0_1 (0xc801) is CLIDR_EL1.
+const PMCR_EL0: u64 = SYS_BASE | 0xdce0;
 const PAC_ENABLES: u64 = (1 << 31) | (1 << 30) | (1 << 27) | (1 << 13);
 const SYS_REGS: &[u16] = &[
     0xc080, 0xc102, 0xc100, 0xc101, 0xc510, 0xc518, 0xc600, 0xc681, 0xde82, 0xc684, 0xde83, 0xc082,
@@ -232,7 +234,7 @@ impl KvmVcpu {
         if self.sys(0xc082)? & ((3 << 16) | (3 << 24)) != 0 {
             return Err("SVE or SME execution cannot return to this Mac".into());
         }
-        if self.regs.get(&(SYS_BASE | 0xc801)).copied().unwrap_or(0) & 1 != 0 {
+        if self.regs.get(&PMCR_EL0).copied().unwrap_or(0) & 1 != 0 {
             return Err("Enabled KVM performance counters cannot return to this Mac".into());
         }
         if self.regs.get(&(SYS_BASE | 0xdf11)).copied().unwrap_or(0) & 1 != 0 {
@@ -432,6 +434,24 @@ mod tests {
         );
         vm.dist.remove(&0x6104);
         assert!(vm.distributor().unwrap_err().contains("high half"));
+    }
+
+    #[test]
+    fn cache_identification_is_not_performance_counter_control() {
+        let (mut cpu, vm) = fixture();
+        // CLIDR_EL1 from a nested M4 KVM capture (S3_1_C0_C0_1).
+        cpu.regs.insert(SYS_BASE | 0xc801, 0x0200_0021);
+        // PMCR_EL0 is S3_3_C9_C12_0. An absent or disabled PMU is safe;
+        // cache identification must not be mistaken for its global enable.
+        cpu.translate(0, &vm, 6000, 123).unwrap();
+        cpu.regs.insert(SYS_BASE | 0xdce0, 0x4101_3000);
+        cpu.translate(0, &vm, 6000, 123).unwrap();
+        cpu.regs.insert(SYS_BASE | 0xdce0, 0x4101_3001);
+        assert!(
+            cpu.translate(0, &vm, 6000, 123)
+                .unwrap_err()
+                .contains("performance counters")
+        );
     }
 
     #[test]
