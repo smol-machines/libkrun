@@ -64,8 +64,7 @@ use kvm_bindings::{KVM_API_VERSION, KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHU
 use kvm_bindings::{KVM_CAP_EXIT_HYPERCALL, KVM_MEMORY_EXIT_FLAG_PRIVATE, kvm_enable_cap};
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::{
-    KVM_CLOCK_HOST_TSC, KVM_CLOCK_REALTIME, KVM_VCPU_TSC_CTRL, KVM_VCPU_TSC_OFFSET, KVMIO,
-    kvm_device_attr,
+    KVM_CLOCK_REALTIME, KVM_VCPU_TSC_CTRL, KVM_VCPU_TSC_OFFSET, KVMIO, kvm_device_attr,
 };
 #[cfg(all(feature = "tee", target_arch = "x86_64"))]
 use kvm_bindings::{
@@ -1158,9 +1157,8 @@ impl Vm {
     #[cfg(target_arch = "x86_64")]
     /// Refuse a portable checkpoint unless it carries the realtime anchor that
     /// KVM_SET_CLOCK needs to advance guest time while the VM is stopped.
-    /// HOST_TSC enables the exact offset fast path but is optional: older KVM
-    /// implementations and VMs restored with KVM_SET_CLOCK may omit it, in
-    /// which case restore writes the saved absolute guest TSC instead.
+    /// The saved absolute guest TSC is advanced by elapsed guest-clock time;
+    /// raw host TSC samples are not interchangeable when KVM scales the TSC.
     pub fn validate_migration_clock(
         &self,
         state: &VmState,
@@ -1176,12 +1174,9 @@ impl Vm {
     }
 
     #[cfg(target_arch = "x86_64")]
-    /// Rebase every saved vCPU TSC offset after the source kvmclock was applied
-    /// to this destination VM. This is the KVM live-migration relationship:
-    ///
-    /// `ofs_dst = ofs_src - (guest_src - guest_dst) * freq + (tsc_src - tsc_dst)`
-    ///
-    /// where guest clock values are nanoseconds and `freq` is in kHz.
+    /// Advance saved guest counters after installing the source kvmclock.
+    /// KVM derives each destination offset when restoring IA32_TSC, after
+    /// restore_state has installed the captured guest frequency.
     pub fn rebase_vcpu_tsc(&self, source: &VmState, vcpu_states: &mut [VcpuState]) -> Result<()> {
         if !vcpu_states
             .iter()
@@ -1192,40 +1187,7 @@ impl Vm {
 
         validate_migration_clock_realtime(&source.clock, "source")?;
         let destination = self.fd.get_clock().map_err(Error::VmGetClock)?;
-        let has_full_samples = source.clock.flags & KVM_CLOCK_HOST_TSC != 0
-            && destination.flags & KVM_CLOCK_HOST_TSC != 0;
-
-        for state in vcpu_states {
-            if let Some(tsc) = &mut state.tsc_migration {
-                if has_full_samples {
-                    tsc.offset = rebased_tsc_offset(
-                        tsc.offset,
-                        tsc.khz,
-                        source.clock.clock,
-                        destination.clock,
-                        source.clock.host_tsc,
-                        destination.host_tsc,
-                    );
-                    tsc.apply_offset = true;
-                } else {
-                    let guest_delta_ns =
-                        i128::from(destination.clock) - i128::from(source.clock.clock);
-                    let tsc_entry = state
-                        .msrs
-                        .as_mut_slice()
-                        .iter_mut()
-                        .find(|entry| entry.index == 0x10)
-                        .ok_or_else(|| {
-                            Error::VmClockMigration(
-                                "portable vCPU state is missing IA32_TSC".to_string(),
-                            )
-                        })?;
-                    tsc_entry.data = advance_tsc(tsc_entry.data, guest_delta_ns, tsc.khz);
-                    tsc.apply_offset = false;
-                }
-            }
-        }
-        Ok(())
+        rebase_vcpu_tsc_samples(&source.clock, &destination, vcpu_states)
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -1249,39 +1211,7 @@ impl Vm {
         }
 
         let destination = self.fd.get_clock().map_err(Error::VmGetClock)?;
-        let has_full_samples = source.clock.flags & KVM_CLOCK_HOST_TSC != 0
-            && destination.flags & KVM_CLOCK_HOST_TSC != 0;
-
-        for state in vcpu_states {
-            let Some(tsc) = &mut state.tsc_migration else {
-                continue;
-            };
-            if has_full_samples {
-                tsc.offset = rebased_tsc_offset(
-                    tsc.offset,
-                    tsc.khz,
-                    source.clock.clock,
-                    destination.clock,
-                    source.clock.host_tsc,
-                    destination.host_tsc,
-                );
-                tsc.apply_offset = true;
-                continue;
-            }
-
-            let guest_delta_ns = i128::from(destination.clock) - i128::from(source.clock.clock);
-            let tsc_entry = state
-                .msrs
-                .as_mut_slice()
-                .iter_mut()
-                .find(|entry| entry.index == 0x10)
-                .ok_or_else(|| {
-                    Error::VmClockMigration("same-host vCPU state is missing IA32_TSC".to_string())
-                })?;
-            tsc_entry.data = advance_tsc(tsc_entry.data, guest_delta_ns, tsc.khz);
-            tsc.apply_offset = false;
-        }
-        Ok(())
+        rebase_vcpu_tsc_samples(&source.clock, &destination, vcpu_states)
     }
 
     #[allow(unused)]
@@ -1395,20 +1325,32 @@ fn bounded_realtime_midpoint(before: u64, after: u64) -> Result<u64> {
 }
 
 #[cfg(target_arch = "x86_64")]
-fn rebased_tsc_offset(
-    source_offset: u64,
-    khz: u32,
-    source_guest_ns: u64,
-    destination_guest_ns: u64,
-    source_host_tsc: u64,
-    destination_host_tsc: u64,
-) -> u64 {
-    let guest_delta_ns = i128::from(source_guest_ns) - i128::from(destination_guest_ns);
-    let guest_delta_ticks = guest_delta_ns * i128::from(khz) / 1_000_000;
-    let guest_delta_ticks_mod = guest_delta_ticks.rem_euclid(1_i128 << 64) as u64;
-    source_offset
-        .wrapping_sub(guest_delta_ticks_mod)
-        .wrapping_add(source_host_tsc.wrapping_sub(destination_host_tsc))
+fn rebase_vcpu_tsc_samples(
+    source: &kvm_clock_data,
+    destination: &kvm_clock_data,
+    vcpu_states: &mut [VcpuState],
+) -> Result<()> {
+    // KVM applies its offset AFTER scaling the host TSC. Subtracting raw
+    // host counters assumes identity scaling on both hosts and corrupts the
+    // guest epoch when either host scales the captured guest frequency.
+    // Use the saved guest counter instead; KVM_SET_MSRS calculates the local
+    // offset using the destination's actual scaling ratio. This also works
+    // on kernels that do not expose KVM_CLOCK_HOST_TSC or a scaling attribute.
+    let guest_delta_ns = i128::from(destination.clock) - i128::from(source.clock);
+    for state in vcpu_states {
+        let Some(tsc) = &mut state.tsc_migration else {
+            continue;
+        };
+        let tsc_entry = state
+            .msrs
+            .as_mut_slice()
+            .iter_mut()
+            .find(|entry| entry.index == 0x10)
+            .ok_or_else(|| Error::VmClockMigration("vCPU state is missing IA32_TSC".to_string()))?;
+        tsc_entry.data = advance_tsc(tsc_entry.data, guest_delta_ns, tsc.khz);
+        tsc.apply_offset = false;
+    }
+    Ok(())
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -3672,6 +3614,8 @@ enum VcpuEmulation {
 #[cfg(test)]
 mod tests {
     use crossbeam_channel::unbounded;
+    #[cfg(target_arch = "x86_64")]
+    use kvm_bindings::KVM_CLOCK_HOST_TSC;
     use std::sync::{Arc, Barrier};
 
     use super::*;
@@ -4374,36 +4318,115 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[test]
-    fn test_rebased_tsc_offset_preserves_epoch() {
-        let source_offset = 10_000_u64;
-        let khz = 2_400_000_u32;
-        let source_guest_ns = 5_000_000_000_u64;
-        let destination_guest_ns = 5_250_000_000_u64;
-        let source_host_tsc = 20_000_000_000_u64;
-        let destination_host_tsc = 31_000_000_000_u64;
-
-        let destination_offset = rebased_tsc_offset(
-            source_offset,
-            khz,
-            source_guest_ns,
-            destination_guest_ns,
-            source_host_tsc,
-            destination_host_tsc,
-        );
-
-        let source_epoch = source_offset
-            .wrapping_add(source_host_tsc)
-            .wrapping_sub(source_guest_ns.wrapping_mul(u64::from(khz)) / 1_000_000);
-        let destination_epoch = destination_offset
-            .wrapping_add(destination_host_tsc)
-            .wrapping_sub(destination_guest_ns.wrapping_mul(u64::from(khz)) / 1_000_000);
-        assert_eq!(destination_epoch, source_epoch);
+    fn migration_preserves_guest_epoch_with_scaled_host_counters() {
+        let (_vm, vcpu, _memory) = setup_vcpu(0x10000);
+        let mut state = vcpu.save_state().unwrap();
+        let source_tsc = 50_000_000_000_u64;
+        let source_host_tsc = 2_000_000_000_000_u64;
+        let destination_host_tsc = 3_000_000_000_000_u64;
+        state.tsc_migration = Some(TscMigrationState {
+            khz: 1_200_000,
+            offset: source_tsc.wrapping_sub(source_host_tsc / 2),
+            apply_offset: true,
+        });
+        state
+            .msrs
+            .as_mut_slice()
+            .iter_mut()
+            .find(|m| m.index == 0x10)
+            .unwrap()
+            .data = source_tsc;
+        let source = kvm_clock_data {
+            clock: 5_000_000_000,
+            host_tsc: source_host_tsc,
+            flags: KVM_CLOCK_REALTIME | KVM_CLOCK_HOST_TSC,
+            ..Default::default()
+        };
+        let destination = kvm_clock_data {
+            clock: 5_250_000_000,
+            host_tsc: destination_host_tsc,
+            flags: KVM_CLOCK_REALTIME | KVM_CLOCK_HOST_TSC,
+            ..Default::default()
+        };
+        rebase_vcpu_tsc_samples(&source, &destination, std::slice::from_mut(&mut state)).unwrap();
+        let migration = state.tsc_migration.unwrap();
+        // Both hosts run at 2.4 GHz and the guest at 1.2 GHz, so KVM
+        // applies the offset to HALF the host counter, not the raw counter.
+        let restored_tsc = if migration.apply_offset {
+            (destination_host_tsc / 2).wrapping_add(migration.offset)
+        } else {
+            state
+                .msrs
+                .as_slice()
+                .iter()
+                .find(|m| m.index == 0x10)
+                .unwrap()
+                .data
+        };
+        assert_eq!(restored_tsc, source_tsc + 300_000_000);
     }
 
     #[cfg(target_arch = "x86_64")]
     #[test]
-    fn test_rebased_tsc_offset_is_unchanged_for_same_clock_sample() {
-        assert_eq!(rebased_tsc_offset(42, 3_000_000, 100, 100, 200, 200), 42);
+    fn checkpoint_restores_guest_tsc_through_kvm() {
+        let (source_vm, mut source_cpu, _source_memory) = setup_vcpu(0x10000);
+        let native_khz = source_cpu.fd.get_tsc_khz().unwrap();
+        let scaled = source_vm.fd.check_extension(kvm_ioctls::Cap::TscControl);
+        let khz = if scaled { native_khz / 2 } else { native_khz };
+        eprintln!(
+            "KVM counter restore: hardware scaling supported={scaled}, guest frequency={khz} kHz"
+        );
+        source_cpu.fd.set_tsc_khz(khz).unwrap();
+        source_cpu.portable_cpu = true;
+        let mut state = source_cpu.save_state().unwrap();
+        let read_tsc = |state: &VcpuState| {
+            state
+                .msrs
+                .as_slice()
+                .iter()
+                .find(|m| m.index == 0x10)
+                .unwrap()
+                .data
+        };
+        let expected = read_tsc(&state).wrapping_add(u64::from(khz) * 250);
+        let source_clock = kvm_clock_data {
+            clock: 5_000_000_000,
+            flags: KVM_CLOCK_HOST_TSC | KVM_CLOCK_REALTIME,
+            host_tsc: 2_000_000_000_000,
+            ..Default::default()
+        };
+        let destination_clock = kvm_clock_data {
+            clock: 5_250_000_000,
+            flags: KVM_CLOCK_HOST_TSC | KVM_CLOCK_REALTIME,
+            host_tsc: 3_000_000_000_000,
+            ..Default::default()
+        };
+        rebase_vcpu_tsc_samples(
+            &source_clock,
+            &destination_clock,
+            std::slice::from_mut(&mut state),
+        )
+        .unwrap();
+        let (_destination_vm, mut destination_cpu, _destination_memory) = setup_vcpu(0x10000);
+        destination_cpu.portable_cpu = true;
+        let started = std::time::Instant::now();
+        destination_cpu.restore_state(state).unwrap();
+        assert_eq!(destination_cpu.fd.get_tsc_khz().unwrap(), khz);
+        let saved_again = destination_cpu.save_state().unwrap();
+        let elapsed = started.elapsed().as_nanos();
+        let actual = read_tsc(&saved_again);
+        // Account for time spent in real KVM ioctls, with 10 ms of scheduling
+        // tolerance; a wrong host offset is orders of magnitude larger.
+        let max_ticks = (elapsed + 10_000_000) * u128::from(khz) / 1_000_000;
+        assert!(
+            u128::from(actual.wrapping_sub(expected)) <= max_ticks,
+            "restored guest TSC {actual}, expected {expected}, tolerance {max_ticks}"
+        );
+        let serialized = saved_again.serialize();
+        assert_eq!(
+            read_tsc(&VcpuState::deserialize(&serialized).unwrap()),
+            actual
+        );
     }
 
     #[cfg(target_arch = "x86_64")]
