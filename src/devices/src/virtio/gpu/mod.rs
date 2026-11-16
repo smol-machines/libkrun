@@ -84,10 +84,42 @@ pub fn advertised_capset_mask() -> u64 {
     }
 }
 
+/// Whether the device serves only rutabaga's CPU 2D component: a scanout the
+/// guest fills with software-rendered frames, with no host renderer behind it.
+///
+/// `KRUN_GPU_BACKEND=2d` asks for it, and rutabaga keeps that choice only when
+/// no capset mask is set; with a mask it builds the component the mask names.
+pub fn serves_2d_only() -> bool {
+    std::env::var("KRUN_GPU_BACKEND").as_deref() == Ok("2d") && advertised_capset_mask() == 0
+}
+
+/// The virtio features the device offers.
+///
+/// A 2D-only device has no 3D contexts, capsets or blob resources to back the
+/// 3D features, so it offers the plain 2D device. Offering them anyway makes
+/// the guest driver query capsets that are never answered, and it waits five
+/// seconds for the first one before it finishes initialising.
+pub fn advertised_features() -> u64 {
+    use defs::uapi;
+    let base = (1u64 << uapi::VIRTIO_F_VERSION_1) | (1u64 << uapi::VIRTIO_GPU_F_EDID);
+    if serves_2d_only() {
+        base
+    } else {
+        base | (1u64 << uapi::VIRTIO_GPU_F_VIRGL)
+            | (1u64 << uapi::VIRTIO_GPU_F_RESOURCE_UUID)
+            | (1u64 << uapi::VIRTIO_GPU_F_RESOURCE_BLOB)
+            | (1u64 << uapi::VIRTIO_GPU_F_CONTEXT_INIT)
+    }
+}
+
 /// How many capsets the device advertises in its config space, matching
 /// [`advertised_capset_mask`] so the guest never queries an index that is not
 /// there.
 pub fn advertised_num_capsets() -> u32 {
+    if serves_2d_only() {
+        // The 2D component has no capsets.
+        return 0;
+    }
     let mask = advertised_capset_mask();
     if mask == 0 {
         // The historical hardcoded count for the "everything" mask.
