@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use socket2::{Domain, Socket, Type};
 
 use super::super::Queue as VirtQueue;
+use super::super::linux_errno::LINUX_EAFNOSUPPORT;
 use super::defs;
 use super::defs::uapi;
 use super::dns_filter::{DNS_PORT, DnsRequest, sockaddr_port};
@@ -266,7 +267,6 @@ impl Proxy for TsiDgramProxy {
         // exactly as it would without interception, and the guest's resolver
         // and address selection see the same errors.
         let intercept = self.dns_sender.is_some() && sockaddr_port(&req.addr) == Some(DNS_PORT);
-        self.connected_dns = false;
         let addr: std::io::Result<socket2::SockAddr> = match req.addr.inet() {
             _ if !req.addr.suits_family(self.family) => {
                 warn!(
@@ -284,21 +284,32 @@ impl Proxy for TsiDgramProxy {
             #[cfg(not(target_os = "linux"))]
             None => Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
         };
-        let (res, poll_host_socket) = match addr.and_then(|a| self.sock.connect(&a)) {
+        let connected =
+            if self.family == Family::Inet && req.addr.inet().is_some_and(|a| a.is_ipv6()) {
+                // Linux rejects this before changing the socket. Darwin can
+                // disconnect an existing UDP peer before returning the error.
+                // This is already a guest errno, not a native Winsock/BSD error.
+                Err(LINUX_EAFNOSUPPORT)
+            } else {
+                addr.and_then(|a| self.sock.connect(&a))
+                    .map_err(|err| sys::to_linux_errno(&err))
+            };
+        let (res, poll_host_socket) = match connected {
             Ok(()) => {
+                // Keep the previous DNS policy until the new connection succeeds.
+                self.connected_dns = intercept;
                 self.status = ProxyStatus::Connected;
                 if intercept {
                     debug!("connect: intercepting DNS socket");
-                    self.connected_dns = true;
                     (0, false)
                 } else {
                     debug!("connect: Connected");
                     (0, true)
                 }
             }
-            Err(e) => {
-                debug!("Error connecting: {e}");
-                (-sys::to_linux_errno(&e), false)
+            Err(errno) => {
+                debug!("Error connecting: Linux errno {errno}");
+                (-errno, false)
             }
         };
 
@@ -550,5 +561,111 @@ impl Proxy for TsiDgramProxy {
         }
 
         update
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::packet::VSOCK_PKT_HDR_SIZE;
+    use super::*;
+    use crate::virtio::queue::tests::VirtQueue as TestQueue;
+    use std::net::{SocketAddr, UdpSocket};
+    use std::time::Duration;
+    use vm_memory::{Bytes, GuestAddress};
+
+    #[test]
+    fn failed_reconnect_preserves_dns_routing_and_successful_reconnect_replaces_it() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x40000)]).unwrap();
+        let rx = TestQueue::new(GuestAddress(0x4000), &mem, 8);
+        let replies = Arc::new(Mutex::new(MuxerRxQ::new()));
+        let (sender, requests) = crossbeam_channel::unbounded();
+        let mut proxy = TsiDgramProxy::new(
+            1,
+            3,
+            defs::LINUX_AF_INET,
+            7000,
+            mem.clone(),
+            Arc::new(Mutex::new(rx.create_queue())),
+            replies.clone(),
+            Some(sender),
+            Arc::new(SnapshotGate::default()),
+        )
+        .unwrap();
+        let packet = |data: &[u8]| {
+            let tx = TestQueue::new(GuestAddress(0x1000), &mem, 8);
+            mem.write_slice(&[0; VSOCK_PKT_HDR_SIZE], GuestAddress(0x10000))
+                .unwrap();
+            mem.write_obj(data.len() as u32, GuestAddress(0x10000 + 24))
+                .unwrap();
+            mem.write_slice(data, GuestAddress(0x10000 + VSOCK_PKT_HDR_SIZE as u64))
+                .unwrap();
+            tx.dtable[0].set(0x10000, (VSOCK_PKT_HDR_SIZE + data.len()) as u32, 0, 0);
+            tx.avail.ring[0].set(0);
+            tx.avail.idx.set(1);
+            let mut pkt =
+                VsockPacket::from_tx_virtq_head(&tx.create_queue().pop(&mem).unwrap()).unwrap();
+            pkt.set_op(uapi::VSOCK_OP_RW)
+                .set_src_port(7000)
+                .set_dst_port(defs::TSI_PROXY_PORT)
+                .set_type(uapi::VSOCK_TYPE_DGRAM);
+            pkt
+        };
+        let resolver: SocketAddr = "127.0.0.1:53".parse().unwrap();
+        for (destination, expected) in [(resolver, 0), ("[::1]:53".parse().unwrap(), -97)] {
+            proxy.connect(
+                &packet(&[]),
+                TsiConnectReq {
+                    peer_port: 7000,
+                    addr: destination.into(),
+                },
+            );
+            let reply = replies.lock().unwrap().pop();
+            match reply {
+                Some(MuxerRx::ConnResponse { result, .. }) => assert_eq!(result, expected),
+                other => panic!("unexpected connect response: {other:?}"),
+            }
+        }
+        assert_eq!(proxy.sock.peer_addr().unwrap().as_socket(), Some(resolver));
+        let bound = proxy.sock.local_addr().unwrap().as_socket().unwrap();
+        proxy.sendmsg(&packet(b"query"));
+        let request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(request.query, b"query");
+        assert_eq!(request.peer_port, 7000);
+
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        proxy.connect(
+            &packet(&[]),
+            TsiConnectReq {
+                peer_port: 7000,
+                addr: peer.local_addr().unwrap().into(),
+            },
+        );
+        assert!(matches!(
+            replies.lock().unwrap().pop(),
+            Some(MuxerRx::ConnResponse { result: 0, .. })
+        ));
+        // The same invalid reconnect must also preserve an ordinary UDP peer.
+        proxy.connect(
+            &packet(&[]),
+            TsiConnectReq {
+                peer_port: 7000,
+                addr: "[::1]:53".parse::<SocketAddr>().unwrap().into(),
+            },
+        );
+        assert!(matches!(
+            replies.lock().unwrap().pop(),
+            Some(MuxerRx::ConnResponse { result: -97, .. })
+        ));
+        assert_eq!(
+            proxy.sock.peer_addr().unwrap().as_socket(),
+            Some(peer.local_addr().unwrap())
+        );
+        proxy.sendmsg(&packet(b"data"));
+        let mut bytes = [0; 16];
+        let (length, source) = peer.recv_from(&mut bytes).unwrap();
+        assert_eq!(&bytes[..length], b"data");
+        assert_eq!(source, bound);
+        assert!(requests.try_recv().is_err());
     }
 }
