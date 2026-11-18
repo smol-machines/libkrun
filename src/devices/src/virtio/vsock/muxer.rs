@@ -135,6 +135,7 @@ pub fn push_packet(
 ) {
     let _snapshot_activity = snapshot_gate.enter();
     let mut queue = queue_mutex.lock().unwrap();
+    drain_pending_packets(cid, rxq_mutex, &mut queue, mem);
     if let Some(head) = queue.pop(mem) {
         if let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head) {
             rx_to_pkt(cid, rx, &mut pkt);
@@ -156,6 +157,36 @@ pub fn push_packet(
         });
         rxq_mutex.lock().unwrap().push(rx);
     }
+}
+
+/// Deliver older control packets before a producer writes newer credit into RX.
+/// The caller holds the RX queue lock and an active snapshot guard.
+pub(super) fn drain_pending_packets(
+    cid: u64,
+    pending: &Mutex<MuxerRxQ>,
+    queue: &mut VirtQueue,
+    mem: &GuestMemoryMmap,
+) -> bool {
+    let mut pending = pending.lock().unwrap();
+    let mut used = false;
+    while !pending.is_empty() {
+        let Some(head) = queue.pop(mem) else { break };
+        let len = match VsockPacket::from_rx_virtq_head(&head) {
+            Ok(mut packet) => {
+                rx_to_pkt(cid, pending.pop().unwrap(), &mut packet);
+                packet.hdr().len() as u32 + packet.len()
+            }
+            Err(error) => {
+                warn!("RX queue error while delivering pending packet: {error:?}");
+                0
+            }
+        };
+        if let Err(error) = queue.add_used(mem, head.index, len) {
+            error!("failed to return pending packet RX buffer: {error:?}");
+        }
+        used = true;
+    }
+    used
 }
 
 pub struct VsockMuxer {
@@ -1631,6 +1662,55 @@ impl VsockMuxer {
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+
+    #[test]
+    fn queued_credit_cannot_arrive_after_newer_credit() {
+        use super::super::packet::VSOCK_PKT_HDR_SIZE;
+        use crate::virtio::queue::tests::VirtQueue as TestQueue;
+        use vm_memory::{Bytes, GuestAddress};
+
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        let rx = TestQueue::new(GuestAddress(0x4000), &mem, 8);
+        let queue = Arc::new(Mutex::new(rx.create_queue()));
+        let pending = Arc::new(Mutex::new(MuxerRxQ::new()));
+        let gate = SnapshotGate::default();
+        let credit = |fwd_cnt| MuxerRx::CreditUpdate {
+            local_port: 1024,
+            peer_port: 2048,
+            fwd_cnt,
+        };
+        push_packet(3, credit(1024), &pending, &queue, &mem, &gate);
+        assert_eq!(pending.lock().unwrap().len(), 1);
+
+        // Refill arrives before the device services its kick, then another
+        // producer has a newer reply. The guest must never see credit regress.
+        for i in 0..2 {
+            rx.dtable[i].set(
+                0x10000 + i as u64 * 0x1000,
+                (VSOCK_PKT_HDR_SIZE + 64) as u32,
+                2,
+                0,
+            );
+            rx.avail.ring[i].set(i as u16);
+        }
+        rx.avail.idx.set(2);
+        push_packet(3, credit(4096), &pending, &queue, &mem, &gate);
+        loop {
+            let next = pending.lock().unwrap().pop();
+            let Some(packet) = next else { break };
+            push_packet(3, packet, &pending, &queue, &mem, &gate);
+        }
+
+        assert_eq!(rx.used.idx.get(), 2);
+        assert_eq!(
+            mem.read_obj::<u32>(GuestAddress(0x10000 + 40)).unwrap(),
+            1024
+        );
+        assert_eq!(
+            mem.read_obj::<u32>(GuestAddress(0x11000 + 40)).unwrap(),
+            4096
+        );
+    }
 
     #[test]
     fn a_control_packet_cannot_miss_the_final_rx_refill() {

@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use socket2::{Domain, SockAddr, Socket, Type};
 
 use super::super::Queue as VirtQueue;
-use super::muxer::{MuxerRx, push_packet};
+use super::muxer::{MuxerRx, drain_pending_packets, push_packet};
 use super::muxer_rxq::MuxerRxQ;
 use super::packet::{TsiAcceptReq, TsiConnectReq, TsiListenReq, TsiSendtoAddr, VsockPacket};
 use super::proxy::{
@@ -276,10 +276,10 @@ impl UnixProxy {
     }
 
     fn recv_pkt(&mut self) -> (bool, bool) {
-        let mut have_used = false;
         let mut wait_credit = false;
         let _snapshot_activity = self.snapshot_gate.enter();
         let mut queue = self.queue.lock().unwrap();
+        let mut have_used = drain_pending_packets(self.cid, &self.rxq, &mut queue, &self.mem);
 
         while let Some(head) = queue.pop(&self.mem) {
             let len = match VsockPacket::from_rx_virtq_head(&head) {
@@ -767,7 +767,17 @@ impl Proxy for UnixProxy {
                         peer_port: self.peer_port,
                         fwd_cnt: self.tx_cnt.0,
                     };
-                    update.push_credit_req = Some(rx);
+                    // Publish while this proxy still owns its credit counters;
+                    // a deferred request could carry older credit after a reply.
+                    push_packet(
+                        self.cid,
+                        rx,
+                        &self.rxq,
+                        &self.queue,
+                        &self.mem,
+                        &self.snapshot_gate,
+                    );
+                    update.signal_queue = true;
                 }
 
                 if self.status == ProxyStatus::PeerClosed {
@@ -1096,6 +1106,69 @@ mod tests {
             Arc::new(SnapshotGate::default()),
         );
         (proxy, peer)
+    }
+
+    #[test]
+    fn a_credit_request_is_published_and_signaled_without_data() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        let rx = TestQueue::new(GuestAddress(0x4000), &mem, 8);
+        let (mut proxy, peer) = proxy_with_peer(&mem, &rx);
+        proxy.status = ProxyStatus::Connected;
+        proxy.tx_cnt = Wrapping(4096);
+        rx.dtable[0].set(HDR, (VSOCK_PKT_HDR_SIZE + 64) as u32, 2, 0);
+        rx.avail.ring[0].set(0);
+        rx.avail.idx.set(1);
+        assert_eq!(peer.send(b"x").unwrap(), 1);
+
+        let update = proxy.process_event(EventSet::IN);
+
+        assert!(update.signal_queue);
+        assert!(
+            update.push_credit_req.is_none(),
+            "request publication was deferred"
+        );
+        assert_eq!(rx.used.idx.get(), 1);
+        assert_eq!(
+            mem.read_obj::<u16>(GuestAddress(HDR + 30)).unwrap(),
+            uapi::VSOCK_OP_CREDIT_REQUEST
+        );
+        assert_eq!(mem.read_obj::<u32>(GuestAddress(HDR + 40)).unwrap(), 4096);
+        assert_eq!(proxy.status, ProxyStatus::WaitingCreditUpdate);
+    }
+
+    #[test]
+    fn queued_credit_precedes_data_carrying_newer_credit() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        let rx = TestQueue::new(GuestAddress(0x4000), &mem, 8);
+        let (mut proxy, peer) = proxy_with_peer(&mem, &rx);
+        proxy.status = ProxyStatus::Connected;
+        proxy.peer_buf_alloc = 4096;
+        proxy.tx_cnt = Wrapping(4096);
+        proxy.rxq.lock().unwrap().push(MuxerRx::CreditUpdate {
+            local_port: 1024,
+            peer_port: 2048,
+            fwd_cnt: 1024,
+        });
+        for (i, address) in [HDR, DATA].into_iter().enumerate() {
+            rx.dtable[i].set(address, (VSOCK_PKT_HDR_SIZE + 64) as u32, 2, 0);
+            rx.avail.ring[i].set(i as u16);
+        }
+        rx.avail.idx.set(2);
+        assert_eq!(peer.send(b"ok").unwrap(), 2);
+
+        assert!(proxy.process_event(EventSet::IN).signal_queue);
+
+        assert_eq!(rx.used.idx.get(), 2);
+        assert_eq!(mem.read_obj::<u32>(GuestAddress(HDR + 40)).unwrap(), 1024);
+        assert_eq!(mem.read_obj::<u32>(GuestAddress(DATA + 40)).unwrap(), 4096);
+        let mut received = [0; 2];
+        mem.read_slice(
+            &mut received,
+            GuestAddress(DATA + VSOCK_PKT_HDR_SIZE as u64),
+        )
+        .unwrap();
+        assert_eq!(&received, b"ok");
+        assert!(proxy.rxq.lock().unwrap().is_empty());
     }
 
     #[test]
