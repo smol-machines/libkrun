@@ -1898,6 +1898,11 @@ impl PassthroughFs {
                             || entry.EaSize == IO_REPARSE_TAG_LX_SYMLINK)
                     {
                         DT_LNK
+                    } else if attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0
+                        && entry.EaSize == IO_REPARSE_TAG_MOUNT_POINT
+                    {
+                        // A junction or a mounted volume: lookup tells which.
+                        DT_UNKNOWN
                     } else if attrs & FILE_ATTRIBUTE_DIRECTORY != 0 {
                         DT_DIR
                     } else {
