@@ -15,7 +15,7 @@ use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Component, Path, PathBuf};
 use std::ptr::null_mut;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -86,6 +86,22 @@ struct InodeData {
     /// the same ctime is the current one, whoever last wrote it.
     override_cache: Mutex<Option<CachedOverride>>,
     metadata_lock: Mutex<()>,
+    /// Whether the host inode is a directory: `KIND_DIR`, `KIND_OTHER`, or
+    /// `KIND_UNKNOWN` until first needed. Read from the host, never from the
+    /// guest-visible mode, which an override can change.
+    kind: AtomicU8,
+}
+
+const KIND_UNKNOWN: u8 = 0;
+const KIND_DIR: u8 = 1;
+const KIND_OTHER: u8 = 2;
+
+fn kind_of(st: &bindings::stat64) -> u8 {
+    if st.st_mode & libc::S_IFMT == libc::S_IFDIR {
+        KIND_DIR
+    } else {
+        KIND_OTHER
+    }
 }
 
 /// The uid, gid and mode an override xattr holds, each optional.
@@ -1023,6 +1039,7 @@ impl PassthroughFs {
                 unlinked_fd: AtomicI64::new(-1),
                 override_cache: Mutex::new(None),
                 metadata_lock: Mutex::new(()),
+                kind: AtomicU8::new(KIND_DIR),
             }),
         );
         Ok(())
@@ -1086,6 +1103,7 @@ impl PassthroughFs {
                     refcount: AtomicU64::new(1),
                     unlinked_fd: AtomicI64::new(-1),
                     metadata_lock: Mutex::new(()),
+                    kind: AtomicU8::new(KIND_UNKNOWN),
                     override_cache: Mutex::new(Some(CachedOverride {
                         over,
                         ctime: ctime_of(&st),
@@ -1262,6 +1280,7 @@ impl PassthroughFs {
                         unlinked_fd: AtomicI64::new(-1),
                         override_cache: Mutex::new(None),
                         metadata_lock: Mutex::new(()),
+                        kind: AtomicU8::new(KIND_UNKNOWN),
                     }),
                 );
             }
@@ -1346,6 +1365,23 @@ impl PassthroughFs {
             .get(&parent)
             .cloned()
             .ok_or_else(ebadf)?;
+
+        // The guest names the parent by node id, and macOS follows a symlink
+        // in the middle of a path: a link's node id used as a parent would
+        // resolve the child against wherever the link points on the host.
+        let kind = match data.kind.load(Ordering::Relaxed) {
+            KIND_UNKNOWN => {
+                let volfs = CString::new(format!("/.vol/{}/{}", data.dev, data.ino))
+                    .map_err(|_| einval())?;
+                let kind = kind_of(&lstat(&volfs, true)?);
+                data.kind.store(kind, Ordering::Relaxed);
+                kind
+            }
+            kind => kind,
+        };
+        if kind != KIND_DIR {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::ENOTDIR)));
+        }
 
         let cstr = CString::new(format!(
             "/.vol/{}/{}/{}",
@@ -3754,6 +3790,72 @@ mod tests {
     use std::os::unix::fs::MetadataExt;
     use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    // The guest names a parent by node id. A symlink's node id is never a
+    // directory to resolve a child in: macOS would follow the link mid-path
+    // and the child would be whatever the link points at on the host.
+    #[test]
+    fn a_symlink_is_never_a_parent() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "libkrun-symlink-parent-{}-{nonce}",
+            std::process::id()
+        ));
+        let root = base.join("export");
+        fs::create_dir_all(root.join("dir")).unwrap();
+        fs::write(root.join("dir/file"), b"inside").unwrap();
+        fs::create_dir(base.join("elsewhere")).unwrap();
+        fs::write(base.join("elsewhere/secret"), b"outside").unwrap();
+        std::os::unix::fs::symlink(base.join("elsewhere"), root.join("linked")).unwrap();
+
+        let filesystem = PassthroughFs::new(
+            Config {
+                root_dir: root.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        FileSystem::init(&filesystem, FsOptions::empty()).unwrap();
+        let context = Context {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        };
+
+        let dir = FileSystem::lookup(&filesystem, context, fuse::ROOT_ID, c"dir").unwrap();
+        FileSystem::lookup(&filesystem, context, dir.inode, c"file").unwrap();
+
+        let linked = FileSystem::lookup(&filesystem, context, fuse::ROOT_ID, c"linked").unwrap();
+        let err = FileSystem::lookup(&filesystem, context, linked.inode, c"secret")
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(
+            err.raw_os_error(),
+            linux_error(io::Error::from_raw_os_error(libc::ENOTDIR)).raw_os_error()
+        );
+        assert!(
+            FileSystem::create(
+                &filesystem,
+                context,
+                linked.inode,
+                c"planted",
+                0o644,
+                false,
+                libc::O_WRONLY as u32,
+                0,
+                Extensions::default(),
+            )
+            .is_err()
+        );
+        assert!(!base.join("elsewhere/planted").exists());
+
+        drop(filesystem);
+        fs::remove_dir_all(base).unwrap();
+    }
 
     // A restore resolves inode identities beneath the export root without
     // following any symlink: an intermediate component that is (or became) a
