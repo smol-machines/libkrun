@@ -401,9 +401,13 @@ impl UnixProxy {
     }
 
     fn maybe_send_credit_update(&mut self) -> bool {
-        if self.peer_buf_alloc != 0
-            && (self.tx_cnt - self.last_tx_cnt_sent).0 >= self.peer_buf_alloc / 2
-        {
+        // Our advertised window limits guest writes, independently of the
+        // guest's receive window for traffic in the opposite direction.
+        let mut window = defs::CONN_TX_BUF_SIZE as u32;
+        if self.peer_buf_alloc != 0 {
+            window = window.min(self.peer_buf_alloc);
+        }
+        if (self.tx_cnt - self.last_tx_cnt_sent).0 >= (window / 2).max(1) {
             self.send_credit_update();
             true
         } else {
@@ -1169,6 +1173,24 @@ mod tests {
         .unwrap();
         assert_eq!(&received, b"ok");
         assert!(proxy.rxq.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn receive_window_cannot_suppress_send_credit() {
+        for receive_window in [0, 32 * 1024 * 1024] {
+            let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+            let rx = TestQueue::new(GuestAddress(0x4000), &mem, 8);
+            let (mut proxy, _peer) = proxy_with_peer(&mem, &rx);
+            proxy.peer_buf_alloc = receive_window;
+            proxy.tx_cnt = Wrapping(defs::CONN_TX_BUF_SIZE as u32);
+            assert!(
+                proxy.maybe_send_credit_update(),
+                "guest exhausted its send window without an acknowledgement"
+            );
+            assert!(
+                matches!(proxy.rxq.lock().unwrap().pop(), Some(MuxerRx::CreditUpdate { fwd_cnt, .. }) if fwd_cnt == proxy.tx_cnt.0)
+            );
+        }
     }
 
     #[test]

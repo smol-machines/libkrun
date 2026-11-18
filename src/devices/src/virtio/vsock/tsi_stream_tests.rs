@@ -112,6 +112,22 @@ fn check_connect_result(events: EventSet, listening: bool) {
 }
 
 #[test]
+fn receive_window_cannot_suppress_send_credit() {
+    for receive_window in [0, 32 * 1024 * 1024] {
+        let (mut proxy, _) = stream_fixture(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        proxy.peer_buf_alloc = receive_window;
+        proxy.tx_cnt = Wrapping(defs::CONN_TX_BUF_SIZE as u32);
+        assert!(
+            proxy.maybe_send_credit_update(),
+            "guest exhausted its send window without an acknowledgement"
+        );
+        assert!(
+            matches!(proxy.rxq.lock().unwrap().pop(), Some(MuxerRx::CreditUpdate { fwd_cnt, .. }) if fwd_cnt == proxy.tx_cnt.0)
+        );
+    }
+}
+
+#[test]
 fn queued_credit_precedes_tcp_data_carrying_newer_credit() {
     let (mut proxy, listener) = connecting(Ipv4Addr::LOCALHOST.into(), true);
     proxy.process_event(EventSet::OUT);

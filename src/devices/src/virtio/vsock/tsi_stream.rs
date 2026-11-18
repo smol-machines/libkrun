@@ -919,11 +919,17 @@ impl TsiStreamProxy {
         );
     }
 
-    /// Return credit before a small explicit send budget can be exhausted.
+    /// Return credit before our advertised window or an explicit send budget
+    /// can be exhausted, regardless of the opposite direction's receive window.
     fn maybe_send_credit_update(&mut self) -> bool {
-        let window = self.buffers.send.map_or(self.peer_buf_alloc, |capacity| {
-            self.peer_buf_alloc.min(capacity as u32)
-        });
+        let mut window = defs::CONN_TX_BUF_SIZE as u32;
+        if self.peer_buf_alloc != 0 {
+            window = window.min(self.peer_buf_alloc);
+        }
+        let window = self
+            .buffers
+            .send
+            .map_or(window, |capacity| window.min(capacity as u32));
         if window != 0 && (self.tx_cnt - self.last_tx_cnt_sent).0 >= (window / 2).max(1) {
             self.send_credit_update();
             true
