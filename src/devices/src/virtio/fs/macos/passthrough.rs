@@ -54,6 +54,18 @@ const MACOS_XATTR_PREFIX: &[u8] = b"com.apple.";
 
 const UID_MAX: u32 = u32::MAX - 1;
 
+// Guest requests and portable checkpoints use Linux values, while F_GETFL and
+// open(2) use the macOS values. Test whole masks: Linux O_SYNC includes O_DSYNC.
+const OPEN_STATUS_FLAGS: &[(i32, i32)] = &[
+    (libc::O_NONBLOCK, bindings::LINUX_O_NONBLOCK),
+    (libc::O_APPEND, bindings::LINUX_O_APPEND),
+    (libc::O_SYNC, bindings::LINUX_O_SYNC),
+    (libc::O_DSYNC, bindings::LINUX_O_DSYNC),
+    (libc::O_DIRECTORY, bindings::LINUX_O_DIRECTORY),
+    (libc::O_NOFOLLOW, bindings::LINUX_O_NOFOLLOW),
+    (libc::O_CLOEXEC, bindings::LINUX_O_CLOEXEC),
+];
+
 /// Where macOS keeps the Rosetta runtime for Linux guests. A share rooted here
 /// holds the binary the guest registers as its x86_64 binfmt interpreter.
 const ROSETTA_RUNTIME_DIR: &str = "/Library/Apple/usr/libexec/oah/RosettaLinux";
@@ -1177,13 +1189,19 @@ impl PassthroughFs {
         {
             let handles = self.handles.read().unwrap();
             for (handle, data) in handles.iter() {
+                let file = data.file.read().unwrap();
+                // SAFETY: F_GETFL only reads flags from this live descriptor.
+                let host_flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+                let mut flags = host_flags & libc::O_ACCMODE;
+                for &(host, linux) in OPEN_STATUS_FLAGS {
+                    if host_flags & host == host {
+                        flags |= linux;
+                    }
+                }
                 handle_snaps.push(FuseHandleSnap {
                     handle: *handle,
                     nodeid: data.inode,
-                    // HandleData does not retain the original open flags; the
-                    // restore path reopens with an RDWR→RDONLY ladder, so this is
-                    // advisory only.
-                    flags: libc::O_RDWR,
+                    flags,
                 });
             }
         }
@@ -1205,8 +1223,8 @@ impl PassthroughFs {
     /// Restore FUSE server state (captured by [`Self::snapshot`]) onto this clone's
     /// freshly-built passthrough: re-seed the root inode, rebuild the inode map
     /// from the saved volfs `(dev, ino)` identities, restore the id counters and
-    /// flags, then reopen the saved handles (best-effort RDWR→RDONLY since the
-    /// original open flags are not retained). Unknown/failed entries are skipped;
+    /// flags, then reopen the saved handles with their recorded access modes.
+    /// Unknown/failed entries are skipped;
     /// the guest re-walks from root on a miss.
     pub fn restore(&self, state: &FuseServerState) -> io::Result<()> {
         self.restore_with_roots(state, &HashMap::new())
@@ -1299,14 +1317,18 @@ impl PassthroughFs {
             .store(state.zero_message_open, Ordering::Relaxed);
 
         for snap in &state.handles {
-            // open_inode reopens via volfs on demand. Try RDWR, then RDONLY
-            // (directories and read-only files reject RDWR).
-            let file = match self.open_inode(snap.nodeid, libc::O_RDWR) {
-                Ok(f) => Some(f),
-                Err(_) => self.open_inode(snap.nodeid, libc::O_RDONLY).ok(),
-            };
+            let flags = self.parse_open_flags(snap.reopen_flags());
+            let file = self.open_inode(snap.nodeid, flags).or_else(|error| {
+                // Older macOS writers guessed O_RDWR for every handle. Keep
+                // their read-only fallback, without downgrading known modes.
+                if snap.flags == libc::O_RDWR {
+                    self.open_inode(snap.nodeid, libc::O_RDONLY)
+                } else {
+                    Err(error)
+                }
+            });
             match file {
-                Some(file) => {
+                Ok(file) => {
                     self.handles.write().unwrap().insert(
                         snap.handle,
                         Arc::new(HandleData {
@@ -1316,8 +1338,8 @@ impl PassthroughFs {
                         }),
                     );
                 }
-                None => warn!(
-                    "fs restore: reopen handle {} (nodeid {}) failed",
+                Err(error) => warn!(
+                    "fs restore: reopen handle {} (nodeid {}) failed: {error}",
                     snap.handle, snap.nodeid
                 ),
             }
@@ -1670,7 +1692,7 @@ impl PassthroughFs {
     }
 
     /// The kept descriptor for `inode`, opened on first use: read-only for a
-    /// read, read-write for a write (a read-only one is replaced then).
+    /// read, read-write for a write when permitted, otherwise write-only.
     fn inode_fd(&self, inode: Inode, write: bool) -> io::Result<Arc<HandleData>> {
         let cached = self
             .inode_fds
@@ -1697,13 +1719,34 @@ impl PassthroughFs {
         // requests racing here may both open; the later insert wins and the
         // other descriptor closes with its last user.
         let flags = if write { libc::O_RDWR } else { libc::O_RDONLY };
-        let file = self.open_inode(inode, flags)?;
+        let (file, readable) = match self.open_inode(inode, flags) {
+            Ok(file) => (file, true),
+            Err(error)
+                if write
+                    && !self.writeback.load(Ordering::Relaxed)
+                    && error.kind() == io::ErrorKind::PermissionDenied =>
+            {
+                (self.open_inode(inode, libc::O_WRONLY)?, false)
+            }
+            Err(error) => return Err(error),
+        };
         let data = Arc::new(HandleData {
             inode,
             file: RwLock::new(file),
             dirstream: Mutex::new(DirStream::new()),
         });
-        Ok(self.keep_inode_fd(inode, data, true, write, false))
+        Ok(self.keep_inode_fd(inode, data, readable, write, false))
+    }
+
+    /// Sync and seek need an open descriptor, without requiring read access.
+    fn file_for_any_access(&self, inode: Inode, handle: Handle) -> io::Result<Arc<HandleData>> {
+        self.file_for(inode, handle, false).or_else(|error| {
+            if error.kind() == io::ErrorKind::PermissionDenied {
+                self.file_for(inode, handle, true)
+            } else {
+                Err(error)
+            }
+        })
     }
 
     /// Whether a kept descriptor still names the file the inode stands for.
@@ -2022,11 +2065,10 @@ impl PassthroughFs {
     fn parse_open_flags(&self, flags: i32) -> i32 {
         let mut mflags: i32 = flags & 0b11;
 
-        if (flags & bindings::LINUX_O_NONBLOCK) != 0 {
-            mflags |= libc::O_NONBLOCK;
-        }
-        if (flags & bindings::LINUX_O_APPEND) != 0 {
-            mflags |= libc::O_APPEND;
+        for &(host, linux) in OPEN_STATUS_FLAGS {
+            if flags & linux == linux {
+                mflags |= host;
+            }
         }
         if (flags & bindings::LINUX_O_CREAT) != 0 {
             mflags |= libc::O_CREAT;
@@ -2037,13 +2079,6 @@ impl PassthroughFs {
         if (flags & bindings::LINUX_O_EXCL) != 0 {
             mflags |= libc::O_EXCL;
         }
-        if (flags & bindings::LINUX_O_NOFOLLOW) != 0 {
-            mflags |= libc::O_NOFOLLOW;
-        }
-        if (flags & bindings::LINUX_O_CLOEXEC) != 0 {
-            mflags |= libc::O_CLOEXEC;
-        }
-
         mflags
     }
 }
@@ -2324,7 +2359,12 @@ impl FileSystem for PassthroughFs {
             // guest as EREMCHG and fail every directory open.
             Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)))
         } else {
-            self.do_open(inode, false, ctx.gid, flags | libc::O_DIRECTORY as u32)
+            self.do_open(
+                inode,
+                false,
+                ctx.gid,
+                flags | bindings::LINUX_O_DIRECTORY as u32,
+            )
         }
     }
 
@@ -3085,7 +3125,7 @@ impl FileSystem for PassthroughFs {
         if self.zero_message_open.load(Ordering::Relaxed) {
             return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));
         }
-        let data = self.file_for(inode, handle, false)?;
+        let data = self.file_for_any_access(inode, handle)?;
 
         // Since this method is called whenever an fd is closed in the client, we can emulate that
         // behavior by doing the same thing (dup-ing the fd and then immediately closing it). Safe
@@ -3111,7 +3151,7 @@ impl FileSystem for PassthroughFs {
         _datasync: bool,
         handle: Handle,
     ) -> io::Result<()> {
-        let data = self.file_for(inode, handle, false)?;
+        let data = self.file_for_any_access(inode, handle)?;
 
         let fd = data.file.write().unwrap().as_raw_fd();
 
@@ -3524,7 +3564,7 @@ impl FileSystem for PassthroughFs {
         offset: u64,
         whence: u32,
     ) -> io::Result<u64> {
-        let data = self.file_for(inode, handle, false)?;
+        let data = self.file_for_any_access(inode, handle)?;
 
         // SEEK_DATA and SEEK_HOLE have slightly different semantics
         // in Linux vs. macOS, which means we can't support them.
@@ -3790,6 +3830,275 @@ mod tests {
     use std::os::unix::fs::MetadataExt;
     use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn open_mode_fixture() -> (PathBuf, PassthroughFs, Vec<(u64, i32)>) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "libkrun-handle-modes-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        let source = PassthroughFs::new(
+            Config {
+                root_dir: root.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        FileSystem::init(&source, FsOptions::empty()).unwrap();
+        let context = Context {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        };
+        let mut handles = Vec::new();
+        for (name, mode, flags) in [
+            ("read", 0o400, libc::O_RDONLY),
+            ("write", 0o200, libc::O_WRONLY),
+            ("both", 0o600, libc::O_RDWR),
+            ("append", 0o600, libc::O_WRONLY | bindings::LINUX_O_APPEND),
+            (
+                "nonblocking",
+                0o400,
+                libc::O_RDONLY | bindings::LINUX_O_NONBLOCK,
+            ),
+            ("sync", 0o600, libc::O_WRONLY | bindings::LINUX_O_SYNC),
+            ("data-sync", 0o600, libc::O_WRONLY | bindings::LINUX_O_DSYNC),
+        ] {
+            fs::write(root.join(name), b"original").unwrap();
+            fs::set_permissions(root.join(name), fs::Permissions::from_mode(mode)).unwrap();
+            let name = CString::new(name).unwrap();
+            let entry = FileSystem::lookup(&source, context, fuse::ROOT_ID, &name).unwrap();
+            let (handle, _) =
+                FileSystem::open(&source, context, entry.inode, false, flags as u32).unwrap();
+            handles.push((handle.unwrap(), flags));
+        }
+        (root, source, handles)
+    }
+
+    #[test]
+    fn handleless_io_respects_host_access_modes() {
+        use std::os::unix::fs::{FileExt, PermissionsExt};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "libkrun-handleless-modes-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        let server = || {
+            let filesystem = PassthroughFs::new(
+                Config {
+                    root_dir: root.to_string_lossy().into_owned(),
+                    ..Default::default()
+                },
+                Arc::new(InodeAllocator::new()),
+            )
+            .unwrap();
+            FileSystem::init(&filesystem, FsOptions::empty()).unwrap();
+            filesystem
+        };
+        let context = Context {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        };
+        for mode in [0o400, 0o200, 0o600, 0] {
+            let path = root.join("file");
+            fs::write(&path, b"original").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            // Match native access, including when the suite runs as root.
+            let can_read = File::open(&path).is_ok();
+            let can_write = fs::OpenOptions::new().write(true).open(&path).is_ok();
+            let source = server();
+            let entry = FileSystem::lookup(&source, context, fuse::ROOT_ID, c"file").unwrap();
+            let mut state = source.snapshot();
+            state.zero_message_open = true;
+            let restored = server();
+            restored.restore(&state).unwrap();
+            let read = restored.file_for(entry.inode, 0, false);
+            assert_eq!(read.is_ok(), can_read, "read mode {mode:o}");
+            let write = restored.file_for(entry.inode, 0, true);
+            assert_eq!(write.is_ok(), can_write, "write mode {mode:o}");
+            if let Ok(write) = write {
+                let file = write.file.read().unwrap();
+                assert_eq!(file.write_at(b"changed!", 0).unwrap(), 8);
+                let mut bytes = [0; 8];
+                assert_eq!(file.read_at(&mut bytes, 0).is_ok(), can_read);
+                drop(file);
+                FileSystem::fsync(&restored, context, entry.inode, false, 0)
+                    .expect("sync must accept a write-only descriptor");
+                assert_eq!(
+                    FileSystem::lseek(&restored, context, entry.inode, 0, 0, libc::SEEK_END as u32)
+                        .unwrap(),
+                    8
+                );
+                let read = restored.file_for(entry.inode, 0, false);
+                if can_read {
+                    assert!(
+                        Arc::ptr_eq(&write, &read.unwrap()),
+                        "keep the read-write fast path"
+                    );
+                } else {
+                    let error = read
+                        .err()
+                        .expect("a write-only cache entry cannot serve reads");
+                    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+                    restored.inode_fds.lock().unwrap().map.clear();
+                    FileSystem::fsync(&restored, context, entry.inode, false, 0)
+                        .expect("sync after cache eviction must reopen with allowed access");
+                    assert_eq!(
+                        FileSystem::lseek(
+                            &restored,
+                            context,
+                            entry.inode,
+                            0,
+                            0,
+                            libc::SEEK_END as u32
+                        )
+                        .unwrap(),
+                        8
+                    );
+                    // An access change requires a readable descriptor; do not
+                    // reuse the cached write-only one just because it exists.
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+                    let read = restored.file_for(entry.inode, 0, false).unwrap();
+                    assert_eq!(read.file.read().unwrap().read_at(&mut bytes, 0).unwrap(), 8);
+                    assert_eq!(&bytes, b"changed!");
+                }
+            }
+            fs::remove_file(path).unwrap();
+        }
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn snapshot_preserves_open_access_modes() {
+        let (root, source, handles) = open_mode_fixture();
+        let state = source.snapshot();
+        for (handle, flags) in handles {
+            let saved = state
+                .handles
+                .iter()
+                .find(|row| row.handle == handle)
+                .unwrap();
+            let mask = 0b11
+                | bindings::LINUX_O_APPEND
+                | bindings::LINUX_O_NONBLOCK
+                | bindings::LINUX_O_SYNC;
+            assert_eq!(saved.flags & mask, flags);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restore_preserves_open_access_modes() {
+        use std::os::unix::fs::FileExt;
+
+        let (root, source, handles) = open_mode_fixture();
+        let mut state = source.snapshot();
+        // Supply the portable flags a Linux source already records, independently
+        // of the macOS snapshot writer under test above.
+        for row in &mut state.handles {
+            row.flags = handles
+                .iter()
+                .find(|(handle, _)| *handle == row.handle)
+                .unwrap()
+                .1;
+        }
+        let restored = PassthroughFs::new(
+            Config {
+                root_dir: root.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        restored.restore(&state).unwrap();
+        let reopened = restored.handles.read().unwrap();
+        for (handle, flags) in handles {
+            let data = reopened
+                .get(&handle)
+                .expect("an open file must remain usable after restore");
+            let file = data.file.read().unwrap();
+            // SAFETY: F_GETFL only reads flags from this live descriptor.
+            let actual = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+            assert!(actual >= 0);
+            let original_handles = source.handles.read().unwrap();
+            let original = original_handles.get(&handle).unwrap().file.read().unwrap();
+            // SAFETY: The original file is still owned by the source server.
+            let expected = unsafe { libc::fcntl(original.as_raw_fd(), libc::F_GETFL) };
+            assert!(expected >= 0);
+            let mask =
+                libc::O_ACCMODE | libc::O_APPEND | libc::O_NONBLOCK | libc::O_SYNC | libc::O_DSYNC;
+            assert_eq!(actual & mask, expected & mask);
+            let mut byte = [0];
+            match flags & 0b11 {
+                libc::O_RDONLY => {
+                    assert_eq!(file.read_at(&mut byte, 0).unwrap(), 1);
+                    assert!(file.write_at(b"x", 0).is_err());
+                }
+                libc::O_WRONLY => {
+                    assert!(file.read_at(&mut byte, 0).is_err());
+                    assert_eq!(file.write_at(b"x", 0).unwrap(), 1);
+                }
+                libc::O_RDWR => {
+                    assert_eq!(file.read_at(&mut byte, 0).unwrap(), 1);
+                    assert_eq!(file.write_at(b"x", 0).unwrap(), 1);
+                }
+                _ => unreachable!(),
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restore_keeps_legacy_readonly_files_and_directory_handles() {
+        let (root, source, handles) = open_mode_fixture();
+        let context = Context {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        };
+        let (directory, _) = FileSystem::opendir(&source, context, fuse::ROOT_ID, 0).unwrap();
+        let directory = directory.unwrap();
+        let mut state = source.snapshot();
+        state
+            .handles
+            .retain(|row| row.handle == handles[0].0 || row.handle == directory);
+        for row in &mut state.handles {
+            row.flags = libc::O_RDWR;
+        }
+        let restored = PassthroughFs::new(
+            Config {
+                root_dir: root.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        restored.restore(&state).unwrap();
+        let reopened = restored.handles.read().unwrap();
+        assert_eq!(reopened.len(), 2);
+        for data in reopened.values() {
+            let file = data.file.read().unwrap();
+            // SAFETY: F_GETFL only reads flags from this live descriptor.
+            assert_eq!(
+                unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) } & libc::O_ACCMODE,
+                libc::O_RDONLY
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
 
     // The guest names a parent by node id. A symlink's node id is never a
     // directory to resolve a child in: macOS would follow the link mid-path
