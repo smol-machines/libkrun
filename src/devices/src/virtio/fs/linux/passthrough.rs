@@ -1186,7 +1186,7 @@ impl PassthroughFs {
             .store(state.zero_message_open, Ordering::Relaxed);
 
         for snap in &state.handles {
-            match self.open_inode(snap.nodeid, snap.flags) {
+            match self.open_inode(snap.nodeid, snap.reopen_flags()) {
                 Ok(file) => {
                     self.handles.write().unwrap().insert(
                         snap.handle,
@@ -3381,6 +3381,72 @@ mod tests {
         .unwrap();
         assert!(!restored_names.is_empty());
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restore_does_not_repeat_file_creation_flags() {
+        use std::os::unix::fs::FileExt;
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "libkrun-restore-create-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("file"), b"saved contents").unwrap();
+        let server = || {
+            PassthroughFs::new(
+                Config {
+                    root_dir: root.to_string_lossy().into_owned(),
+                    ..Default::default()
+                },
+                Arc::new(InodeAllocator::new()),
+            )
+            .unwrap()
+        };
+        let source = server();
+        let context = Context {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        };
+        let entry = FileSystem::lookup(&source, context, fuse::ROOT_ID, c"file").unwrap();
+        let (handle, _) =
+            FileSystem::open(&source, context, entry.inode, false, libc::O_RDWR as u32).unwrap();
+        let handle = handle.unwrap();
+        for creation in [
+            libc::O_TRUNC,
+            libc::O_CREAT | libc::O_EXCL,
+            libc::O_CREAT | libc::O_TRUNC,
+        ] {
+            let mut state = source.snapshot();
+            // Windows snapshots retain the original guest OPEN/CREATE flags.
+            state
+                .handles
+                .iter_mut()
+                .find(|row| row.handle == handle)
+                .unwrap()
+                .flags |= creation;
+            let restored = server();
+            restored.restore(&state).unwrap();
+            assert_eq!(
+                fs::read(root.join("file")).unwrap(),
+                b"saved contents",
+                "restore must never replay truncation"
+            );
+            let handles = restored.handles.read().unwrap();
+            let data = handles
+                .get(&handle)
+                .expect("restoring an existing handle must not fail with EEXIST");
+            let file = data.file.read().unwrap();
+            let mut contents = [0; 14];
+            assert_eq!(file.read_at(&mut contents, 0).unwrap(), contents.len());
+            assert_eq!(&contents, b"saved contents");
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
