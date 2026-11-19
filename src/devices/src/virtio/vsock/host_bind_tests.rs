@@ -307,10 +307,15 @@ fn host_listener_snapshot_restores_without_a_publishing_map() {
         let mut client = TcpStream::connect_timeout(&bound, Duration::from_secs(2)).unwrap();
         client.write_all(b"restored").unwrap();
         let id = ((GUEST as u64) << 32) | defs::TSI_PROXY_PORT as u64;
+        // A completed client connect does not guarantee that the server's
+        // nonblocking accept is ready yet. Dispatch actual listener readiness.
+        let mut events = [EpollEvent::default(); 1];
+        assert_eq!(restored.muxer.epoll.wait(1, 2000, &mut events).unwrap(), 1);
+        assert_eq!(events[0].data(), id);
         let accepted = restored.muxer.proxy_map.read().unwrap()[&id]
             .lock()
             .unwrap()
-            .process_event(EventSet::IN)
+            .process_event(events[0].event_set())
             .new_proxy
             .unwrap()
             .1;
