@@ -1692,7 +1692,7 @@ impl PassthroughFs {
     }
 
     /// The kept descriptor for `inode`, opened on first use: read-only for a
-    /// read, read-write for a write (a read-only one is replaced then).
+    /// read, read-write for a write when permitted, otherwise write-only.
     fn inode_fd(&self, inode: Inode, write: bool) -> io::Result<Arc<HandleData>> {
         let cached = self
             .inode_fds
@@ -1719,13 +1719,34 @@ impl PassthroughFs {
         // requests racing here may both open; the later insert wins and the
         // other descriptor closes with its last user.
         let flags = if write { libc::O_RDWR } else { libc::O_RDONLY };
-        let file = self.open_inode(inode, flags)?;
+        let (file, readable) = match self.open_inode(inode, flags) {
+            Ok(file) => (file, true),
+            Err(error)
+                if write
+                    && !self.writeback.load(Ordering::Relaxed)
+                    && error.kind() == io::ErrorKind::PermissionDenied =>
+            {
+                (self.open_inode(inode, libc::O_WRONLY)?, false)
+            }
+            Err(error) => return Err(error),
+        };
         let data = Arc::new(HandleData {
             inode,
             file: RwLock::new(file),
             dirstream: Mutex::new(DirStream::new()),
         });
-        Ok(self.keep_inode_fd(inode, data, true, write, false))
+        Ok(self.keep_inode_fd(inode, data, readable, write, false))
+    }
+
+    /// Sync and seek need an open descriptor, without requiring read access.
+    fn file_for_any_access(&self, inode: Inode, handle: Handle) -> io::Result<Arc<HandleData>> {
+        self.file_for(inode, handle, false).or_else(|error| {
+            if error.kind() == io::ErrorKind::PermissionDenied {
+                self.file_for(inode, handle, true)
+            } else {
+                Err(error)
+            }
+        })
     }
 
     /// Whether a kept descriptor still names the file the inode stands for.
@@ -3104,7 +3125,7 @@ impl FileSystem for PassthroughFs {
         if self.zero_message_open.load(Ordering::Relaxed) {
             return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));
         }
-        let data = self.file_for(inode, handle, false)?;
+        let data = self.file_for_any_access(inode, handle)?;
 
         // Since this method is called whenever an fd is closed in the client, we can emulate that
         // behavior by doing the same thing (dup-ing the fd and then immediately closing it). Safe
@@ -3130,7 +3151,7 @@ impl FileSystem for PassthroughFs {
         _datasync: bool,
         handle: Handle,
     ) -> io::Result<()> {
-        let data = self.file_for(inode, handle, false)?;
+        let data = self.file_for_any_access(inode, handle)?;
 
         let fd = data.file.write().unwrap().as_raw_fd();
 
@@ -3543,7 +3564,7 @@ impl FileSystem for PassthroughFs {
         offset: u64,
         whence: u32,
     ) -> io::Result<u64> {
-        let data = self.file_for(inode, handle, false)?;
+        let data = self.file_for_any_access(inode, handle)?;
 
         // SEEK_DATA and SEEK_HOLE have slightly different semantics
         // in Linux vs. macOS, which means we can't support them.
@@ -3859,6 +3880,105 @@ mod tests {
             handles.push((handle.unwrap(), flags));
         }
         (root, source, handles)
+    }
+
+    #[test]
+    fn handleless_io_respects_host_access_modes() {
+        use std::os::unix::fs::{FileExt, PermissionsExt};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "libkrun-handleless-modes-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        let server = || {
+            let filesystem = PassthroughFs::new(
+                Config {
+                    root_dir: root.to_string_lossy().into_owned(),
+                    ..Default::default()
+                },
+                Arc::new(InodeAllocator::new()),
+            )
+            .unwrap();
+            FileSystem::init(&filesystem, FsOptions::empty()).unwrap();
+            filesystem
+        };
+        let context = Context {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        };
+        for mode in [0o400, 0o200, 0o600, 0] {
+            let path = root.join("file");
+            fs::write(&path, b"original").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            // Match native access, including when the suite runs as root.
+            let can_read = File::open(&path).is_ok();
+            let can_write = fs::OpenOptions::new().write(true).open(&path).is_ok();
+            let source = server();
+            let entry = FileSystem::lookup(&source, context, fuse::ROOT_ID, c"file").unwrap();
+            let mut state = source.snapshot();
+            state.zero_message_open = true;
+            let restored = server();
+            restored.restore(&state).unwrap();
+            let read = restored.file_for(entry.inode, 0, false);
+            assert_eq!(read.is_ok(), can_read, "read mode {mode:o}");
+            let write = restored.file_for(entry.inode, 0, true);
+            assert_eq!(write.is_ok(), can_write, "write mode {mode:o}");
+            if let Ok(write) = write {
+                let file = write.file.read().unwrap();
+                assert_eq!(file.write_at(b"changed!", 0).unwrap(), 8);
+                let mut bytes = [0; 8];
+                assert_eq!(file.read_at(&mut bytes, 0).is_ok(), can_read);
+                drop(file);
+                FileSystem::fsync(&restored, context, entry.inode, false, 0)
+                    .expect("sync must accept a write-only descriptor");
+                assert_eq!(
+                    FileSystem::lseek(&restored, context, entry.inode, 0, 0, libc::SEEK_END as u32)
+                        .unwrap(),
+                    8
+                );
+                let read = restored.file_for(entry.inode, 0, false);
+                if can_read {
+                    assert!(
+                        Arc::ptr_eq(&write, &read.unwrap()),
+                        "keep the read-write fast path"
+                    );
+                } else {
+                    let error = read
+                        .err()
+                        .expect("a write-only cache entry cannot serve reads");
+                    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+                    restored.inode_fds.lock().unwrap().map.clear();
+                    FileSystem::fsync(&restored, context, entry.inode, false, 0)
+                        .expect("sync after cache eviction must reopen with allowed access");
+                    assert_eq!(
+                        FileSystem::lseek(
+                            &restored,
+                            context,
+                            entry.inode,
+                            0,
+                            0,
+                            libc::SEEK_END as u32
+                        )
+                        .unwrap(),
+                        8
+                    );
+                    // An access change requires a readable descriptor; do not
+                    // reuse the cached write-only one just because it exists.
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+                    let read = restored.file_for(entry.inode, 0, false).unwrap();
+                    assert_eq!(read.file.read().unwrap().read_at(&mut bytes, 0).unwrap(), 8);
+                    assert_eq!(&bytes, b"changed!");
+                }
+            }
+            fs::remove_file(path).unwrap();
+        }
+        fs::remove_dir(root).unwrap();
     }
 
     #[test]
