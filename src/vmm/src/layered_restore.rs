@@ -750,6 +750,26 @@ impl Image {
         })
     }
 
+    /// The sorted ranges of this image, relative to its start, where no
+    /// backing holds data: what reads as zero without being mapped from a file.
+    fn hole_ranges(&self) -> io::Result<Vec<(usize, usize)>> {
+        let mut holes = Vec::new();
+        for extent in &self.extents {
+            let len = extent.end - extent.start;
+            let mut cursor = 0;
+            for (start, end) in data_runs(&extent.file, extent.offset, len, host_page_size())? {
+                if start > cursor {
+                    holes.push((extent.start + cursor, extent.start + start));
+                }
+                cursor = end;
+            }
+            if cursor < len {
+                holes.push((extent.start + cursor, extent.end));
+            }
+        }
+        Ok(holes)
+    }
+
     fn restore(&self) -> io::Result<Instance> {
         let prot = libc::PROT_READ | libc::PROT_WRITE;
         let region = MmapRegion::build(
@@ -768,19 +788,7 @@ impl Image {
             // SAFETY: each aligned extent lies exclusively inside the reserved
             // mapping owned above. On failure its RAII owner unmaps the whole
             // reservation, including already-installed file views.
-            let result = unsafe {
-                libc::mmap(
-                    base.add(extent.start).cast(),
-                    extent.end - extent.start,
-                    prot,
-                    libc::MAP_PRIVATE | libc::MAP_FIXED | libc::MAP_NORESERVE,
-                    extent.file.as_raw_fd(),
-                    extent.offset as libc::off_t,
-                )
-            };
-            if result == libc::MAP_FAILED {
-                return Err(io::Error::last_os_error());
-            }
+            unsafe { map_extent_data(base, extent)? };
         }
         Ok(Instance {
             memory,
@@ -796,11 +804,24 @@ fn private_or_swapped(entry: u64) -> bool {
     entry & (1 << 62) != 0 || (entry & (1 << 63) != 0 && entry & (1 << 61) == 0)
 }
 
+/// Whether a present anonymous page is mapped by this process alone. The
+/// kernel's shared zero page, which a read of untouched anonymous memory maps,
+/// is not.
+fn exclusively_mapped(entry: u64) -> bool {
+    entry & (1 << 56) != 0
+}
+
+/// The page-aligned ranges of `len` bytes at `base` this process holds as
+/// private (or swapped) pages, which a capture copies. A present anonymous page
+/// that is not exclusively mapped is first offered to `reads_as_image`, given
+/// its offset: one that reads exactly as the image does there (the zero page
+/// over one of the image's holes, faulted in by a read) is not a change.
 fn private_page_ranges(
     pagemap: &File,
     base: u64,
     len: usize,
     page_size: usize,
+    reads_as_image: &dyn Fn(usize) -> io::Result<bool>,
 ) -> io::Result<Vec<(usize, usize)>> {
     let mut dirty = Vec::<(usize, usize)>::new();
     let mut entries = vec![0_u8; 8192 * 8];
@@ -812,8 +833,9 @@ fn private_page_ranges(
         )?;
         for index in 0..count {
             let entry = u64::from_ne_bytes(entries[index * 8..index * 8 + 8].try_into().unwrap());
-            if private_or_swapped(entry) {
-                let start = (first + index) * page_size;
+            let start = (first + index) * page_size;
+            let shared_anonymous = entry & (1 << 62) == 0 && !exclusively_mapped(entry);
+            if private_or_swapped(entry) && !(shared_anonymous && reads_as_image(start)?) {
                 if let Some(last) = dirty.last_mut().filter(|last| last.1 == start) {
                     last.1 += page_size;
                 } else {
@@ -823,6 +845,87 @@ fn private_page_ranges(
         }
     }
     Ok(dirty)
+}
+
+/// Map the parts of `extent` whose backing holds data, copy-on-write, over
+/// the zero-filled anonymous memory already at `base + extent.start`.
+///
+/// A hole in a backing reads as zero, exactly like the anonymous memory under
+/// it, but a private file mapping over a hole charges twice for each page the
+/// guest touches there: the fault allocates a page in the shared backing,
+/// charged to the touching VM's cgroup and kept in the backing after that VM
+/// is gone, and a write then copies it into a private page as well. A source
+/// that used a quarter of its RAM thus left each branch paying double for the
+/// other three quarters, which pushed CI runners and branch sources past their
+/// memory limits. Anonymous memory over the holes pays once, for what is written.
+///
+/// # Safety
+/// `base + extent.start .. base + extent.end` must lie inside a mapping the
+/// caller owns and may replace.
+unsafe fn map_extent_data(base: *mut u8, extent: &Extent) -> io::Result<()> {
+    let len = extent.end - extent.start;
+    for (start, end) in data_runs(&extent.file, extent.offset, len, host_page_size())? {
+        // SAFETY: the run lies inside the extent, which the caller owns.
+        let result = unsafe {
+            libc::mmap(
+                base.add(extent.start + start).cast(),
+                end - start,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_FIXED | libc::MAP_NORESERVE,
+                extent.file.as_raw_fd(),
+                (extent.offset + start as u64) as libc::off_t,
+            )
+        };
+        if result == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// The runs of `file[offset .. offset + len]` that hold data, relative to
+/// `offset`, widened to whole pages (a backing's block can be smaller than a
+/// host page) and merged. A file system that cannot report holes is taken to
+/// be all data, which maps the whole range as before.
+fn data_runs(file: &File, offset: u64, len: usize, page: usize) -> io::Result<Vec<(usize, usize)>> {
+    let fd = file.as_raw_fd();
+    let end = offset + len as u64;
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut cursor = offset;
+    while cursor < end {
+        // SAFETY: lseek on a descriptor this function borrows.
+        let data = unsafe { libc::lseek(fd, cursor as libc::off_t, libc::SEEK_DATA) };
+        if data < 0 {
+            let error = io::Error::last_os_error();
+            return match error.raw_os_error() {
+                // No data at or after `cursor`.
+                Some(libc::ENXIO) => Ok(runs),
+                // Holes cannot be reported here: map everything.
+                Some(libc::EINVAL) | Some(libc::EOPNOTSUPP) if runs.is_empty() => {
+                    Ok(vec![(0, len)])
+                }
+                _ => Err(error),
+            };
+        }
+        let data = data as u64;
+        if data >= end {
+            break;
+        }
+        // SAFETY: as above.
+        let hole = unsafe { libc::lseek(fd, data as libc::off_t, libc::SEEK_HOLE) };
+        if hole < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let hole = (hole as u64).min(end);
+        let start = (((data - offset) as usize) / page) * page;
+        let stop = (((hole - offset) as usize).div_ceil(page) * page).min(len);
+        match runs.last_mut() {
+            Some(last) if last.1 >= start => last.1 = last.1.max(stop),
+            _ => runs.push((start, stop)),
+        }
+        cursor = hole;
+    }
+    Ok(runs)
 }
 
 impl Instance {
@@ -843,18 +946,21 @@ impl Instance {
         for extent in &image.extents {
             // SAFETY: this instance owns the full reservation; all writers are
             // stopped and each backing contains the captured bytes for its run.
-            let result = unsafe {
-                libc::mmap(
+            // The extent is first reset to zero-filled anonymous memory, which
+            // is what its backing's holes hold, then its data is mapped over.
+            unsafe {
+                let result = libc::mmap(
                     base.add(extent.start).cast(),
                     extent.end - extent.start,
                     libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_PRIVATE | libc::MAP_FIXED | libc::MAP_NORESERVE,
-                    extent.file.as_raw_fd(),
-                    extent.offset as libc::off_t,
-                )
-            };
-            if result == libc::MAP_FAILED {
-                return Err(io::Error::last_os_error());
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED | libc::MAP_NORESERVE,
+                    -1,
+                    0,
+                );
+                if result == libc::MAP_FAILED {
+                    return Err(io::Error::last_os_error());
+                }
+                map_extent_data(base, extent)?;
             }
         }
         self.image = image;
@@ -882,7 +988,32 @@ impl Instance {
             .memory
             .get_host_address(GuestAddress(self.image.gpa))
             .unwrap() as u64;
-        let dirty = private_page_ranges(&pagemap, base, self.image.len, host_page_size())?;
+        // Reads of the image's holes map the zero page, which pagemap cannot
+        // tell from a written page; it reads as the image does, so it is no change.
+        let holes = self.image.hole_ranges()?;
+        let page = host_page_size();
+        let reads_as_image = |offset: usize| -> io::Result<bool> {
+            let in_hole = holes
+                .binary_search_by(|&(start, end)| {
+                    if offset < start {
+                        std::cmp::Ordering::Greater
+                    } else if offset >= end {
+                        std::cmp::Ordering::Less
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                })
+                .is_ok();
+            if !in_hole {
+                return Ok(false);
+            }
+            let mut bytes = vec![0; page];
+            self.memory
+                .read_slice(&mut bytes, GuestAddress(self.image.gpa + offset as u64))
+                .map_err(|error| io::Error::other(format!("read RAM page: {error:?}")))?;
+            Ok(bytes.iter().all(|byte| *byte == 0))
+        };
+        let dirty = private_page_ranges(&pagemap, base, self.image.len, page, &reads_as_image)?;
         if dirty.is_empty() && self.image.extents.len() <= limits.trigger {
             return Ok((self.image.clone(), 0));
         }
@@ -1347,10 +1478,31 @@ fn dirty_page_ranges_use_host_page_units() {
                 .write_all_at(&entry.to_ne_bytes(), ((7 + index) * 8) as u64)
                 .unwrap();
         }
+        let differs = |_: usize| -> io::Result<bool> { Ok(false) };
         assert_eq!(
-            private_page_ranges(&pagemap, (7 * page_size) as u64, 3 * page_size, page_size)
-                .unwrap(),
+            private_page_ranges(
+                &pagemap,
+                (7 * page_size) as u64,
+                3 * page_size,
+                page_size,
+                &differs
+            )
+            .unwrap(),
             vec![(page_size, 3 * page_size)]
+        );
+        // A shared anonymous page reading as the image (the zero page over a
+        // hole) is no change; a swapped page is still copied.
+        let same = |_: usize| -> io::Result<bool> { Ok(true) };
+        assert_eq!(
+            private_page_ranges(
+                &pagemap,
+                (7 * page_size) as u64,
+                3 * page_size,
+                page_size,
+                &same
+            )
+            .unwrap(),
+            vec![(2 * page_size, 3 * page_size)]
         );
     }
 }
@@ -3401,6 +3553,104 @@ fn data_ranges_skip_a_memfd_s_holes() {
     let empty = crate::builder::create_guest_ram_memfd(MIB as usize).unwrap();
     assert!(
         file_data_ranges(&empty, 0, MIB as usize)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A branch that touches the holes of its generation's backing pays for its
+/// own writes only: the backing allocates nothing, siblings still read the
+/// generation as it was captured, and the holes read as zero.
+#[test]
+fn touching_a_backings_holes_allocates_nothing_in_it() {
+    use crate::snapshot::MemoryRegionDesc;
+    use std::os::unix::fs::MetadataExt;
+    const PAGES: usize = 64;
+    let page = host_page_size();
+    let file = crate::builder::create_guest_ram_memfd(PAGES * page).unwrap();
+    file.write_all_at(&vec![0x11; page], 0).unwrap();
+    let blocks = file.metadata().unwrap().blocks();
+    let generation = Generation::from_immutable_file(
+        &[MemoryRegionDesc {
+            gpa: 0,
+            len: (PAGES * page) as u64,
+        }],
+        &file,
+    )
+    .unwrap();
+    let mut expected = vec![0; PAGES * page];
+    expected[..page].fill(0x11);
+
+    let child = generation.restore().unwrap();
+    let mut actual = vec![0; PAGES * page];
+    child.read_slice(&mut actual, GuestAddress(0)).unwrap();
+    assert!(actual == expected, "holes read as zero, data as captured");
+    child
+        .write_slice(&vec![0x22; PAGES * page], GuestAddress(0))
+        .unwrap();
+    child.read_slice(&mut actual, GuestAddress(0)).unwrap();
+    assert!(actual.iter().all(|byte| *byte == 0x22));
+    assert_eq!(
+        file.metadata().unwrap().blocks(),
+        blocks,
+        "reading and writing the holes allocated pages in the shared backing"
+    );
+
+    let sibling = generation.restore().unwrap();
+    sibling.read_slice(&mut actual, GuestAddress(0)).unwrap();
+    assert!(actual == expected, "a sibling still sees the generation");
+}
+
+/// Rebasing onto a generation leaves its holes reading zero, even where the
+/// running memory had been written before.
+#[test]
+fn rebasing_resets_memory_over_a_backings_holes_to_zero() {
+    use crate::snapshot::MemoryRegionDesc;
+    use std::os::unix::fs::MetadataExt;
+    const PAGES: usize = 16;
+    let page = host_page_size();
+    let file = crate::builder::create_guest_ram_memfd(PAGES * page).unwrap();
+    file.write_all_at(&vec![0x11; page], 0).unwrap();
+    let blocks = file.metadata().unwrap().blocks();
+    let generation = Generation::from_immutable_file(
+        &[MemoryRegionDesc {
+            gpa: 0,
+            len: (PAGES * page) as u64,
+        }],
+        &file,
+    )
+    .unwrap();
+    let memory = generation.restore().unwrap();
+    memory
+        .write_slice(&vec![0x33; PAGES * page], GuestAddress(0))
+        .unwrap();
+    generation.rebase_quiesced(&memory).unwrap();
+    let mut actual = vec![0; PAGES * page];
+    memory.read_slice(&mut actual, GuestAddress(0)).unwrap();
+    let mut expected = vec![0; PAGES * page];
+    expected[..page].fill(0x11);
+    assert!(actual == expected);
+    assert_eq!(file.metadata().unwrap().blocks(), blocks);
+}
+
+#[test]
+fn data_runs_cover_whole_pages_of_data_only() {
+    let page = host_page_size();
+    let file = crate::builder::create_guest_ram_memfd(8 * page).unwrap();
+    file.write_all_at(&[1], (2 * page + 10) as u64).unwrap();
+    file.write_all_at(&vec![1; page + 1], (5 * page) as u64)
+        .unwrap();
+    assert_eq!(
+        data_runs(&file, 0, 8 * page, page).unwrap(),
+        vec![(2 * page, 3 * page), (5 * page, 7 * page)]
+    );
+    // Relative to an extent's offset, and clipped to its length.
+    assert_eq!(
+        data_runs(&file, (2 * page) as u64, 4 * page, page).unwrap(),
+        vec![(0, page), (3 * page, 4 * page)]
+    );
+    assert!(
+        data_runs(&file, (3 * page) as u64, 2 * page, page)
             .unwrap()
             .is_empty()
     );
