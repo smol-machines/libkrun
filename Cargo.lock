@@ -773,7 +773,9 @@ dependencies = [
  "rand 0.9.2",
  "serde",
  "serde_json",
+ "sha2",
  "socket2",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "vhost",
@@ -783,6 +785,7 @@ dependencies = [
  "vmm-sys-util 0.15.0",
  "windows-sys 0.61.2",
  "zerocopy",
+ "zstd",
 ]
 
 [[package]]

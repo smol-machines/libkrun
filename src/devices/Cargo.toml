@@ -35,6 +35,8 @@ rand = "0.9.2"
 socket2 = { version = "0.5", features = ["all"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
+zstd = "0.13"
 thiserror = { version = "2.0", optional = true }
 vhost = { version = "0.15", optional = true, features = ["vhost-user-frontend"] }
 vmm-sys-util = { version = "0.15", optional = true }
@@ -91,3 +93,6 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_Threading",
     "Win32_Networking_WinSock",
 ] }
+
+[dev-dependencies]
+tempfile = "3"
