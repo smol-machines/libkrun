@@ -11,6 +11,13 @@
 //!
 //! Which chunks the cache holds is persisted beside it only after the cache is
 //! synced, so a crash never claims data the cache does not hold: it refetches.
+//! It is persisted at once when the last chunk arrives, which is how smolvm
+//! learns a running machine's disk is complete.
+//!
+//! The VMM holds a shared lock on the descriptor for as long as it serves the
+//! disk. smolvm fills a disk itself only holding that lock exclusively, so the
+//! two never write the cache at once; a disk smolvm is filling cannot be
+//! opened.
 //!
 //! While the guest runs, workers fetch ahead of it: the chunks after one it
 //! asked for, the order an earlier restore of the same checkpoint asked for
@@ -135,6 +142,8 @@ struct Shared {
     fill_max: usize,
     fetch_deadline: Duration,
     stop: AtomicBool,
+    /// The descriptor, locked shared until the last worker is gone.
+    _lock: File,
     /// Chunks not present yet. When it reaches zero the presence record is
     /// written at once, so smolvm sees the disk is complete while it runs.
     missing: AtomicUsize,
@@ -165,7 +174,16 @@ fn invalid(msg: impl Into<String>) -> io::Error {
 impl LazyStorage {
     /// Open the lazy disk `descriptor` describes.
     pub fn open(descriptor: &Path) -> io::Result<Self> {
-        let d: Descriptor = serde_json::from_slice(&std::fs::read(descriptor)?)
+        let mut held = File::open(descriptor)?;
+        held.try_lock_shared().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!("{}: smolvm is completing this disk", descriptor.display()),
+            )
+        })?;
+        let mut body = Vec::new();
+        io::Read::read_to_end(&mut held, &mut body)?;
+        let d: Descriptor = serde_json::from_slice(&body)
             .map_err(|e| invalid(format!("{}: {e}", descriptor.display())))?;
         if d.version != 1 {
             return Err(invalid(format!(
@@ -251,6 +269,7 @@ impl LazyStorage {
             fill_max: d.fill_max,
             fetch_deadline: Duration::from_secs(d.fetch_deadline_secs),
             stop: AtomicBool::new(false),
+            _lock: held,
             missing: AtomicUsize::new(missing),
         });
         {
@@ -721,6 +740,21 @@ mod tests {
         let mut expected = data[..CS].to_vec();
         expected[10..15].copy_from_slice(b"hello");
         assert_eq!(read(&disk, 0, CS).unwrap(), expected);
+    }
+
+    #[test]
+    fn a_disk_smolvm_is_completing_cannot_be_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let (descriptor, _) = store(dir.path(), &[Some(1)], 0, "");
+        let held = File::open(&descriptor).unwrap();
+        held.lock().unwrap();
+        let error = LazyStorage::open(&descriptor).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        held.unlock().unwrap();
+        let disk = LazyStorage::open(&descriptor).unwrap();
+        // While the VMM serves it, smolvm cannot take it over.
+        assert!(File::open(&descriptor).unwrap().try_lock().is_err());
+        drop(disk);
     }
 
     #[test]
