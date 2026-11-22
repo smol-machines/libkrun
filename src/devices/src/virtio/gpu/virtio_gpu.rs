@@ -549,8 +549,12 @@ impl VirtioGpu {
             rutabaga_gfx::RutabagaComponentType::VirglRenderer
         };
 
-        let builder = RutabagaBuilder::new(component, virgl_flags, super::advertised_capset_mask())
-            .set_rutabaga_channels(rutabaga_channels_opt);
+        let builder = RutabagaBuilder::new(
+            component,
+            virgl_flags,
+            super::advertised_capset_mask(virgl_flags),
+        )
+        .set_rutabaga_channels(rutabaga_channels_opt);
         let builder = if let Some(export_table) = export_table {
             builder.set_export_table(export_table)
         } else {
