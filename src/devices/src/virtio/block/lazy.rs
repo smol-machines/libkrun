@@ -135,6 +135,9 @@ struct Shared {
     fill_max: usize,
     fetch_deadline: Duration,
     stop: AtomicBool,
+    /// Chunks not present yet. When it reaches zero the presence record is
+    /// written at once, so smolvm sees the disk is complete while it runs.
+    missing: AtomicUsize,
 }
 
 /// A disk served from a stored checkpoint (see the module docs).
@@ -229,6 +232,7 @@ impl LazyStorage {
             .and_then(|s| s.strip_suffix(DESCRIPTOR_SUFFIX))
             .map(PathBuf::from)
             .unwrap_or_else(|| descriptor.to_path_buf());
+        let missing = state.iter().filter(|st| **st != PRESENT).count();
         let shared = Arc::new(Shared {
             image,
             objects: d.objects,
@@ -247,6 +251,7 @@ impl LazyStorage {
             fill_max: d.fill_max,
             fetch_deadline: Duration::from_secs(d.fetch_deadline_secs),
             stop: AtomicBool::new(false),
+            missing: AtomicUsize::new(missing),
         });
         {
             let mut q = lock(&shared.queue);
@@ -397,6 +402,14 @@ fn ensure(s: &Shared, i: usize, on_demand: bool) -> io::Result<()> {
     s.changed.notify_all();
     drop(state);
     result?;
+    if s.missing.fetch_sub(1, Ordering::AcqRel) == 1
+        && let Err(e) = persist(s)
+    {
+        log::warn!(
+            "lazy disk {}: could not record that it is complete: {e}",
+            s.image.display()
+        );
+    }
     if on_demand {
         if let Some(out) = &s.trace_out {
             let _ = writeln!(lock(out), "{i}");
@@ -721,9 +734,15 @@ mod tests {
         let (descriptor, _) = store(dir.path(), &[Some(1), Some(2), Some(3), Some(4)], 0, &extra);
         let disk = LazyStorage::open(&descriptor).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
-        while lock(&disk.shared.state).iter().any(|s| *s != PRESENT) {
-            assert!(Instant::now() < deadline, "the disk never completed");
+        // The record says so while the disk is still open: smolvm reads it
+        // to know a running machine's disk is complete.
+        while std::fs::read(&disk.shared.present_path).map_or(true, |p| p != [1, 1, 1, 1]) {
+            assert!(
+                Instant::now() < deadline,
+                "the disk never recorded completion"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
+        assert!(lock(&disk.shared.state).iter().all(|s| *s == PRESENT));
     }
 }
