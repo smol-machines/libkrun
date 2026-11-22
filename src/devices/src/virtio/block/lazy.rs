@@ -14,6 +14,10 @@
 //! It is persisted at once when the last chunk arrives, which is how smolvm
 //! learns a running machine's disk is complete.
 //!
+//! The checkpoint fixes only the bytes it holds. A qcow2 layer the guest writes
+//! grows past them as it allocates clusters: those bytes are local, never
+//! fetched, and the disk's size is the cache file's.
+//!
 //! The VMM holds a shared lock on the descriptor for as long as it serves the
 //! disk. smolvm fills a disk itself only holding that lock exclusively, so the
 //! two never write the cache at once; a disk smolvm is filling cannot be
@@ -41,6 +45,7 @@ use std::time::{Duration, Instant};
 
 use imago::format::gate::ImplicitOpenGate;
 use imago::io_buffers::{IoVector, IoVectorMut};
+use imago::storage::PreallocateMode;
 use imago::storage::drivers::CommonStorageHelper;
 use imago::{DynStorage, FormatAccess, FormatDriverBuilder, Storage, StorageOpenOptions};
 use serde::Deserialize;
@@ -221,14 +226,18 @@ impl LazyStorage {
         let resumed = std::fs::read(&present_path)
             .ok()
             .filter(|p| p.len() == file.chunks.len())
-            .filter(|_| std::fs::metadata(&d.cache).is_ok_and(|m| m.len() == file.size));
+            .filter(|_| std::fs::metadata(&d.cache).is_ok_and(|m| m.len() >= file.size));
         let cache = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(resumed.is_none())
             .open(&d.cache)?;
-        cache.set_len(file.size)?;
+        // Never shorter than the checkpoint's file; a qcow2 layer may have
+        // grown past it since, and that growth is kept.
+        if cache.metadata()?.len() < file.size {
+            cache.set_len(file.size)?;
+        }
         let state: Vec<u8> = file
             .chunks
             .iter()
@@ -309,7 +318,9 @@ impl LazyStorage {
             return Ok(());
         }
         let cs = self.shared.chunk_size;
-        for chunk in offset / cs..=(offset + len - 1) / cs {
+        // Chunks past the checkpoint's file hold only what was written here.
+        let end = ((offset + len - 1) / cs + 1).min(self.shared.chunks.len() as u64);
+        for chunk in offset / cs..end {
             ensure(&self.shared, chunk as usize, true)?;
         }
         Ok(())
@@ -507,7 +518,7 @@ fn fetch_into_cache(s: &Shared, i: usize) -> io::Result<()> {
 
 impl Storage for LazyStorage {
     fn size(&self) -> io::Result<u64> {
-        Ok(self.shared.size)
+        Ok(self.shared.cache.metadata()?.len())
     }
 
     fn get_filename(&self) -> Option<PathBuf> {
@@ -542,6 +553,18 @@ impl Storage for LazyStorage {
         let mut data = vec![0u8; len as usize];
         bufv.copy_into_slice(&mut data);
         self.shared.cache.write_all_at(&data, offset)
+    }
+
+    async fn resize(&self, new_size: u64, _prealloc_mode: PreallocateMode) -> io::Result<()> {
+        // Shrinking into the checkpoint's bytes would lose chunks the
+        // presence record still claims.
+        if new_size < self.shared.size {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "a lazy disk cannot shrink below its checkpoint's size",
+            ));
+        }
+        self.shared.cache.set_len(new_size)
     }
 
     async fn flush(&self) -> io::Result<()> {
@@ -740,6 +763,34 @@ mod tests {
         let mut expected = data[..CS].to_vec();
         expected[10..15].copy_from_slice(b"hello");
         assert_eq!(read(&disk, 0, CS).unwrap(), expected);
+    }
+
+    #[test]
+    fn a_qcow2_layer_grows_past_its_checkpoint_and_keeps_the_growth() {
+        let dir = tempfile::tempdir().unwrap();
+        // A short last chunk, as a qcow2 file's size rarely is a whole chunk.
+        let (descriptor, data) = store(dir.path(), &[Some(3), Some(5)], 100, r#","readahead":0"#);
+        let disk = LazyStorage::open(&descriptor).unwrap();
+        let end = data.len() as u64;
+        assert_eq!(Storage::size(&disk).unwrap(), end);
+        // A write straddling the old end, then one well past it: the guest
+        // allocating clusters.
+        disk.ensure_range(end - 10, 20).unwrap();
+        disk.shared.cache.write_all_at(&[7; 20], end - 10).unwrap();
+        disk.ensure_range(end + 5 * CS as u64, 4).unwrap();
+        disk.shared
+            .cache
+            .write_all_at(b"tail", end + 5 * CS as u64)
+            .unwrap();
+        assert_eq!(Storage::size(&disk).unwrap(), end + 5 * CS as u64 + 4);
+        disk.persist().unwrap();
+        drop(disk);
+
+        let disk = LazyStorage::open(&descriptor).unwrap();
+        assert_eq!(Storage::size(&disk).unwrap(), end + 5 * CS as u64 + 4);
+        assert_eq!(read(&disk, end - 10, 20).unwrap(), [7; 20]);
+        assert_eq!(read(&disk, end + 5 * CS as u64, 4).unwrap(), b"tail");
+        assert_eq!(read(&disk, 0, 16).unwrap(), data[..16]);
     }
 
     #[test]
