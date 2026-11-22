@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod device;
+#[cfg(unix)]
+pub mod lazy;
 mod worker;
 
 pub use self::device::{Block, BlockState, CacheType, create_overlay};

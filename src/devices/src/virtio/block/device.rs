@@ -456,6 +456,36 @@ pub(crate) fn open_disk_format(
         .filename(path)
         .direct(direct_io);
     let file_opts = file_opts.relaxed_sync(relaxed_sync);
+    // A disk smolvm wrote a `.lazydisk` descriptor for is served from a stored
+    // checkpoint as the guest touches it (see `lazy`).
+    #[cfg(unix)]
+    if let Some(descriptor) = super::lazy::descriptor_for(std::path::Path::new(path)) {
+        let storage: Box<dyn DynStorage> = Box::new(super::lazy::LazyStorage::open(&descriptor)?);
+        let backend = match format {
+            ImageType::Qcow2 => {
+                let mut qcow2 =
+                    Qcow2::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::open_image_sync(
+                        storage, writable,
+                    )?;
+                open_backing_chain(&mut qcow2)?;
+                disk_backend(qcow2, io_engine, None)?
+            }
+            // The async engine drives a raw file descriptor directly; a lazy raw
+            // disk goes through the storage instead.
+            ImageType::Raw => disk_backend(
+                Raw::<Box<dyn DynStorage>>::open_image_sync(storage, writable)?,
+                BlockIoEngine::Sync,
+                None,
+            )?,
+            ImageType::Vmdk => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "lazy vmdk disks are not supported",
+                ));
+            }
+        };
+        return Ok((backend, 4096));
+    }
     let file = ImagoFile::open_sync(file_opts)?;
     let discard_alignment = file.discard_align();
 
@@ -466,7 +496,7 @@ pub(crate) fn open_disk_format(
                     Box::new(file),
                     writable,
                 )?;
-            qcow2.open_implicit_dependencies_sync()?;
+            open_backing_chain(&mut qcow2)?;
             disk_backend(qcow2, io_engine, None)?
         }
         ImageType::Raw => {
@@ -491,6 +521,24 @@ pub(crate) fn open_disk_format(
         }
     };
     Ok((backend, discard_alignment))
+}
+
+/// A qcow2 image over any storage, as the block device opens it.
+type Qcow2Disk = Qcow2<Box<dyn DynStorage>, Arc<imago::FormatAccess<Box<dyn DynStorage>>>>;
+
+/// Open a qcow2 image's backing files: lazily where smolvm wrote a descriptor
+/// for one (a machine restored from a stored checkpoint), as files otherwise.
+fn open_backing_chain(qcow2: &mut Qcow2Disk) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        tokio::runtime::Builder::new_current_thread()
+            .build()?
+            .block_on(qcow2.open_implicit_dependencies_gated(super::lazy::LazyGate))
+    }
+    #[cfg(not(unix))]
+    {
+        qcow2.open_implicit_dependencies_sync()
+    }
 }
 
 /// Create a qcow2 overlay at `overlay_path` backed by `base_path` (format
