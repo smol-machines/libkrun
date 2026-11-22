@@ -373,11 +373,25 @@ pub struct Rutabaga {
     // Declare components after resources and contexts such that it is dropped last.
     components: Map<RutabagaComponentType, Box<dyn RutabagaComponent>>,
     default_component: RutabagaComponentType,
+    // The component that serves resources created outside any context: the
+    // guest's plain 2D buffers. It is the default component unless that one
+    // cannot make them, which is the case for a virglrenderer running without
+    // OpenGL; the CPU 2D component stands in for it then.
+    plain_component: RutabagaComponentType,
     capset_info: Vec<RutabagaCapsetInfo>,
     fence_handler: RutabagaFenceHandler,
 }
 
 impl Rutabaga {
+    /// The component that serves `resource`: the one that created it.
+    fn resource_component(&self, resource: &RutabagaResource) -> RutabagaComponentType {
+        if resource.component_mask == 1 << (self.plain_component as u8) {
+            self.plain_component
+        } else {
+            self.default_component
+        }
+    }
+
     /// Take a snapshot of Rutabaga's current state. The snapshot is serialized into an opaque byte
     /// stream and written to `w`.
     ///
@@ -579,9 +593,16 @@ impl Rutabaga {
 
             ctx.context_create_fence(fence)?;
         } else {
+            // A fence outside any context waits on work done for plain
+            // resources, so the component serving those signals it.
+            let component_type = if fence.ctx_id == 0 {
+                self.plain_component
+            } else {
+                self.default_component
+            };
             let component = self
                 .components
-                .get_mut(&self.default_component)
+                .get_mut(&component_type)
                 .ok_or(RutabagaError::InvalidComponent)?;
 
             component.create_fence(fence)?;
@@ -630,7 +651,7 @@ impl Rutabaga {
     ) -> RutabagaResult<()> {
         let component = self
             .components
-            .get_mut(&self.default_component)
+            .get_mut(&self.plain_component)
             .ok_or(RutabagaError::InvalidComponent)?;
 
         if self.resources.contains_key(&resource_id) {
@@ -648,9 +669,15 @@ impl Rutabaga {
         resource_id: u32,
         mut vecs: Vec<RutabagaIovec>,
     ) -> RutabagaResult<()> {
+        let component_type = self
+            .resources
+            .get(&resource_id)
+            .map(|resource| self.resource_component(resource))
+            .ok_or(RutabagaError::InvalidResourceId)?;
+
         let component = self
             .components
-            .get_mut(&self.default_component)
+            .get_mut(&component_type)
             .ok_or(RutabagaError::InvalidComponent)?;
 
         let resource = self
@@ -665,9 +692,15 @@ impl Rutabaga {
 
     /// Detaches any previously attached iovecs from the resource.
     pub fn detach_backing(&mut self, resource_id: u32) -> RutabagaResult<()> {
+        let component_type = self
+            .resources
+            .get(&resource_id)
+            .map(|resource| self.resource_component(resource))
+            .ok_or(RutabagaError::InvalidResourceId)?;
+
         let component = self
             .components
-            .get_mut(&self.default_component)
+            .get_mut(&component_type)
             .ok_or(RutabagaError::InvalidComponent)?;
 
         let resource = self
@@ -682,9 +715,15 @@ impl Rutabaga {
 
     /// Releases guest kernel reference on the resource.
     pub fn unref_resource(&mut self, resource_id: u32) -> RutabagaResult<()> {
+        let component_type = self
+            .resources
+            .get(&resource_id)
+            .map(|resource| self.resource_component(resource))
+            .ok_or(RutabagaError::InvalidResourceId)?;
+
         let component = self
             .components
-            .get_mut(&self.default_component)
+            .get_mut(&component_type)
             .ok_or(RutabagaError::InvalidComponent)?;
 
         self.resources
@@ -703,9 +742,15 @@ impl Rutabaga {
         resource_id: u32,
         transfer: Transfer3D,
     ) -> RutabagaResult<()> {
+        let component_type = self
+            .resources
+            .get(&resource_id)
+            .map(|resource| self.resource_component(resource))
+            .ok_or(RutabagaError::InvalidResourceId)?;
+
         let component = self
             .components
-            .get(&self.default_component)
+            .get(&component_type)
             .ok_or(RutabagaError::InvalidComponent)?;
 
         let resource = self
@@ -727,9 +772,15 @@ impl Rutabaga {
         transfer: Transfer3D,
         buf: Option<IoSliceMut>,
     ) -> RutabagaResult<()> {
+        let component_type = self
+            .resources
+            .get(&resource_id)
+            .map(|resource| self.resource_component(resource))
+            .ok_or(RutabagaError::InvalidResourceId)?;
+
         let component = self
             .components
-            .get(&self.default_component)
+            .get(&component_type)
             .ok_or(RutabagaError::InvalidComponent)?;
 
         let resource = self
@@ -741,9 +792,15 @@ impl Rutabaga {
     }
 
     pub fn resource_flush(&mut self, resource_id: u32) -> RutabagaResult<()> {
+        let component_type = self
+            .resources
+            .get(&resource_id)
+            .map(|resource| self.resource_component(resource))
+            .ok_or(RutabagaError::InvalidResourceId)?;
+
         let component = self
             .components
-            .get(&self.default_component)
+            .get(&component_type)
             .ok_or(RutabagaError::Unsupported)?;
 
         let resource = self
@@ -1297,6 +1354,9 @@ impl RutabagaBuilder {
             ));
         }
 
+        #[allow(unused_mut)]
+        let mut plain_component = self.default_component;
+
         if self.default_component == RutabagaComponentType::Rutabaga2D {
             let rutabaga_2d = Rutabaga2D::init(fence_handler.clone())?;
             rutabaga_components.insert(RutabagaComponentType::Rutabaga2D, rutabaga_2d);
@@ -1312,6 +1372,15 @@ impl RutabagaBuilder {
                     rutabaga_server_descriptor,
                 )?;
                 rutabaga_components.insert(RutabagaComponentType::VirglRenderer, virgl);
+
+                // Without OpenGL, virglrenderer serves contexts (Venus) but
+                // cannot make the guest's plain 2D buffers, which a display
+                // scans out. The CPU 2D component makes those instead.
+                if !self.virglrenderer_flags.uses_virgl() {
+                    let rutabaga_2d = Rutabaga2D::init(fence_handler.clone())?;
+                    rutabaga_components.insert(RutabagaComponentType::Rutabaga2D, rutabaga_2d);
+                    plain_component = RutabagaComponentType::Rutabaga2D;
+                }
 
                 push_capset(RUTABAGA_CAPSET_VIRGL);
                 push_capset(RUTABAGA_CAPSET_VIRGL2);
@@ -1351,6 +1420,7 @@ impl RutabagaBuilder {
             contexts: Default::default(),
             components: rutabaga_components,
             default_component: self.default_component,
+            plain_component,
             capset_info: rutabaga_capsets,
             fence_handler,
         })

@@ -214,7 +214,7 @@ impl VirtioDevice for Gpu {
             events_read: 0,
             events_clear: 0,
             num_scanouts: self.displays.len() as u32,
-            num_capsets: super::advertised_num_capsets(),
+            num_capsets: super::advertised_num_capsets(self.virgl_flags),
         };
 
         let config_slice = config.as_slice();
