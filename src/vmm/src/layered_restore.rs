@@ -458,9 +458,20 @@ impl Generation {
     /// Logical regions remain unchanged even when the backing has many extents;
     /// a KVM slot is not consumed for each extent.
     pub fn restore(&self) -> io::Result<GuestMemoryMmap> {
+        self.restore_mapped(false)
+    }
+
+    /// [`Self::restore`] with every extent's backing mapped in full, holes
+    /// included: for backing still being written, such as lazily restored
+    /// RAM, whose holes are where data has yet to arrive rather than zeros.
+    pub fn restore_dense(&self) -> io::Result<GuestMemoryMmap> {
+        self.restore_mapped(true)
+    }
+
+    fn restore_mapped(&self, dense: bool) -> io::Result<GuestMemoryMmap> {
         let mut regions = Vec::new();
         for image in &self.regions {
-            let instance = image.restore()?;
+            let instance = image.restore_with(dense)?;
             let (_, region) = instance
                 .memory
                 .remove_region(GuestAddress(image.gpa), image.len as u64)
@@ -770,6 +781,11 @@ impl Image {
     }
 
     fn restore(&self) -> io::Result<Instance> {
+        self.restore_with(false)
+    }
+
+    /// Map the image; with `dense`, every extent's backing in full.
+    fn restore_with(&self, dense: bool) -> io::Result<Instance> {
         let prot = libc::PROT_READ | libc::PROT_WRITE;
         let region = MmapRegion::build(
             None,
@@ -787,7 +803,7 @@ impl Image {
             // SAFETY: each aligned extent lies exclusively inside the reserved
             // mapping owned above. On failure its RAII owner unmaps the whole
             // reservation, including already-installed file views.
-            unsafe { map_extent_data(base, extent)? };
+            unsafe { map_extent_data(base, extent, dense)? };
         }
         Ok(Instance {
             memory,
@@ -858,12 +874,19 @@ fn private_page_ranges(
 /// other three quarters, which pushed CI runners and branch sources past their
 /// memory limits. Anonymous memory over the holes pays once, for what is written.
 ///
+/// With `dense`, the whole extent is mapped, holes included.
+///
 /// # Safety
 /// `base + extent.start .. base + extent.end` must lie inside a mapping the
 /// caller owns and may replace.
-unsafe fn map_extent_data(base: *mut u8, extent: &Extent) -> io::Result<()> {
+unsafe fn map_extent_data(base: *mut u8, extent: &Extent, dense: bool) -> io::Result<()> {
     let len = extent.end - extent.start;
-    for (start, end) in data_runs(&extent.file, extent.offset, len, host_page_size())? {
+    let runs = if dense {
+        vec![(0, len)]
+    } else {
+        data_runs(&extent.file, extent.offset, len, host_page_size())?
+    };
+    for (start, end) in runs {
         // SAFETY: the run lies inside the extent, which the caller owns.
         let result = unsafe {
             libc::mmap(
@@ -959,7 +982,7 @@ impl Instance {
                 if result == libc::MAP_FAILED {
                     return Err(io::Error::last_os_error());
                 }
-                map_extent_data(base, extent)?;
+                map_extent_data(base, extent, false)?;
             }
         }
         self.image = image;
