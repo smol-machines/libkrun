@@ -4,6 +4,8 @@ use std::io::Read;
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::sync::{Arc, Mutex};
 use std::thread;
+#[cfg(target_os = "linux")]
+use std::time::{Duration, Instant};
 
 use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use utils::eventfd::EventFd;
@@ -12,6 +14,8 @@ use utils::eventfd::EventFd;
 use crossbeam_channel::Sender;
 #[cfg(target_os = "linux")]
 use rutabaga_gfx::AsRawDescriptor;
+#[cfg(target_os = "linux")]
+use rutabaga_gfx::{RUTABAGA_CAPSET_VENUS, RUTABAGA_CONTEXT_INIT_CAPSET_ID_MASK};
 use rutabaga_gfx::{
     RUTABAGA_PIPE_BIND_RENDER_TARGET, RUTABAGA_PIPE_TEXTURE_2D, ResourceCreate3D,
     ResourceCreateBlob, RutabagaFence, Transfer3D,
@@ -59,6 +63,11 @@ pub struct Worker {
     /// The fds are owned by virglrenderer — do NOT close them.
     #[cfg(target_os = "linux")]
     context_poll_fds: HashMap<u32, Option<i32>>,
+    /// The Venus contexts among those blind-polled ones: a poll of one is a
+    /// read of the render server's shared memory, cheap enough to repeat
+    /// often while the guest waits on a fence (see `work_loop_epoll`).
+    #[cfg(target_os = "linux")]
+    blind_polled_venus_ctxs: Vec<u32>,
     /// Context IDs whose poll fds need registering with epoll.
     /// Populated by CtxCreate, drained after process_queue.
     #[cfg(target_os = "linux")]
@@ -120,6 +129,8 @@ impl Worker {
             display_backend,
             #[cfg(target_os = "linux")]
             context_poll_fds: HashMap::new(),
+            #[cfg(target_os = "linux")]
+            blind_polled_venus_ctxs: Vec::new(),
             #[cfg(target_os = "linux")]
             pending_ctx_registrations: Vec::new(),
             #[cfg(target_os = "linux")]
@@ -238,12 +249,72 @@ impl Worker {
         const MAX_EVENTS: usize = 8;
         let mut events = [libc::epoll_event { events: 0, u64: 0 }; MAX_EVENTS];
 
+        /// How often to poll a context for a fence the guest is blocked on.
+        const FENCE_POLL: Duration = Duration::from_micros(50);
+        /// How often the idle duties below run.
+        const IDLE_TICK: Duration = Duration::from_millis(1);
+        // Contexts with no poll fd that have a fence the guest is waiting on.
+        let mut waited_ctxs: Vec<u32> = Vec::new();
+        // Whether the kernel has epoll_pwait2 (Linux 5.11), the only epoll
+        // wait with a timeout finer than a millisecond.
+        let mut fine_timeout = true;
+        let mut last_idle_tick = Instant::now();
+
         loop {
-            // 1ms timeout: keeps blind-polled fallback contexts (those where
-            // virglrenderer returned -1 for the poll fd) drained each tick.
-            // SAFETY: epoll_wait with a valid epoll_fd, properly sized buffer.
-            let n =
-                unsafe { libc::epoll_wait(epoll_fd, events.as_mut_ptr(), MAX_EVENTS as i32, 1) };
+            // A Venus context with no poll fd (virglrenderer has no fence
+            // thread on this host, see `virgl_fence_thread_enabled`) only
+            // reports a retired fence when it is polled. A guest thread
+            // blocked on such a fence waits until the next poll, so while one
+            // is outstanding that context is polled every FENCE_POLL instead
+            // of once per IDLE_TICK: a guest driver that waits on a fence per
+            // presented frame was otherwise held to about one frame per
+            // millisecond. OpenGL contexts keep the idle cadence: polling one
+            // runs the OpenGL renderer's fence check, which costs more than
+            // the wait it would save.
+            virtio_gpu.contexts_with_pending_fences(&mut waited_ctxs);
+            waited_ctxs.retain(|ctx_id| self.blind_polled_venus_ctxs.contains(ctx_id));
+
+            let n = if fine_timeout && !waited_ctxs.is_empty() {
+                let timeout = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: FENCE_POLL.as_nanos() as libc::c_long,
+                };
+                // SAFETY: epoll_pwait2 with a valid epoll_fd, a properly sized
+                // buffer, a valid timeout and no signal mask.
+                let n = unsafe {
+                    libc::syscall(
+                        libc::SYS_epoll_pwait2,
+                        epoll_fd,
+                        events.as_mut_ptr(),
+                        MAX_EVENTS as libc::c_int,
+                        &timeout as *const libc::timespec,
+                        std::ptr::null::<libc::sigset_t>(),
+                        0usize,
+                    )
+                } as libc::c_int;
+                if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOSYS) {
+                    fine_timeout = false;
+                    continue;
+                }
+                if n == 0 {
+                    for &ctx_id in &waited_ctxs {
+                        virtio_gpu.context_event_poll(ctx_id);
+                    }
+                    // Everything else keeps its cadence.
+                    if last_idle_tick.elapsed() < IDLE_TICK {
+                        continue;
+                    }
+                }
+                n
+            } else {
+                // 1ms timeout: keeps blind-polled fallback contexts (those where
+                // virglrenderer returned -1 for the poll fd) drained each tick.
+                // SAFETY: epoll_wait with a valid epoll_fd, properly sized buffer.
+                unsafe { libc::epoll_wait(epoll_fd, events.as_mut_ptr(), MAX_EVENTS as i32, 1) }
+            };
+            if n == 0 {
+                last_idle_tick = Instant::now();
+            }
             if n < 0 {
                 let err = std::io::Error::last_os_error();
                 if err.raw_os_error() == Some(libc::EINTR) {
@@ -495,6 +566,10 @@ impl Worker {
                 if result.is_ok() {
                     let poll_fd = virtio_gpu.context_poll_fd(hdr.ctx_id);
                     self.context_poll_fds.insert(hdr.ctx_id, poll_fd);
+                    let capset_id = info.context_init & RUTABAGA_CONTEXT_INIT_CAPSET_ID_MASK;
+                    if poll_fd.is_none() && capset_id == RUTABAGA_CAPSET_VENUS {
+                        self.blind_polled_venus_ctxs.push(hdr.ctx_id);
+                    }
                     self.pending_ctx_registrations.push(hdr.ctx_id);
                 }
                 result
@@ -503,6 +578,9 @@ impl Worker {
                 // Deregister from epoll BEFORE destroying the context.
                 // virglrenderer owns the poll fd and closes it on context destroy.
                 // Calling epoll_ctl(DEL) after destroy would use a stale or reused fd.
+                #[cfg(target_os = "linux")]
+                self.blind_polled_venus_ctxs
+                    .retain(|&ctx_id| ctx_id != hdr.ctx_id);
                 #[cfg(target_os = "linux")]
                 if let Some(Some(fd)) = self.context_poll_fds.remove(&hdr.ctx_id)
                     && self.epoll_fd >= 0
