@@ -29,7 +29,10 @@
 //! reads keep the store's bandwidth.
 //!
 //! A chunk the store cannot supply yet is retried until a deadline rather than
-//! failing at once: a guest I/O error turns its filesystem read-only. A chunk
+//! failing at once: a guest I/O error turns its filesystem read-only. smolvm
+//! may still be importing the checkpoint, writing each object whole under its
+//! name; one it marked `.import-failed` will not bring the rest, so a missing
+//! object fails at once there. A chunk
 //! whose content does not match its hash fails at once; corrupt data is never
 //! returned.
 
@@ -469,6 +472,14 @@ fn read_ahead(s: &Shared, i: usize) {
     s.queued.notify_all();
 }
 
+/// Whether smolvm marked the checkpoint holding `objects` as an import that
+/// stopped short: an object missing from it will not arrive.
+fn import_failed(objects: &Path) -> bool {
+    objects
+        .parent()
+        .is_some_and(|checkpoint| checkpoint.join(".import-failed").exists())
+}
+
 /// Read chunk `i`'s object, check it, and write it into the cache. An object the
 /// store cannot supply is retried until the deadline; a corrupt one fails at once.
 fn fetch_into_cache(s: &Shared, i: usize) -> io::Result<()> {
@@ -480,18 +491,25 @@ fn fetch_into_cache(s: &Shared, i: usize) -> io::Result<()> {
     let path = s.objects.join(hash);
     let started = Instant::now();
     let mut delay = Duration::from_millis(20);
+    let mut warned = false;
     let compressed = loop {
         match std::fs::read(&path) {
             Ok(b) => break b,
-            Err(e) if started.elapsed() < s.fetch_deadline && !s.stop.load(Ordering::Relaxed) => {
-                if started.elapsed() > Duration::from_secs(5) {
+            Err(e)
+                if started.elapsed() < s.fetch_deadline
+                    && !s.stop.load(Ordering::Relaxed)
+                    && !import_failed(&s.objects) =>
+            {
+                if !warned && started.elapsed() > Duration::from_secs(5) {
+                    warned = true;
                     log::warn!(
                         "lazy disk {}: object {hash} not available yet: {e}",
                         s.image.display()
                     );
                 }
                 std::thread::sleep(delay);
-                delay = (delay * 2).min(Duration::from_secs(2));
+                // Short: an object still being imported is read soon after it lands.
+                delay = (delay * 2).min(Duration::from_millis(100));
             }
             Err(e) => return Err(io::Error::new(e.kind(), format!("object {hash}: {e}"))),
         }
@@ -791,6 +809,19 @@ mod tests {
         assert_eq!(read(&disk, end - 10, 20).unwrap(), [7; 20]);
         assert_eq!(read(&disk, end + 5 * CS as u64, 4).unwrap(), b"tail");
         assert_eq!(read(&disk, 0, 16).unwrap(), data[..16]);
+    }
+
+    #[test]
+    fn a_missing_object_of_a_failed_import_fails_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (descriptor, _) = store(dir.path(), &[Some(7)], 0, r#","readahead":0"#);
+        std::fs::remove_dir_all(dir.path().join("objects")).unwrap();
+        std::fs::create_dir(dir.path().join("objects")).unwrap();
+        std::fs::write(dir.path().join(".import-failed"), b"1\n").unwrap();
+        let disk = LazyStorage::open(&descriptor).unwrap();
+        let started = Instant::now();
+        assert!(read(&disk, 0, 16).is_err());
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]
