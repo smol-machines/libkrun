@@ -45,6 +45,66 @@ pub struct VirglRenderer {}
 
 struct VirglRendererContext {
     ctx_id: u32,
+    /// Set for an OpenGL context on a host whose OpenGL driver cannot import a
+    /// dma-buf that has no explicit non-linear format modifier.
+    drop_untagged_dmabuf_imports: bool,
+    /// Whether this context has already logged a dropped import.
+    warned_of_dropped_import: bool,
+}
+
+const VIRGL_CCMD_NOP: u32 = 0;
+const VIRGL_CCMD_PIPE_RESOURCE_SET_TYPE: u32 = 49;
+const VIRGL_PIPE_RES_SET_TYPE_MODIFIER_LO: usize = 7;
+const VIRGL_PIPE_RES_SET_TYPE_MODIFIER_HI: usize = 8;
+const DRM_FORMAT_MOD_LINEAR: u64 = 0;
+const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
+
+/// Turns every dma-buf import that names no non-linear format modifier into a
+/// no-op, in an OpenGL command stream.
+///
+/// A guest imports a dma-buf made by another API (a Vulkan image, for one)
+/// into OpenGL with `PIPE_RESOURCE_SET_TYPE`. NVIDIA's EGL library accepts
+/// such an import when the modifier is missing or linear, then crashes when
+/// the image is freed, and virglrenderer's OpenGL renderer runs inside the VM
+/// process. Without the command the resource stays untyped, so the guest gets
+/// OpenGL errors for it instead. Returns how many imports were dropped.
+fn drop_untagged_dmabuf_imports(commands: &mut [u8]) -> usize {
+    const WORD: usize = size_of::<u32>();
+    let word = |commands: &[u8], index: usize| {
+        let at = index * WORD;
+        u32::from_le_bytes([
+            commands[at],
+            commands[at + 1],
+            commands[at + 2],
+            commands[at + 3],
+        ])
+    };
+    let words = commands.len() / WORD;
+    let mut dropped = 0;
+    let mut at = 0;
+    while at < words {
+        let header = word(commands, at);
+        let length = (header >> 16) as usize;
+        if header & 0xff == VIRGL_CCMD_PIPE_RESOURCE_SET_TYPE
+            && length >= VIRGL_PIPE_RES_SET_TYPE_MODIFIER_HI
+            && at + length < words
+        {
+            let modifier = u64::from(word(commands, at + VIRGL_PIPE_RES_SET_TYPE_MODIFIER_LO))
+                | u64::from(word(commands, at + VIRGL_PIPE_RES_SET_TYPE_MODIFIER_HI)) << 32;
+            if modifier == DRM_FORMAT_MOD_LINEAR || modifier == DRM_FORMAT_MOD_INVALID {
+                dropped += 1;
+                let nop = (header & !0xff) | VIRGL_CCMD_NOP;
+                commands[at * WORD..(at + 1) * WORD].copy_from_slice(&nop.to_le_bytes());
+            }
+        }
+        at += length + 1;
+    }
+    dropped
+}
+
+/// Whether an OpenGL renderer name belongs to NVIDIA's own driver.
+fn is_nvidia_opengl(virgl_capset: &[u8]) -> bool {
+    virgl_capset.windows(6).any(|name| name == b"NVIDIA")
 }
 
 fn import_resource(resource: &mut RutabagaResource) -> RutabagaResult<()> {
@@ -93,6 +153,17 @@ impl RutabagaContext for VirglRendererContext {
         }
         if !commands.len().is_multiple_of(size_of::<u32>()) {
             return Err(RutabagaError::InvalidCommandSize(commands.len()));
+        }
+        if self.drop_untagged_dmabuf_imports
+            && drop_untagged_dmabuf_imports(commands) > 0
+            && !self.warned_of_dropped_import
+        {
+            self.warned_of_dropped_import = true;
+            warn!(
+                "context {}: dropping OpenGL dma-buf imports that name no non-linear format \
+                 modifier, which the host's NVIDIA driver cannot free safely",
+                self.ctx_id
+            );
         }
         let dword_count = (commands.len() / size_of::<u32>()) as i32;
         // Safe because the context and buffer are valid and virglrenderer will have been
@@ -859,6 +930,99 @@ impl RutabagaComponent for VirglRenderer {
             virgl_renderer_context_create(ctx_id, name.len() as u32, name.as_ptr() as *const c_char)
         };
         ret_to_res(ret)?;
-        Ok(Box::new(VirglRendererContext { ctx_id }))
+        // The OpenGL capability set carries the host renderer's name. It is
+        // empty when virglrenderer runs without OpenGL.
+        let capset_id = context_init & RUTABAGA_CONTEXT_INIT_CAPSET_ID_MASK;
+        let drop_untagged_dmabuf_imports = capset_id <= RUTABAGA_CAPSET_VIRGL2 && {
+            let (version, _) = self.get_capset_info(RUTABAGA_CAPSET_VIRGL2);
+            is_nvidia_opengl(&self.get_capset(RUTABAGA_CAPSET_VIRGL2, version))
+        };
+        Ok(Box::new(VirglRendererContext {
+            ctx_id,
+            drop_untagged_dmabuf_imports,
+            warned_of_dropped_import: false,
+        }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stream(words: &[u32]) -> Vec<u8> {
+        words.iter().flat_map(|word| word.to_le_bytes()).collect()
+    }
+
+    fn set_type(modifier: u64) -> Vec<u32> {
+        // header, resource, format, bind, width, height, usage, modifier, one plane
+        let mut command = vec![
+            VIRGL_CCMD_PIPE_RESOURCE_SET_TYPE | 10 << 16,
+            7,
+            1,
+            2,
+            64,
+            64,
+            0,
+        ];
+        command.extend([modifier as u32, (modifier >> 32) as u32, 256, 0]);
+        command
+    }
+
+    fn command_ids(commands: &[u8]) -> Vec<u32> {
+        let words: Vec<u32> = commands
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+            .collect();
+        let mut ids = Vec::new();
+        let mut at = 0;
+        while at < words.len() {
+            ids.push(words[at] & 0xff);
+            at += (words[at] >> 16) as usize + 1;
+        }
+        ids
+    }
+
+    #[test]
+    fn imports_without_a_non_linear_modifier_become_no_ops() {
+        const DRAW: u32 = 8 | 2 << 16;
+        const NVIDIA_MODIFIER: u64 = 0x0300_0000_0060_6010;
+        let mut words = vec![DRAW, 1, 2];
+        words.extend(set_type(DRM_FORMAT_MOD_INVALID));
+        words.extend(set_type(NVIDIA_MODIFIER));
+        words.extend(set_type(DRM_FORMAT_MOD_LINEAR));
+        words.extend([DRAW, 3, 4]);
+        let mut commands = stream(&words);
+        let length = commands.len();
+
+        assert_eq!(drop_untagged_dmabuf_imports(&mut commands), 2);
+
+        assert_eq!(commands.len(), length);
+        assert_eq!(
+            command_ids(&commands),
+            [
+                8,
+                VIRGL_CCMD_NOP,
+                VIRGL_CCMD_PIPE_RESOURCE_SET_TYPE,
+                VIRGL_CCMD_NOP,
+                8
+            ]
+        );
+    }
+
+    #[test]
+    fn a_truncated_import_is_left_for_virglrenderer_to_reject() {
+        let mut commands = stream(&set_type(DRM_FORMAT_MOD_INVALID)[..6]);
+        let before = commands.clone();
+        assert_eq!(drop_untagged_dmabuf_imports(&mut commands), 0);
+        assert_eq!(commands, before);
+    }
+
+    #[test]
+    fn only_nvidia_renderers_are_matched() {
+        assert!(is_nvidia_opengl(
+            b"\0\x01NVIDIA GeForce RTX 5070 Ti/PCIe/SSE2\0"
+        ));
+        assert!(!is_nvidia_opengl(b"Mesa Intel(R) Graphics (ADL GT2)\0"));
+        assert!(!is_nvidia_opengl(b""));
     }
 }
