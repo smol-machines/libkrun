@@ -202,6 +202,10 @@ struct Shared {
     /// Chunks not present yet. When it reaches zero the presence record is
     /// written at once, so smolvm sees the disk is complete while it runs.
     missing: AtomicUsize,
+    /// How many chunks the presence record on disk leaves missing, `None`
+    /// until there is one. Chunks only ever become present, so an equal count
+    /// means an identical record, and a guest flush need not rewrite it.
+    recorded: Mutex<Option<usize>>,
 }
 
 /// A disk served from a stored checkpoint (see the module docs).
@@ -287,6 +291,7 @@ impl LazyStorage {
             .map(PathBuf::from)
             .unwrap_or_else(|| descriptor.to_path_buf());
         let missing = state.iter().filter(|st| **st != PRESENT).count();
+        let recorded = resumed.is_some().then_some(missing);
         let shared = Arc::new(Shared {
             image,
             objects: d.objects,
@@ -307,6 +312,7 @@ impl LazyStorage {
             stop: AtomicBool::new(false),
             _lock: held,
             missing: AtomicUsize::new(missing),
+            recorded: Mutex::new(recorded),
         });
         {
             let mut q = lock(&shared.queue);
@@ -384,17 +390,23 @@ fn is_sha256(s: &str) -> bool {
 
 fn persist(s: &Shared) -> io::Result<()> {
     s.cache.sync_data()?;
+    // Held while writing, so two flushes never share the temporary file.
+    let mut recorded = lock(&s.recorded);
     let present: Vec<u8> = lock(&s.state)
         .iter()
         .map(|st| u8::from(*st == PRESENT))
         .collect();
-    let tmp = PathBuf::from(format!("{}.tmp", s.present_path.display()));
-    {
-        let mut f = File::create(&tmp)?;
-        f.write_all(&present)?;
-        f.sync_all()?;
+    let missing = present.iter().filter(|p| **p == 0).count();
+    if *recorded != Some(missing) {
+        let tmp = PathBuf::from(format!("{}.tmp", s.present_path.display()));
+        {
+            let mut f = File::create(&tmp)?;
+            f.write_all(&present)?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, &s.present_path)?;
+        *recorded = Some(missing);
     }
-    std::fs::rename(&tmp, &s.present_path)?;
     if let Some(out) = &s.trace_out {
         lock(out).flush()?;
     }
@@ -828,6 +840,30 @@ mod tests {
         let mut expected = data[..CS].to_vec();
         expected[10..15].copy_from_slice(b"hello");
         assert_eq!(read(&disk, 0, CS).unwrap(), expected);
+    }
+
+    #[test]
+    fn a_flush_rewrites_the_presence_record_only_when_it_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (descriptor, data) = store(dir.path(), &[None, Some(6)], 0, r#","readahead":0"#);
+        let record = dir.path().join("cache.present");
+        let disk = LazyStorage::open(&descriptor).unwrap();
+        // Nothing fetched yet, but there is no record: the first flush writes
+        // one, or a write to the zero chunk would be lost at the next open.
+        disk.shared.cache.write_all_at(b"zero", 0).unwrap();
+        disk.persist().unwrap();
+        assert_eq!(std::fs::read(&record).unwrap(), [1, 0]);
+        let ino = |p: &Path| std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(p).unwrap());
+        let first = ino(&record);
+        disk.persist().unwrap();
+        assert_eq!(ino(&record), first, "an unchanged record was rewritten");
+        disk.ensure_range(CS as u64, 1).unwrap();
+        disk.persist().unwrap();
+        assert_eq!(std::fs::read(&record).unwrap(), [1, 1]);
+        drop(disk);
+        let disk = LazyStorage::open(&descriptor).unwrap();
+        assert_eq!(read(&disk, 0, 4).unwrap(), b"zero");
+        assert_eq!(read(&disk, CS as u64, 8).unwrap(), data[CS..CS + 8]);
     }
 
     #[test]
