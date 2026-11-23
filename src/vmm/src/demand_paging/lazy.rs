@@ -15,9 +15,10 @@
 //! page of a chunk of zeros gets the shared zero page, leaving the memfd's hole.
 //! Workers fill every other chunk in the background.
 //!
-//! The memfd is the checkpoint's RAM only once every chunk is in. Anything that
-//! reads it other than through the guest's own mappings (a save, a branch) must
-//! first call [`wait_complete`].
+//! The memfd is the checkpoint's RAM only once every chunk is in; it is then
+//! sealed against writes, as the immutable generation a branch receives.
+//! Anything that reads it other than through the guest's own mappings (a save,
+//! a branch) must first call [`wait_complete`].
 
 use std::fs::File;
 use std::io;
@@ -126,6 +127,8 @@ struct Shared {
     missing: AtomicUsize,
     stop: AtomicBool,
     failure: Mutex<Option<String>>,
+    /// Every chunk is in and the memfd is sealed against writes.
+    sealed: AtomicBool,
     complete: Option<PathBuf>,
 }
 
@@ -162,7 +165,15 @@ impl LazyRam {
                 stored.size
             )));
         }
-        let fd = unsafe { libc::memfd_create(c"smolvm-lazy-ram".as_ptr(), libc::MFD_CLOEXEC) };
+        // Sealable and unsealed, as a restore base file reads to the snapshot
+        // code: a memfd that forbids sealing is taken for an older source's
+        // raw RAM, which restores differently.
+        let fd = unsafe {
+            libc::memfd_create(
+                c"smolvm-lazy-ram".as_ptr(),
+                libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+            )
+        };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -186,6 +197,7 @@ impl LazyRam {
                 missing: AtomicUsize::new(missing),
                 stop: AtomicBool::new(false),
                 failure: Mutex::new(None),
+                sealed: AtomicBool::new(false),
                 complete: d.complete,
             }),
         }))
@@ -247,7 +259,7 @@ pub fn wait_complete() -> io::Result<()> {
         if let Some(failure) = lock(&shared.failure).clone() {
             return Err(io::Error::other(format!("lazy RAM failed: {failure}")));
         }
-        if shared.missing.load(Ordering::Acquire) == 0 {
+        if shared.sealed.load(Ordering::Acquire) {
             return Ok(());
         }
         state = shared
@@ -450,7 +462,18 @@ fn fetch(shared: &Shared, i: usize) -> io::Result<()> {
         .write_all_at(&chunk, i as u64 * shared.stored.chunk_size)
 }
 
+/// Every chunk is in: seal the memfd so it can stand as an immutable
+/// generation a branch receives, then say so.
 fn finished(shared: &Shared) {
+    let seals = libc::F_SEAL_WRITE | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL;
+    if unsafe { libc::fcntl(shared.memfd.as_raw_fd(), libc::F_ADD_SEALS, seals) } < 0 {
+        let error = io::Error::last_os_error();
+        *lock(&shared.failure) = Some(format!("seal the restored RAM: {error}"));
+        shared.changed.notify_all();
+        return;
+    }
+    shared.sealed.store(true, Ordering::Release);
+    shared.changed.notify_all();
     if let Some(marker) = &shared.complete
         && let Err(error) = std::fs::write(marker, b"1\n")
     {
@@ -576,9 +599,39 @@ mod tests {
         memory.write_slice(&[0xee; 8], GuestAddress(0)).unwrap();
         wait_complete().unwrap();
         assert!(dir.path().join("complete").exists());
+        let seals = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) };
+        assert!(seals & libc::F_SEAL_WRITE != 0, "sealed once complete");
         let mut base = vec![0_u8; data.len()];
         file.read_exact_at(&mut base, 0).unwrap();
         assert_eq!(base, data);
+    }
+
+    #[test]
+    fn a_layered_generation_over_lazy_ram_sees_the_checkpoint() {
+        let _serial = lock(&SERIAL);
+        let dir = tempfile::tempdir().unwrap();
+        let data = stored(dir.path(), &[Some(4), None, Some(6)]);
+        let ram = LazyRam::open(dir.path(), data.len() as u64)
+            .unwrap()
+            .unwrap();
+        let descs = [crate::snapshot::MemoryRegionDesc {
+            gpa: 0,
+            len: data.len() as u64,
+        }];
+        let generation =
+            crate::layered_restore::Generation::from_immutable_file(&descs, ram.file()).unwrap();
+        // The memfd is all holes yet; a sparse mapping would miss it entirely.
+        let memory = generation.restore_dense().unwrap();
+        let region = memory.iter().next().unwrap();
+        let _pager = ram
+            .start(
+                &[(region.as_ptr() as u64, data.len() as u64, 0)],
+                UserfaultfdMode::UserModeTest,
+            )
+            .unwrap();
+        let mut read = vec![0_u8; data.len()];
+        memory.read_slice(&mut read, GuestAddress(0)).unwrap();
+        assert_eq!(read, data);
     }
 
     #[test]

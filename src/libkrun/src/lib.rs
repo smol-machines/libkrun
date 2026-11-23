@@ -1720,8 +1720,9 @@ fn lazy_ram_restore_ctx(
     }
     let generation = vmm::layered_restore::Generation::from_immutable_file(descs, lazy.file())
         .map_err(|error| format!("lazy RAM generation: {error}"))?;
+    // Mapped in full: the memfd's holes are where RAM has yet to arrive.
     let guest_memory = generation
-        .restore()
+        .restore_dense()
         .map_err(|error| format!("map lazy RAM: {error}"))?;
     let mut mappings = Vec::with_capacity(descs.len());
     let mut offset = 0_u64;
