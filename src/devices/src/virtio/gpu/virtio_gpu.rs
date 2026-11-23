@@ -1445,6 +1445,21 @@ impl VirtioGpu {
         Ok(OkNoData)
     }
 
+    /// Collects the contexts that have a fence the guest is still waiting on.
+    ///
+    /// Fences on the global ring are left out: no context owns them.
+    #[cfg(target_os = "linux")]
+    pub fn contexts_with_pending_fences(&self, ctx_ids: &mut Vec<u32>) {
+        ctx_ids.clear();
+        for desc in &self.fence_state.lock().unwrap().descs {
+            if let VirtioGpuRing::ContextSpecific { ctx_id, .. } = desc.ring
+                && !ctx_ids.contains(&ctx_id)
+            {
+                ctx_ids.push(ctx_id);
+            }
+        }
+    }
+
     pub fn process_fence(
         &mut self,
         ring: VirtioGpuRing,
