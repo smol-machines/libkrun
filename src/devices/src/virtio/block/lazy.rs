@@ -112,6 +112,53 @@ fn default_fetch_deadline() -> u64 {
     300
 }
 
+/// One file of a stored checkpoint: its size and the SHA-256 names of its
+/// chunks, `None` for a chunk of zeros.
+#[derive(Debug)]
+pub struct StoredFile {
+    pub chunk_size: u64,
+    pub size: u64,
+    pub chunks: Vec<Option<String>>,
+}
+
+impl StoredFile {
+    /// File `file` of the stored checkpoint whose index is at `index`.
+    pub fn read(index: &Path, file: &str) -> io::Result<Self> {
+        let parsed: Index = serde_json::from_slice(&std::fs::read(index)?)
+            .map_err(|e| invalid(format!("{}: {e}", index.display())))?;
+        if parsed.version != 1 || parsed.chunk_size == 0 {
+            return Err(invalid(
+                "stored checkpoint index version or chunk size is not supported",
+            ));
+        }
+        let found = parsed
+            .files
+            .into_iter()
+            .find(|f| f.path == file)
+            .ok_or_else(|| invalid(format!("the checkpoint has no file {file}")))?;
+        if found.chunks.len() as u64 != found.size.div_ceil(parsed.chunk_size) {
+            return Err(invalid(format!(
+                "{file}: chunk count does not match its size"
+            )));
+        }
+        if let Some(bad) = found.chunks.iter().flatten().find(|h| !is_sha256(h)) {
+            return Err(invalid(format!(
+                "{file}: object name {bad} is not a SHA-256"
+            )));
+        }
+        Ok(Self {
+            chunk_size: parsed.chunk_size,
+            size: found.size,
+            chunks: found.chunks,
+        })
+    }
+
+    /// Bytes chunk `i` holds; the last chunk may be short.
+    pub fn chunk_len(&self, i: usize) -> usize {
+        (self.size - i as u64 * self.chunk_size).min(self.chunk_size) as usize
+    }
+}
+
 /// The parts of a stored checkpoint's index this reads.
 #[derive(Debug, Deserialize)]
 struct Index {
@@ -199,30 +246,7 @@ impl LazyStorage {
                 d.version
             )));
         }
-        let index: Index = serde_json::from_slice(&std::fs::read(&d.index)?)
-            .map_err(|e| invalid(format!("{}: {e}", d.index.display())))?;
-        if index.version != 1 || index.chunk_size == 0 {
-            return Err(invalid(
-                "stored checkpoint index version or chunk size is not supported",
-            ));
-        }
-        let file = index
-            .files
-            .into_iter()
-            .find(|f| f.path == d.file)
-            .ok_or_else(|| invalid(format!("the checkpoint has no file {}", d.file)))?;
-        if file.chunks.len() as u64 != file.size.div_ceil(index.chunk_size) {
-            return Err(invalid(format!(
-                "{}: chunk count does not match its size",
-                d.file
-            )));
-        }
-        if let Some(bad) = file.chunks.iter().flatten().find(|h| !is_sha256(h)) {
-            return Err(invalid(format!(
-                "{}: object name {bad} is not a SHA-256",
-                d.file
-            )));
-        }
+        let file = StoredFile::read(&d.index, &d.file)?;
 
         // A cache whose presence record is intact resumes; anything else starts over.
         let present_path = PathBuf::from(format!("{}.present", d.cache.display()));
@@ -266,7 +290,7 @@ impl LazyStorage {
         let shared = Arc::new(Shared {
             image,
             objects: d.objects,
-            chunk_size: index.chunk_size,
+            chunk_size: file.chunk_size,
             size: file.size,
             chunks: file.chunks,
             cache,
@@ -488,7 +512,30 @@ fn fetch_into_cache(s: &Shared, i: usize) -> io::Result<()> {
         .expect("a missing chunk names its object");
     let offset = i as u64 * s.chunk_size;
     let expected = (s.size - offset).min(s.chunk_size) as usize;
-    let path = s.objects.join(hash);
+    let chunk = read_object(
+        &s.objects,
+        hash,
+        expected,
+        s.fetch_deadline,
+        &s.stop,
+        &s.image,
+    )?;
+    s.cache.write_all_at(&chunk, offset)
+}
+
+/// Read object `hash` from `objects` and return the `expected` bytes it holds,
+/// checked against its SHA-256 name. An object the store cannot supply yet is
+/// retried until `deadline` (or `stop`); one smolvm will not bring (its import
+/// failed) and a corrupt one fail at once. `what` names the reader in logs.
+pub fn read_object(
+    objects: &Path,
+    hash: &str,
+    expected: usize,
+    deadline: Duration,
+    stop: &AtomicBool,
+    what: &Path,
+) -> io::Result<Vec<u8>> {
+    let path = objects.join(hash);
     let started = Instant::now();
     let mut delay = Duration::from_millis(20);
     let mut warned = false;
@@ -496,15 +543,15 @@ fn fetch_into_cache(s: &Shared, i: usize) -> io::Result<()> {
         match std::fs::read(&path) {
             Ok(b) => break b,
             Err(e)
-                if started.elapsed() < s.fetch_deadline
-                    && !s.stop.load(Ordering::Relaxed)
-                    && !import_failed(&s.objects) =>
+                if started.elapsed() < deadline
+                    && !stop.load(Ordering::Relaxed)
+                    && !import_failed(objects) =>
             {
                 if !warned && started.elapsed() > Duration::from_secs(5) {
                     warned = true;
                     log::warn!(
-                        "lazy disk {}: object {hash} not available yet: {e}",
-                        s.image.display()
+                        "lazy {}: object {hash} not available yet: {e}",
+                        what.display()
                     );
                 }
                 std::thread::sleep(delay);
@@ -531,7 +578,7 @@ fn fetch_into_cache(s: &Shared, i: usize) -> io::Result<()> {
     if actual != hash {
         return Err(invalid(format!("object {hash} does not match its hash")));
     }
-    s.cache.write_all_at(&chunk, offset)
+    Ok(chunk)
 }
 
 impl Storage for LazyStorage {

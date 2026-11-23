@@ -577,6 +577,9 @@ pub fn create_demand_paged_memory(
     })
 }
 
+#[cfg(feature = "blk")]
+pub mod lazy;
+
 #[cfg(test)]
 mod tests {
     use super::*;

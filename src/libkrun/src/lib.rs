@@ -1704,6 +1704,54 @@ fn build_restore_ctx_with_memory(
     build_restore_ctx_with_memory_mode(dir, readonly_memory, layered_requested)
 }
 
+/// Restore guest RAM from the stored checkpoint smolvm named instead of a RAM
+/// image. Only a branchable machine restores this way: its RAM is a layered
+/// generation over the memfd being filled, so guest writes stay private and
+/// the memfd becomes the base its branches share.
+#[cfg(all(target_os = "linux", feature = "blk"))]
+fn lazy_ram_restore_ctx(
+    lazy: vmm::demand_paging::lazy::LazyRam,
+    descs: &[vmm::snapshot::MemoryRegionDesc],
+    checkpoint: Vec<u8>,
+) -> std::result::Result<vmm::builder::RestoreCtx, String> {
+    use vm_memory::{GuestAddress, GuestMemory, GuestMemoryRegion};
+    if std::env::var_os("SMOLVM_FORKABLE").is_none_or(|value| value != "1") {
+        return Err("lazy RAM restores only a branchable machine".into());
+    }
+    let generation = vmm::layered_restore::Generation::from_immutable_file(descs, lazy.file())
+        .map_err(|error| format!("lazy RAM generation: {error}"))?;
+    let guest_memory = generation
+        .restore()
+        .map_err(|error| format!("map lazy RAM: {error}"))?;
+    let mut mappings = Vec::with_capacity(descs.len());
+    let mut offset = 0_u64;
+    for desc in descs {
+        let region = guest_memory
+            .find_region(GuestAddress(desc.gpa))
+            .ok_or_else(|| format!("lazy RAM has no region at {:#x}", desc.gpa))?;
+        if region.len() != desc.len {
+            return Err(format!(
+                "lazy RAM region at {:#x} has the wrong length",
+                desc.gpa
+            ));
+        }
+        mappings.push((region.as_ptr() as u64, desc.len, offset));
+        offset += desc.len;
+    }
+    let pager = lazy
+        .start(&mappings, vmm::demand_paging::UserfaultfdMode::KernelFaults)
+        .map_err(|error| format!("start lazy RAM: {error}"))?;
+    Ok(vmm::builder::RestoreCtx {
+        demand_pager: Some(pager),
+        layered_ram: Some(generation),
+        guest_memory,
+        fork_backed_regions: vec![true; descs.len()],
+        checkpoint,
+        portable_clock: true,
+        cow_backing: Vec::new(),
+    })
+}
+
 #[cfg(fork_supported)]
 fn build_restore_ctx_with_memory_mode(
     dir: &std::path::Path,
@@ -1744,6 +1792,13 @@ fn build_restore_ctx_with_memory_mode(
         let descs = decode_portable_manifest(&manifest).map_err(|e| format!("manifest: {e}"))?;
         let checkpoint =
             std::fs::read(dir.join("checkpoint.bin")).map_err(|e| format!("checkpoint: {e}"))?;
+        #[cfg(all(target_os = "linux", feature = "blk"))]
+        if let Some(lazy) =
+            vmm::demand_paging::lazy::LazyRam::open(dir, vmm::snapshot::memory_image_len(&descs))
+                .map_err(|e| format!("lazy RAM: {e}"))?
+        {
+            return lazy_ram_restore_ctx(lazy, &descs, checkpoint);
+        }
         let memory_path = dir.join("memory.bin");
         let memory_file = if let Some(_file) = readonly_memory {
             #[cfg(target_os = "linux")]
@@ -1929,6 +1984,37 @@ type ControlStream = std::os::unix::net::UnixStream;
 #[cfg(windows)]
 type ControlStream = std::net::TcpStream;
 
+/// For a command that reads guest RAM through its backing files (a save, a
+/// checkpoint, a branch), wait until lazily restored RAM holds every chunk:
+/// until then those files lack what the guest has not touched. `Some` says
+/// why it never will.
+fn lazy_ram_unready(verb: &str) -> Option<String> {
+    let reads_backing = matches!(
+        verb,
+        "CHECKPOINT"
+            | "SAVE"
+            | "SAVE_UNSYNCED"
+            | "SAVE_FROZEN"
+            | "PREPARE_SAVE"
+            | "PREPARE_SAVE_HELD"
+            | "PREPARE_SAVE_LAYERED"
+            | "FINISH_SAVE"
+            | "FINISH_SAVE_STREAM"
+            | "FINISH_SAVE_SPARSE"
+            | "FORK"
+            | "FORK_CONTINUE"
+            | "FORK_CONTINUE_PAGED"
+    );
+    #[cfg(all(target_os = "linux", feature = "blk"))]
+    if reads_backing {
+        return vmm::demand_paging::lazy::wait_complete()
+            .err()
+            .map(|error| error.to_string());
+    }
+    let _ = reads_backing;
+    None
+}
+
 fn handle_control_stream(mut stream: ControlStream, vmm: &Arc<Mutex<vmm::Vmm>>) {
     let response = match read_control_command(&mut stream) {
         Ok(buf) if buf.is_empty() => "ERR EINVAL empty command\n".to_string(),
@@ -1943,7 +2029,9 @@ fn handle_control_stream(mut stream: ControlStream, vmm: &Arc<Mutex<vmm::Vmm>>) 
             // and those are cfg-gated out on aarch64-linux, where it'd otherwise
             // be an unused-variable error under -D warnings.
             let _arg = parts.next().map(str::trim).unwrap_or("");
+            let lazy_ram = lazy_ram_unready(&verb);
             match verb.as_str() {
+                _ if lazy_ram.is_some() => format!("ERR EIO {}\n", lazy_ram.unwrap()),
                 #[cfg(all(
                     any(target_os = "linux", target_os = "macos"),
                     any(target_arch = "x86_64", target_arch = "aarch64"),
