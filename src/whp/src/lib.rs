@@ -6,7 +6,7 @@
 use std::ffi::c_void;
 use std::fmt::{Display, Formatter};
 use std::mem::{self, MaybeUninit};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use log::{debug, error};
 use windows_sys::Win32::Foundation::{S_OK, WHV_E_INSUFFICIENT_BUFFER};
@@ -67,8 +67,10 @@ use windows_sys::Win32::System::Hypervisor::{
     WHvX64RegisterTscAux, WHvX64RegisterTscDeadline, WHvX64RegisterXCr0, WHvX64RegisterXfd,
     WHvX64RegisterXfdErr, WHvX64RegisterXss,
 };
+use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows_sys::core::HRESULT;
+use windows_sys::{s, w};
 
 #[derive(Debug)]
 pub enum Error {
@@ -80,6 +82,7 @@ pub enum Error {
     SetupPartition(i32),
     DeletePartition(i32),
     MapGpaRange(i32),
+    PopulateUnavailable,
     RequestInterrupt(i32),
     CreateVirtualProcessor(i32),
     DeleteVirtualProcessor(i32),
@@ -114,6 +117,7 @@ impl Display for Error {
             SetupPartition(hr) => write!(f, "WHvSetupPartition failed: HRESULT 0x{hr:08x}"),
             DeletePartition(hr) => write!(f, "WHvDeletePartition failed: HRESULT 0x{hr:08x}"),
             MapGpaRange(hr) => write!(f, "WHvMapGpaRange failed: HRESULT 0x{hr:08x}"),
+            PopulateUnavailable => write!(f, "WHP guest memory prefill is unavailable"),
             RequestInterrupt(hr) => write!(f, "WHvRequestInterrupt failed: HRESULT 0x{hr:08x}"),
             CreateVirtualProcessor(hr) => {
                 write!(f, "WHvCreateVirtualProcessor failed: HRESULT 0x{hr:08x}")
@@ -985,8 +989,37 @@ impl WhpVm {
     /// guest touch (`WHvAdviseGpaRange` populate).
     pub fn populate(&self, gpa: u64, size: u64, write: bool) -> Result<(), Error> {
         use windows_sys::Win32::System::Hypervisor::{
-            WHV_MEMORY_RANGE_ENTRY, WHvAdviseGpaRange, WHvAdviseGpaRangeCodePopulate,
+            WHV_ADVISE_GPA_RANGE_CODE, WHV_MEMORY_RANGE_ENTRY, WHvAdviseGpaRangeCodePopulate,
         };
+
+        type AdviseGpaRange = unsafe extern "system" fn(
+            WHV_PARTITION_HANDLE,
+            *const WHV_MEMORY_RANGE_ENTRY,
+            u32,
+            WHV_ADVISE_GPA_RANGE_CODE,
+            *const c_void,
+            u32,
+        ) -> HRESULT;
+        static ADVISE_GPA_RANGE: OnceLock<Option<AdviseGpaRange>> = OnceLock::new();
+
+        // Some Windows 10 builds lack this optional export. A static import
+        // would prevent the VM from loading even with prefill disabled.
+        let advise_gpa_range = ADVISE_GPA_RANGE
+            .get_or_init(|| {
+                // SAFETY: WinHvPlatform.dll is already loaded by the required WHP imports.
+                let platform = unsafe { GetModuleHandleW(w!("WinHvPlatform.dll")) };
+                if platform.is_null() {
+                    return None;
+                }
+                // SAFETY: the module handle and NUL-terminated export name are valid.
+                let entry = unsafe { GetProcAddress(platform, s!("WHvAdviseGpaRange")) }?;
+                // SAFETY: the named export has the AdviseGpaRange ABI.
+                Some(unsafe {
+                    mem::transmute::<unsafe extern "system" fn() -> isize, AdviseGpaRange>(entry)
+                })
+            })
+            .ok_or(Error::PopulateUnavailable)?;
+
         let range = WHV_MEMORY_RANGE_ENTRY {
             GuestAddress: gpa,
             SizeInBytes: size,
@@ -995,7 +1028,7 @@ impl WhpVm {
         let advice: [u32; 2] = [0, write as u32];
         // SAFETY: valid partition handle, one range entry, correctly sized buffer.
         let hr = unsafe {
-            WHvAdviseGpaRange(
+            advise_gpa_range(
                 self.handle,
                 &range,
                 1,
