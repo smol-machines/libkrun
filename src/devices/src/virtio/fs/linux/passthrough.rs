@@ -3128,6 +3128,11 @@ impl FileSystem for PassthroughFs {
         _exit_code: &Arc<AtomicI32>,
     ) -> io::Result<Vec<u8>> {
         const VIRTIO_IOC_MAGIC: u8 = b'v';
+        // `struct fsxattr`: five u32 fields and 8 bytes of padding.
+        const FSXATTR_SIZE: usize = 28;
+        const FS_IOC_GETFLAGS: u32 =
+            request_code_read!(b'f', 1, mem::size_of::<libc::c_long>()) as u32;
+        const FS_IOC_FSGETXATTR: u32 = request_code_read!(b'X', 31, FSXATTR_SIZE) as u32;
 
         const VIRTIO_IOC_TYPE_EXPORT_FD: u8 = 1;
         const VIRTIO_IOC_EXPORT_FD_SIZE: usize = 2 * mem::size_of::<u64>();
@@ -3167,7 +3172,47 @@ impl FileSystem for PassthroughFs {
                 ret.extend_from_slice(&handle.to_ne_bytes());
                 Ok(ret)
             }
-            _ => Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP)),
+            // The file-attribute reads a guest's vfs_fileattr_get() makes, as
+            // overlayfs does on every copy-up: answer them from the host file.
+            FS_IOC_GETFLAGS | FS_IOC_FSGETXATTR => {
+                // The guest's handle when it is one of ours (a regular file it
+                // opened); a directory's comes from opendir, so open the inode.
+                let opened = {
+                    let handles = self.handles.read().unwrap();
+                    handles
+                        .get(&handle)
+                        .filter(|hd| hd.inode == inode)
+                        .map(|hd| hd.file.read().unwrap().try_clone())
+                };
+                let file = match opened {
+                    Some(file) => file?,
+                    None => self.open_inode(inode, libc::O_RDONLY | libc::O_NONBLOCK)?,
+                };
+                // FS_IOC_GETFLAGS is declared with a long but reads an int;
+                // size the buffer for either and return what the guest asked.
+                let mut buf = vec![0u8; (out_size as usize).max(FSXATTR_SIZE)];
+                // SAFETY: both requests write at most FSXATTR_SIZE bytes into
+                // `buf`, which is at least that long, through a valid fd.
+                let ret = unsafe { libc::ioctl(file.as_raw_fd(), cmd as _, buf.as_mut_ptr()) };
+                if ret < 0 {
+                    let error = io::Error::last_os_error();
+                    // A host filesystem without file attributes: tell the
+                    // guest the way a local one would.
+                    return Err(match error.raw_os_error() {
+                        Some(libc::EOPNOTSUPP) | Some(libc::ENOTTY) => {
+                            io::Error::from_raw_os_error(libc::ENOTTY)
+                        }
+                        _ => error,
+                    });
+                }
+                buf.truncate(out_size as usize);
+                Ok(buf)
+            }
+            // Not a request this filesystem implements. ENOTTY is what a local
+            // filesystem answers, and what overlayfs copy-up (and other callers
+            // probing for optional ioctls) take as "not supported here";
+            // EOPNOTSUPP makes a guest kernel's overlayfs copy-up fail.
+            _ => Err(io::Error::from_raw_os_error(libc::ENOTTY)),
         }
     }
 }
