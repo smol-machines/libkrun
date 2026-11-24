@@ -41,7 +41,9 @@ pub fn arch_memory_regions(
         ram_last_addr,
         shm_start_addr,
         page_size,
-        initrd_addr: ram_last_addr - layout::FDT_MAX_SIZE as u64 - initrd_size,
+        // The kernel requires the initrd to start on a page boundary.
+        initrd_addr: (ram_last_addr - layout::FDT_MAX_SIZE as u64 - initrd_size)
+            & !(page_size as u64 - 1),
         firmware_addr: FIRMWARE_START,
     };
     let regions = vec![(GuestAddress(layout::DRAM_MEM_START), dram_size)];

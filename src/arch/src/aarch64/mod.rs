@@ -72,7 +72,8 @@ pub fn arch_memory_regions(
         shm_start_addr,
         page_size,
         fdt_addr,
-        initrd_addr: fdt_addr - initrd_size,
+        // The kernel requires the initrd to start on a page boundary.
+        initrd_addr: (fdt_addr - initrd_size) & !(page_size as u64 - 1),
         firmware_addr: FIRMWARE_START,
     };
     let regions = if let Some(firmware_size) = firmware_size {
