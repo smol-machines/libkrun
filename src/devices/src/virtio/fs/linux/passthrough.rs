@@ -3175,6 +3175,11 @@ impl FileSystem for PassthroughFs {
             // The file-attribute reads a guest's vfs_fileattr_get() makes, as
             // overlayfs does on every copy-up: answer them from the host file.
             FS_IOC_GETFLAGS | FS_IOC_FSGETXATTR => {
+                // Best effort: when the host cannot answer (an inode this
+                // process may not open, a filesystem without attributes),
+                // ENOTTY tells the guest there are none, which overlayfs
+                // copy-up takes as nothing to copy, as before.
+                let no_attributes = || io::Error::from_raw_os_error(libc::ENOTTY);
                 // The guest's handle when it is one of ours (a regular file it
                 // opened); a directory's comes from opendir, so open the inode.
                 let opened = {
@@ -3185,9 +3190,10 @@ impl FileSystem for PassthroughFs {
                         .map(|hd| hd.file.read().unwrap().try_clone())
                 };
                 let file = match opened {
-                    Some(file) => file?,
-                    None => self.open_inode(inode, libc::O_RDONLY | libc::O_NONBLOCK)?,
-                };
+                    Some(file) => file,
+                    None => self.open_inode(inode, libc::O_RDONLY | libc::O_NONBLOCK),
+                }
+                .map_err(|_| no_attributes())?;
                 // FS_IOC_GETFLAGS is declared with a long but reads an int;
                 // size the buffer for either and return what the guest asked.
                 let mut buf = vec![0u8; (out_size as usize).max(FSXATTR_SIZE)];
@@ -3195,15 +3201,7 @@ impl FileSystem for PassthroughFs {
                 // `buf`, which is at least that long, through a valid fd.
                 let ret = unsafe { libc::ioctl(file.as_raw_fd(), cmd as _, buf.as_mut_ptr()) };
                 if ret < 0 {
-                    let error = io::Error::last_os_error();
-                    // A host filesystem without file attributes: tell the
-                    // guest the way a local one would.
-                    return Err(match error.raw_os_error() {
-                        Some(libc::EOPNOTSUPP) | Some(libc::ENOTTY) => {
-                            io::Error::from_raw_os_error(libc::ENOTTY)
-                        }
-                        _ => error,
-                    });
+                    return Err(no_attributes());
                 }
                 buf.truncate(out_size as usize);
                 Ok(buf)
