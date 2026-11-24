@@ -87,6 +87,26 @@ fn get_page_size() -> usize {
     sysinfo.dwPageSize as usize
 }
 
+/// Where the initrd goes: at the top of the RAM below the 32-bit MMIO gap, on
+/// a page boundary. The boot protocol's ramdisk address is 32 bits (the high
+/// half needs ext_ramdisk_image, which is not set), so an initrd above 4 GiB
+/// would be read from the wrong place; and the kernel frees the initrd's pages
+/// after unpacking it, so its start must be page-aligned.
+fn initrd_addr(
+    ram_below_gap: u64,
+    ram_above_gap: u64,
+    ram_last_addr: u64,
+    initrd_size: u64,
+    page_size: usize,
+) -> u64 {
+    let top = if ram_above_gap > 0 {
+        ram_below_gap
+    } else {
+        ram_last_addr
+    };
+    (top - initrd_size) & !(page_size as u64 - 1)
+}
+
 /// Returns a Vec of the valid memory addresses.
 /// These should be used to configure the GuestMemoryMmap structure for the platform.
 /// Make a hole for the kernel region that will be injected directly from libkrunfw's
@@ -196,7 +216,13 @@ pub fn arch_memory_regions(
         ram_last_addr,
         shm_start_addr,
         page_size,
-        initrd_addr: ram_last_addr - initrd_size,
+        initrd_addr: initrd_addr(
+            ram_below_gap,
+            ram_above_gap,
+            ram_last_addr,
+            initrd_size,
+            page_size,
+        ),
         firmware_addr,
     };
     (info, regions)
@@ -537,6 +563,31 @@ mod tests {
             regions[1].0
         );
         assert_eq!(GuestAddress(1u64 << 32), regions[2].0);
+    }
+
+    #[test]
+    fn initrd_starts_on_a_page_boundary() {
+        // An initrd whose size is not a page multiple, as a dracut one rarely
+        // is: the kernel warns and drops it when its start is not aligned.
+        let (info, _) = arch_memory_regions(
+            1usize << 29,
+            Some(KERNEL_LOAD_ADDR),
+            KERNEL_SIZE,
+            0x3c4_8165,
+            None,
+        );
+        assert_eq!(info.initrd_addr % 4096, 0);
+        assert!(info.initrd_addr + 0x3c4_8165 <= info.ram_last_addr);
+    }
+
+    #[test]
+    fn initrd_stays_below_4gib_when_ram_extends_past_the_gap() {
+        // 4 GiB of RAM runs past the MMIO gap: the initrd still has to be
+        // reachable through the boot protocol's 32-bit ramdisk address.
+        let (info, _) = arch_memory_regions(4 << 30, None, 0, 0x3c4_8165, None);
+        assert!(info.ram_last_addr > FIRST_ADDR_PAST_32BITS);
+        assert_eq!(info.initrd_addr % 4096, 0);
+        assert!(info.initrd_addr + 0x3c4_8165 <= MMIO_MEM_START);
     }
 
     #[test]
