@@ -133,6 +133,8 @@ pub enum StartMicrovmError {
     HostNetwork(&'static str),
     /// Unable to attach block device to Vmm.
     AttachBlockDevice(io::Error),
+    /// Unable to attach the TPM.
+    AttachTpm(io::Error),
     #[cfg(target_os = "macos")]
     /// Failed to create HVF in-kernel IrqChip.
     CreateHvfIrqChip(hvf::Error),
@@ -265,6 +267,7 @@ impl Display for StartMicrovmError {
             AttachBlockDevice(ref err) => {
                 write!(f, "Unable to attach block device to Vmm. Error: {err}")
             }
+            AttachTpm(ref err) => write!(f, "Unable to attach the TPM: {err}"),
             #[cfg(target_os = "macos")]
             CreateHvfIrqChip(ref err) => {
                 write!(f, "Cannot create HVF in-kernel IrqChip: {err}")
@@ -1673,6 +1676,25 @@ pub fn build_microvm(
             Some(console_cfg),
             console_id as u32,
         )?;
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    if let Some(socket) = &vm_resources.tpm_socket {
+        let backend =
+            devices::legacy::SwtpmSocket::connect(socket).map_err(StartMicrovmError::AttachTpm)?;
+        vmm.mmio_device_manager
+            .bus
+            .insert(
+                Arc::new(Mutex::new(devices::legacy::TpmTis::new(Box::new(backend)))),
+                devices::legacy::TPM_TIS_ADDR,
+                devices::legacy::TPM_TIS_SIZE,
+            )
+            .map_err(|e| StartMicrovmError::AttachTpm(io::Error::other(format!("{e:?}"))))?;
+        // No ACPI table names it: have the driver probe the standard address,
+        // and poll, as nothing raises its interrupt.
+        vmm.kernel_cmdline
+            .insert_str("tpm_tis.force=1 tpm_tis.interrupts=0")
+            .map_err(|e| StartMicrovmError::AttachTpm(io::Error::other(format!("{e:?}"))))?;
     }
 
     #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]

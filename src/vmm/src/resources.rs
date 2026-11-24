@@ -238,6 +238,8 @@ pub struct VmResources {
     pub split_irqchip: bool,
     /// The console id to use for console= in the kernel cmdline
     pub kernel_console: Option<String>,
+    /// swtpm's control socket: attach a TPM 2.0 (TIS) backed by it.
+    pub tpm_socket: Option<std::path::PathBuf>,
     /// Serial consoles to attach to the guest
     pub serial_consoles: Vec<SerialConsoleConfig>,
     /// Virtio consoles to attach to the guest
@@ -486,6 +488,7 @@ mod tests {
             serial_consoles: Vec::new(),
             virtio_consoles: Vec::new(),
             kernel_console: None,
+            tpm_socket: None,
             #[cfg(target_os = "windows")]
             console_output: None,
             #[cfg(target_os = "windows")]

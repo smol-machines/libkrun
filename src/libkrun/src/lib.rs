@@ -4614,6 +4614,24 @@ pub unsafe extern "C" fn krun_set_console_output(ctx_id: u32, c_filepath: *const
     }
 }
 
+/// Attach a TPM 2.0 with the TIS interface, served by swtpm through its
+/// control socket at `c_socket_path` (`swtpm socket --tpm2 --ctrl
+/// type=unixio,path=...`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn krun_set_tpm_socket(ctx_id: u32, c_socket_path: *const c_char) -> i32 {
+    let path = match unsafe { CStr::from_ptr(c_socket_path) }.to_str() {
+        Ok(path) => PathBuf::from(path),
+        Err(_) => return -libc::EINVAL,
+    };
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            ctx_cfg.get_mut().vmr.tpm_socket = Some(path);
+            KRUN_SUCCESS
+        }
+        Entry::Vacant(_) => -libc::ENOENT,
+    }
+}
+
 #[allow(unused_assignments)]
 #[unsafe(no_mangle)]
 pub extern "C" fn krun_get_shutdown_eventfd(ctx_id: u32) -> i32 {

@@ -32,6 +32,8 @@ mod kvmioapic;
 mod pit;
 #[cfg(target_arch = "aarch64")]
 mod rtc_pl031;
+#[cfg(unix)]
+mod tpm_tis;
 #[cfg(target_os = "macos")]
 mod vcpu;
 #[cfg(target_arch = "x86_64")]
@@ -51,7 +53,6 @@ mod riscv64;
 #[cfg(target_arch = "riscv64")]
 use riscv64::serial;
 
-#[cfg(target_arch = "x86_64")]
 pub use self::cmos::Cmos;
 #[cfg(target_os = "macos")]
 pub use self::gicv3::GicV3;
@@ -81,6 +82,9 @@ pub use self::pit::Pit;
 #[cfg(target_arch = "aarch64")]
 pub use self::rtc_pl031::RTC;
 pub use self::serial::Serial;
+#[cfg(target_arch = "x86_64")]
+#[cfg(unix)]
+pub use self::tpm_tis::{SwtpmSocket, TPM_TIS_ADDR, TPM_TIS_SIZE, TpmBackend, TpmTis};
 #[cfg(target_os = "macos")]
 pub use self::vcpu::VcpuList;
 
