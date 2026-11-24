@@ -1157,6 +1157,17 @@ int32_t krun_get_shutdown_eventfd(uint32_t ctx_id);
 int32_t krun_set_console_output(uint32_t ctx_id, const char *c_filepath);
 
 /**
+ * Attaches a TPM 2.0 with the TIS (FIFO) interface, served by swtpm through
+ * its control socket at "socket_path" ("swtpm socket --tpm2 --ctrl
+ * type=unixio,path=..."), as QEMU's tpm-emulator backend uses it.
+ * Linux x86_64 hosts only for now.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ */
+int32_t krun_set_tpm_socket(uint32_t ctx_id, const char *socket_path);
+
+/**
  * Configures a Unix stream socket used to control a running microVM.
  *
  * The socket is created by the VMM process after the microVM is built and before

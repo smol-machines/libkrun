@@ -57,7 +57,7 @@ imago = { version = "0.2.3", features = ["sync-wrappers", "vm-memory"] }
 tokio = { version = "1", features = ["rt"] }
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.30.1", features = ["ioctl", "net", "poll", "socket", "fs"] }
+nix = { version = "0.30.1", features = ["ioctl", "net", "poll", "socket", "fs", "uio"] }
 # vm-memory's `rawfd` feature provides FileReadWriteVolatile (read_volatile/
 # write_volatile) on file descriptors, used by the console port I/O. It is
 # Unix-only (vm-memory hard-errors on `rawfd` for Windows targets), so enable it
