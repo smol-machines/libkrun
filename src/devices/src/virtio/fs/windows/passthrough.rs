@@ -1467,10 +1467,7 @@ impl PassthroughFs {
             let Some(data) = self.inodes.read().unwrap().get(&snap.nodeid).cloned() else {
                 continue;
             };
-            let mut flags = parse_linux_open_flags(
-                snap.flags & !(LINUX_O_CREAT | LINUX_O_TRUNC | LINUX_O_EXCL),
-                state.writeback,
-            );
+            let mut flags = parse_linux_open_flags(snap.reopen_flags(), state.writeback);
             flags.create_disposition = FILE_OPEN;
             let root_h = *self.root_handle.read().unwrap();
             match open_by_id(root_h, data.file_index, &flags)

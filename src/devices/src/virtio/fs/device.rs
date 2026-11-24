@@ -147,13 +147,24 @@ pub struct FuseInodeSnap {
     pub share: Option<u64>,
 }
 
-/// One open FUSE handle: the guest's fh, its owning nodeid, and the open flags
-/// it was created with (so it can be re-opened against the rebuilt inode).
+/// One open FUSE handle: the guest's fh, its owning nodeid, and open flags in
+/// the Linux guest encoding, independent of the host that captured them.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FuseHandleSnap {
     pub handle: u64,
     pub nodeid: u64,
     pub flags: i32,
+}
+
+impl FuseHandleSnap {
+    /// Restore opens the existing inode; creation flags from a source handle
+    /// must never truncate it or try to create it a second time.
+    pub(crate) fn reopen_flags(&self) -> i32 {
+        self.flags
+            & !(super::bindings::LINUX_O_CREAT
+                | super::bindings::LINUX_O_TRUNC
+                | super::bindings::LINUX_O_EXCL)
+    }
 }
 
 /// One active DAX window mapping (a SETUPMAPPING the guest has not removed):
