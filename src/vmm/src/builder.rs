@@ -962,6 +962,18 @@ pub fn build_microvm(
     #[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
     #[allow(unused_mut)]
     let mut vm = setup_vm(&guest_memory, vm_resources.nested_enabled)?;
+    // Intel GPU memory mapped into the guest keeps the cache type the host
+    // driver needs only if KVM applies the guest's PAT. Hosts without an
+    // Intel GPU keep KVM's default.
+    #[cfg(all(
+        feature = "gpu",
+        target_os = "linux",
+        target_arch = "x86_64",
+        not(feature = "tee")
+    ))]
+    if vm_resources.gpu_virgl_flags.is_some() && host_has_intel_gpu() {
+        vm.honor_guest_pat();
+    }
     // WHP needs the virtual-processor count at partition-creation time.
     #[cfg(all(not(feature = "tee"), target_os = "windows"))]
     #[allow(unused_mut)]
@@ -1906,6 +1918,34 @@ pub fn build_microvm(
     vmm_timing!("build_microvm complete");
 
     Ok(vmm)
+}
+
+/// Whether a GPU from Intel has a render node on this host.
+#[cfg(all(
+    feature = "gpu",
+    target_os = "linux",
+    target_arch = "x86_64",
+    not(feature = "tee")
+))]
+fn host_has_intel_gpu() -> bool {
+    has_intel_render_node("/sys/class/drm")
+}
+
+#[cfg(all(
+    feature = "gpu",
+    target_os = "linux",
+    target_arch = "x86_64",
+    not(feature = "tee")
+))]
+fn has_intel_render_node(drm_dir: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(drm_dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry.file_name().to_string_lossy().starts_with("renderD")
+            && std::fs::read_to_string(entry.path().join("device/vendor"))
+                .is_ok_and(|vendor| vendor.trim() == "0x8086")
+    })
 }
 
 fn load_external_kernel(
@@ -4383,6 +4423,30 @@ fn attach_input_devices(
 
 #[cfg(test)]
 pub mod tests {
+
+    /// Only a render node whose device is from Intel counts.
+    #[cfg(all(
+        feature = "gpu",
+        target_os = "linux",
+        target_arch = "x86_64",
+        not(feature = "tee")
+    ))]
+    #[test]
+    fn intel_render_node_is_found_by_vendor() {
+        let drm = tempfile::tempdir().unwrap();
+        let add = |node: &str, vendor: &str| {
+            let device = drm.path().join(node).join("device");
+            std::fs::create_dir_all(&device).unwrap();
+            std::fs::write(device.join("vendor"), vendor).unwrap();
+        };
+        let found = || super::has_intel_render_node(drm.path().to_str().unwrap());
+        assert!(!found());
+        add("renderD128", "0x10de\n");
+        add("card1", "0x8086\n");
+        assert!(!found());
+        add("renderD129", "0x8086\n");
+        assert!(found());
+    }
 
     /// SIGTERM ends the VMM through its exit event; a handler that cannot
     /// write the event leaves the process running until it is killed.
