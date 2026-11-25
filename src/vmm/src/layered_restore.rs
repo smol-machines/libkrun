@@ -905,47 +905,119 @@ unsafe fn map_extent_data(base: *mut u8, extent: &Extent, dense: bool) -> io::Re
     Ok(())
 }
 
-/// The runs of `file[offset .. offset + len]` that hold data, relative to
-/// `offset`, widened to whole pages (a backing's block can be smaller than a
-/// host page) and merged. A file system that cannot report holes is taken to
-/// be all data, which maps the whole range as before.
-fn data_runs(file: &File, offset: u64, len: usize, page: usize) -> io::Result<Vec<(usize, usize)>> {
+/// The data runs of a write-sealed backing, scanned once: the kernel guarantees
+/// a sealed memfd (every delta a capture makes) never changes, so its runs
+/// never do. Scanning them again for every extent of every capture
+/// and every branch's restore walked the page cache with `SEEK_DATA` and
+/// `SEEK_HOLE` thousands of times per branch: a 16 GiB source branched a few
+/// hundred times took minutes per capture, and its branches missed their boot
+/// deadline. `None` is a file system that cannot report holes.
+type FileRuns = Option<Arc<Vec<(u64, u64)>>>;
+
+/// Cached runs by backing, keyed by the `Arc`'s address. The `Weak` is checked
+/// on every lookup, so a backing that was dropped, or a new one allocated at a
+/// reused address, is scanned afresh rather than handed another file's runs.
+type RunsByBacking = std::collections::HashMap<usize, (std::sync::Weak<File>, FileRuns)>;
+static BACKING_RUNS: std::sync::LazyLock<std::sync::Mutex<RunsByBacking>> =
+    std::sync::LazyLock::new(Default::default);
+
+thread_local! {
+    /// Full-file scans made on this thread: a test can tell a cached answer
+    /// from a new scan without counting other tests' scans.
+    static BACKING_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn backing_runs(file: &Arc<File>) -> io::Result<FileRuns> {
+    // Only a write-sealed memfd (every delta a capture makes) is guaranteed not
+    // to change. Anything else, such as a restore base on disk or RAM still
+    // arriving lazily, is scanned on every call as before: a cached answer for
+    // a file still being written would map data that arrived later as zeros.
+    // SAFETY: fcntl on a descriptor this function borrows.
+    let seals = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) };
+    if seals < 0 || seals & libc::F_SEAL_WRITE == 0 {
+        return scan_file_runs(file);
+    }
+    let key = Arc::as_ptr(file) as usize;
+    {
+        let cache = BACKING_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((weak, runs)) = cache.get(&key)
+            && weak
+                .upgrade()
+                .is_some_and(|cached| Arc::ptr_eq(&cached, file))
+        {
+            return Ok(runs.clone());
+        }
+    }
+    // Scanned outside the lock: two restores of a new backing may both scan it,
+    // which costs time but not correctness.
+    let runs = scan_file_runs(file)?;
+    let mut cache = BACKING_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+    cache.retain(|_, (weak, _)| weak.strong_count() > 0);
+    cache.insert(key, (Arc::downgrade(file), runs.clone()));
+    Ok(runs)
+}
+
+/// Every data run of `file`, in absolute offsets.
+fn scan_file_runs(file: &File) -> io::Result<FileRuns> {
+    BACKING_SCANS.with(|scans| scans.set(scans.get() + 1));
     let fd = file.as_raw_fd();
-    let end = offset + len as u64;
-    let mut runs: Vec<(usize, usize)> = Vec::new();
-    let mut cursor = offset;
-    while cursor < end {
+    let size = file.metadata()?.len();
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    let mut cursor = 0u64;
+    while cursor < size {
         // SAFETY: lseek on a descriptor this function borrows.
         let data = unsafe { libc::lseek(fd, cursor as libc::off_t, libc::SEEK_DATA) };
         if data < 0 {
             let error = io::Error::last_os_error();
             return match error.raw_os_error() {
                 // No data at or after `cursor`.
-                Some(libc::ENXIO) => Ok(runs),
-                // Holes cannot be reported here: map everything.
-                Some(libc::EINVAL) | Some(libc::EOPNOTSUPP) if runs.is_empty() => {
-                    Ok(vec![(0, len)])
-                }
+                Some(libc::ENXIO) => Ok(Some(Arc::new(runs))),
+                // Holes cannot be reported here.
+                Some(libc::EINVAL) | Some(libc::EOPNOTSUPP) if runs.is_empty() => Ok(None),
                 _ => Err(error),
             };
         }
         let data = data as u64;
-        if data >= end {
-            break;
-        }
         // SAFETY: as above.
         let hole = unsafe { libc::lseek(fd, data as libc::off_t, libc::SEEK_HOLE) };
         if hole < 0 {
             return Err(io::Error::last_os_error());
         }
-        let hole = (hole as u64).min(end);
+        let hole = hole as u64;
+        runs.push((data, hole));
+        cursor = hole;
+    }
+    Ok(Some(Arc::new(runs)))
+}
+
+/// The runs of `file[offset .. offset + len]` that hold data, relative to
+/// `offset`, widened to whole pages (a backing's block can be smaller than a
+/// host page) and merged. A file system that cannot report holes is taken to
+/// be all data, which maps the whole range as before.
+fn data_runs(
+    file: &Arc<File>,
+    offset: u64,
+    len: usize,
+    page: usize,
+) -> io::Result<Vec<(usize, usize)>> {
+    let Some(all) = backing_runs(file)? else {
+        return Ok(vec![(0, len)]);
+    };
+    let end = offset + len as u64;
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let first = all.partition_point(|&(_, hole)| hole <= offset);
+    for &(data, hole) in &all[first..] {
+        if data >= end {
+            break;
+        }
+        let data = data.max(offset);
+        let hole = hole.min(end);
         let start = (((data - offset) as usize) / page) * page;
         let stop = (((hole - offset) as usize).div_ceil(page) * page).min(len);
         match runs.last_mut() {
             Some(last) if last.1 >= start => last.1 = last.1.max(stop),
             _ => runs.push((start, stop)),
         }
-        cursor = hole;
     }
     Ok(runs)
 }
@@ -3662,6 +3734,7 @@ fn data_runs_cover_whole_pages_of_data_only() {
     file.write_all_at(&[1], (2 * page + 10) as u64).unwrap();
     file.write_all_at(&vec![1; page + 1], (5 * page) as u64)
         .unwrap();
+    let file = Arc::new(file);
     assert_eq!(
         data_runs(&file, 0, 8 * page, page).unwrap(),
         vec![(2 * page, 3 * page), (5 * page, 7 * page)]
@@ -3675,5 +3748,61 @@ fn data_runs_cover_whole_pages_of_data_only() {
         data_runs(&file, (3 * page) as u64, 2 * page, page)
             .unwrap()
             .is_empty()
+    );
+}
+
+#[test]
+fn a_backings_data_runs_are_scanned_once_and_never_handed_to_another_backing() {
+    let page = host_page_size();
+    let seal = |file: &File| {
+        let seals = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK;
+        assert!(unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, seals) } >= 0);
+    };
+    let first = crate::builder::create_guest_ram_memfd(8 * page).unwrap();
+    first.write_all_at(&[1], page as u64).unwrap();
+    seal(&first);
+    let first = Arc::new(first);
+    let scans = || BACKING_SCANS.with(|scans| scans.get());
+    let before = scans();
+    assert_eq!(
+        data_runs(&first, 0, 8 * page, page).unwrap(),
+        vec![(page, 2 * page)]
+    );
+    // Every later extent of the same backing reads the cached runs.
+    for _ in 0..100 {
+        assert_eq!(
+            data_runs(&first, page as u64, 4 * page, page).unwrap(),
+            vec![(0, page)]
+        );
+    }
+    assert_eq!(
+        scans() - before,
+        1,
+        "one scan for the backing, however many extents"
+    );
+    // Another backing has its own runs, even when it reuses the first one's address.
+    drop(first);
+    let second = crate::builder::create_guest_ram_memfd(8 * page).unwrap();
+    second.write_all_at(&[1], (6 * page) as u64).unwrap();
+    seal(&second);
+    let second = Arc::new(second);
+    assert_eq!(
+        data_runs(&second, 0, 8 * page, page).unwrap(),
+        vec![(6 * page, 7 * page)]
+    );
+}
+
+/// A backing that is not write-sealed may still be filling (RAM restored
+/// lazily, a base being written): it is scanned every time, so data that
+/// arrives after a first look is mapped, not served as zeros.
+#[test]
+fn an_unsealed_backing_is_scanned_on_every_call() {
+    let page = host_page_size();
+    let file = Arc::new(crate::builder::create_guest_ram_memfd(8 * page).unwrap());
+    assert!(data_runs(&file, 0, 8 * page, page).unwrap().is_empty());
+    file.write_all_at(&[1], (3 * page) as u64).unwrap();
+    assert_eq!(
+        data_runs(&file, 0, 8 * page, page).unwrap(),
+        vec![(3 * page, 4 * page)]
     );
 }
