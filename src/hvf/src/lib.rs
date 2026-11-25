@@ -94,6 +94,8 @@ const CNTHCTL_EL2_BITS: u64 = CNTHCTL_EL0VCTEN | CNTHCTL_EL0PCTEN;
 const AA64PFR0_EL1_EL2EN: u64 = 1 << 8;
 const AA64PFR0_EL1_GIC3EN: u64 = 1 << 24;
 const AA64PFR1_EL1_SMEMASK: u64 = 3 << 24;
+const AA64DFR0_EL1_PMUVER_MASK: u64 = 0xf << 8;
+const AA64DFR0_EL1_PMUVER_PMUV3: u64 = 1 << 8;
 
 /// PSCI and SMCCC's NOT_SUPPORTED (-1) as the guest reads it in X0.
 const PSCI_RET_NOT_SUPPORTED: u64 = u64::MAX;
@@ -1287,6 +1289,34 @@ impl HvfVcpu<'_> {
             if ret != HV_SUCCESS {
                 return Err(Error::VcpuInitialRegisters);
             }
+
+            // With EL2 enabled and no PMU advertised, the framework answers a
+            // PMU register access with an undefined instruction exception,
+            // and stops the whole process when the access comes from a
+            // nested guest. With a PMU advertised it emulates the registers.
+            let val: u64 = 0;
+            let ret = unsafe {
+                hv_vcpu_get_sys_reg(
+                    self.vcpuid,
+                    hv_sys_reg_t_HV_SYS_REG_ID_AA64DFR0_EL1,
+                    &val as *const _ as *mut _,
+                )
+            };
+            if ret != HV_SUCCESS {
+                return Err(Error::VcpuInitialRegisters);
+            }
+            if val & AA64DFR0_EL1_PMUVER_MASK == 0 {
+                let ret = unsafe {
+                    hv_vcpu_set_sys_reg(
+                        self.vcpuid,
+                        hv_sys_reg_t_HV_SYS_REG_ID_AA64DFR0_EL1,
+                        val | AA64DFR0_EL1_PMUVER_PMUV3,
+                    )
+                };
+                if ret != HV_SUCCESS {
+                    return Err(Error::VcpuInitialRegisters);
+                }
+            }
         } else {
             let ret = unsafe {
                 hv_vcpu_set_reg(self.vcpuid, hv_reg_t_HV_REG_CPSR, PSTATE_EL1_FAULT_BITS_64)
@@ -1577,12 +1607,18 @@ impl HvfVcpu<'_> {
                             self.write_reg(rt, val)?;
                             Ok(VcpuExit::SystemRegister)
                         }
-                        None => panic!(
-                            "UNKNOWN rt={}, reg={} name={}",
-                            rt,
-                            reg,
-                            sys_reg_name(reg).unwrap_or("unknown sysreg")
-                        ),
+                        // A register nobody emulates reads as zero. Stopping
+                        // here would leave the guest with a dead vCPU.
+                        None => {
+                            warn!(
+                                "vcpu[{}]: read of unhandled system register {} ({})",
+                                self.vcpuid,
+                                reg,
+                                sys_reg_name(reg).unwrap_or("unknown sysreg")
+                            );
+                            self.write_reg(rt, 0)?;
+                            Ok(VcpuExit::SystemRegister)
+                        }
                     }
                 } else {
                     assert!(rt < 32);
@@ -1593,11 +1629,13 @@ impl HvfVcpu<'_> {
                     if vcpu_list.handle_sysreg_write(self.vcpuid, reg, val) {
                         Ok(VcpuExit::SystemRegister)
                     } else {
-                        panic!(
-                            "unexpected write: {} name={}",
+                        warn!(
+                            "vcpu[{}]: write to unhandled system register {} ({}) ignored",
+                            self.vcpuid,
                             reg,
                             sys_reg_name(reg).unwrap_or("unknown sysreg")
                         );
+                        Ok(VcpuExit::SystemRegister)
                     }
                 }
             }

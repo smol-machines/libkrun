@@ -411,6 +411,11 @@ impl Vcpu {
         self.mpidr
     }
 
+    /// Whether this vCPU runs with nested virtualization.
+    pub fn nested_enabled(&self) -> bool {
+        self.nested_enabled
+    }
+
     /// Sets a MMIO bus for this vcpu.
     pub fn set_mmio_bus(&mut self, mmio_bus: devices::Bus) {
         self.mmio_bus = Some(mmio_bus);

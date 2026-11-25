@@ -2750,6 +2750,12 @@ impl Vmm {
         #[cfg(target_arch = "aarch64")]
         {
             let vcpu_mpidr = vcpus.iter().map(|cpu| cpu.get_mpidr()).collect();
+            // On macOS a vCPU with nested virtualization advertises a PMU.
+            // The guest needs the node to offer one to its own guests.
+            #[cfg(target_os = "macos")]
+            let pmu = vcpus.iter().any(Vcpu::nested_enabled);
+            #[cfg(not(target_os = "macos"))]
+            let pmu = false;
             fdt::create_fdt(
                 &self.guest_memory,
                 &self.arch_memory_info,
@@ -2758,6 +2764,7 @@ impl Vmm {
                 self.mmio_device_manager.get_device_info(),
                 _intc,
                 initrd,
+                pmu,
             )
             .map_err(Error::SetupFDT)?;
         }
