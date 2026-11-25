@@ -1121,7 +1121,9 @@ impl Vmm {
             .map(|topology| (self.vcpus_handles.len(), topology.capacity))
             .ok_or_else(|| {
                 self.arm_cpu_growth_refusal
-                    .unwrap_or("CPU growth was not enabled at boot")
+                    .unwrap_or(
+                        "this boot has no CPU growth slots (started without growth, or restored from a checkpoint taken without it); a machine of at most 16 CPUs gains them at its next start",
+                    )
                     .into()
             })
     }

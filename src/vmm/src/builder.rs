@@ -904,8 +904,7 @@ pub fn build_microvm(
         None
     };
 
-    // A checkpoint keeps the topology it was taken with: a Mac checkpoint
-    // that could grow restores here with its parked slots.
+    // A checkpoint keeps the topology it was taken with, parked slots included.
     #[cfg(all(target_os = "linux", target_arch = "aarch64", not(feature = "tee")))]
     #[allow(unused_mut)]
     let mut arm_cpu_topology = if let Some(topology) = restore_checkpoint
@@ -1401,6 +1400,13 @@ pub fn build_microvm(
                             vcpus.iter().map(|v| v.get_mpidr()).collect(),
                         );
                         IrqChipDevice::new(Box::new(gicv3))
+                    }
+                    // A GICv2 addresses at most 8 CPUs; every growth slot
+                    // already exists, so a fallback could never boot.
+                    Err(e) if vcpu_count > 8 => {
+                        return Err(StartMicrovmError::GuestMemoryMmap(format!(
+                            "KVM GICv3 creation failed for {vcpu_count} vCPUs and a GICv2 holds at most 8: {e}"
+                        )));
                     }
                     Err(_) => {
                         warn!("KVM GICv3 creation failed, falling back to KVM GICv2");
