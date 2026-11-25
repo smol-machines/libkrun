@@ -416,8 +416,9 @@ pub(crate) fn import(sections: CheckpointSections<'_>) -> Result<VmCheckpoint, S
         vcpu_states,
         devices: sections.devices,
         ioapic: None,
-        // KVM on arm64 cannot add vCPUs to a running guest; the imported
-        // machine keeps the CPUs it has.
+        // A guest that booted on a Mac accepts only CPUs with Apple's
+        // features (the TSO memory model), which a KVM vCPU never has, so the
+        // imported machine keeps the CPUs it has.
         cpu_growth: None,
         memory_growth: sections.memory_growth,
     })

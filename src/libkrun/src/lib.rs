@@ -2066,6 +2066,7 @@ fn handle_control_stream(mut stream: ControlStream, vmm: &Arc<Mutex<vmm::Vmm>>) 
                 #[cfg(all(
                     any(
                         all(target_os = "linux", target_arch = "x86_64"),
+                        all(target_os = "linux", target_arch = "aarch64"),
                         all(target_os = "macos", target_arch = "aarch64")
                     ),
                     not(feature = "tee")
@@ -2076,11 +2077,16 @@ fn handle_control_stream(mut stream: ControlStream, vmm: &Arc<Mutex<vmm::Vmm>>) 
                     }
                     Err(error) => format!("ERR EIO {error}\n"),
                 },
-                #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+                #[cfg(all(
+                    target_os = "linux",
+                    any(target_arch = "x86_64", target_arch = "aarch64"),
+                    not(feature = "tee")
+                ))]
                 "CPU_SHRINK_CAPABILITIES" => "OK preserved-offline-cpu-slots-v1\n".into(),
                 #[cfg(all(
                     any(
                         all(target_os = "linux", target_arch = "x86_64"),
+                        all(target_os = "linux", target_arch = "aarch64"),
                         all(target_os = "macos", target_arch = "aarch64")
                     ),
                     not(feature = "tee")
@@ -2823,6 +2829,7 @@ pub extern "C" fn krun_set_live_resize(ctx_id: u32, flags: u32) -> i32 {
         && !cfg!(all(
             any(
                 all(target_os = "linux", target_arch = "x86_64"),
+                all(target_os = "linux", target_arch = "aarch64"),
                 all(target_os = "macos", target_arch = "aarch64")
             ),
             not(feature = "tee")
@@ -6260,6 +6267,7 @@ mod test_live_resize_config {
         let supported = cfg!(all(
             any(
                 all(target_os = "linux", target_arch = "x86_64"),
+                all(target_os = "linux", target_arch = "aarch64"),
                 all(target_os = "macos", target_arch = "aarch64")
             ),
             not(feature = "tee")

@@ -14,7 +14,11 @@ pub struct CpuGrowthTopology {
 impl CpuGrowthTopology {
     /// Online quota can be smaller than the preserved KVM CPU slots. The
     /// checkpoint still needs every slot, including offline CPU MP state.
-    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        not(feature = "tee")
+    ))]
     pub(crate) fn restored_slot_count(
         &self,
         configured_online: u8,
@@ -69,13 +73,21 @@ impl CpuGrowthTopology {
     }
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    not(feature = "tee")
+))]
 #[derive(Default)]
 pub(crate) struct CpuGrowthProgress {
     incomplete: Option<String>,
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    not(feature = "tee")
+))]
 impl CpuGrowthProgress {
     pub(crate) fn check(&self) -> Result<(), String> {
         match &self.incomplete {
@@ -102,7 +114,7 @@ impl CpuGrowthProgress {
 #[cfg(all(
     test,
     target_os = "linux",
-    target_arch = "x86_64",
+    any(target_arch = "x86_64", target_arch = "aarch64"),
     not(feature = "tee")
 ))]
 mod tests {

@@ -849,7 +849,11 @@ pub fn build_microvm(
     }
     #[cfg(snapshot_supported)]
     if let Some(checkpoint) = &restore_checkpoint {
-        #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64"),
+            not(feature = "tee")
+        ))]
         if let Some(topology) = &checkpoint.cpu_growth {
             vcpu_config.vcpu_count = topology
                 .restored_slot_count(vcpu_config.vcpu_count, checkpoint.vcpu_states.len())
@@ -864,7 +868,11 @@ pub fn build_microvm(
         }
         #[cfg(not(any(
             target_os = "macos",
-            all(target_os = "linux", target_arch = "x86_64", not(feature = "tee"))
+            all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64"),
+                not(feature = "tee")
+            )
         )))]
         if checkpoint.cpu_growth.is_some() {
             return Err(StartMicrovmError::GuestMemoryMmap(
@@ -895,6 +903,48 @@ pub fn build_microvm(
     } else {
         None
     };
+
+    // A checkpoint keeps the topology it was taken with, parked slots included.
+    #[cfg(all(target_os = "linux", target_arch = "aarch64", not(feature = "tee")))]
+    #[allow(unused_mut)]
+    let mut arm_cpu_topology = if let Some(topology) = restore_checkpoint
+        .as_ref()
+        .and_then(|checkpoint| checkpoint.cpu_growth.clone())
+    {
+        if topology.capacity > 16
+            || topology.ht_enabled
+            || topology.cpu_template.is_some()
+            || topology.nested_enabled != vm_resources.nested_enabled
+        {
+            return Err(StartMicrovmError::GuestMemoryMmap(
+                "checkpoint arm64 CPU growth topology is incompatible".into(),
+            ));
+        }
+        Some(topology)
+    } else if !restoring && vm_resources.live_cpu_growth {
+        Some(crate::cpu_growth::CpuGrowthTopology {
+            capacity: 16,
+            ht_enabled: false,
+            nested_enabled: vm_resources.nested_enabled,
+            cpu_template: None,
+        })
+    } else {
+        None
+    };
+    #[cfg(all(target_os = "linux", target_arch = "aarch64", not(feature = "tee")))]
+    let mut arm_cpu_growth_refusal: Option<&'static str> = None;
+    // Only a checkpoint imported from a Mac carries a board.
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "aarch64",
+        not(feature = "tee"),
+        snapshot_supported
+    ))]
+    if restore_board.is_some() {
+        arm_cpu_growth_refusal = Some(
+            "a machine that booted on a Mac cannot add CPUs on Linux: its kernel accepts only CPUs with Apple's features",
+        );
+    }
 
     // Clone the command-line so that a failed boot doesn't pollute the original.
     #[cfg(target_os = "macos")]
@@ -1302,9 +1352,22 @@ pub fn build_microvm(
     // Search for `kvm_arch_vcpu_create` in arch/arm/kvm/arm.c.
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     {
+        // A GICv2 addresses at most 8 CPUs, so a host without GICv3 boots
+        // with exactly its configured CPUs and cannot grow them.
+        #[cfg(not(feature = "tee"))]
+        if !restoring && arm_cpu_topology.is_some() && !KvmGicV3::is_supported(vm.fd()) {
+            warn!("KVM GICv3 is unavailable; live CPU growth is disabled for this VM");
+            arm_cpu_topology = None;
+            arm_cpu_growth_refusal = Some("this host has no GICv3, which CPU growth needs");
+        }
+        let mut capacity_config = vcpu_config.clone();
+        #[cfg(not(feature = "tee"))]
+        if let Some(topology) = &arm_cpu_topology {
+            capacity_config.vcpu_count = topology.capacity;
+        }
         vcpus = create_vcpus_aarch64(
             &vm,
-            &vcpu_config,
+            &capacity_config,
             &arch_memory_info,
             payload_config.entry_addr,
             &exit_evt,
@@ -1316,7 +1379,7 @@ pub fn build_microvm(
             // architected vGIC, which is required for requesting KVM the instantiation of a
             // GICv3. To relieve the users from having to configure the gic version manually,
             // try first to instantiate a GICv3, and fall back to a GICv2 if it fails.
-            let vcpu_count = vm_resources.vm_config().vcpu_count.unwrap() as u64;
+            let vcpu_count = vcpus.len() as u64;
             #[cfg(snapshot_supported)]
             let board_gic = match &restore_board {
                 Some(board) => Some(create_board_gic(&mut vm, &vcpus, vcpu_count, board)?),
@@ -1337,6 +1400,13 @@ pub fn build_microvm(
                             vcpus.iter().map(|v| v.get_mpidr()).collect(),
                         );
                         IrqChipDevice::new(Box::new(gicv3))
+                    }
+                    // A GICv2 addresses at most 8 CPUs; every growth slot
+                    // already exists, so a fallback could never boot.
+                    Err(e) if vcpu_count > 8 => {
+                        return Err(StartMicrovmError::GuestMemoryMmap(format!(
+                            "KVM GICv3 creation failed for {vcpu_count} vCPUs and a GICv2 holds at most 8: {e}"
+                        )));
                     }
                     Err(_) => {
                         warn!("KVM GICv3 creation failed, falling back to KVM GICv2");
@@ -1552,7 +1622,17 @@ pub fn build_microvm(
         prototype_cpu_topology,
         #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
         restored_cpuid: None,
-        #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+        #[cfg(all(target_os = "linux", target_arch = "aarch64", not(feature = "tee")))]
+        arm_cpu_topology: arm_cpu_topology.clone(),
+        #[cfg(all(target_os = "linux", target_arch = "aarch64", not(feature = "tee")))]
+        arm_pending_vcpus: Vec::new(),
+        #[cfg(all(target_os = "linux", target_arch = "aarch64", not(feature = "tee")))]
+        arm_cpu_growth_refusal,
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64"),
+            not(feature = "tee")
+        ))]
         cpu_growth_progress: Default::default(),
         #[cfg(all(
             any(target_os = "linux", target_os = "macos"),
@@ -1799,6 +1879,11 @@ pub fn build_microvm(
         vmm.kernel_cmdline
             .insert_kernel_arg(&format!("maxcpus={}", vcpu_config.vcpu_count))?;
     }
+    #[cfg(all(target_os = "linux", target_arch = "aarch64", not(feature = "tee")))]
+    if !restoring && vmm.arm_cpu_topology.is_some() {
+        vmm.kernel_cmdline
+            .insert_kernel_arg(&format!("maxcpus={}", vcpu_config.vcpu_count))?;
+    }
     if let Some(s) = &vm_resources.kernel_cmdline.epilog {
         vmm.kernel_cmdline.insert_str(s).unwrap();
     };
@@ -1870,6 +1955,10 @@ pub fn build_microvm(
     #[cfg(target_os = "macos")]
     {
         vmm.mac_pending_vcpus = vcpus.split_off(usize::from(vcpu_config.vcpu_count));
+    }
+    #[cfg(all(target_os = "linux", target_arch = "aarch64", not(feature = "tee")))]
+    if vmm.arm_cpu_topology.is_some() {
+        vmm.arm_pending_vcpus = vcpus.split_off(usize::from(vcpu_config.vcpu_count));
     }
     match restore_checkpoint {
         None => {

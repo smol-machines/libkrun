@@ -490,7 +490,20 @@ pub struct Vmm {
     /// CPUID of the vCPUs a checkpoint restored, which CPUs added later copy.
     #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
     restored_cpuid: Option<kvm_bindings::CpuId>,
-    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    /// KVM arm64 creates every possible vCPU before the vGIC exists. Slots
+    /// beyond the boot count stay powered off with no thread until growth.
+    #[cfg(all(target_os = "linux", target_arch = "aarch64", not(feature = "tee")))]
+    arm_cpu_topology: Option<cpu_growth::CpuGrowthTopology>,
+    #[cfg(all(target_os = "linux", target_arch = "aarch64", not(feature = "tee")))]
+    arm_pending_vcpus: Vec<Vcpu>,
+    /// Why this VM cannot grow, when the reason is not just a boot without growth.
+    #[cfg(all(target_os = "linux", target_arch = "aarch64", not(feature = "tee")))]
+    arm_cpu_growth_refusal: Option<&'static str>,
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        not(feature = "tee")
+    ))]
     cpu_growth_progress: cpu_growth::CpuGrowthProgress,
     #[cfg(all(
         any(target_os = "linux", target_os = "macos"),
@@ -905,7 +918,11 @@ impl Vmm {
                 .check_host_support(self.vm.supported_cpuid())
                 .map_err(Error::VcpuSnapshot)?;
         }
-        #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64"),
+            not(feature = "tee")
+        ))]
         self.cpu_growth_progress
             .check()
             .map_err(Error::VcpuSnapshot)?;
@@ -916,6 +933,8 @@ impl Vmm {
     fn snapshot_cpu_growth(&self) -> Option<cpu_growth::CpuGrowthTopology> {
         #[cfg(target_os = "macos")]
         return self.mac_cpu_topology.clone();
+        #[cfg(all(target_os = "linux", target_arch = "aarch64", not(feature = "tee")))]
+        return self.arm_cpu_topology.clone();
         #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
         return self
             .prototype_cpu_topology
@@ -928,7 +947,11 @@ impl Vmm {
             });
         #[cfg(not(any(
             target_os = "macos",
-            all(target_os = "linux", target_arch = "x86_64", not(feature = "tee"))
+            all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64"),
+                not(feature = "tee")
+            )
         )))]
         None
     }
@@ -1042,6 +1065,67 @@ impl Vmm {
             .map_err(|error| format!("new vCPU did not enter its run loop: {error:?}"))?;
         }
         Ok(())
+    }
+
+    /// Start parked arm64 slots; guest onlining (PSCI CPU_ON) is separate.
+    #[cfg(all(target_os = "linux", target_arch = "aarch64", not(feature = "tee")))]
+    pub fn prototype_grow_cpus(&mut self, count: u8) -> std::result::Result<(), String> {
+        self.cpu_growth_progress.check()?;
+        let result = self.prototype_grow_cpus_inner(count);
+        self.cpu_growth_progress.finish(&result);
+        result
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "aarch64", not(feature = "tee")))]
+    fn prototype_grow_cpus_inner(&mut self, count: u8) -> std::result::Result<(), String> {
+        let (created, capacity) = self.prototype_cpu_status()?;
+        if self.run_state != VmmRunState::Running || self.devices_quiesced {
+            return Err("CPU growth requires a running VM".into());
+        }
+        if usize::from(count) < created || count > capacity {
+            return Err("CPU target must grow within the advertised topology".into());
+        }
+        while self.vcpus_handles.len() < usize::from(count) {
+            let id = self.vcpus_handles.len() as u8;
+            self.arm_pending_vcpus
+                .first()
+                .ok_or("no parked vCPU slot is left")?
+                .reset_parked_aarch64(self.vm.fd())
+                .map_err(|error| error.to_string())?;
+            self.cpu_growth_progress.begin_creation(id);
+            let mut vcpu = self.arm_pending_vcpus.remove(0);
+            vcpu.set_mmio_bus(self.mmio_device_manager.bus.clone());
+            let handle = vcpu.start_threaded().map_err(|error| error.to_string())?;
+            self.vcpus_handles.push(handle);
+            let handle = self.vcpus_handles.last().unwrap();
+            // The thread enters KVM_RUN, where KVM keeps a powered-off vCPU
+            // asleep until the guest's PSCI CPU_ON.
+            handle
+                .send_event(VcpuEvent::Resume { paused_ns: 0 })
+                .map_err(|error| error.to_string())?;
+            Self::wait_for_vcpu_response(
+                handle,
+                VcpuResponse::Resumed,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .map_err(|error| format!("new vCPU did not enter its run loop: {error:?}"))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "aarch64", not(feature = "tee")))]
+    pub fn prototype_cpu_status(&self) -> std::result::Result<(usize, u8), String> {
+        self.cpu_growth_progress.check()?;
+        self.arm_cpu_topology
+            .as_ref()
+            .map(|topology| (self.vcpus_handles.len(), topology.capacity))
+            .ok_or_else(|| {
+                self.arm_cpu_growth_refusal
+                    .unwrap_or(
+                        "this boot has no CPU growth slots (started without growth, or restored from a checkpoint taken without it); a machine of at most 16 CPUs gains them at its next start",
+                    )
+                    .into()
+            })
     }
 
     /// Host-created CPU count and capacity, not the guest-online count.
@@ -1420,7 +1504,11 @@ impl Vmm {
                 .validate_backing(&self.guest_memory)
                 .map_err(Error::VcpuSnapshot)?;
         }
-        #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64"),
+            not(feature = "tee")
+        ))]
         self.cpu_growth_progress
             .check()
             .map_err(Error::VcpuSnapshot)?;
