@@ -94,6 +94,20 @@ fn build_rust_init() -> PathBuf {
             (musl_rustc.to_string_lossy().into_owned(), cargo, true)
         }
         None => {
+            // On a Linux host the fallback still produces an ELF the guest
+            // can exec, just dynamically linked. On any other host it
+            // produces a host-arch binary (Mach-O on macOS), the blob embeds
+            // it anyway, and every guest built against the library panics at
+            // boot with "Requested init /init.krun failed (error -8)".
+            // Refuse to build that library.
+            if !cfg!(target_os = "linux") {
+                panic!(
+                    "krun-init must be a Linux binary, and the {target} Rust target is not \
+                     installed. Install it with `rustup target add {target}` and configure \
+                     its cross linker (see the musl linker block in the Makefile).",
+                    target = musl_target_for_host()
+                );
+            }
             println!(
                 "cargo:warning=musl target not available; krun-init will be dynamically linked. \
                  Run `rustup target add $(uname -m)-unknown-linux-musl` for a static binary."
