@@ -35,6 +35,8 @@ const KEY_RESTART: u32 = 0x198;
 // Look for "The 1st cell..."
 const GIC_FDT_IRQ_TYPE_SPI: u32 = 0;
 const GIC_FDT_IRQ_TYPE_PPI: u32 = 1;
+// PPI of the performance monitor interrupt (INTID 23).
+const PMU_PPI: u32 = 7;
 
 // From https://elixir.bootlin.com/linux/v4.9.62/source/include/dt-bindings/interrupt-controller/irq.h#L17
 const IRQ_TYPE_EDGE_RISING: u32 = 1;
@@ -69,6 +71,7 @@ impl From<FdtError> for Error {
 }
 
 /// Creates the flattened device tree for this aarch64 microVM.
+#[allow(clippy::too_many_arguments)]
 pub fn create_fdt<T: DeviceInfoForFDT + Clone + Debug>(
     guest_mem: &GuestMemoryMmap,
     arch_memory_info: &ArchMemoryInfo,
@@ -77,6 +80,7 @@ pub fn create_fdt<T: DeviceInfoForFDT + Clone + Debug>(
     device_info: &HashMap<(DeviceType, String), T>,
     gic_device: &IrqChip,
     initrd: &Option<InitrdConfig>,
+    pmu: bool,
 ) -> Result<Vec<u8>> {
     // Alocate stuff necessary for the holding the blob.
     let mut fdt = FdtWriter::new()?;
@@ -100,6 +104,9 @@ pub fn create_fdt<T: DeviceInfoForFDT + Clone + Debug>(
     create_chosen_node(&mut fdt, cmdline, initrd, device_info)?;
     create_gic_node(&mut fdt, gic_device)?;
     create_timer_node(&mut fdt)?;
+    if pmu {
+        create_pmu_node(&mut fdt)?;
+    }
     create_clock_node(&mut fdt)?;
     create_psci_node(&mut fdt)?;
     create_devices_node(&mut fdt, device_info)?;
@@ -283,6 +290,17 @@ fn create_timer_node(fdt: &mut FdtWriter) -> Result<()> {
     fdt.property_string("compatible", compatible)?;
     fdt.property_null("always-on")?;
     fdt.property("interrupts", &timer_reg_prop)?;
+    fdt.end_node(node)?;
+
+    Ok(())
+}
+
+fn create_pmu_node(fdt: &mut FdtWriter) -> Result<()> {
+    let irq = generate_prop32(&[GIC_FDT_IRQ_TYPE_PPI, PMU_PPI, IRQ_TYPE_LEVEL_HI]);
+
+    let node = fdt.begin_node("pmu")?;
+    fdt.property_string("compatible", "arm,armv8-pmuv3")?;
+    fdt.property("interrupts", &irq)?;
     fdt.end_node(node)?;
 
     Ok(())
