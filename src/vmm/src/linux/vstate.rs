@@ -50,6 +50,8 @@ use crate::resources::TeeConfig;
 use crate::vmm_config::machine_config::CpuFeaturesTemplate;
 #[cfg(target_arch = "x86_64")]
 use cpuid::{VmSpec, c3, compat, filter_cpuid, intel_portable, t2};
+#[cfg(all(target_arch = "x86_64", feature = "gpu", not(feature = "tee")))]
+use kvm_bindings::kvm_enable_cap;
 #[cfg(not(feature = "tee"))]
 use kvm_bindings::kvm_userspace_memory_region;
 #[cfg(target_arch = "x86_64")]
@@ -818,6 +820,35 @@ impl Vm {
             tee_config: tee_config.tee,
             guest_memfds: Vec::new(),
         })
+    }
+
+    /// Make KVM apply the cache type the guest sets on its own mappings.
+    ///
+    /// On Intel, KVM by default ignores the guest's PAT and maps all guest
+    /// memory as write-back. A blob of host GPU memory that the host driver
+    /// maps write-combined, because the GPU does not snoop the CPU caches, is
+    /// then read and written through the cache in the guest: the GPU does not
+    /// see guest writes and the guest does not see GPU writes. Disabling the
+    /// quirk lets the guest's write-combined mapping of such a blob take
+    /// effect. Kernels without the quirk either always honor guest PAT (AMD)
+    /// or cannot, and are left alone.
+    #[cfg(all(target_arch = "x86_64", feature = "gpu", not(feature = "tee")))]
+    pub fn honor_guest_pat(&self) {
+        const KVM_CAP_DISABLE_QUIRKS2: u32 = 213;
+        const KVM_X86_QUIRK_IGNORE_GUEST_PAT: u64 = 1 << 9;
+
+        let quirks = self.fd.check_extension_raw(KVM_CAP_DISABLE_QUIRKS2.into());
+        if quirks <= 0 || quirks as u64 & KVM_X86_QUIRK_IGNORE_GUEST_PAT == 0 {
+            return;
+        }
+        let cap = kvm_enable_cap {
+            cap: KVM_CAP_DISABLE_QUIRKS2,
+            args: [KVM_X86_QUIRK_IGNORE_GUEST_PAT, 0, 0, 0],
+            ..Default::default()
+        };
+        if let Err(e) = self.fd.enable_cap(&cap) {
+            warn!("could not make KVM honor guest PAT: {e}");
+        }
     }
 
     /// Returns a ref to the supported `CpuId` for this Vm.
