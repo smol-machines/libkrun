@@ -2457,6 +2457,18 @@ impl Vcpu {
         mem_info: &ArchMemoryInfo,
         kernel_load_addr: GuestAddress,
     ) -> Result<()> {
+        let kvi = self.init_features(vm_fd)?;
+        self.fd.vcpu_init(&kvi).map_err(Error::VcpuArmInit)?;
+        arch::aarch64::regs::setup_regs(&self.fd, self.id, kernel_load_addr.raw_value(), mem_info)
+            .map_err(Error::REGSConfiguration)?;
+
+        self.mpidr = arch::aarch64::regs::read_mpidr(&self.fd).map_err(Error::REGSConfiguration)?;
+
+        Ok(())
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn init_features(&self, vm_fd: &VmFd) -> Result<kvm_bindings::kvm_vcpu_init> {
         let mut kvi: kvm_bindings::kvm_vcpu_init = kvm_bindings::kvm_vcpu_init::default();
 
         // This reads back the kernel's preferred target type.
@@ -2476,14 +2488,21 @@ impl Vcpu {
         if vm_fd.check_extension(kvm_ioctls::Cap::ArmPtrAuthGeneric) {
             kvi.features[0] |= 1 << kvm_bindings::KVM_ARM_VCPU_PTRAUTH_GENERIC;
         }
+        Ok(kvi)
+    }
 
-        self.fd.vcpu_init(&kvi).map_err(Error::VcpuArmInit)?;
-        arch::aarch64::regs::setup_regs(&self.fd, self.id, kernel_load_addr.raw_value(), mem_info)
-            .map_err(Error::REGSConfiguration)?;
-
-        self.mpidr = arch::aarch64::regs::read_mpidr(&self.fd).map_err(Error::REGSConfiguration)?;
-
-        Ok(())
+    /// Return a parked growth slot to its powered-off reset state before its
+    /// thread first starts. KVM accepts a guest's PSCI CPU_ON for a slot no
+    /// thread runs yet; the guest gives up on that CPU after its timeout, so
+    /// the slot must not later start at that stale entry point.
+    #[cfg(target_arch = "aarch64")]
+    pub fn reset_parked_aarch64(&self, vm_fd: &VmFd) -> Result<()> {
+        let state = self.fd.get_mp_state().map_err(Error::VcpuGetMpState)?;
+        if state.mp_state == kvm_bindings::KVM_MP_STATE_STOPPED {
+            return Ok(());
+        }
+        let kvi = self.init_features(vm_fd)?;
+        self.fd.vcpu_init(&kvi).map_err(Error::VcpuArmInit)
     }
 
     #[cfg(target_arch = "riscv64")]

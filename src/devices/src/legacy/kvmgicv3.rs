@@ -27,6 +27,26 @@ pub struct KvmGicV3 {
 }
 
 impl KvmGicV3 {
+    /// Whether this host can create an in-kernel GICv3, asked without
+    /// creating one: the vGIC must follow every vCPU it will serve.
+    pub fn is_supported(vm: &VmFd) -> bool {
+        use std::os::unix::io::AsRawFd;
+
+        // _IOWR(KVMIO, 0xe0, struct kvm_create_device). Not `VmFd::create_device`:
+        // it wraps the returned fd, and a TEST request returns none.
+        const KVM_CREATE_DEVICE: u64 = (3 << 30)
+            | ((std::mem::size_of::<kvm_bindings::kvm_create_device>() as u64) << 16)
+            | (0xae << 8)
+            | 0xe0;
+        let mut gic_device = kvm_bindings::kvm_create_device {
+            type_: kvm_bindings::kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_V3,
+            fd: 0,
+            flags: kvm_bindings::KVM_CREATE_DEVICE_TEST,
+        };
+        // SAFETY: the request matches the struct it points to, which outlives the call.
+        unsafe { libc::ioctl(vm.as_raw_fd(), KVM_CREATE_DEVICE as _, &mut gic_device) == 0 }
+    }
+
     pub fn new(vm: &VmFd, vcpu_count: u64) -> Result<Self, Error> {
         let dist_addr = arch::MMIO_MEM_START - KVM_VGIC_V3_BASE_SIZE;
         let redists_addr = dist_addr - 2 * KVM_VGIC_V3_BASE_SIZE * vcpu_count;
