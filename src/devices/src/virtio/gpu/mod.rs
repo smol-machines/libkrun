@@ -1,5 +1,6 @@
 mod device;
 pub mod display;
+mod display_replay;
 mod edid;
 mod protocol;
 mod virtio_gpu;
@@ -9,6 +10,7 @@ use super::descriptor_utils::Error as DescriptorError;
 
 pub use self::defs::uapi::VIRTIO_ID_GPU as TYPE_GPU;
 pub use self::device::{Gpu, GpuState};
+pub use self::display_replay::DisplayReplay;
 
 mod defs {
     pub const GPU_DEV_ID: &str = "virtio_gpu";

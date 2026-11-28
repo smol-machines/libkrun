@@ -26,6 +26,7 @@ use vm_memory::{GuestAddress, GuestMemoryMmap};
 
 use super::super::descriptor_utils::{Reader, Writer};
 use super::super::{GpuError, Queue as VirtQueue};
+use super::display_replay::DisplayReplay;
 use super::protocol::{
     GpuCommand, GpuResponse, VirtioGpuResult, virtio_gpu_ctrl_hdr, virtio_gpu_mem_entry,
 };
@@ -55,6 +56,12 @@ pub struct Worker {
     export_table: Option<ExportTable>,
     displays: Box<[DisplayInfo]>,
     display_backend: DisplayBackend<'static>,
+    /// The guest's 2D framebuffers, shared with the device so a snapshot can
+    /// carry them (see [`DisplayReplay`]).
+    display_replay: Arc<Mutex<DisplayReplay>>,
+    /// Recreate `display_replay` on the fresh renderer before serving the
+    /// guest: this device was restored from a checkpoint or fork.
+    replay_on_start: bool,
     /// Per-context poll fds, populated on CtxCreate.
     /// `Some(fd)` — epollable fd returned by virgl_renderer_context_get_poll_fd.
     /// `None`     — virglrenderer returned -1; context is blind-polled each tick.
@@ -94,6 +101,8 @@ impl Worker {
         export_table: Option<ExportTable>,
         displays: Box<[DisplayInfo]>,
         display_backend: DisplayBackend<'static>,
+        display_replay: Arc<Mutex<DisplayReplay>>,
+        replay_on_start: bool,
     ) -> Self {
         // Clone the eventfd so we have our own file description, then set it to blocking mode.
         let control_evt = control_event.try_clone().unwrap();
@@ -127,6 +136,8 @@ impl Worker {
             export_table,
             displays,
             display_backend,
+            display_replay,
+            replay_on_start,
             #[cfg(target_os = "linux")]
             context_poll_fds: HashMap::new(),
             #[cfg(target_os = "linux")]
@@ -157,6 +168,10 @@ impl Worker {
             self.displays.clone(),
             self.display_backend,
         );
+
+        if self.replay_on_start {
+            self.replay_display(&mut virtio_gpu);
+        }
 
         #[cfg(target_os = "linux")]
         self.work_loop_epoll(&mut virtio_gpu);
@@ -464,6 +479,105 @@ impl Worker {
         }
     }
 
+    /// Recreate the guest's 2D framebuffers on this restored device, before it
+    /// serves any guest command: each recorded resource is created again with
+    /// the same parameters and attached to the same guest memory, which was
+    /// restored with the machine, and each scanout is set back and presented
+    /// once so the display shows the guest's current frame. A resource or
+    /// scanout that cannot be recreated is dropped from the record (and logged)
+    /// rather than failing the restore; the guest then sees the same errors it
+    /// would have without the replay.
+    fn replay_display(&self, virtio_gpu: &mut VirtioGpu) {
+        let recorded = self.display_replay.lock().unwrap().clone();
+        if recorded.is_empty() {
+            return;
+        }
+        virtio_gpu.force_ctx_0();
+        let mut kept = DisplayReplay::default();
+        for resource in &recorded.resources {
+            let create = ResourceCreate3D {
+                target: RUTABAGA_PIPE_TEXTURE_2D,
+                format: resource.format,
+                bind: RUTABAGA_PIPE_BIND_RENDER_TARGET,
+                width: resource.width,
+                height: resource.height,
+                depth: 1,
+                array_size: 1,
+                last_level: 0,
+                nr_samples: 0,
+                flags: 0,
+            };
+            if let Err(e) = virtio_gpu.resource_create_3d(resource.id, create) {
+                error!(
+                    "virtio_gpu: restore of 2D resource {} failed: {e:?}",
+                    resource.id
+                );
+                continue;
+            }
+            kept.created(
+                resource.id,
+                resource.format,
+                resource.width,
+                resource.height,
+            );
+            if resource.backing.is_empty() {
+                continue;
+            }
+            let vecs = resource
+                .backing
+                .iter()
+                .map(|&(addr, len)| (GuestAddress(addr), len as usize))
+                .collect();
+            match virtio_gpu.attach_backing(resource.id, &self.mem, vecs) {
+                Ok(_) => kept.attached(resource.id, resource.backing.clone()),
+                Err(e) => error!(
+                    "virtio_gpu: restore of the backing of 2D resource {} failed: {e:?}",
+                    resource.id
+                ),
+            }
+        }
+        for binding in &recorded.scanouts {
+            if let Err(e) = virtio_gpu.set_scanout(
+                binding.scanout_id,
+                binding.resource_id,
+                binding.width,
+                binding.height,
+            ) {
+                error!(
+                    "virtio_gpu: restore of scanout {} failed: {e:?}",
+                    binding.scanout_id
+                );
+                continue;
+            }
+            kept.scanout(
+                binding.scanout_id,
+                binding.resource_id,
+                binding.width,
+                binding.height,
+            );
+            // Present the guest's current frame: the pixels are in the restored
+            // guest memory, and an idle compositor sends nothing until the
+            // screen changes.
+            let transfer = Transfer3D::new_2d(0, 0, binding.width, binding.height);
+            let rect = Rect {
+                x: 0,
+                y: 0,
+                width: binding.width,
+                height: binding.height,
+            };
+            if let Err(e) = virtio_gpu
+                .transfer_write(0, binding.resource_id, transfer)
+                .and_then(|_| virtio_gpu.flush_resource(binding.resource_id, rect))
+            {
+                error!(
+                    "virtio_gpu: presenting restored scanout {} failed: {e:?}",
+                    binding.scanout_id
+                );
+            }
+        }
+        *self.display_replay.lock().unwrap() = kept;
+    }
+
     fn process_gpu_command(
         &mut self,
         virtio_gpu: &mut VirtioGpu,
@@ -493,15 +607,41 @@ impl Worker {
                     flags: 0,
                 };
 
-                virtio_gpu.resource_create_3d(resource_id, resource_create_3d)
+                let result = virtio_gpu.resource_create_3d(resource_id, resource_create_3d);
+                if result.is_ok() {
+                    self.display_replay.lock().unwrap().created(
+                        resource_id,
+                        info.format,
+                        info.width,
+                        info.height,
+                    );
+                }
+                result
             }
-            GpuCommand::ResourceUnref(info) => virtio_gpu.unref_resource(info.resource_id),
-            GpuCommand::SetScanout(info) => virtio_gpu.set_scanout(
-                info.scanout_id,
-                info.resource_id,
-                info.r.width,
-                info.r.height,
-            ),
+            GpuCommand::ResourceUnref(info) => {
+                let result = virtio_gpu.unref_resource(info.resource_id);
+                if result.is_ok() {
+                    self.display_replay.lock().unwrap().unref(info.resource_id);
+                }
+                result
+            }
+            GpuCommand::SetScanout(info) => {
+                let result = virtio_gpu.set_scanout(
+                    info.scanout_id,
+                    info.resource_id,
+                    info.r.width,
+                    info.r.height,
+                );
+                if result.is_ok() {
+                    self.display_replay.lock().unwrap().scanout(
+                        info.scanout_id,
+                        info.resource_id,
+                        info.r.width,
+                        info.r.height,
+                    );
+                }
+                result
+            }
             GpuCommand::ResourceFlush(info) => {
                 let rect = Rect {
                     x: info.r.x,
@@ -531,13 +671,33 @@ impl Worker {
                             Err(_) => return Err(GpuResponse::ErrUnspec),
                         }
                     }
-                    virtio_gpu.attach_backing(info.resource_id, mem, vecs)
+                    let recorded = vecs
+                        .iter()
+                        .map(|&(addr, len)| (addr.0, len as u32))
+                        .collect();
+                    let result = virtio_gpu.attach_backing(info.resource_id, mem, vecs);
+                    if result.is_ok() {
+                        self.display_replay
+                            .lock()
+                            .unwrap()
+                            .attached(info.resource_id, recorded);
+                    }
+                    result
                 } else {
                     error!("missing data for command {cmd:?}");
                     Err(GpuResponse::ErrUnspec)
                 }
             }
-            GpuCommand::ResourceDetachBacking(info) => virtio_gpu.detach_backing(info.resource_id),
+            GpuCommand::ResourceDetachBacking(info) => {
+                let result = virtio_gpu.detach_backing(info.resource_id);
+                if result.is_ok() {
+                    self.display_replay
+                        .lock()
+                        .unwrap()
+                        .detached(info.resource_id);
+                }
+                result
+            }
             GpuCommand::UpdateCursor(_info) => {
                 error!("virtio_gpu: GpuCommand::UpdateCursor unimplemented");
                 Err(GpuResponse::ErrUnspec)
@@ -720,18 +880,28 @@ impl Worker {
                     mem,
                 )
             }
-            GpuCommand::SetScanoutBlob(info) => virtio_gpu.set_scanout_blob(
-                info.scanout_id,
-                BlobScanout {
-                    ctx_id: hdr.ctx_id,
-                    resource_id: info.resource_id,
-                    width: info.width,
-                    height: info.height,
-                    format: info.format,
-                    stride: info.strides[0],
-                    offset: info.offsets[0],
-                },
-            ),
+            GpuCommand::SetScanoutBlob(info) => {
+                let result = virtio_gpu.set_scanout_blob(
+                    info.scanout_id,
+                    BlobScanout {
+                        ctx_id: hdr.ctx_id,
+                        resource_id: info.resource_id,
+                        width: info.width,
+                        height: info.height,
+                        format: info.format,
+                        stride: info.strides[0],
+                        offset: info.offsets[0],
+                    },
+                );
+                if result.is_ok() {
+                    // A blob holds host GPU state the replay cannot rebuild.
+                    self.display_replay
+                        .lock()
+                        .unwrap()
+                        .scanout_cleared(info.scanout_id);
+                }
+                result
+            }
             GpuCommand::ResourceMapBlob(info) => {
                 let resource_id = info.resource_id;
                 let offset = info.offset;
