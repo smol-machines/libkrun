@@ -12,6 +12,7 @@ use super::super::{
 use super::defs;
 use super::defs::uapi;
 use super::defs::uapi::virtio_gpu_config;
+use super::display_replay::DisplayReplay;
 use super::worker::Worker;
 use crate::virtio::InterruptTransport;
 use crate::virtio::display::DisplayInfo;
@@ -37,13 +38,18 @@ static QUEUE_CONFIG: [QueueConfig; defs::NUM_QUEUES] =
 /// render-server connection) — that is live host GPU state which is not
 /// serializable (rutabaga only snapshots 2D). A fork clone re-activates the GPU
 /// device fresh, spawning its own render-server and rutabaga; this snapshot
-/// carries only what the transport needs to re-attach the guest's queues:
-/// negotiated features + per-queue ring state.
+/// carries what the transport needs to re-attach the guest's queues
+/// (negotiated features + per-queue ring state) and the guest's 2D framebuffers,
+/// which the clone recreates on its fresh renderer (see [`DisplayReplay`]).
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GpuState {
     pub acked_features: u64,
     /// Control queue then cursor queue (index order), each `None` if never set up.
     pub queues: Vec<Option<QueueState>>,
+    /// Absent from snapshots taken before it existed: those restore with no
+    /// framebuffers to recreate, as before.
+    #[serde(default)]
+    pub display: DisplayReplay,
 }
 
 pub struct Gpu {
@@ -64,6 +70,12 @@ pub struct Gpu {
     /// drains and acks cursor commands, so ring state must be read live at
     /// snapshot time.
     cursor_queue: Option<Arc<Mutex<VirtQueue>>>,
+    /// The guest's 2D framebuffers, kept up to date by the worker and carried by
+    /// a snapshot.
+    display_replay: Arc<Mutex<DisplayReplay>>,
+    /// Set by [`Gpu::restore_state`]: the next activation recreates
+    /// `display_replay` before the worker serves the guest.
+    replay_on_activate: bool,
 }
 
 impl Gpu {
@@ -86,6 +98,8 @@ impl Gpu {
             display_backend,
             control_queue: None,
             cursor_queue: None,
+            display_replay: Arc::new(Mutex::new(DisplayReplay::default())),
+            replay_on_activate: false,
         })
     }
 
@@ -104,6 +118,11 @@ impl Gpu {
         GpuState {
             acked_features: self.acked_features,
             queues: vec![control, cursor],
+            display: self
+                .display_replay
+                .lock()
+                .expect("gpu display replay poisoned")
+                .clone(),
         }
     }
 
@@ -112,6 +131,11 @@ impl Gpu {
     /// the saved ring state by the transport's `restore_and_activate`.
     pub fn restore_state(&mut self, state: &GpuState) -> Result<(), String> {
         self.acked_features = state.acked_features;
+        *self
+            .display_replay
+            .lock()
+            .expect("gpu display replay poisoned") = state.display.clone();
+        self.replay_on_activate = true;
         Ok(())
     }
 
@@ -285,6 +309,8 @@ impl VirtioDevice for Gpu {
             self.export_table.take(),
             self.displays.clone(),
             self.display_backend,
+            self.display_replay.clone(),
+            std::mem::take(&mut self.replay_on_activate),
         );
         worker.run();
 

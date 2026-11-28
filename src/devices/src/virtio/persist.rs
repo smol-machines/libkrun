@@ -327,6 +327,17 @@ mod tests {
     // A GPU device carries only transport state (features + queue rings) into a
     // fork — never its rutabaga GPU state — so the clone re-activates the device
     // fresh. This checks the snapshot reports that transport state and survives
+    /// smolvm#2475: a GPU snapshot taken before the display record existed
+    /// still restores, with no framebuffers to recreate.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn a_gpu_snapshot_without_a_display_record_still_restores() {
+        let old = r#"{"acked_features":61453,"queues":[null,null]}"#;
+        let state: GpuState = serde_json::from_str(old).expect("old snapshot");
+        assert_eq!(state.acked_features, 0xF00D);
+        assert!(state.display.is_empty());
+    }
+
     // the serialization used for cross-process fork.
     #[cfg(feature = "gpu")]
     #[test]
@@ -344,9 +355,14 @@ mod tests {
             event_idx_enabled: false,
             num_added: 0,
         };
+        let mut display = crate::virtio::gpu::DisplayReplay::default();
+        display.created(7, 2, 1280, 800);
+        display.attached(7, vec![(0x1000, 4096)]);
+        display.scanout(0, 7, 1280, 800);
         let snap = DeviceSnapshot::Gpu(GpuState {
             acked_features: 0xF00D,
             queues: vec![Some(qs.clone()), None],
+            display,
         });
 
         assert_eq!(snap.device_type(), TYPE_GPU);
